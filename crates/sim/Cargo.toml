@@ -7,3 +7,6 @@ description = "Shared deterministic simulation crate (Tier 0 integrator + Tier 1
 
 [dependencies]
 glam.workspace = true
+serde.workspace = true
+bevy_ecs.workspace = true
+rapier2d.workspace = true
