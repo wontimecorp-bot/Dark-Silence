@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/sim"]
+
+# Shared, version-pinned dependencies. Crates opt in via `dep.workspace = true`.
+# Heavy deps (bevy, lightyear, rapier2d, sqlx, redis, tokio, bitcode, tracing)
+# are added here as their owning crates come online per the phased roadmap.
+[workspace.dependencies]
+glam = { version = "0.30", features = ["serde"] }
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# Tighter release profile; the sim is CPU-bound at scale.
+[profile.release]
+lto = "thin"
+codegen-units = 1
