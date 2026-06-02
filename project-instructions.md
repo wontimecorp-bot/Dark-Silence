@@ -43,7 +43,7 @@ Every delivery increment MUST yield something runnable and demoable, and core "f
 <!-- Downstream phases (Plan, QC, Autopilot) read this section as the authoritative tech-stack reference. -->
 
 - **Language/Runtime**: Rust (edition 2021; dev toolchain 1.92.0; MSRV to be pinned later).
-- **Frameworks**: Bevy (client) + `bevy_ecs` as a pure ECS library inside the shared `sim` crate; lightyear for networking — prediction/reconciliation/interpolation/interest management (planned); Rapier2D for planar physics behind a swappable `Physics` trait (planned). Currently wired: `glam`. Serialization: `bitcode` for snapshots (planned).
+- **Frameworks**: Bevy (client) + `bevy_ecs` as a pure ECS library inside the shared `sim` crate; renet (transport-level UDP) for networking, isolated behind the `protocol` crate + a swappable `NetTransport` adapter, with prediction/reconciliation/interpolation/snapshots game-owned against the shared `sim` (ADR-0014, refining the earlier lightyear choice; `bevy_replicon`/`aeronet` documented fallbacks) (planned); Rapier2D for planar physics behind a swappable `Physics` trait (planned). Currently wired: `glam`. Serialization: `bitcode` for snapshots (planned).
 - **Storage**: PostgreSQL + Redis for Tier 1 transit and Tier 2 persistent state (planned); none wired currently.
 - **Infrastructure**: Local dev now; single VPS + managed PostgreSQL at launch; containerization later; multi-node orchestration deferred (Phase 5).
 
@@ -76,4 +76,6 @@ Every delivery increment MUST yield something runnable and demoable, and core "f
 - Complexity beyond these principles MUST be justified and documented.
 - The SDD-Pilot lifecycle and phase gates are enforced; any violation of these project instructions is CRITICAL severity.
 
-**Version**: 1.0.0 | **Last Amended**: 2026-05-31
+**Version**: 1.1.0 | **Last Amended**: 2026-06-02
+
+> **Changelog** — 1.1.0 (2026-06-02): networking library changed from lightyear to **renet** (transport-level; prediction/reconciliation/interpolation/snapshots game-owned), isolated behind the `protocol` adapter, per ADR-0014 (refines ADR-0007). · 1.0.0 (2026-05-31): initial.

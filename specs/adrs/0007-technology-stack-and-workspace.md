@@ -98,6 +98,7 @@ Chosen option: **Rust 2021 Cargo workspace** — Bevy client; custom authoritati
 
 ## Links
 
+- Networking-library choice refined by [ADR-0014](0014-netcode-transport-renet-own-netcode.md) (lightyear → renet).
 - Related ADR: [ADR-0003](0003-shared-sim-crate-and-fixed-step-integration.md)
 - Related ADR: [ADR-0004](0004-2d-physics-behind-trait.md)
 - Related ADR: ADR-0006
