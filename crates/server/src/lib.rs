@@ -167,6 +167,33 @@ impl ClientLink {
     }
 }
 
+/// One entity's **unquantized** authoritative render pose, as read directly from
+/// the server `world` by [`ServerApp::render_state`].
+///
+/// This is the in-process render seam the windowed solo client draws from: for
+/// loopback there is no real latency, so rendering the embedded server's world at
+/// full `f32` precision (rather than through the quantized snapshot wire +
+/// predict/interpolate netcode) gives crisp, in-sync collision and hits. It is
+/// keyed by the SAME wire [`EntityId`] the snapshots use, so the client can
+/// find-or-spawn and despawn its rendered entities by stable id.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderEntity {
+    /// Stable wire id (same mapping the snapshots use).
+    pub id: EntityId,
+    /// What the entity is (picks the client mesh/material).
+    pub kind: EntityKind,
+    /// Sub-kind tag for targets ([`TargetKind::as_u8`]); `0` for ship/projectile.
+    pub flags: u8,
+    /// World-space position on the 2D gameplay plane (full `f32`, unquantized).
+    pub pos: Vec2,
+    /// Facing angle (radians): ship `Heading`, projectile `vel.to_angle()`, `0.0`
+    /// for targets.
+    pub heading: f32,
+    /// Linear velocity (full `f32`, unquantized) — drives the HUD SPD readout for
+    /// the local ship.
+    pub vel: Vec2,
+}
+
 /// The headless authoritative server app.
 pub struct ServerApp {
     /// The authoritative ECS world (single source of truth, Principle I).
@@ -778,6 +805,86 @@ impl ServerApp {
     /// broadcast, but mutates no world state).
     pub fn current_full_state(&mut self) -> FullState {
         self.build_full_state()
+    }
+
+    /// The current authoritative per-entity render state, **unquantized** (full
+    /// `f32` precision, no wire round-trip) — the in-process render read the
+    /// windowed solo client draws from directly (no predict/interpolate netcode on
+    /// that path; the embedded server IS the authoritative sim, so its world is the
+    /// crisp, in-sync source of truth for collision and hits).
+    ///
+    /// One [`RenderEntity`] per replicated Ship / Projectile / Target, keyed by the
+    /// SAME wire [`EntityId`] mapping ([`EntityIdAllocator::id_for`]) the snapshots
+    /// use, so the client can reconcile its rendered entities by stable id. Mirrors
+    /// [`ServerApp::full_records`] but skips quantization: `flags` carries the
+    /// target sub-kind ([`TargetKind::as_u8`]; `0` for ship/projectile) and
+    /// `heading` is the ship `Heading` (projectile heading is derived from velocity
+    /// direction, target heading is `0.0`).
+    ///
+    /// Additive and client-only: no test depends on it, and it mutates no world
+    /// state (it only mints wire ids for any not-yet-seen entity, exactly as a
+    /// snapshot build would).
+    pub fn render_state(&mut self) -> Vec<RenderEntity> {
+        let mut out = Vec::new();
+
+        // Ships (carry a `Heading`).
+        let mut ships = self
+            .world
+            .query_filtered::<(Entity, &Position, &Velocity, &Heading), With<Ship>>();
+        let ship_rows: Vec<(Entity, Vec2, Vec2, f32)> = ships
+            .iter(&self.world)
+            .map(|(e, p, v, h)| (e, p.0, v.0, h.0))
+            .collect();
+        for (entity, pos, vel, heading) in ship_rows {
+            out.push(RenderEntity {
+                id: self.entity_ids.id_for(entity),
+                kind: EntityKind::Ship,
+                flags: 0,
+                pos,
+                heading,
+                vel,
+            });
+        }
+
+        // Projectiles (heading derived from velocity direction).
+        let mut projectiles = self
+            .world
+            .query_filtered::<(Entity, &Position, &Velocity), With<Projectile>>();
+        let proj_rows: Vec<(Entity, Vec2, Vec2)> = projectiles
+            .iter(&self.world)
+            .map(|(e, p, v)| (e, p.0, v.0))
+            .collect();
+        for (entity, pos, vel) in proj_rows {
+            out.push(RenderEntity {
+                id: self.entity_ids.id_for(entity),
+                kind: EntityKind::Projectile,
+                flags: 0,
+                pos,
+                heading: vel.to_angle(),
+                vel,
+            });
+        }
+
+        // Targets (the sub-kind rides in `flags` via `TargetKind::as_u8`).
+        let mut targets = self
+            .world
+            .query_filtered::<(Entity, &Position, &Velocity, &TargetKind), With<Target>>();
+        let target_rows: Vec<(Entity, Vec2, Vec2, u8)> = targets
+            .iter(&self.world)
+            .map(|(e, p, v, k)| (e, p.0, v.0, k.as_u8()))
+            .collect();
+        for (entity, pos, vel, kind_flag) in target_rows {
+            out.push(RenderEntity {
+                id: self.entity_ids.id_for(entity),
+                kind: EntityKind::Target,
+                flags: kind_flag,
+                pos,
+                heading: 0.0,
+                vel,
+            });
+        }
+
+        out
     }
 
     /// The flat authoritative record list (ships, projectiles, targets), quantized

@@ -1,42 +1,41 @@
 //! Scene setup (FR-001/FR-008/FR-012), networkized in E003 OBJ4.
 //!
-//! The scene now spawns **only** the locally-owned, render-bound entities: the
-//! lighting, the gunsight pip, and the LOCAL player ship (the one entity this
-//! client simulates via prediction). The gameplay **targets** (dummies,
-//! asteroids, seeker) are no longer spawned here — they are authoritative on the
-//! embedded server ([`server::ServerApp::spawn_demo_world`]) and arrive over the
-//! network as interpolated **remotes** with meshes attached by
-//! [`crate::net::net_update`]. This is what binds the render world to the world
-//! that actually steps (Principle I): the previous local gameplay entities had
-//! no system stepping them, so they were frozen.
+//! The scene spawns **only** the locally-owned, render-bound entities: the
+//! lighting, the gunsight pip, and the LOCAL player ship. The gameplay **targets**
+//! (dummies, asteroids, seeker) and projectiles are not spawned here — they are
+//! authoritative on the embedded server ([`server::ServerApp::spawn_demo_world`])
+//! and are rendered by reading the server world directly each tick
+//! ([`crate::net::capture_render_state`], which find-or-spawns a mesh-bearing Bevy
+//! entity per authoritative entity). This binds the render world to the world that
+//! actually steps (Principle I).
 //!
-//! [`RenderAssets`] now also carries the mesh/material handles for remote ships
-//! and remote targets, so `net_update` can spawn each remote with the right look
-//! by [`protocol::EntityKind`] (the projectile look is reused for runtime-spawned
-//! projectiles whether local or remote).
+//! [`RenderAssets`] carries the mesh/material handles for ships, the per-kind
+//! targets, and projectiles, so [`crate::net::capture_render_state`] can spawn each
+//! rendered entity with the right look by [`protocol::EntityKind`] (+ the target
+//! sub-kind in `flags`).
 
 use bevy::prelude::*;
 use sim::components::{FlightAssist, Health, Ship, Velocity};
 
 use crate::net::LocalShip;
-use crate::render_sync::AimPip;
+use crate::render_sync::{AimPip, RenderInterp};
 use sim::ShipIntent;
 
-/// Render assets reused for runtime-spawned visuals: projectiles (E002), and —
-/// for E003's networked render path — remote **ships** and remote **targets**
-/// spawned by [`crate::net::net_update`] keyed on [`protocol::EntityKind`].
+/// Render assets reused for the entities [`crate::net::capture_render_state`]
+/// spawns from the server world: projectiles, **ships**, and per-kind **targets**,
+/// keyed on [`protocol::EntityKind`] (+ the target sub-kind in `flags`).
 #[derive(Resource)]
 pub struct RenderAssets {
     pub projectile_mesh: Handle<Mesh>,
     pub projectile_material: Handle<StandardMaterial>,
-    /// Mesh/material for a remote ship (other players / AI ships). Matches the
-    /// E002 player-ship look so a remote ship reads identically to the local one.
+    /// Mesh/material for a ship (other players / AI ships). Matches the E002
+    /// player-ship look so any rendered ship reads identically to the local one.
     pub ship_mesh: Handle<Mesh>,
     pub ship_material: Handle<StandardMaterial>,
-    /// Per-`TargetKind` remote looks, picked by `EntityRecord.flags` in
-    /// [`crate::net::net_update`] (the wire `EntityKind` only says "Target"):
-    /// reddish dummy cube, grey asteroid sphere, green seeker dart — matching the
-    /// E002 scene so networked targets read the same as the old local ones.
+    /// Per-`TargetKind` looks, picked by the server render entity's `flags` in
+    /// [`crate::net::capture_render_state`] (the wire `EntityKind` only says
+    /// "Target"): reddish dummy cube, grey asteroid sphere, green seeker dart —
+    /// matching the E002 scene.
     pub dummy_mesh: Handle<Mesh>,
     pub dummy_material: Handle<StandardMaterial>,
     pub asteroid_mesh: Handle<Mesh>,
@@ -103,10 +102,16 @@ pub fn setup_scene(
     //
     // It carries exactly the components the render/input/HUD path queries by
     // `With<Ship>`: `ShipIntent` (input writes it), `FlightAssist` (toggle + HUD),
-    // `Velocity` (HUD SPD, driven from prediction by `net_update`), `Health` (HUD),
-    // plus the mesh/material/transform. It is driven from CLIENT-SIDE PREDICTION
-    // (its `Transform` is set by `net_update`), so it gets neither `RemoteEntity`
-    // (it is not interpolated) nor `RenderInterp` (no local fixed-step sim runs).
+    // `Velocity` (HUD SPD, set from the server's authoritative speed by
+    // `net::capture_render_state`), `Health` (HUD), plus the mesh/material/transform.
+    //
+    // It also carries a `RenderInterp` (snapped to the origin): the local ship is
+    // no longer special-cased — it renders from the embedded server's world like
+    // every other entity. `net::capture_render_state` rolls its `RenderInterp`
+    // prev→curr each fixed step from the authoritative pose, and
+    // `render_sync::interpolate_transforms` blends it into the `Transform` each
+    // frame (E002's smooth fixed-step interpolation). The net plugin's `Startup`
+    // maps this entity under the client's authoritative ship id.
     commands.spawn((
         Ship,
         LocalShip,
@@ -114,6 +119,7 @@ pub fn setup_scene(
         FlightAssist::On,
         Velocity(Vec2::ZERO),
         Health(100.0),
+        RenderInterp::snapped(Vec2::ZERO, 0.0),
         Mesh3d(ship_mesh),
         MeshMaterial3d(ship_material),
         Transform::from_xyz(0.0, 0.0, 0.0),

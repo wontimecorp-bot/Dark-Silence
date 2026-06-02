@@ -2,19 +2,23 @@
 //! interpolated Bevy `Transform`s so motion is smooth and frame-rate
 //! independent. Also attaches visuals to projectiles the sim spawns at runtime.
 //!
-//! E003 OBJ4 (T044) networkizes this seam (AD-005, ADR-0013):
-//! - the **local** ship renders from the *predicted* state + the smoothed
-//!   reconciliation correction (driven by [`crate::net`], OBJ3) — it is the one
-//!   entity that is simulated locally, so it keeps the fixed-step
-//!   [`RenderInterp`] path for any non-networked single-player use;
-//! - **remote** entities (other ships, projectiles, targets) are NOT simulated
-//!   locally; they carry a [`RemoteEntity`] tag and render from snapshot
-//!   *interpolation* ~100 ms in the past ([`crate::interpolation`], OBJ4), driven
-//!   by [`crate::net::net_update`].
+//! E003 OBJ4 renders the **windowed solo client** directly from the embedded
+//! authoritative server's world (zero loopback latency makes the
+//! predict/interpolate netcode a feel regression there). Every rendered entity —
+//! the local ship, targets, and projectiles alike — carries a [`RenderInterp`]
+//! whose prev/curr poses [`crate::net::capture_render_state`] rolls from the
+//! server's [`server::ServerApp::render_state`] each fixed step, and
+//! [`interpolate_transforms`] blends into the `Transform` each frame (E002's
+//! smooth fixed-step interpolation). Non-local rendered entities additionally
+//! carry a [`RemoteEntity`] tag keyed by their stable network [`EntityId`] so the
+//! capture system can find/despawn them by id.
+//!
+//! (The snapshot-*interpolation* path — [`crate::interpolation`] — and client-side
+//! *prediction* — [`crate::prediction`] — are unchanged and remain the path real
+//! *remote* multiplayer uses; the windowed solo path does not run them.)
 //!
 //! The E002 gunsight pip and follow camera continue to read the local ship's
-//! rendered `Transform`, so their feel is unchanged whether the ship's pose comes
-//! from the local fixed step or from prediction.
+//! rendered `Transform`, so their feel is unchanged.
 
 use bevy::prelude::*;
 use protocol::{EntityId, EntityKind};
@@ -25,12 +29,13 @@ use crate::scene::RenderAssets;
 /// How far ahead of the ship's nose the gunsight pip sits, in sim units.
 const AIM_DISTANCE: f32 = 5.0;
 
-/// Tags a rendered entity as a **remote** (interpolated) entity, not the local
-/// predicted ship (AD-005). Its `Transform` is driven from snapshot interpolation
-/// ([`crate::interpolation::SnapshotBuffer::interpolate_remotes`]) by
-/// [`crate::net::net_update`], keyed by its stable network [`EntityId`]. Remotes
-/// are explicitly distinct from the local ship so the two render paths
-/// (prediction vs interpolation) never cross.
+/// Tags a rendered entity as a **non-local** entity (a target, projectile, or
+/// other ship), distinct from the local player's [`crate::net::LocalShip`]. Keyed
+/// by its stable network [`EntityId`] so [`crate::net::capture_render_state`] can
+/// find/update/despawn it across ticks as the authoritative
+/// [`server::ServerApp::render_state`] changes. Like the local ship it renders via
+/// its [`RenderInterp`] + [`interpolate_transforms`]; the tag exists only to
+/// id-key it in the [`crate::net::NetRenderMap`].
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RemoteEntity {
     /// Stable network id, matched to the per-frame interpolated set.
