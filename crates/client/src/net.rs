@@ -27,17 +27,18 @@
 
 use bevy::prelude::*;
 use protocol::{
-    ClientInput, Connect, ConnectionId, EntityId, LoopbackTransport, Message, NetTransport,
-    Snapshot, SnapshotAck, CLIENT_TOKEN_BYTES,
+    ClientInput, Connect, ConnectionId, EntityId, EntityKind, LoopbackTransport, Message,
+    NetTransport, Snapshot, SnapshotAck, CLIENT_TOKEN_BYTES,
 };
 use server::{ServerApp, PROTOCOL_VERSION};
-use sim::components::Ship;
+use sim::components::Velocity;
 use sim::ShipIntent;
 
 use crate::input::{build_client_input, InputSequencer};
 use crate::interpolation::{DeltaReconstructor, SnapshotBuffer};
 use crate::prediction::{InputBuffer, NumberedInput, Predictor, RenderSmoother, ShipInit};
 use crate::render_sync::RemoteEntity;
+use crate::scene::RenderAssets;
 
 /// The loopback solo-play host: the embedded authoritative [`ServerApp`] plus the
 /// client end of its [`LoopbackTransport`] and the established connection. A
@@ -113,11 +114,21 @@ impl Plugin for NetClientPlugin {
     }
 }
 
-/// `Startup`: stand up the embedded loopback server, connect the client, run the
-/// handshake to learn this client's ship id and the announced rates, and seed the
-/// client netcode state. Tags the scene's local ship with [`LocalShip`].
+/// `Startup`: stand up the embedded loopback server, populate its authoritative
+/// world with the demo targets, connect the client, run the handshake to learn
+/// this client's ship id and the announced rates, and seed the client netcode
+/// state.
+///
+/// The scene (`scene::setup_scene`) owns the [`LocalShip`] tag now — it spawns the
+/// local ship with the tag deterministically, so this system no longer tags it
+/// (the old `With<Ship>` tagging here raced scene setup in `Startup` and, if it
+/// ran first, never tagged the ship → frozen local ship, dead controls).
 fn setup_loopback_host(world: &mut World) {
     let (mut server, mut transport) = ServerApp::loopback();
+    // Populate the authoritative world with the demo targets BEFORE the handshake
+    // tick below, so the very first snapshot the client receives already carries
+    // them (they then render as interpolated remotes via `net_update`).
+    server.spawn_demo_world();
     let conn = NetTransport::connect(&mut transport, loopback_addr());
 
     // Handshake: send Connect, tick the server once so it accepts + replies, then
@@ -163,16 +174,6 @@ fn setup_loopback_host(world: &mut World) {
         conn,
     });
     world.insert_non_send_resource(state);
-
-    // Tag the scene's player ship as the local ship (so `net_update` drives only
-    // it from prediction). The scene spawns exactly one `Ship`.
-    let ship = {
-        let mut q = world.query_filtered::<Entity, With<Ship>>();
-        q.iter(world).next()
-    };
-    if let Some(ship) = ship {
-        world.entity_mut(ship).insert(LocalShip);
-    }
 }
 
 /// `FixedUpdate`: advance the full netcode lifecycle one authoritative tick.
@@ -280,16 +281,21 @@ fn net_fixed_update(
 pub fn net_update(
     mut commands: Commands,
     mut state: NonSendMut<NetClientState>,
-    mut local_q: Query<&mut Transform, (With<LocalShip>, Without<RemoteEntity>)>,
+    assets: Res<RenderAssets>,
+    mut local_q: Query<(&mut Transform, &mut Velocity), (With<LocalShip>, Without<RemoteEntity>)>,
     mut remote_q: Query<(Entity, &RemoteEntity, &mut Transform), Without<LocalShip>>,
 ) {
     // --- Local ship: predicted pose + smoothed correction (AD-005). ----------
     let predicted = state.predictor.ship_state();
     let rendered = state.smoother.step(predicted.pos);
-    if let Ok(mut tf) = local_q.single_mut() {
+    if let Ok((mut tf, mut vel)) = local_q.single_mut() {
         tf.translation.x = rendered.x;
         tf.translation.y = rendered.y;
         tf.rotation = Quat::from_rotation_z(predicted.heading);
+        // Feed the HUD: the predicted velocity drives the SPD readout (the scene
+        // ship has no local sim stepping its `Velocity`, so prediction is the
+        // authoritative-for-render source).
+        vel.0 = predicted.vel;
     }
 
     // --- Remote entities: interpolate from the snapshot buffer (TR-010). -----
@@ -315,19 +321,33 @@ pub fn net_update(
         }
     }
 
-    // Spawn a visual for any newly-appeared remote not yet represented. Runtime
-    // visuals are minimal (a transform marker carrying the id); the windowed app
-    // attaches meshes via a separate system path (runtime-only, see module note).
+    // Spawn a mesh-bearing visual for any newly-appeared remote not yet
+    // represented, picking the mesh/material by `EntityKind` from the shared
+    // render assets so remote ships/targets/projectiles are actually VISIBLE
+    // (the previous meshless marker spawn rendered nothing). Subsequent frames
+    // update the existing remote's `Transform` above and despawn it when it
+    // leaves the interpolated set.
     for e in &remotes {
         if updated.contains(&e.id.0) {
             continue;
         }
+        let (mesh, material) = match e.kind {
+            EntityKind::Ship => (assets.ship_mesh.clone(), assets.ship_material.clone()),
+            EntityKind::Target => (assets.target_mesh.clone(), assets.target_material.clone()),
+            EntityKind::Projectile => (
+                assets.projectile_mesh.clone(),
+                assets.projectile_material.clone(),
+            ),
+        };
         commands.spawn((
             RemoteEntity {
                 id: e.id,
                 kind: e.kind,
             },
-            Transform::from_xyz(e.pos.x, e.pos.y, 0.0),
+            Mesh3d(mesh),
+            MeshMaterial3d(material),
+            Transform::from_rotation(Quat::from_rotation_z(e.heading))
+                .with_translation(Vec3::new(e.pos.x, e.pos.y, 0.0)),
         ));
     }
 }

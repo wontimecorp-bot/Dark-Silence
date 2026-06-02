@@ -1,31 +1,51 @@
-//! Scene setup (FR-001/FR-008/FR-012): spawn the tinted composed-primitive
-//! ship, the static dummies, drifting asteroids, and the single seeker — each
-//! with its `sim` gameplay components, a Bevy mesh/material, and a render-interp
-//! snapshot. Also holds the shared projectile render assets.
+//! Scene setup (FR-001/FR-008/FR-012), networkized in E003 OBJ4.
+//!
+//! The scene now spawns **only** the locally-owned, render-bound entities: the
+//! lighting, the gunsight pip, and the LOCAL player ship (the one entity this
+//! client simulates via prediction). The gameplay **targets** (dummies,
+//! asteroids, seeker) are no longer spawned here — they are authoritative on the
+//! embedded server ([`server::ServerApp::spawn_demo_world`]) and arrive over the
+//! network as interpolated **remotes** with meshes attached by
+//! [`crate::net::net_update`]. This is what binds the render world to the world
+//! that actually steps (Principle I): the previous local gameplay entities had
+//! no system stepping them, so they were frozen.
+//!
+//! [`RenderAssets`] now also carries the mesh/material handles for remote ships
+//! and remote targets, so `net_update` can spawn each remote with the right look
+//! by [`protocol::EntityKind`] (the projectile look is reused for runtime-spawned
+//! projectiles whether local or remote).
 
 use bevy::prelude::*;
-use sim::components::{
-    AngularVelocity, CollisionRadius, FlightAssist, Heading, Health, Position, Ship, Target,
-    TargetKind, Velocity, Weapon,
-};
-use sim::{ShipIntent, Tuning};
+use sim::components::{FlightAssist, Health, Ship, Velocity};
 
-use crate::render_sync::{AimPip, RenderInterp};
+use crate::net::LocalShip;
+use crate::render_sync::AimPip;
+use sim::ShipIntent;
 
-/// Render assets reused for every runtime-spawned projectile.
+/// Render assets reused for runtime-spawned visuals: projectiles (E002), and —
+/// for E003's networked render path — remote **ships** and remote **targets**
+/// spawned by [`crate::net::net_update`] keyed on [`protocol::EntityKind`].
 #[derive(Resource)]
 pub struct RenderAssets {
     pub projectile_mesh: Handle<Mesh>,
     pub projectile_material: Handle<StandardMaterial>,
+    /// Mesh/material for a remote ship (other players / AI ships). Matches the
+    /// E002 player-ship look so a remote ship reads identically to the local one.
+    pub ship_mesh: Handle<Mesh>,
+    pub ship_material: Handle<StandardMaterial>,
+    /// Mesh/material for a remote target (dummy / asteroid / seeker). One generic
+    /// destructible look; the kind is carried on the [`crate::render_sync::RemoteEntity`]
+    /// for any future per-kind visual split.
+    pub target_mesh: Handle<Mesh>,
+    pub target_material: Handle<StandardMaterial>,
 }
 
-/// Spawn lighting, the player ship, and the targets, and register the shared
-/// projectile assets.
+/// Spawn lighting, the gunsight pip, and the LOCAL player ship; register the
+/// shared runtime render assets (projectile + remote ship/target looks).
 pub fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    tuning: Res<Tuning>,
 ) {
     // Lighting: a key directional light so PBR primitives read (ambient fill is
     // attached to the camera in `camera::setup_camera`).
@@ -44,39 +64,46 @@ pub fn setup_scene(
         emissive: LinearRgba::rgb(1.2, 0.7, 0.1),
         ..default()
     });
+
+    // Ship look (dart-shaped cuboid long along +X, blue) — used for both the
+    // local ship spawned below and any remote ship spawned by `net_update`.
+    let ship_mesh = meshes.add(Cuboid::new(1.6, 0.6, 0.3));
+    let ship_material = materials.add(Color::srgb(0.30, 0.65, 1.0));
+
+    // Generic destructible-target look for remote targets (dummies/asteroids/
+    // seeker now come from the network, not the scene).
+    let target_mesh = meshes.add(Cuboid::new(1.4, 1.4, 1.4));
+    let target_material = materials.add(Color::srgb(0.75, 0.35, 0.30));
+
     commands.insert_resource(RenderAssets {
         projectile_mesh,
         projectile_material,
+        ship_mesh: ship_mesh.clone(),
+        ship_material: ship_material.clone(),
+        target_mesh,
+        target_material,
     });
 
-    // Player ship: a dart-shaped cuboid long along +X (its nose at heading 0).
-    let ship_mesh = meshes.add(Cuboid::new(1.6, 0.6, 0.3));
-    let ship_material = materials.add(Color::srgb(0.30, 0.65, 1.0));
+    // The LOCAL player ship — spawned here deterministically so the `LocalShip`
+    // tag never depends on Startup-system ordering (the old `setup_loopback_host`
+    // tagging-by-`With<Ship>` could run first and miss the ship, freezing it).
+    //
+    // It carries exactly the components the render/input/HUD path queries by
+    // `With<Ship>`: `ShipIntent` (input writes it), `FlightAssist` (toggle + HUD),
+    // `Velocity` (HUD SPD, driven from prediction by `net_update`), `Health` (HUD),
+    // plus the mesh/material/transform. It is driven from CLIENT-SIDE PREDICTION
+    // (its `Transform` is set by `net_update`), so it gets neither `RemoteEntity`
+    // (it is not interpolated) nor `RenderInterp` (no local fixed-step sim runs).
     commands.spawn((
         Ship,
-        // Per-entity intent: `input::read_input` writes this each frame and the
-        // shared `sim` flight/weapon systems read it (intent is no longer a
-        // global resource).
+        LocalShip,
         ShipIntent::default(),
-        Position(Vec2::ZERO),
-        Velocity(Vec2::ZERO),
-        Heading(0.0),
-        AngularVelocity(0.0),
-        Health(100.0),
-        // Flight-model is the default (drag-capped top speed, angular inertia,
-        // shared power budget — the "Silent Death but better" feel). Press F to
-        // toggle the decoupled/Newtonian mode.
         FlightAssist::On,
-        CollisionRadius(0.8),
-        Weapon {
-            cooldown: 0.0,
-            fire_rate: tuning.fire_rate,
-            muzzle_speed: tuning.muzzle_speed,
-        },
+        Velocity(Vec2::ZERO),
+        Health(100.0),
         Mesh3d(ship_mesh),
         MeshMaterial3d(ship_material),
         Transform::from_xyz(0.0, 0.0, 0.0),
-        RenderInterp::snapped(Vec2::ZERO, 0.0),
     ));
 
     // Forward gunsight pip — a glowing marker ahead of the nose showing the
@@ -90,100 +117,5 @@ pub fn setup_scene(
             ..default()
         })),
         Transform::from_xyz(5.0, 0.0, 0.0),
-    ));
-
-    // Targets.
-    spawn_dummy(
-        &mut commands,
-        &mut meshes,
-        &mut materials,
-        Vec2::new(11.0, 4.0),
-    );
-    spawn_dummy(
-        &mut commands,
-        &mut meshes,
-        &mut materials,
-        Vec2::new(15.0, -5.0),
-    );
-    spawn_asteroid(
-        &mut commands,
-        &mut meshes,
-        &mut materials,
-        Vec2::new(-13.0, 7.0),
-        Vec2::new(2.5, -1.2),
-    );
-    spawn_asteroid(
-        &mut commands,
-        &mut meshes,
-        &mut materials,
-        Vec2::new(-7.0, -11.0),
-        Vec2::new(1.0, 2.0),
-    );
-    spawn_seeker(
-        &mut commands,
-        &mut meshes,
-        &mut materials,
-        Vec2::new(22.0, 16.0),
-    );
-}
-
-fn spawn_dummy(
-    commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
-    pos: Vec2,
-) {
-    commands.spawn((
-        Target,
-        TargetKind::Dummy,
-        Position(pos),
-        Velocity(Vec2::ZERO),
-        CollisionRadius(0.9),
-        Health(20.0),
-        Mesh3d(meshes.add(Cuboid::new(1.4, 1.4, 1.4))),
-        MeshMaterial3d(materials.add(Color::srgb(0.75, 0.35, 0.30))),
-        Transform::from_xyz(pos.x, pos.y, 0.0),
-        RenderInterp::snapped(pos, 0.0),
-    ));
-}
-
-fn spawn_asteroid(
-    commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
-    pos: Vec2,
-    vel: Vec2,
-) {
-    commands.spawn((
-        Target,
-        TargetKind::Asteroid,
-        Position(pos),
-        Velocity(vel),
-        CollisionRadius(0.9),
-        Health(40.0),
-        Mesh3d(meshes.add(Sphere::new(0.9))),
-        MeshMaterial3d(materials.add(Color::srgb(0.55, 0.5, 0.45))),
-        Transform::from_xyz(pos.x, pos.y, 0.0),
-        RenderInterp::snapped(pos, 0.0),
-    ));
-}
-
-fn spawn_seeker(
-    commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
-    pos: Vec2,
-) {
-    commands.spawn((
-        Target,
-        TargetKind::Seeker,
-        Position(pos),
-        Velocity(Vec2::ZERO),
-        CollisionRadius(0.7),
-        Health(30.0),
-        Mesh3d(meshes.add(Cuboid::new(1.2, 0.6, 0.3))),
-        MeshMaterial3d(materials.add(Color::srgb(0.35, 0.85, 0.40))),
-        Transform::from_xyz(pos.x, pos.y, 0.0),
-        RenderInterp::snapped(pos, 0.0),
     ));
 }

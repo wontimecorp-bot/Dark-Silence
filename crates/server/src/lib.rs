@@ -40,7 +40,7 @@ use protocol::{
 };
 use sim::components::{
     AngularVelocity, CollisionRadius, FlightAssist, Heading, Health, Position, Projectile, Ship,
-    Target, Velocity, Weapon,
+    Target, TargetKind, Velocity, Weapon,
 };
 use sim::{FixedDt, HitFeedback, ShipIntent, Tuning};
 
@@ -874,6 +874,86 @@ impl ServerApp {
                     fire_rate: tuning.fire_rate,
                     muzzle_speed: tuning.muzzle_speed,
                 },
+            ))
+            .id()
+    }
+
+    /// Populate the authoritative world with the E002 starter targets — two
+    /// static dummies, two drifting asteroids, and one player-seeking AI — so the
+    /// embedded loopback server has something to fight over (Principle I/VII). The
+    /// shared fixed-step systems (`ai::seek_system`, weapon/collision/combat,
+    /// already registered via [`sim::add_fixed_step_systems`]) move, damage, and
+    /// despawn these authoritatively; they replicate to the client as
+    /// [`EntityKind::Target`] records (see [`ServerApp::full_records`]) and are
+    /// rendered there as interpolated remotes.
+    ///
+    /// Values mirror the E002 client scene exactly so the look/feel is unchanged.
+    /// **Client-only**: no test calls this, so the existing entity set the session
+    /// tests depend on is unaffected (additive). Call it once, before the client
+    /// connects, so the first snapshot already carries the targets.
+    pub fn spawn_demo_world(&mut self) {
+        // Two static practice dummies.
+        self.spawn_target(
+            TargetKind::Dummy,
+            Vec2::new(11.0, 4.0),
+            Vec2::ZERO,
+            0.9,
+            20.0,
+        );
+        self.spawn_target(
+            TargetKind::Dummy,
+            Vec2::new(15.0, -5.0),
+            Vec2::ZERO,
+            0.9,
+            20.0,
+        );
+        // Two drifting asteroids (constant velocity; the sim integrates the drift).
+        self.spawn_target(
+            TargetKind::Asteroid,
+            Vec2::new(-13.0, 7.0),
+            Vec2::new(2.5, -1.2),
+            0.9,
+            40.0,
+        );
+        self.spawn_target(
+            TargetKind::Asteroid,
+            Vec2::new(-7.0, -11.0),
+            Vec2::new(1.0, 2.0),
+            0.9,
+            40.0,
+        );
+        // One seeker — `ai::seek_system` thrusts it toward the player ship each
+        // tick (it queries `With<Ship>`, satisfied by the connected client's ship).
+        self.spawn_target(
+            TargetKind::Seeker,
+            Vec2::new(22.0, 16.0),
+            Vec2::ZERO,
+            0.7,
+            30.0,
+        );
+    }
+
+    /// Spawn one authoritative target with the `sim` gameplay components the shared
+    /// fixed-step systems read: `ai::seek_system` reads `TargetKind`/`Position`/
+    /// `Velocity`, collision/combat read `CollisionRadius`/`Health`. Matches the
+    /// E002 client scene component set (minus rendering). Helper for
+    /// [`ServerApp::spawn_demo_world`].
+    fn spawn_target(
+        &mut self,
+        kind: TargetKind,
+        pos: Vec2,
+        vel: Vec2,
+        radius: f32,
+        health: f32,
+    ) -> Entity {
+        self.world
+            .spawn((
+                Target,
+                kind,
+                Position(pos),
+                Velocity(vel),
+                CollisionRadius(radius),
+                Health(health),
             ))
             .id()
     }

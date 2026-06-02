@@ -478,16 +478,23 @@ impl RenderSmoother {
         Self::default()
     }
 
-    /// Begin (or accumulate into) a correction: record the residual between the
-    /// just-reconciled authoritative state and where the ship was **previously
-    /// rendered**, so the rendered ship can decay from its old pose to the new
-    /// one rather than jumping.
+    /// Record a correction: set the rendered offset to the residual between where
+    /// the ship was **previously rendered** and the just-reconciled authoritative
+    /// state, so the rendered ship decays from its old pose to the new one rather
+    /// than jumping.
     ///
-    /// Adds to any offset still in flight (a correction arriving mid-decay does
-    /// not discard the remaining decay; it composes), keeping the rendered motion
-    /// continuous.
+    /// This **composes** a mid-decay correction without discarding the remaining
+    /// decay: the caller computes `previously_rendered` as `predicted_pos +
+    /// self.offset()`, so it ALREADY contains the in-flight offset. The residual
+    /// that keeps the rendered ship exactly where it is — old offset plus any new
+    /// divergence — is therefore `previously_rendered − reconciled`, and we **set**
+    /// the offset to it. Using `+=` would re-add the in-flight offset (it is
+    /// already inside `previously_rendered`), double-counting it; since the live
+    /// loop reconciles every tick the offset would then diverge (~1.5×/tick) and
+    /// fling the rendered ship off-screen (regression test
+    /// `render_smoother_stays_bounded_under_repeated_in_sync_corrections`).
     pub fn observe_correction(&mut self, previously_rendered: Vec2, reconciled: Vec2) {
-        self.offset += previously_rendered - reconciled;
+        self.offset = previously_rendered - reconciled;
     }
 
     /// Advance the smoothing one tick: shrink the offset by [`smooth_correction`]
@@ -614,6 +621,37 @@ mod tests {
             buf.len(),
             1,
             "the predicted input is buffered for reconcile"
+        );
+    }
+
+    #[test]
+    fn render_smoother_stays_bounded_under_repeated_in_sync_corrections() {
+        // Mirrors the live client loop: a snapshot arrives and reconciles EVERY
+        // tick, so `observe_correction` is called every tick with
+        // `previously_rendered = authoritative + current_offset`. When prediction
+        // matches authority (in sync) the rendered offset must DECAY toward zero,
+        // never grow. A `+=` (rather than set) double-counts the in-flight offset
+        // and the rendered ship diverges off-screen — this guards that regression.
+        let mut s = RenderSmoother::new();
+        let auth = Vec2::new(5.0, 0.0);
+        // One real divergence to put an offset in flight (initial residual 1.0).
+        s.observe_correction(Vec2::new(6.0, 0.0), auth);
+        let mut max_seen = 0.0_f32;
+        for _ in 0..120 {
+            let rendered = s.step(auth); // render frame: decay + read
+            max_seen = max_seen.max((rendered - auth).length());
+            // Tick: in-sync correction — predicted == authoritative.
+            let previously_rendered = auth + s.offset();
+            s.observe_correction(previously_rendered, auth);
+        }
+        assert!(
+            s.residual() < RECON_EPS_POS,
+            "offset must decay to ~0 under in-sync corrections, got {}",
+            s.residual()
+        );
+        assert!(
+            max_seen <= 1.0 + 1e-3,
+            "rendered offset must never exceed the initial divergence; peaked at {max_seen}"
         );
     }
 

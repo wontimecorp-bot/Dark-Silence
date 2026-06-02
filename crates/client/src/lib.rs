@@ -30,11 +30,14 @@ use bevy::prelude::*;
 use net::NetClientPlugin;
 use sim::{FixedDt, HitFeedback, Tuning};
 
-/// The fixed simulation tick rate the **client render clock** runs at. The
-/// authoritative tick rate is server-announced (TR-044, default 30 Hz) and drives
-/// the netcode lifecycle inside [`net::NetClientPlugin`]; this is the Bevy
-/// `Time<Fixed>` cadence the netcode systems are scheduled on.
-pub const TICK_HZ: f64 = 60.0;
+/// The Bevy `FixedUpdate` cadence the netcode lifecycle runs at. It MUST match
+/// the server-announced authoritative tick rate (TR-044, default **30 Hz**):
+/// [`net::net_fixed_update`] steps the embedded server and the predictor **once
+/// per FixedUpdate**, each advancing one server tick's worth of sim, so a
+/// mismatched (e.g. 60 Hz) cadence would step the 30 Hz sim twice per real tick —
+/// 2× game speed and a doubled input rate that desyncs prediction. Rendering is
+/// decoupled and runs per-frame in `Update` at the display rate.
+pub const TICK_HZ: f64 = 30.0;
 
 /// Build and run the Bevy client app (the windowed single-player shell, T045).
 ///
