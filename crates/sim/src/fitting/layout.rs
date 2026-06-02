@@ -1,0 +1,427 @@
+//! The fit layout — the fit IS the hit/armor map (FR-018/019/020/021, ADR-0008,
+//! AD-002/AD-005).
+//!
+//! ADR-0008's keystone consequence: a ship's positional [`Hull`] cell-grid, once
+//! a [`Fit`] populates its slots, **is** the hitbox/armor map E007 resolves damage
+//! against. This module realizes that contract:
+//!
+//! - [`build_layout`] turns a [`Fit`] (+ its [`Hull`] and the [`ModuleCatalog`])
+//!   into a [`FitLayout`]: a per-cell [`CellOccupant`] map covering **every**
+//!   authored hull cell (INV-F11), each carrying the slot it belongs to, the
+//!   module installed there (if any), that module's live `health`, and an
+//!   occlusion `depth` (outer cells = lower depth — encountered first along a hit
+//!   line, INV-F10).
+//! - [`module_at`] / [`cell_map`] are the E007 per-cell lookups (FR-019): what
+//!   occupies a cell and the live occupant + health map.
+//! - [`resolve_hit`] traces a segment across the grid with the **existing** swept
+//!   point-vs-circle primitive ([`Physics::swept_cast`], reused — not reinvented)
+//!   and returns the FIRST module struck **outer-before-inner by depth** (INV-F10,
+//!   FR-018/021): a centrally-placed module is shielded by the cells covering it.
+//! - [`hardpoint_arc`] derives a weapon mount's position/facing firing arc
+//!   ([`FiringArc`], FR-020), bounded `(0, π]` (INV-F12); `None` for a non-weapon
+//!   slot.
+//!
+//! E006 **produces** this map + the first-hit geometry + the arcs; E007 **consumes**
+//! them (penetration, defense channels, destruction). E006 does not mutate health
+//! — it exposes it (contracts/fitting-api.md §3).
+//!
+//! Derive discipline matches the rest of the fitting domain: serde as a
+//! replication/persistence seam (not exercised this epic), value semantics; a
+//! `BTreeMap` keys the cells so iteration/order is deterministic (Principle II).
+
+use std::collections::BTreeMap;
+
+use bevy_ecs::component::Component;
+use glam::Vec2;
+use serde::{Deserialize, Serialize};
+
+use super::content::ModuleCatalog;
+use super::fit::{Fit, ModuleRef};
+use super::hull::{FiringArc, Hull, HullId, SlotId};
+use crate::physics::{Physics, RapierPhysics};
+
+/// A grid cell coordinate `(col, row)` on the hull — the shared fitting / hit-map
+/// unit (contracts/fitting-api.md `Cell`). Mirrors [`super::hull::GridCell::coord`].
+pub type Cell = (u16, u16);
+
+/// What occupies one cell of the hull grid, its live health, and its occlusion
+/// depth (data-model.md `CellOccupant`).
+///
+/// Empty cells (no module installed in their owning slot) are still part of the
+/// armor map — they carry `module: None` and `health: 0.0` (no installed device to
+/// have hit points), at their structural position. A cell's `depth` orders it
+/// along a hit line: **smaller depth = outer**, encountered first (INV-F10).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CellOccupant {
+    /// The slot this cell belongs to.
+    pub slot: SlotId,
+    /// The module installed in that slot, or `None` for an empty cell (FR-019).
+    pub module: Option<super::module::ModuleId>,
+    /// Live hit points of the installed module (`>= 0`); seeded from the module's
+    /// `health_max`. `0.0` when the cell is empty (no device to damage). E007
+    /// mutates this as it applies damage; E006 only exposes it.
+    pub health: f32,
+    /// Occlusion depth: **smaller = outer** (encountered first along a hit line).
+    /// A fully-interior cell has a larger depth and is reached only after the
+    /// covering cells (INV-F10).
+    pub depth: u16,
+}
+
+/// The full per-cell occupant + health map E007 consumes (contracts/fitting-api.md
+/// `CellMap`). Keyed by [`Cell`] for deterministic iteration; mirrors the
+/// occupied-and-empty completeness of [`FitLayout`] but exposes only the occupant
+/// value (the E007 read surface, FR-019).
+pub type CellMap = BTreeMap<Cell, CellOccupant>;
+
+/// The fit-layout hit/armor map — the queryable hitbox E007 reads (data-model.md
+/// `FitLayout`; ADR-0008). Built from a [`Fit`] by [`build_layout`] and rebuilt on
+/// every fit change (INV-F08); attached to the ship entity as a `bevy_ecs`
+/// [`Component`].
+///
+/// Every authored hull cell is present (INV-F11): the map covers the whole chassis
+/// so a hit anywhere on the grid resolves to a defined occupant (or an empty
+/// structural cell). Per-cell `health` is the live module health (mutated by E007).
+#[derive(Component, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FitLayout {
+    /// The hull this layout was built for (resolved in `HullCatalog`).
+    pub hull: HullId,
+    /// Per-cell occupant; covers **every** authored hull cell (INV-F11).
+    pub cells: CellMap,
+}
+
+impl FitLayout {
+    /// The occupant of `cell`, if that cell is authored on the hull (null-safe).
+    pub fn occupant(&self, cell: Cell) -> Option<&CellOccupant> {
+        self.cells.get(&cell)
+    }
+}
+
+/// The local-space center of a unit cell `(col, row)` — its mid-point on the grid
+/// (`coord + 0.5`). The hit-line `p0`→`p1` and the cell circles in [`resolve_hit`]
+/// share this local cell-space.
+fn cell_center(coord: Cell) -> Vec2 {
+    Vec2::new(coord.0 as f32 + 0.5, coord.1 as f32 + 0.5)
+}
+
+/// The occlusion depth of a cell (INV-F10): how far **inward** it sits, measured as
+/// the inward offset from the grid edge toward the center. An edge cell yields `0`
+/// (outermost); a cell one ring in yields `1`; the central cell yields the largest
+/// depth. Computed from the per-axis distance to the nearest grid boundary so the
+/// metric is a clean integer ring index independent of hull size.
+///
+/// Concretely: `depth = min(col, cols-1-col, row, rows-1-row)` — the cell's ring
+/// from the perimeter. A hit line entering from outside crosses lower-depth (outer)
+/// rings before higher-depth (inner) ones, so ordering occupants by ascending
+/// `depth` gives outer-before-inner (the shield-the-interior property, FR-021).
+fn cell_depth(hull: &Hull, coord: Cell) -> u16 {
+    let (cols, rows) = hull.grid_dims;
+    // Saturating arithmetic: an out-of-bounds coord (never authored, but defensive)
+    // collapses to a 0 ring rather than underflowing.
+    let from_left = coord.0;
+    let from_right = cols.saturating_sub(1).saturating_sub(coord.0);
+    let from_bottom = coord.1;
+    let from_top = rows.saturating_sub(1).saturating_sub(coord.1);
+    from_left.min(from_right).min(from_bottom).min(from_top)
+}
+
+/// Build the [`FitLayout`] hit/armor map for `fit` on `hull`, resolving installed
+/// modules through `catalog` (FR-019, INV-F10/F11). **Pure** — reads only its
+/// arguments, mutates nothing — so the client preview, the running sim, and a
+/// future authoritative server build identical maps (Principle II).
+///
+/// Completeness (INV-F11): **every** authored hull cell becomes a [`CellOccupant`].
+/// A cell whose owning slot holds a module carries that module's id + its `health`
+/// (seeded from `health_max`); a cell on an empty (or slot-less) position carries
+/// `module: None`, `health: 0.0`. Each occupant's `depth` is its perimeter ring
+/// ([`cell_depth`]) — outer cells lower, central cells higher (INV-F10).
+///
+/// A dangling [`ModuleId`](super::module::ModuleId) (not in `catalog`) yields an
+/// occupant with `module: None` / `health: 0.0` — the dangling-ref *rejection* is
+/// `validate_fit`'s concern (INV-F13); the map stays total regardless.
+pub fn build_layout(hull: &Hull, fit: &Fit, catalog: &ModuleCatalog) -> FitLayout {
+    let mut cells: CellMap = BTreeMap::new();
+
+    for grid_cell in &hull.cells {
+        let coord = grid_cell.coord;
+        // The slot (if any) sitting on this authored cell drives occupancy. The
+        // seed authoring is one slot per cell; this finds it positionally so the
+        // map stays correct under any authoring.
+        let slot = hull.slots.iter().find(|s| s.coord == coord);
+
+        let (slot_id, module_id, health) = match slot {
+            Some(slot) => {
+                let module_id = fit.module_in(slot.id);
+                let health = module_id
+                    .and_then(|m| catalog.get(m))
+                    .map(|m| m.health_max)
+                    .unwrap_or(0.0);
+                (slot.id, module_id, health)
+            }
+            // A cell with no slot on it is still part of the armor map (structural
+            // cell); it has no slot identity, so key it by a sentinel slot id of
+            // its own coord is not possible — use the cell's own structural id.
+            None => (SlotId(u32::MAX), None, 0.0),
+        };
+
+        cells.insert(
+            coord,
+            CellOccupant {
+                slot: slot_id,
+                module: module_id,
+                health,
+                depth: cell_depth(hull, coord),
+            },
+        );
+    }
+
+    FitLayout {
+        hull: hull.id,
+        cells,
+    }
+}
+
+/// The module installed at `cell` on `fit`'s `hull`, if any (FR-019; contracts/
+/// fitting-api.md §3 `module_at`). Returns a [`ModuleRef`] (slot + module id) so
+/// E007 has the installed-module identity; `None` for an empty or slot-less cell.
+/// **Pure** — reads only its arguments.
+pub fn module_at(fit: &Fit, cell: Cell, hull: &Hull, catalog: &ModuleCatalog) -> Option<ModuleRef> {
+    let slot = hull.slots.iter().find(|s| s.coord == cell)?;
+    let module = fit.module_in(slot.id)?;
+    // Only report an occupant whose module actually resolves (a dangling ref is no
+    // occupant for E007's purposes; validate_fit rejects the fit, INV-F13).
+    catalog.get(module)?;
+    Some(ModuleRef::new(slot.id, module))
+}
+
+/// The full per-cell occupant + live-health map for `fit` (FR-019; contracts/
+/// fitting-api.md §3 `cell_map`). Covers every authored hull cell (INV-F11) with
+/// its occupant + module health, the value E007 mutates as it applies damage.
+/// **Pure** — a thin projection of [`build_layout`]'s cell map.
+pub fn cell_map(fit: &Fit, hull: &Hull, catalog: &ModuleCatalog) -> CellMap {
+    build_layout(hull, fit, catalog).cells
+}
+
+/// The resolution of a hit traced across the hull grid (contracts/fitting-api.md §3
+/// `HitResolution`). Names the first module struck, the time-of-impact along the
+/// query segment, and the cell entered. `toi ∈ [0, 1]` along `p0`→`p1`, consistent
+/// with [`SweptHit`](crate::physics::SweptHit).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HitResolution {
+    /// The installed module struck (slot + module id).
+    pub module: ModuleRef,
+    /// Time-of-impact fraction along `p0`→`p1` (`∈ [0, 1]`).
+    pub toi: f32,
+    /// The grid cell the line entered to strike the module.
+    pub cell: Cell,
+}
+
+/// The per-cell circle radius used to sweep the hit line across the grid. A unit
+/// cell spans `1.0` in local space; a radius of `0.5` inscribes the cell so a line
+/// passing through the cell center registers, while a clean pass between cells does
+/// not over-trigger. (The grid is coarse section-granularity, HINT-004; a finer
+/// authoring would shrink this with the cell size.)
+const CELL_RADIUS: f32 = 0.5;
+
+/// Resolve the FIRST module struck by the segment `p0`→`p1` traced across `fit`'s
+/// hull grid, **outer-before-inner by depth** (FR-018/021, INV-F10; contracts/
+/// fitting-api.md §3 `resolve_hit`). Returns `None` if the line strikes no
+/// installed module.
+///
+/// `p0`/`p1` are in the hull's **local cell-space** (the same space
+/// [`cell_center`] maps a coord into; world↔local transform is the caller's
+/// concern). The trace reuses the **existing** swept point-vs-circle primitive
+/// ([`Physics::swept_cast`] → [`crate::collision::segment_circle_toi`]) against
+/// each occupied cell's inscribed circle — it is **not** reinvented here.
+///
+/// Ordering (INV-F10, the survivability property FR-021): every occupied cell the
+/// line enters is collected with its `toi` and occlusion `depth`, then the winner
+/// is the one struck **first along the line** — primarily the lowest `toi`, with
+/// `depth` (outer = lower) as the deterministic tie-break when two cells are
+/// entered at the same time-of-impact. A module placed behind others (higher depth)
+/// is therefore reached only after the covering cells: central placement shields,
+/// edge placement exposes. Two fits differing only in a module's placement resolve
+/// the same shot to different depths (SC-004).
+pub fn resolve_hit(
+    fit: &Fit,
+    p0: Vec2,
+    p1: Vec2,
+    hull: &Hull,
+    catalog: &ModuleCatalog,
+) -> Option<HitResolution> {
+    let physics = RapierPhysics::new();
+
+    let mut best: Option<(f32, u16, ModuleRef, Cell)> = None;
+
+    for slot in &hull.slots {
+        // Only occupied slots are strikeable modules (empty/structural cells carry
+        // no installed device for the first-module-struck query).
+        let Some(module_id) = fit.module_in(slot.id) else {
+            continue;
+        };
+        // A dangling module ref is not a strikeable occupant (INV-F13).
+        if catalog.get(module_id).is_none() {
+            continue;
+        }
+
+        let center = cell_center(slot.coord);
+        let Some(hit) = physics.swept_cast(p0, p1, center, CELL_RADIUS) else {
+            continue;
+        };
+        // `swept_cast`/`segment_circle_toi` already guarantees toi ∈ [0, 1].
+        let depth = cell_depth(hull, slot.coord);
+        let candidate = (
+            hit.toi,
+            depth,
+            ModuleRef::new(slot.id, module_id),
+            slot.coord,
+        );
+
+        // First-along-the-line wins: lowest toi, then outer (lower depth) on a tie.
+        let take = match best {
+            None => true,
+            Some((best_toi, best_depth, _, _)) => {
+                hit.toi < best_toi - f32::EPSILON
+                    || ((hit.toi - best_toi).abs() <= f32::EPSILON && depth < best_depth)
+            }
+        };
+        if take {
+            best = Some(candidate);
+        }
+    }
+
+    best.map(|(toi, _, module, cell)| HitResolution { module, toi, cell })
+}
+
+/// Smallest weapon firing-arc half-angle (INV-F12 lower bound): a strictly positive
+/// floor so the arc is never zero-width even for a perfectly centered mount.
+const MIN_HALF_ANGLE: f32 = std::f32::consts::FRAC_PI_8;
+/// Widest weapon firing-arc half-angle (INV-F12 upper bound `π`): a perimeter mount
+/// covers a full half-plane, never a wrap-around (`> π`) arc.
+const MAX_HALF_ANGLE: f32 = std::f32::consts::PI;
+
+/// Derive a weapon hardpoint's firing arc from its position + facing on `hull`
+/// (FR-020, INV-F12; contracts/fitting-api.md §3 `hardpoint_arc`). Returns `None`
+/// for a non-weapon slot (or an unknown slot id). **Pure** — reads only its args.
+///
+/// The arc is **defined here as fit data**; its *enforcement* (turret track /
+/// can-this-weapon-hit) is E007 (the firing-arc note in data-model.md / the
+/// contract). The returned [`FiringArc`]:
+///
+/// - `center = slot.facing` — the mount's facing on the hull. At runtime a consumer
+///   adds the hull `heading` (`center = heading + facing`, data-model.md); E006
+///   exposes the hull-local center (the position/facing-derived datum), and the
+///   heading offset is applied by the combat consumer that knows the live heading.
+/// - `half_angle ∈ (0, π]` (INV-F12) — a function of the mount's position: an
+///   edge/perimeter mount gets a **wider** arc (more open field of fire), a central
+///   mount a **narrower** one. Derived from the cell's perimeter ring
+///   ([`cell_depth`]) normalized over the hull's max ring, mapped onto
+///   `[MIN_HALF_ANGLE, π]` and floored strictly above `0` so it is never a
+///   zero-width or wrap-around arc.
+pub fn hardpoint_arc(hull: &Hull, slot: SlotId) -> Option<FiringArc> {
+    let slot = hull.slot(slot)?;
+    if !slot.is_weapon_mount {
+        return None;
+    }
+
+    // Position factor: outer mounts (depth 0) → wide arc; central mounts → narrow.
+    // Normalize the cell's perimeter ring over the hull's maximum possible ring so
+    // the factor is a clean 0..=1 independent of hull size.
+    let (cols, rows) = hull.grid_dims;
+    let max_ring = ((cols.min(rows)).saturating_sub(1) / 2).max(1) as f32;
+    let ring = cell_depth(hull, slot.coord) as f32;
+    let centrality = (ring / max_ring).clamp(0.0, 1.0); // 0 = edge, 1 = center
+
+    // Edge (centrality 0) → MAX_HALF_ANGLE; center (centrality 1) → MIN_HALF_ANGLE.
+    let half_angle = MAX_HALF_ANGLE - centrality * (MAX_HALF_ANGLE - MIN_HALF_ANGLE);
+    // Belt-and-suspenders: clamp strictly into (0, π] (INV-F12).
+    let half_angle = half_angle.clamp(MIN_HALF_ANGLE, MAX_HALF_ANGLE);
+
+    Some(FiringArc {
+        center: slot.facing,
+        half_angle,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fitting::content::{
+        seed_catalogs, HULL_FIGHTER, MODULE_AUTOCANNON, MODULE_REACTOR_BASIC,
+    };
+
+    #[test]
+    fn build_layout_covers_every_authored_cell() {
+        // INV-F11: the layout map has exactly one occupant per authored hull cell.
+        let (modules, hulls) = seed_catalogs();
+        let hull = hulls.get(HULL_FIGHTER).unwrap();
+        let fit = Fit::new(HULL_FIGHTER);
+        let layout = build_layout(hull, &fit, &modules);
+        assert_eq!(layout.cells.len(), hull.cells.len());
+        for cell in &hull.cells {
+            assert!(layout.occupant(cell.coord).is_some());
+        }
+    }
+
+    #[test]
+    fn occupied_cell_reports_module_health() {
+        let (modules, hulls) = seed_catalogs();
+        let hull = hulls.get(HULL_FIGHTER).unwrap();
+        let mut fit = Fit::new(HULL_FIGHTER);
+        // Slot 0 is the central reactor slot on the fighter.
+        fit.install_raw(SlotId(0), MODULE_REACTOR_BASIC);
+        let reactor_coord = hull.slot(SlotId(0)).unwrap().coord;
+        let layout = build_layout(hull, &fit, &modules);
+        let occ = layout.occupant(reactor_coord).unwrap();
+        assert_eq!(occ.module, Some(MODULE_REACTOR_BASIC));
+        assert_eq!(
+            occ.health,
+            modules.get(MODULE_REACTOR_BASIC).unwrap().health_max
+        );
+    }
+
+    #[test]
+    fn central_cell_has_greater_depth_than_an_edge_cell() {
+        // INV-F10: the central reactor cell sits deeper (higher depth) than a
+        // forward weapon mount on the perimeter.
+        let (_, hulls) = seed_catalogs();
+        let hull = hulls.get(HULL_FIGHTER).unwrap();
+        let center = hull.slot(SlotId(0)).unwrap().coord; // reactor, central
+        let edge = hull.slot(SlotId(3)).unwrap().coord; // weapon, forward edge
+        assert!(cell_depth(hull, center) > cell_depth(hull, edge));
+    }
+
+    #[test]
+    fn hardpoint_arc_is_bounded_and_none_for_non_weapon() {
+        let (_, hulls) = seed_catalogs();
+        let hull = hulls.get(HULL_FIGHTER).unwrap();
+        // A weapon mount (slot 3) exposes a bounded arc.
+        let arc = hardpoint_arc(hull, SlotId(3)).expect("weapon mount has an arc");
+        assert!(arc.half_angle > 0.0 && arc.half_angle <= std::f32::consts::PI);
+        // The reactor slot (slot 0) is not a weapon mount.
+        assert!(hardpoint_arc(hull, SlotId(0)).is_none());
+    }
+
+    #[test]
+    fn resolve_hit_picks_the_module_on_the_line() {
+        let (modules, hulls) = seed_catalogs();
+        let hull = hulls.get(HULL_FIGHTER).unwrap();
+        // Put the reactor in its central slot, fire a line straight through it.
+        let mut fit = Fit::new(HULL_FIGHTER);
+        fit.install_raw(SlotId(0), MODULE_REACTOR_BASIC);
+        let coord = hull.slot(SlotId(0)).unwrap().coord;
+        let center = cell_center(coord);
+        let hit = resolve_hit(
+            &fit,
+            center - Vec2::new(3.0, 0.0),
+            center + Vec2::new(3.0, 0.0),
+            hull,
+            &modules,
+        )
+        .expect("line through the reactor cell strikes it");
+        assert_eq!(hit.module.module, MODULE_REACTOR_BASIC);
+        assert_eq!(hit.cell, coord);
+        assert!((0.0..=1.0).contains(&hit.toi));
+        // An autocannon id exists in the catalog (referenced for the import).
+        assert!(modules.get(MODULE_AUTOCANNON).is_some());
+    }
+}

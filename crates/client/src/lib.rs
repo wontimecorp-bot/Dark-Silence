@@ -26,6 +26,7 @@
 #![allow(clippy::type_complexity)]
 
 pub mod camera;
+pub mod fitting_ui;
 pub mod hud;
 pub mod input;
 pub mod interpolation;
@@ -35,6 +36,7 @@ pub mod render_sync;
 pub mod scene;
 
 use bevy::prelude::*;
+use fitting_ui::{FittingScreenState, FittingUiPlugin};
 use net::NetClientPlugin;
 use sim::{FixedDt, HitFeedback, Tuning};
 
@@ -81,6 +83,12 @@ pub fn run() -> AppExit {
         // Input runs before the fixed step so intents apply the same frame; the
         // net plugin reads the local ship's `ShipIntent` in FixedUpdate.
         .add_systems(PreUpdate, (input::read_input, input::toggle_assist))
+        // The interactive fitting screen (E006 US5): the plugin registers the
+        // `FittingScreenState` app-state + the screen's build/teardown + the
+        // place/remove/budget/preview/preset systems. A key (Tab) toggles between
+        // the flying view and the fitting screen (T034, FR-012).
+        .add_plugins(FittingUiPlugin)
+        .add_systems(Update, toggle_fitting_screen)
         // The embedded-server lifecycle: pilot + step the server and capture its
         // world into every rendered entity's `RenderInterp` in FixedUpdate;
         // interpolate `RenderInterp` → `Transform` in Update.
@@ -99,4 +107,23 @@ pub fn run() -> AppExit {
             ),
         )
         .run()
+}
+
+/// Toggle between the flying view and the interactive fitting screen on a fresh
+/// `Tab` press (T034, FR-012). Flips the [`FittingScreenState`] app-state, which
+/// the [`FittingUiPlugin`] watches to build/tear down the screen and gate its
+/// place/remove/budget/preview/preset systems. Flight input keeps running so the
+/// player can still see the ship behind the panel; the fitting edits never touch a
+/// running ship until committed (client-only sandbox).
+fn toggle_fitting_screen(
+    keys: Res<ButtonInput<KeyCode>>,
+    state: Res<State<FittingScreenState>>,
+    mut next: ResMut<NextState<FittingScreenState>>,
+) {
+    if keys.just_pressed(KeyCode::Tab) {
+        next.set(match state.get() {
+            FittingScreenState::Flying => FittingScreenState::Fitting,
+            FittingScreenState::Fitting => FittingScreenState::Flying,
+        });
+    }
 }

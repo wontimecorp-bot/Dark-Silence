@@ -20,6 +20,7 @@ pub mod clock;
 pub mod collision;
 pub mod combat;
 pub mod components;
+pub mod fitting;
 pub mod flight;
 pub mod intent;
 pub mod motion;
@@ -32,6 +33,11 @@ pub use combat::HitFeedback;
 pub use components::{
     AngularVelocity, CollisionRadius, Damage, FlightAssist, Heading, Health, Lifetime, Position,
     PrevPosition, Projectile, ProjectileOwner, Ship, Target, TargetKind, Velocity, Weapon,
+};
+pub use fitting::{
+    build_layout, cell_map, derive_ship_stats, hardpoint_arc, load_preset, module_at,
+    preview_stats, recompute_ship_stats_system, resolve_hit, save_preset, CellOccupant, FitLayout,
+    FitPreset, HitResolution, PresetId, ShipStats, WeaponProfile,
 };
 pub use intent::ShipIntent;
 pub use motion::{analytic, integrate, simulate, BodyState};

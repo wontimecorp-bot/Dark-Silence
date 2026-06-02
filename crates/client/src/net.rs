@@ -54,6 +54,10 @@ use protocol::{
 };
 use server::{RenderEntity, ServerApp, PROTOCOL_VERSION};
 use sim::components::{TargetKind, Velocity};
+use sim::fitting::{
+    build_layout, derive_ship_stats, seed_catalogs, Fit, SlotId, HULL_FIGHTER, MODULE_AUTOCANNON,
+    MODULE_REACTOR_BASIC, MODULE_THRUSTER_BASIC,
+};
 use sim::{FixedDt, ShipIntent};
 
 use crate::input::{build_client_input, InputSequencer};
@@ -180,6 +184,16 @@ fn setup_loopback_host(world: &mut World) {
     }
     let local_id = local_id.expect("loopback handshake yields a ConnectAccepted");
 
+    // T033 (FR-014): give the embedded server's player ship a fit so the windowed
+    // ship flies fit-driven. The handshake tick above spawned this client's
+    // authoritative ship; attach a starter fighter fit + its derived `ShipStats` +
+    // `FitLayout` directly on the SERVER-side entity, because the windowed window
+    // renders from (and the flight is computed in) the embedded server's world. The
+    // flight system's override path then reads this `ShipStats` instead of the
+    // global `Tuning` — "fit drives the ship". `spawn_demo_world` targets are
+    // untouched (only this one ship entity is fitted).
+    attach_starter_fit(&mut server, local_id);
+
     // Register the pre-spawned local ship under its authoritative id so the capture
     // system updates it in place (the scene spawns exactly one `LocalShip`).
     let mut local_ship_q = world.query_filtered::<Entity, With<LocalShip>>();
@@ -200,6 +214,56 @@ fn setup_loopback_host(world: &mut World) {
         sequencer: InputSequencer::new(),
         local_id,
     });
+}
+
+/// Attach a starter fighter fit + its derived [`ShipStats`] + [`FitLayout`] to the
+/// embedded server's player ship (T033, FR-014/019).
+///
+/// The windowed ship's flight is computed in the embedded server's `sim` schedule,
+/// which reads a ship's [`ShipStats`] component when present (the Phase 4 rewire) —
+/// so to make fitting drive flight, the fit + derived stats must live on the
+/// SERVER-side ship entity. This resolves that entity by the wire [`EntityId`] the
+/// client learned at handshake ([`ServerApp::ship_entity_for`]) and inserts:
+/// - a starter [`Fit`] on [`HULL_FIGHTER`] (reactor + two thrusters + one
+///   autocannon — a valid, within-budget loadout from the seed catalog);
+/// - the [`derive_ship_stats`] result (so flight reads fit-derived thrust/mass/turn
+///   and the ship can fire — the autocannon makes `can_fire == true`);
+/// - the [`build_layout`] hit/armor map (the E007 surface, kept in lock-step).
+///
+/// **Flight sanity:** the two seed thrusters sum to the E002 thrust/torque/strafe
+/// magnitudes (30/12/18), so emergent top speed (`thrust/linear_drag = 80`) and max
+/// turn rate (`turn_torque/angular_drag = 3.0 rad/s`) match the old `Tuning`
+/// baseline; the fighter's heavier total mass (hull base + modules) makes
+/// acceleration more deliberate than the unit-mass `Tuning` ship — the intended
+/// "the feel now reflects the fighter's fit" payoff, still bounded and playable.
+///
+/// `spawn_demo_world` targets are unaffected — only this one ship entity is fitted.
+/// If the ship entity cannot be resolved (it always can after the handshake), this
+/// is a no-op rather than a panic (defensive).
+fn attach_starter_fit(server: &mut ServerApp, local_id: EntityId) {
+    let (modules, hulls) = seed_catalogs();
+    let Some(hull) = hulls.get(HULL_FIGHTER).cloned() else {
+        return;
+    };
+
+    // Build the starter loadout on the fighter via the validate-then-apply install
+    // (so the fit is guaranteed legal / within budget). Slot layout:
+    // 0 Reactor, 1+2 Thruster, 3 Weapon.
+    let mut fit = Fit::new(HULL_FIGHTER);
+    let _ = fit.install_module(SlotId(0), MODULE_REACTOR_BASIC, &hull, &modules);
+    let _ = fit.install_module(SlotId(1), MODULE_THRUSTER_BASIC, &hull, &modules);
+    let _ = fit.install_module(SlotId(2), MODULE_THRUSTER_BASIC, &hull, &modules);
+    let _ = fit.install_module(SlotId(3), MODULE_AUTOCANNON, &hull, &modules);
+
+    let stats = derive_ship_stats(&hull, &fit, &modules);
+    let layout = build_layout(&hull, &fit, &modules);
+
+    let Some(ship) = server.ship_entity_for(local_id) else {
+        return;
+    };
+    if let Ok(mut entity) = server.world_mut().get_entity_mut(ship) {
+        entity.insert((fit, stats, layout));
+    }
 }
 
 /// `FixedUpdate`: pilot + step the embedded authoritative server one tick.

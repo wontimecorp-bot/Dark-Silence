@@ -9,11 +9,67 @@
 
 use crate::clock::FixedDt;
 use crate::components::{AngularVelocity, FlightAssist, Heading, Position, Ship, Velocity};
+use crate::fitting::ShipStats;
 use crate::intent::ShipIntent;
 use crate::motion::{integrate, BodyState};
 use crate::tuning::Tuning;
 use bevy_ecs::prelude::*;
 use glam::Vec2;
+
+/// The flight magnitudes one step of [`ship_motion_system`] consumes — the
+/// override-or-fallback view (FR-014/015). A fitted ship's [`ShipStats`] and the
+/// global [`Tuning`] both project onto this exact field set, so the motion math
+/// runs **identical formulae** regardless of source: only the numbers move from
+/// the global resource to the per-entity component.
+#[derive(Clone, Copy)]
+struct FlightParams {
+    thrust_force: f32,
+    reverse_force: f32,
+    strafe_force: f32,
+    mass: f32,
+    linear_drag: f32,
+    turn_torque: f32,
+    angular_drag: f32,
+    angular_inertia: f32,
+    turn_power_share: f32,
+}
+
+impl FlightParams {
+    /// Fallback source: the global [`Tuning`] (unfitted ships — E001/E002/E003).
+    fn from_tuning(t: &Tuning) -> Self {
+        Self {
+            thrust_force: t.thrust_force,
+            reverse_force: t.reverse_force,
+            strafe_force: t.strafe_force,
+            mass: t.mass,
+            linear_drag: t.linear_drag,
+            turn_torque: t.turn_torque,
+            angular_drag: t.angular_drag,
+            angular_inertia: t.angular_inertia,
+            turn_power_share: t.turn_power_share,
+        }
+    }
+
+    /// Override source: the ship's fit-derived [`ShipStats`] (fitted ships).
+    fn from_ship_stats(s: &ShipStats) -> Self {
+        Self {
+            thrust_force: s.thrust_force,
+            reverse_force: s.reverse_force,
+            strafe_force: s.strafe_force,
+            mass: s.total_mass,
+            linear_drag: s.linear_drag,
+            turn_torque: s.turn_torque,
+            angular_drag: s.angular_drag,
+            angular_inertia: s.angular_inertia,
+            turn_power_share: s.turn_power_share,
+        }
+    }
+
+    /// Emergent max turn rate (decoupled mode), mirroring [`Tuning::max_turn_rate`].
+    fn max_turn_rate(&self) -> f32 {
+        self.turn_torque / self.angular_drag
+    }
+}
 
 /// Available-thrust scale from the shared power budget: hard turning diverts
 /// drive power, so translational thrust is multiplied by `1 - share·|turn|`
@@ -55,10 +111,31 @@ pub fn linear_accel(vel: Vec2, thrust: Vec2, drag: f32, mass: f32) -> Vec2 {
 /// component, so the server can drive N independently-controlled ships in one
 /// shared step. A ship without the component is simply not piloted (no thrust);
 /// AI-driven ships are steered by [`crate::ai::seek_system`] instead.
+///
+/// **Override-or-fallback flight source** (FR-014, the E006 rewire): a ship that
+/// carries a fit-derived [`ShipStats`] component flies on **its** stats; a ship
+/// without one falls back to the global [`Tuning`] resource. The two paths run
+/// the **identical** motion math via [`step_ship_motion`] — only the source of the
+/// numbers differs — so unfitted E001/E002/E003 ships keep their exact current
+/// behavior while fitted ships are fit-driven.
 pub fn ship_motion_system(
     tuning: Res<Tuning>,
     dt: Res<FixedDt>,
-    mut q: Query<
+    // Fitted ships: per-entity ShipStats override the global Tuning.
+    mut fitted: Query<
+        (
+            &ShipIntent,
+            &mut Position,
+            &mut Velocity,
+            &mut Heading,
+            &mut AngularVelocity,
+            &mut FlightAssist,
+            &ShipStats,
+        ),
+        With<Ship>,
+    >,
+    // Unfitted ships: fall back to the global Tuning (unchanged E001/E002/E003).
+    mut unfitted: Query<
         (
             &ShipIntent,
             &mut Position,
@@ -67,62 +144,106 @@ pub fn ship_motion_system(
             &mut AngularVelocity,
             &mut FlightAssist,
         ),
-        With<Ship>,
+        (With<Ship>, Without<ShipStats>),
     >,
 ) {
     let dt = dt.0;
-    let t = &*tuning;
-    for (intent, mut pos, mut vel, mut heading, mut omega, mut assist) in &mut q {
-        if intent.toggle_assist {
-            *assist = match *assist {
-                FlightAssist::On => FlightAssist::Off,
-                FlightAssist::Off => FlightAssist::On,
-            };
-        }
 
-        let nose = Vec2::from_angle(heading.0);
-        let left = Vec2::new(-nose.y, nose.x);
-        // Reverse uses the weaker retro thrusters.
-        let fwd_force = if intent.forward >= 0.0 {
-            t.thrust_force
-        } else {
-            t.reverse_force
-        };
-
-        let accel = match *assist {
-            FlightAssist::On => {
-                omega.0 = step_angular(
-                    omega.0,
-                    intent.turn,
-                    t.turn_torque,
-                    t.angular_drag,
-                    t.angular_inertia,
-                    dt,
-                );
-                heading.0 += omega.0 * dt;
-                let power = turn_power_factor(intent.turn, t.turn_power_share);
-                let thrust = (nose * (intent.forward * fwd_force)
-                    + left * (intent.strafe * t.strafe_force))
-                    * power;
-                linear_accel(vel.0, thrust, t.linear_drag, t.mass)
-            }
-            FlightAssist::Off => {
-                // Decoupled: instant rotation, no drag (free Newtonian drift).
-                omega.0 = intent.turn * t.max_turn_rate();
-                heading.0 += omega.0 * dt;
-                let thrust =
-                    nose * (intent.forward * fwd_force) + left * (intent.strafe * t.strafe_force);
-                thrust / t.mass
-            }
-        };
-
-        // Keep the heading bounded for f32 precision over long sessions.
-        heading.0 = heading.0.rem_euclid(std::f32::consts::TAU);
-
-        let stepped = integrate(BodyState::new(pos.0, vel.0), accel, dt);
-        pos.0 = stepped.pos;
-        vel.0 = stepped.vel;
+    // Fitted: each ship uses its own fit-derived stats.
+    for (intent, mut pos, mut vel, mut heading, mut omega, mut assist, stats) in &mut fitted {
+        let params = FlightParams::from_ship_stats(stats);
+        step_ship_motion(
+            &params,
+            dt,
+            intent,
+            &mut pos,
+            &mut vel,
+            &mut heading,
+            &mut omega,
+            &mut assist,
+        );
     }
+
+    // Unfitted: fall back to the single global Tuning.
+    let fallback = FlightParams::from_tuning(&tuning);
+    for (intent, mut pos, mut vel, mut heading, mut omega, mut assist) in &mut unfitted {
+        step_ship_motion(
+            &fallback,
+            dt,
+            intent,
+            &mut pos,
+            &mut vel,
+            &mut heading,
+            &mut omega,
+            &mut assist,
+        );
+    }
+}
+
+/// One ship's fixed-step motion under the given [`FlightParams`] — the shared
+/// formulae both the [`ShipStats`] override and the [`Tuning`] fallback run
+/// (factored out so the two sources stay bit-identical; the math is unchanged
+/// from the E002 model).
+#[allow(clippy::too_many_arguments)]
+fn step_ship_motion(
+    p: &FlightParams,
+    dt: f32,
+    intent: &ShipIntent,
+    pos: &mut Position,
+    vel: &mut Velocity,
+    heading: &mut Heading,
+    omega: &mut AngularVelocity,
+    assist: &mut FlightAssist,
+) {
+    if intent.toggle_assist {
+        *assist = match *assist {
+            FlightAssist::On => FlightAssist::Off,
+            FlightAssist::Off => FlightAssist::On,
+        };
+    }
+
+    let nose = Vec2::from_angle(heading.0);
+    let left = Vec2::new(-nose.y, nose.x);
+    // Reverse uses the weaker retro thrusters.
+    let fwd_force = if intent.forward >= 0.0 {
+        p.thrust_force
+    } else {
+        p.reverse_force
+    };
+
+    let accel = match *assist {
+        FlightAssist::On => {
+            omega.0 = step_angular(
+                omega.0,
+                intent.turn,
+                p.turn_torque,
+                p.angular_drag,
+                p.angular_inertia,
+                dt,
+            );
+            heading.0 += omega.0 * dt;
+            let power = turn_power_factor(intent.turn, p.turn_power_share);
+            let thrust = (nose * (intent.forward * fwd_force)
+                + left * (intent.strafe * p.strafe_force))
+                * power;
+            linear_accel(vel.0, thrust, p.linear_drag, p.mass)
+        }
+        FlightAssist::Off => {
+            // Decoupled: instant rotation, no drag (free Newtonian drift).
+            omega.0 = intent.turn * p.max_turn_rate();
+            heading.0 += omega.0 * dt;
+            let thrust =
+                nose * (intent.forward * fwd_force) + left * (intent.strafe * p.strafe_force);
+            thrust / p.mass
+        }
+    };
+
+    // Keep the heading bounded for f32 precision over long sessions.
+    heading.0 = heading.0.rem_euclid(std::f32::consts::TAU);
+
+    let stepped = integrate(BodyState::new(pos.0, vel.0), accel, dt);
+    pos.0 = stepped.pos;
+    vel.0 = stepped.vel;
 }
 
 #[cfg(test)]

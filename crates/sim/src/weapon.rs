@@ -6,11 +6,15 @@ use crate::components::{
     Damage, Heading, Lifetime, Position, PrevPosition, Projectile, ProjectileOwner, Ship, Velocity,
     Weapon,
 };
+use crate::fitting::ShipStats;
 use crate::intent::ShipIntent;
 use bevy_ecs::prelude::*;
 use glam::Vec2;
 
-/// Default damage a projectile carries (Damage > 0, INV-04).
+/// Default damage a projectile carries (Damage > 0, INV-04) — the unfitted-ship
+/// fallback when the shot's source is the [`Weapon`] component, which has no
+/// per-shot damage field. Fitted ships use their [`ShipStats`] weapon profile's
+/// `damage`.
 const PROJECTILE_DAMAGE: f32 = 10.0;
 /// Projectile time-to-live in seconds.
 const PROJECTILE_LIFETIME: f32 = 3.0;
@@ -35,13 +39,66 @@ pub fn cooldown_after_fire(fire_rate: f32) -> f32 {
 /// [`ShipIntent`] component, so N independently-controlled ships fire from their
 /// own inputs in one shared step. A ship without the component is not piloted
 /// and does not fire.
+///
+/// **Override-or-fallback weapon source** (FR-014/016, the E006 rewire): a ship
+/// that carries a fit-derived [`ShipStats`] component is gated on
+/// [`ShipStats::can_fire`] (no weapon module ⇒ no fire) and fires with that fit's
+/// [`WeaponProfile`](crate::fitting::WeaponProfile) params + damage; a ship
+/// without [`ShipStats`] keeps the exact E002 [`Weapon`]-component behavior. The
+/// [`Weapon`] component still owns the cooldown state machine (INV-03) on both
+/// paths, so the cooldown gate is unchanged. A fitted ship that cannot fire still
+/// has its cooldown ticked harmlessly.
 pub fn weapon_fire_system(
     dt: Res<FixedDt>,
     mut commands: Commands,
-    mut ship_q: Query<(Entity, &ShipIntent, &Position, &Heading, &mut Weapon), With<Ship>>,
+    // Fitted ships: ShipStats gates firing + supplies the profile; the optional
+    // Weapon component (present when a weapon module is installed) holds cooldown.
+    mut fitted: Query<
+        (
+            Entity,
+            &ShipIntent,
+            &Position,
+            &Heading,
+            &ShipStats,
+            Option<&mut Weapon>,
+        ),
+        With<Ship>,
+    >,
+    // Unfitted ships: the E002 Weapon-component behavior, unchanged.
+    mut unfitted: Query<
+        (Entity, &ShipIntent, &Position, &Heading, &mut Weapon),
+        (With<Ship>, Without<ShipStats>),
+    >,
 ) {
     let dt = dt.0;
-    for (owner, intent, pos, heading, mut weapon) in &mut ship_q {
+
+    // Fitted path: fit-derived can_fire + WeaponProfile (FR-016).
+    for (owner, intent, pos, heading, stats, weapon) in &mut fitted {
+        // No weapon module ⇒ cannot fire; if a Weapon component lingers, still
+        // tick its cooldown so it stays a valid (idle) state machine.
+        let (Some(profile), Some(mut weapon)) = (stats.weapon, weapon) else {
+            continue;
+        };
+        if weapon.cooldown > 0.0 {
+            weapon.cooldown -= dt;
+        }
+        if stats.can_fire && intent.fire && can_fire(weapon.cooldown) {
+            let vel = Vec2::from_angle(heading.0) * profile.muzzle_speed;
+            commands.spawn((
+                Projectile,
+                Position(pos.0),
+                PrevPosition(pos.0),
+                Velocity(vel),
+                Damage(profile.damage),
+                Lifetime(PROJECTILE_LIFETIME),
+                ProjectileOwner(owner),
+            ));
+            weapon.cooldown = cooldown_after_fire(profile.fire_rate);
+        }
+    }
+
+    // Unfitted path: the original Weapon-component behavior (E001/E002/E003).
+    for (owner, intent, pos, heading, mut weapon) in &mut unfitted {
         if weapon.cooldown > 0.0 {
             weapon.cooldown -= dt;
         }
