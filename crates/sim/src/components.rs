@@ -67,6 +67,11 @@ pub struct Ship;
 #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Heading(pub f32);
 
+/// Turn rate in radians/s — the ship's angular velocity, carried with inertia
+/// (the flight-model spins it up/down rather than snapping).
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AngularVelocity(pub f32);
+
 /// Remaining hit points; an entity is destroyed at or below zero.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Health(pub f32);

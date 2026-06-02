@@ -129,8 +129,8 @@ N/A — local single-player client; no API, external services, or untrusted-inpu
 | Req ID | Component(s) | File Path(s) | Notes |
 |--------|--------------|--------------|-------|
 | FR-001 | Renderer, Camera, Ship | `crates/client/src/{scene,camera,render_sync}.rs`; `crates/sim/src/components.rs` | tinted primitives; top-down follow + zoom |
-| FR-002 | Sim motion, Flight, Input | `crates/sim/src/{motion,flight}.rs`; `crates/client/src/input.rs` | thrust→accel→`integrate`; coast on release |
-| FR-003 | Flight | `crates/sim/src/flight.rs`; `crates/client/src/input.rs` | `FlightAssist` On/Off transform; toggle key |
+| FR-002 | Sim motion, Flight, Input | `crates/sim/src/{motion,flight}.rs`; `crates/client/src/input.rs` | thrust(force)+drag→terminal velocity; reverse via retros; decoupled coasts |
+| FR-003 | Flight | `crates/sim/src/flight.rs`; `crates/client/src/input.rs` | flight-model: angular inertia + shared power budget; decoupled toggle |
 | FR-004 | Sim Driver, Render Sync | `crates/client/src/{main,render_sync}.rs` | `FixedUpdate` + interpolate; {AD-001, ADR-0013} |
 | FR-005 | Weapon, Input | `crates/sim/src/weapon.rs`; `crates/client/src/input.rs` | fire along heading; fire key |
 | FR-006 | Collision, Physics, Weapon | `crates/sim/src/{collision,physics,weapon}.rs` | swept segment-cast CCD; {AD-002} |

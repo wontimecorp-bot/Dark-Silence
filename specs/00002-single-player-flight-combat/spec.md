@@ -136,8 +136,8 @@ A single dumb seeking target thrusts toward the player, giving the player a mane
 ### Functional Requirements *(product specs only)*
 
 - **FR-001**: System MUST render the 2D gameplay plane in 3D with a tinted composed-primitive ship and a top-down camera that follows the ship and supports zoom.
-- **FR-002**: System MUST drive ship motion (thrust, rotation, strafe) so the ship accelerates under thrust and coasts on momentum (Newtonian inertia) when input stops, computed by reusing the E001 `sim` crate's existing fixed-step integrator rather than a new one.
-- **FR-003**: System MUST provide a flight-assist toggle: assist ON damps drift and trends velocity toward heading; assist OFF is decoupled, preserving full momentum independent of heading.
+- **FR-002**: System MUST drive ship translation by applying thrust along the nose (forward via the main drive, reverse via weaker retro thrusters) plus lateral strafe, computed via the reused E001 fixed-step integrator. In the default flight-model, linear drag opposes velocity so top speed is the emergent terminal velocity `thrust_force / linear_drag` (no hard clamp) and cutting thrust bleeds speed; in the decoupled mode, motion is pure Newtonian (no drag, coasts indefinitely).
+- **FR-003**: System MUST default to a flight-model with (a) **angular inertia** — the turn rate spins up/down toward an emergent maximum `turn_torque / angular_drag` rather than snapping — and (b) a **shared power budget** — hard turning diverts translational thrust (available thrust ×= `1 − turn_power_share·|turn|`), so the ship cannot boost and hard-turn at once. A toggle MUST switch to a **decoupled/Newtonian** mode (instant rotation, no drag).
 - **FR-004**: System MUST decouple the fixed-step simulation from rendering using interpolation so flight feel is frame-rate independent and smooth at 60+ FPS. "Frame-rate independent" means the observable equivalence criterion of FR-017: for the same inputs and start state, the per-tick sim trajectory is identical regardless of render frame rate (rendering only interpolates between sim ticks); this replaces reliance on the subjective term "smooth" as the testable property. (FR-004, FR-016, and FR-017 are layered facets of the fixed-step model — render-decoupling, tick-rate assertability, and per-tick determinism respectively — not redundant requirements.)
 - **FR-005**: System MUST fire projectiles from a fixed forward-mounted weapon in the ship's heading direction on player input.
 - **FR-006**: System MUST resolve projectile–target collisions with swept/continuous tests so fast projectiles never tunnel through targets.
@@ -149,7 +149,7 @@ A single dumb seeking target thrusts toward the player, giving the player a mane
 - **FR-012**: System MUST provide one seeking-AI target that thrusts toward the player's position and is destroyable like other targets.
 - **FR-013**: System MUST map all controls (thrust, reverse, rotate, strafe, flight-assist toggle, fire) to the keyboard as the single input device for this slice.
 - **FR-014**: System MUST run as a self-contained single-player session with no network connection and no persistence — a window in which the player flies, shoots, and destroys targets.
-- **FR-015**: System MUST expose flight, weapon, and collision magnitudes (thrust, max speed, projectile speed, lethal ram threshold) as in-engine tunable values, grounded-but-scaled per ADR-0012 rather than bound to real-world units.
+- **FR-015**: System MUST expose flight/weapon/collision magnitudes (`thrust_force`, `reverse_force`, `strafe_force`, `mass`, `linear_drag`, `turn_torque`, `angular_drag`, `angular_inertia`, `turn_power_share`, `muzzle_speed`, `fire_rate`, `lethal_ram_speed`) as in-engine tunable values, grounded-but-scaled per ADR-0012. They are a global stand-in that will later be sourced from installed equipment/modules (main/retro/maneuvering thrusters, module mass) rather than a global resource.
 - **FR-016**: System MUST advance the gameplay simulation at a fixed logical tick rate (default 60 Hz, i.e. `dt = 1/60 s`) that is decoupled from render frame rate; the tick rate MUST be a defined, assertable value (not only a plan note) so tests can drive the sim a known number of ticks.
 - **FR-017**: System MUST keep the fixed-step gameplay simulation deterministic: for the same start state and the same per-tick inputs, advancing the same number of ticks MUST produce the same resulting sim state (motion, projectiles, collisions, AI). This reuses the E001 integrator↔analytic motion invariant unchanged (covered-by-E001) and extends the same reproducibility guarantee to this slice's gameplay systems (weapon, swept collision, ram, seek). The guarantee level is **bit-identical (zero tolerance)**: under a deterministic test harness supplying identical per-tick inputs, advancing N ticks MUST yield byte-for-byte equal sim state. Live cross-frame-rate equivalence — where inputs are sampled per render frame and may therefore land on slightly different ticks at different FPS — is explicitly NOT required to be bit-identical and is not asserted with a numeric tolerance; it is validated through the SC-008 manual feel gate instead.
 
@@ -189,7 +189,7 @@ A single dumb seeking target thrusts toward the player, giving the player a mane
 ### Measurable Outcomes
 
 - **SC-001** [US1]: A player can fly the ship with visible momentum/inertia and the flight feels smooth at 60+ FPS, with consistent feel across 30/60/144 FPS. Cross-frame-rate consistency is verified two ways: (a) automated — a deterministic harness asserts bit-identical sim state at equal tick counts (FR-017, zero tolerance); (b) manual — live 30/60/144 FPS "consistent feel" is confirmed in the SC-008 playtest, since live per-frame input timing makes live cross-FPS states non-bit-identical by design.
-- **SC-002** [US1]: With assist OFF the ship retains full momentum (can face one direction while drifting another); with assist ON, drift is damped and the ship trends toward its heading.
+- **SC-002** [US1]: In the flight-model the ship accelerates to an emergent drag-capped top speed and no further, turns with visible angular inertia, bleeds speed during a hard turn (shared power budget), and reverses below its forward top speed; toggling to decoupled gives instant rotation and free Newtonian drift.
 - **SC-003** [US2]: A player can aim by pointing the nose and destroy static and drifting targets, with hits registering across the full projectile-velocity range — including grazing and simultaneous hits — and no tunneling.
 - **SC-004** [US2]: Every projectile hit applies damage, and a destroyed target is removed with clear visual/audio feedback.
 - **SC-005** [US3]: Ramming an asteroid below the threshold produces a believable momentum-transferring bounce; ramming at/above it destroys the ship. Observable acceptance signal for the bounce: after a sub-lethal contact both bodies' post-collision velocities change consistently with a closed-form elastic 2-body impulse (AD-003) — total linear momentum is conserved and the bodies separate (no overlap/sticking) — so the bounce is asserted from velocities, not judged subjectively.
@@ -201,9 +201,13 @@ A single dumb seeking target thrusts toward the player, giving the player a mane
 
 | Term | Definition |
 |------|------------|
-| Flight-assist | A pilot aid that damps unwanted drift and trends velocity toward the ship's heading; toggled ON/OFF. |
-| Decoupled mode | Flight-assist OFF: heading and velocity are independent, preserving full Newtonian momentum. |
-| Coasting | Continuing at constant velocity with no thrust input — frictionless Newtonian motion. |
+| Flight-model | The default grounded-arcade flight: drag-capped top speed, angular inertia, and a shared power budget. Toggled against the decoupled mode (the `FlightAssist` component: `On` = flight-model, `Off` = decoupled). |
+| Decoupled mode | The toggle alternative: instant rotation and no drag — full Newtonian free-drift (heading independent of velocity). |
+| Coasting | Moving with thrust released; in decoupled mode velocity stays constant, in the flight-model drag gently bleeds it. |
+| Terminal velocity | The emergent top speed where thrust balances drag (`thrust_force / linear_drag`); replaces a hard speed clamp. |
+| Angular inertia | Turning has momentum: the turn rate spins up/down toward `turn_torque / angular_drag` rather than snapping. |
+| Shared power budget | Hard turning diverts drive power from translational thrust, so a ship cannot boost and hard-turn at once. |
+| Retro thrust | Reverse thrust from weaker rear thrusters; reverse top speed sits below the forward top speed. |
 | Swept collision (CCD) | Continuous collision testing along a projectile's path between frames, preventing fast objects from tunneling through targets. |
 | Fixed timestep | Advancing the simulation in constant `dt` steps independent of frame rate, with rendering interpolated between steps. |
 | Ram damage | Damage applied to the ship when it collides with an asteroid above a velocity threshold. |

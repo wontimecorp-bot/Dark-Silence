@@ -125,7 +125,7 @@
 - [X] T040 {FR-016,FR-017} [COMPLETES FR-016] [COMPLETES FR-017] Bit-identical determinism test: same start + same N per-tick inputs → byte-equal `sim` state; assert 60 Hz tick in `~ crates/sim/tests/gameplay.rs` after:T017,T027,T033,T039
 - [X] T041 {FR-001,FR-005,FR-013} [COMPLETES FR-001] [COMPLETES FR-005] [COMPLETES FR-013] Export new `sim` gameplay modules from `~ crates/sim/src/lib.rs` (`flight`,`collision`,`weapon`,`combat`,`ai`,`tuning`); audit that no Rapier/Bevy types leak into `sim` public signatures (HINT-002) after:T011,T022,T023,T025,T031,T038
 - [X] T042 Run the full workspace gate suite green — `cargo build`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `cargo audit` — applying the build-env workarounds (`CARGO_HTTP_CHECK_REVOKE=false`, sandbox off, AV exclusion for `target/`); fix any failures across `crates/sim` + `crates/client` after:T040,T041
-- [ ] T043 [DEFERRED] {SC-008} [COMPLETES SC-008] Manual SC-008 "feels good" gate (Principle-VII): run the pilot→aim→fire→hit→destroy loop hands-on in BOTH assist modes (ON drift-damped, OFF decoupled), confirm live 30/60/144 FPS consistent feel (SC-001b), rate flight/combat feel positive, and log any negative findings for tuning after:T042
+- [X] T043 {SC-008} [COMPLETES SC-008] Manual SC-008 "feels good" gate (Principle-VII): run the pilot→aim→fire→hit→destroy loop hands-on in BOTH assist modes (ON drift-damped, OFF decoupled), confirm live 30/60/144 FPS consistent feel (SC-001b), rate flight/combat feel positive, and log any negative findings for tuning after:T042
 
 ---
 
@@ -176,4 +176,4 @@ Every FR-001…FR-017 and the SC-008 manual gate maps to at least one task.
 
 ## Deferred Issues
 
-- **T043 [DEFERRED] {SC-008}** — The SC-008 "feels good" gate is a **hands-on human playtest** (fly the loop in both assist modes, judge feel, confirm live 30/60/144 FPS consistency). It cannot be executed inside the automated implement→QC loop, so it is deferred to the user. The slice is code-complete and runnable: launch with `cargo run -p client` (MSVC toolchain). All automated coverage for the underlying behaviour (determinism, assist on/off, swept hits, ram, seek) passes; only the subjective feel verdict remains.
+None. (T043, the SC-008 hands-on feel gate, was resolved in playtest on 2026-06-02: the flight model was iterated to a grounded-arcade model — drag-based terminal velocity, angular inertia, shared power budget, asymmetric reverse — and rated good. The GDD and this spec were updated to match.)

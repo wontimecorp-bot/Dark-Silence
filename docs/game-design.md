@@ -81,7 +81,14 @@ Single-node: there are no seams (sectors are just an index). Multi-node seamless
 ## 4. Core Gameplay Loop
 
 ### Flight
-**Newtonian planar flight** (3DOF: x, y, heading; thrust/mass/momentum/torque) with a **flight-assist toggle**: ON = drift-dampened/accessible; OFF = decoupled full-momentum/high-skill (Elite-style).
+**Grounded-arcade planar flight** (3DOF: x, y, heading) — real Newtonian *relationships* scaled for dogfighting (ADR-0012), inspired by Silent Death. Validated playable in E002.
+- **Top speed is emergent, not clamped:** thrust *force* opposed by linear **drag** → terminal velocity `thrust_force / linear_drag`. Cutting thrust bleeds speed (controllable); no infinite acceleration.
+- **Turning has angular inertia** — the turn rate spins up/down toward `turn_torque / angular_drag` (weighty, not instant).
+- **Shared power budget:** hard turning diverts drive power from thrust (`thrust ×= 1 − turn_power_share·|turn|`), so you can't boost *and* hard-turn at once, and you bleed speed in hard turns.
+- **Asymmetric thrust:** forward main drive > reverse retro thrusters > lateral strafe. Reverse lets you back off while keeping the nose (guns) on a target.
+- **Decoupled toggle** (advanced/Elite-style): instant rotation, no drag — pure Newtonian free-drift.
+- **Damage is emergent:** a damaged thruster lowers its force → lower top speed *and* acceleration; damaged RCS → mushy turns.
+- **Flight stats come from installed equipment** (main / retro / maneuvering thrusters, total module mass), not hand-set globals — fitting changes how the ship flies. *(Current slice uses a global `Tuning` stand-in until the fitting system lands.)*
 
 ### Combat feel & controls (scales by ship class)
 - **Fighters/small (visceral):** direct **thrust + rotate** keyboard piloting; **fixed forward weapons fire where the nose points** (manual aim by pointing). Momentum dogfights.

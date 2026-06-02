@@ -5,8 +5,8 @@
 
 use bevy::prelude::*;
 use sim::components::{
-    CollisionRadius, FlightAssist, Heading, Health, Position, Ship, Target, TargetKind, Velocity,
-    Weapon,
+    AngularVelocity, CollisionRadius, FlightAssist, Heading, Health, Position, Ship, Target,
+    TargetKind, Velocity, Weapon,
 };
 use sim::Tuning;
 
@@ -57,10 +57,12 @@ pub fn setup_scene(
         Position(Vec2::ZERO),
         Velocity(Vec2::ZERO),
         Heading(0.0),
+        AngularVelocity(0.0),
         Health(100.0),
-        // Default to decoupled Newtonian flight (true "space" feel — velocity is
-        // independent of facing, so you drift). Press F for the assisted mode.
-        FlightAssist::Off,
+        // Flight-model is the default (drag-capped top speed, angular inertia,
+        // shared power budget — the "Silent Death but better" feel). Press F to
+        // toggle the decoupled/Newtonian mode.
+        FlightAssist::On,
         CollisionRadius(0.8),
         Weapon {
             cooldown: 0.0,

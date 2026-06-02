@@ -37,7 +37,7 @@ pub fn seek_system(
     for (mut pos, mut vel, kind) in &mut targets {
         let accel = match (*kind, player) {
             (TargetKind::Seeker, Some(player_pos)) => {
-                seek_accel(pos.0, player_pos, tuning.thrust_accel)
+                seek_accel(pos.0, player_pos, tuning.thrust_force / tuning.mass)
             }
             _ => Vec2::ZERO,
         };

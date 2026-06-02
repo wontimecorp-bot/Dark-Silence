@@ -1,5 +1,6 @@
-﻿QC Passed: 2026-06-01T23:22:10-07:00
-E002 Single-player Flight & Combat — automated QC PASS.
-build OK; 42 tests pass; clippy -D warnings clean; fmt clean; cargo-audit exit 0 (1 allowed informational advisory).
-US1-US5 PASS; SC-001..SC-007 PASS; SC-008 = deferred manual feel gate (T043 [DEFERRED], see manual-test.md).
+﻿QC Passed: 2026-06-02T00:42:28-07:00
+E002 Single-player Flight & Combat — FULL PASS (no deferred items).
+build OK; 44 tests pass; clippy -D warnings clean; fmt clean; cargo-audit exit 0 (1 allowed informational advisory).
+US1-US5 PASS; SC-001..SC-008 PASS (SC-008 hands-on feel gate met in playtest 2026-06-02); T043 complete.
+Flight model: grounded-arcade (drag terminal velocity, angular inertia, shared power budget, asymmetric reverse); GDD + spec synced.
 PI compliance: no violations.

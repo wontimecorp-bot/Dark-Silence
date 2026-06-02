@@ -14,7 +14,7 @@ pub struct HudText;
 /// overlay — the weapon fires along the heading, not at screen centre.
 pub fn setup_hud(mut commands: Commands) {
     commands.spawn((
-        Text::new("SPD   0.0   MANUAL   HP 100"),
+        Text::new("SPD   0.0   FLIGHT   HP 100"),
         TextFont {
             font_size: 18.0,
             ..default()
@@ -45,8 +45,8 @@ pub fn update_hud(
     };
     let speed = vel.0.length();
     let mode = match assist {
-        FlightAssist::On => "ASSIST",
-        FlightAssist::Off => "MANUAL",
+        FlightAssist::On => "FLIGHT",
+        FlightAssist::Off => "NEWTON",
     };
     let flash = if feedback.destroy_flash > 0.0 {
         "   KILL"

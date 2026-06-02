@@ -1,62 +1,55 @@
-//! Flight dynamics: pure helpers (input → acceleration, the flight-assist
-//! transform, speed clamping) plus the fixed-step ECS ship-motion system that
-//! composes them with the `sim::motion` integrator.
+//! Flight dynamics: the "grounded arcade" flight-model — thrust *force* opposed
+//! by linear *drag* (emergent top speed = `thrust_force / linear_drag`, no hard
+//! clamp), angular inertia for weighty turns, and a shared power budget where
+//! hard turning steals translational thrust — plus an optional decoupled /
+//! Newtonian mode. Pure helpers are unit-tested; the ECS system composes them
+//! with the `sim::motion` integrator (the E001 keystone, unchanged). Drag lives
+//! only on piloted ships, so projectiles and Tier-1 transit stay exactly
+//! ballistic and the integrator↔analytic invariant is untouched.
 
 use crate::clock::FixedDt;
-use crate::components::{FlightAssist, Heading, Position, Ship, Velocity};
+use crate::components::{AngularVelocity, FlightAssist, Heading, Position, Ship, Velocity};
 use crate::intent::ShipIntent;
 use crate::motion::{integrate, BodyState};
 use crate::tuning::Tuning;
 use bevy_ecs::prelude::*;
 use glam::Vec2;
 
-/// World-space acceleration from the pilot's discrete inputs. `forward` and
-/// `strafe` are each in `-1..=1`. Forward thrust acts along `heading`; strafe
-/// acts perpendicular (to the left of heading).
-pub fn input_accel(
-    heading: f32,
-    forward: f32,
-    strafe: f32,
-    thrust_accel: f32,
-    strafe_accel: f32,
-) -> Vec2 {
-    let fwd = Vec2::from_angle(heading);
-    let left = Vec2::new(-fwd.y, fwd.x);
-    fwd * (forward * thrust_accel) + left * (strafe * strafe_accel)
+/// Available-thrust scale from the shared power budget: hard turning diverts
+/// drive power, so translational thrust is multiplied by `1 - share·|turn|`
+/// (clamped to `0..=1`). You cannot boost and hard-turn at once.
+pub fn turn_power_factor(turn_input: f32, share: f32) -> f32 {
+    (1.0 - share * turn_input.abs()).clamp(0.0, 1.0)
 }
 
-/// Apply flight-assist for one step of `dt` seconds.
+/// One step of angular velocity under `torque` vs `angular_drag`, smoothed by
+/// the angular `inertia`. The steady-state turn rate at full input is
+/// `torque / angular_drag`.
+pub fn step_angular(
+    omega: f32,
+    turn_input: f32,
+    torque: f32,
+    angular_drag: f32,
+    inertia: f32,
+    dt: f32,
+) -> f32 {
+    let alpha = (torque * turn_input - angular_drag * omega) / inertia;
+    omega + alpha * dt
+}
+
+/// Linear acceleration from a thrust vector opposed by linear drag, per unit
+/// mass. Terminal velocity under steady thrust `F` is `|F| / drag`.
+pub fn linear_accel(vel: Vec2, thrust: Vec2, drag: f32, mass: f32) -> Vec2 {
+    (thrust - vel * drag) / mass
+}
+
+/// Fixed-step ship motion (FR-002/FR-003).
 ///
-/// `Off` (decoupled) returns the velocity unchanged — full Newtonian momentum,
-/// heading independent of motion. `On` damps drift by easing the velocity
-/// toward `speed · heading` at rate `damping`, so the ship trends toward where
-/// it points without changing speed abruptly. A single step only nudges the
-/// vector — the toggle never snaps velocity (INV-07).
-pub fn flight_assist(vel: Vec2, heading: f32, mode: FlightAssist, damping: f32, dt: f32) -> Vec2 {
-    match mode {
-        FlightAssist::Off => vel,
-        FlightAssist::On => {
-            let dir = Vec2::from_angle(heading);
-            let target = dir * vel.length();
-            let t = (damping * dt).clamp(0.0, 1.0);
-            vel.lerp(target, t)
-        }
-    }
-}
-
-/// Clamp speed to `max` (INV-02), preserving direction.
-pub fn clamp_speed(vel: Vec2, max: f32) -> Vec2 {
-    let s = vel.length();
-    if s > max && s > f32::EPSILON {
-        vel / s * max
-    } else {
-        vel
-    }
-}
-
-/// Fixed-step ship motion (FR-002/FR-003): turn from input, integrate thrust
-/// via the E001 keystone, apply flight-assist, clamp speed. Coasts when input
-/// is zero (no thrust → constant velocity).
+/// **Flight-model** (assist `On`, default): angular inertia turns the nose; the
+/// shared power budget scales translational thrust by how hard you're turning;
+/// drag gives an emergent top speed and bleeds momentum when thrust is cut.
+/// **Decoupled** (assist `Off`): instant rotation, no drag — pure Newtonian
+/// free-drift for advanced pilots.
 pub fn ship_motion_system(
     intent: Res<ShipIntent>,
     tuning: Res<Tuning>,
@@ -66,31 +59,64 @@ pub fn ship_motion_system(
             &mut Position,
             &mut Velocity,
             &mut Heading,
+            &mut AngularVelocity,
             &mut FlightAssist,
         ),
         With<Ship>,
     >,
 ) {
     let dt = dt.0;
-    for (mut pos, mut vel, mut heading, mut assist) in &mut q {
+    let t = &*tuning;
+    for (mut pos, mut vel, mut heading, mut omega, mut assist) in &mut q {
         if intent.toggle_assist {
             *assist = match *assist {
                 FlightAssist::On => FlightAssist::Off,
                 FlightAssist::Off => FlightAssist::On,
             };
         }
-        heading.0 += intent.turn * tuning.rotation_rate * dt;
-        let accel = input_accel(
-            heading.0,
-            intent.forward,
-            intent.strafe,
-            tuning.thrust_accel,
-            tuning.strafe_accel,
-        );
+
+        let nose = Vec2::from_angle(heading.0);
+        let left = Vec2::new(-nose.y, nose.x);
+        // Reverse uses the weaker retro thrusters.
+        let fwd_force = if intent.forward >= 0.0 {
+            t.thrust_force
+        } else {
+            t.reverse_force
+        };
+
+        let accel = match *assist {
+            FlightAssist::On => {
+                omega.0 = step_angular(
+                    omega.0,
+                    intent.turn,
+                    t.turn_torque,
+                    t.angular_drag,
+                    t.angular_inertia,
+                    dt,
+                );
+                heading.0 += omega.0 * dt;
+                let power = turn_power_factor(intent.turn, t.turn_power_share);
+                let thrust = (nose * (intent.forward * fwd_force)
+                    + left * (intent.strafe * t.strafe_force))
+                    * power;
+                linear_accel(vel.0, thrust, t.linear_drag, t.mass)
+            }
+            FlightAssist::Off => {
+                // Decoupled: instant rotation, no drag (free Newtonian drift).
+                omega.0 = intent.turn * t.max_turn_rate();
+                heading.0 += omega.0 * dt;
+                let thrust =
+                    nose * (intent.forward * fwd_force) + left * (intent.strafe * t.strafe_force);
+                thrust / t.mass
+            }
+        };
+
+        // Keep the heading bounded for f32 precision over long sessions.
+        heading.0 = heading.0.rem_euclid(std::f32::consts::TAU);
+
         let stepped = integrate(BodyState::new(pos.0, vel.0), accel, dt);
-        let assisted = flight_assist(stepped.vel, heading.0, *assist, tuning.assist_damping, dt);
         pos.0 = stepped.pos;
-        vel.0 = clamp_speed(assisted, tuning.max_speed);
+        vel.0 = stepped.vel;
     }
 }
 
@@ -99,46 +125,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn assist_off_preserves_velocity_vector() {
-        let v = Vec2::new(3.0, 4.0);
-        assert_eq!(flight_assist(v, 1.2, FlightAssist::Off, 4.0, 1.0 / 60.0), v);
+    fn turn_power_factor_diverts_thrust_with_turn() {
+        assert!((turn_power_factor(0.0, 0.7) - 1.0).abs() < 1e-6);
+        assert!((turn_power_factor(1.0, 0.7) - 0.3).abs() < 1e-6);
+        assert!((turn_power_factor(-1.0, 0.7) - 0.3).abs() < 1e-6); // magnitude
+        assert_eq!(turn_power_factor(2.0, 0.7), 0.0); // clamped to 0
     }
 
     #[test]
-    fn assist_on_trends_velocity_toward_heading() {
-        let v = Vec2::new(0.0, 5.0); // moving +y
-        let after = flight_assist(v, 0.0, FlightAssist::On, 4.0, 1.0 / 60.0); // heading +x
+    fn step_angular_converges_to_max_rate() {
+        let (torque, drag, inertia, dt) = (12.0, 4.0, 1.2, 1.0 / 60.0);
+        let mut omega = 0.0;
+        for _ in 0..600 {
+            omega = step_angular(omega, 1.0, torque, drag, inertia, dt);
+        }
         assert!(
-            after.x > v.x,
-            "velocity should gain a component toward heading"
-        );
-        assert!(after.y < v.y, "off-heading drift should be damped");
-        assert!(
-            (after.length() - v.length()).abs() < 0.5,
-            "assist eases direction, it does not bleed speed"
-        );
-    }
-
-    #[test]
-    fn assist_on_one_step_never_snaps() {
-        let v = Vec2::new(0.0, 5.0);
-        let after = flight_assist(v, 0.0, FlightAssist::On, 4.0, 1.0 / 60.0);
-        assert!(
-            after.distance(v) < 1.0,
-            "a single 60 Hz step is a nudge, not a snap"
+            (omega - torque / drag).abs() < 1e-2,
+            "omega -> torque/drag (3.0)"
         );
     }
 
     #[test]
-    fn clamp_caps_speed() {
-        assert!((clamp_speed(Vec2::new(100.0, 0.0), 80.0).length() - 80.0).abs() < 1e-4);
-        let slow = Vec2::new(1.0, 0.0);
-        assert_eq!(clamp_speed(slow, 80.0), slow);
+    fn linear_drag_gives_terminal_velocity() {
+        let (thrust_force, drag, mass, dt) = (30.0, 0.375, 1.0, 1.0 / 60.0);
+        let thrust = Vec2::new(thrust_force, 0.0);
+        let mut state = BodyState::new(Vec2::ZERO, Vec2::ZERO);
+        for _ in 0..3000 {
+            let a = linear_accel(state.vel, thrust, drag, mass);
+            state = integrate(state, a, dt);
+        }
+        let v_max = thrust_force / drag; // 80
+        assert!(
+            (state.vel.x - v_max).abs() < 0.5,
+            "speed approaches terminal velocity {v_max}"
+        );
+        assert!(
+            state.vel.x <= v_max + 0.1,
+            "never exceeds terminal velocity"
+        );
     }
 
     #[test]
-    fn input_accel_thrust_is_along_heading() {
-        let a = input_accel(0.0, 1.0, 0.0, 30.0, 20.0);
-        assert!((a - Vec2::new(30.0, 0.0)).length() < 1e-4);
+    fn drag_bleeds_speed_when_coasting_but_zero_drag_coasts() {
+        let v = Vec2::new(10.0, 0.0);
+        assert_eq!(linear_accel(v, Vec2::ZERO, 0.0, 1.0), Vec2::ZERO);
+        assert!(
+            linear_accel(v, Vec2::ZERO, 0.5, 1.0).x < 0.0,
+            "drag opposes motion when thrust is cut"
+        );
     }
 }

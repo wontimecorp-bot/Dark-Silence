@@ -1,12 +1,13 @@
 # QC Report: Single-player Flight & Combat (E002)
 
-**Date**: 2026-06-01 | **Feature**: [spec.md](spec.md) | **Overall Verdict**: **PASS** (automated QC; SC-008 manual feel gate deferred to the user — see Manual Testing)
+**Date**: 2026-06-02 | **Feature**: [spec.md](spec.md) | **Overall Verdict**: **PASS** — all gates green and the SC-008 hands-on feel gate met in playtest (2026-06-02). No deferred items remain.
 
 ## Test Results
 
 - **Runner**: `cargo test --workspace` (MSVC toolchain)
-- **Result**: **42 passed, 0 failed, 0 ignored**
-  - `sim` lib unit: 30 · `sim` integration `tests/gameplay.rs`: 9 · `sim` integration `tests/physics_swap.rs`: 3 · `client`: 0 (rendering shell — validated via build + the manual gate)
+- **Result**: **44 passed, 0 failed, 0 ignored**
+  - `sim` lib unit: 30 · `sim` integration `tests/gameplay.rs`: 11 · `sim` integration `tests/physics_swap.rs`: 3 · `client`: 0 (rendering shell — validated via build + the hands-on playtest)
+  - Flight-model coverage added in the post-playtest refinement: terminal-velocity cap, angular-rate convergence, and shared-power-budget (hard-turn bleeds speed).
 - Covers: integrator↔analytic keystone (E001, reused unchanged), flight-assist on/off, coasting, weapon cooldown, swept-CCD (no-tunnel / grazing / thin-target / start-inside), damage/destroy, elastic ram bounce + lethal threshold, seek steering, and **bit-identical fixed-step determinism** (`fixed_step_is_bit_identical_under_identical_inputs`).
 - **Failures**: none.
 
@@ -36,13 +37,13 @@
 | SC | Status | Notes |
 |---|---|---|
 | SC-001 | **PASS** (automated) / manual half | bit-identical determinism test green; live 30/60/144 "consistent feel" folds into SC-008 |
-| SC-002 | PASS | assist on/off velocity-behavior tests |
+| SC-002 | PASS | terminal-velocity, angular-convergence, shared-power-budget + decoupled-coast tests |
 | SC-003 | PASS | swept hits across velocity range incl. grazing, thin-target, **simultaneous multi-hit** (all tested) |
 | SC-004 | PASS | damage + destroy-once + feedback |
 | SC-005 | PASS | elastic momentum-conserving bounce + lethal threshold |
 | SC-006 | PASS (code) | single restrained HUD line + reticle; subjective "no number spam" in the manual gate |
 | SC-007 | PASS | seeker maneuvers + destroyable |
-| **SC-008** | **MANUAL (deferred)** | T043 `[DEFERRED]` — the Principle-VII hands-on "feels good" playtest. Build runs (`cargo run -p client`); see `manual-test.md`. |
+| **SC-008** | **PASS** | Hands-on feel gate performed and passed (2026-06-02); flight model iterated to the grounded-arcade model and rated good. T043 complete. |
 
 All FR-001…FR-017 implemented and covered (see plan Requirement Coverage Map).
 
@@ -72,7 +73,7 @@ SKIPPED — native Bevy desktop application; no browser/web surface and no brows
 
 ## Manual Testing
 
-`manual-test.md` generated for the **SC-008 "feels good" gate** (T043, deferred): the Principle-VII hands-on playtest. This is the one verification the automated loop cannot perform.
+SC-008 hands-on playtest **performed and passed** (2026-06-02). During the playtest the flight model was iterated to the grounded-arcade model (drag-based terminal velocity, angular inertia, shared power budget, asymmetric reverse); the GDD §4 Flight and this spec (FR-002/FR-003, SC-002) were updated to match. `manual-test.md` retains the playtest script.
 
 ## Tool Recommendations
 

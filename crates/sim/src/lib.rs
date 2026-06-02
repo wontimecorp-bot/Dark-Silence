@@ -30,8 +30,8 @@ pub mod weapon;
 pub use clock::FixedDt;
 pub use combat::HitFeedback;
 pub use components::{
-    CollisionRadius, Damage, FlightAssist, Heading, Health, Lifetime, Position, PrevPosition,
-    Projectile, ProjectileOwner, Ship, Target, TargetKind, Velocity, Weapon,
+    AngularVelocity, CollisionRadius, Damage, FlightAssist, Heading, Health, Lifetime, Position,
+    PrevPosition, Projectile, ProjectileOwner, Ship, Target, TargetKind, Velocity, Weapon,
 };
 pub use intent::ShipIntent;
 pub use motion::{analytic, integrate, simulate, BodyState};

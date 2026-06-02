@@ -47,7 +47,10 @@ fn spawn_ship(w: &mut World, pos: Vec2, heading: f32, vel: Vec2) -> Entity {
         Position(pos),
         Velocity(vel),
         Heading(heading),
+        AngularVelocity(0.0),
         Health(100.0),
+        // Decoupled mode (no drag) so the coast/ram/seek/determinism tests see
+        // pure Newtonian motion; the flight-model is exercised in its own tests.
         FlightAssist::Off,
         CollisionRadius(1.0),
         Weapon {
@@ -360,5 +363,75 @@ fn projectiles_resolve_harmlessly_after_target_destroyed() {
         count::<With<Projectile>>(&mut w),
         0,
         "projectiles with no target expire harmlessly"
+    );
+}
+
+/// Spawn a ship in flight-model (assist On) mode for the drag/power-budget tests.
+fn spawn_flight_model_ship(w: &mut World) -> Entity {
+    w.spawn((
+        Ship,
+        Position(Vec2::ZERO),
+        Velocity(Vec2::ZERO),
+        Heading(0.0),
+        AngularVelocity(0.0),
+        Health(100.0),
+        FlightAssist::On,
+        CollisionRadius(0.8),
+        Weapon {
+            cooldown: 0.0,
+            fire_rate: 5.0,
+            muzzle_speed: 200.0,
+        },
+    ))
+    .id()
+}
+
+#[test]
+fn flight_model_caps_speed_at_terminal_velocity() {
+    let mut w = make_world();
+    let ship = spawn_flight_model_ship(&mut w);
+    let mut sched = make_schedule();
+    w.resource_mut::<ShipIntent>().forward = 1.0;
+    for _ in 0..900 {
+        sched.run(&mut w); // 15 s of full thrust
+    }
+    let speed = w.get::<Velocity>(ship).unwrap().0.length();
+    let v_max = Tuning::default().top_speed(); // 80
+    assert!(
+        (speed - v_max).abs() < 2.0,
+        "speed approaches the emergent terminal velocity {v_max}, got {speed}"
+    );
+    assert!(
+        speed <= v_max + 0.5,
+        "drag caps speed — never blows past v_max"
+    );
+}
+
+#[test]
+fn hard_turn_diverts_thrust_and_bleeds_speed() {
+    let mut w = make_world();
+    let ship = spawn_flight_model_ship(&mut w);
+    let mut sched = make_schedule();
+    w.resource_mut::<ShipIntent>().forward = 1.0;
+    for _ in 0..900 {
+        sched.run(&mut w);
+    }
+    let cruise = w.get::<Velocity>(ship).unwrap().0.length();
+    assert!(cruise > 70.0, "should be near top speed before turning");
+
+    // Hold full thrust AND full turn: the shared power budget cuts available
+    // thrust to 30%, so the reduced terminal velocity bleeds speed off.
+    {
+        let mut intent = w.resource_mut::<ShipIntent>();
+        intent.forward = 1.0;
+        intent.turn = 1.0;
+    }
+    for _ in 0..600 {
+        sched.run(&mut w);
+    }
+    let turning = w.get::<Velocity>(ship).unwrap().0.length();
+    assert!(
+        turning < 50.0,
+        "hard turning should bleed speed via the shared power budget (was {cruise}, now {turning})"
     );
 }
