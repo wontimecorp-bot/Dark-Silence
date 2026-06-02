@@ -11,7 +11,7 @@
 ## Technical Context
 
 **Language/Version**: Rust (edition 2021; toolchain 1.92.0; MSVC toolchain on the Windows dev host)
-**Primary Dependencies**: `renet` 2.0 + `renet_netcode` (UDP) + `bevy_renet`, confined behind `protocol`'s `NetTransport` adapter (ADR-0014); `bitcode` (snapshot encoding); reuses `sim` (E001), extends `client` (E002); `bevy_ecs` 0.18 (headless server), `bevy` 0.18 (client), `glam`, `serde`
+**Primary Dependencies**: `renet` 2.0 + `renet_netcode` (UDP) + `bevy_renet`, confined behind `protocol`'s `NetTransport` adapter, used in **secure mode** (authenticated + encrypted connect-token sessions; stub token-issuer this epic → E004 replaces) (ADR-0014); `bitcode` (snapshot encoding); reuses `sim` (E001), extends `client` (E002); `bevy_ecs` 0.18 (headless server), `bevy` 0.18 (client), `glam`, `serde`
 **Storage**: N/A — no persistence this epic (E004)
 **Testing**: `cargo test` (pure-logic unit + headless-bot integration over the in-memory loopback, with simulated loss/jitter), `clippy -D warnings`, `rustfmt`, `cargo-audit`
 **Target Platform**: Desktop Bevy client + headless native server; Windows dev (MSVC)
@@ -86,6 +86,7 @@ Feature-local tradeoffs only; project-wide decisions are standalone ADRs (refere
 | AD-004 | Loopback transport | real UDP only / in-memory `NetTransport` impl | In-memory transport implementing `NetTransport` | Deterministic, dependency-free solo/dev/tests (TR-003); the renet UDP adapter is tested separately on the loopback address. |
 | AD-005 | Client under prediction | simulate all entities locally / predict own ship only, interpolate remotes | Predict own ship via `sim`; remotes interpolated (not locally simulated) | ADR-0002/0013: inter-player interactions are server-resolved, not predicted; avoids divergence. |
 | AD-006 | Channel reliability mapping | all-reliable / per-message | Handshake reliable-ordered; `ClientInput` unreliable + redundant; `Snapshot` unreliable + delta + ack | Avoids head-of-line latency; UDP self-heals via redundancy/deltas (TR-006). **Security rationale**: the handshake (`Connect`/`ConnectAccepted`/`Disconnect`) is reliable-**ordered** so connection establishment and teardown cannot be spoofed or replayed mid-stream out of order — a duplicate/late `Connect` cannot fork or hijack an established session; the ordered channel is the integrity guarantee for session lifecycle, not only a latency choice (TR-024/025/026). |
+| AD-007 | Transport security (E003) | unsecure baseline / secure now (stub issuer) / partial | renet_netcode **secure mode** now; stub local token-issuer | User decision 2026-06-02: encryption from day one. Secure-connection wiring is reused; the isolated stub token-issuer is replaced by E004's account-backed issuance; netcode.io secure = authenticated + encrypted together (TR-048, SC-013). |
 
 ## Data Model Summary
 
