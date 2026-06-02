@@ -54,7 +54,7 @@ use protocol::{
 };
 use server::{RenderEntity, ServerApp, PROTOCOL_VERSION};
 use sim::components::{TargetKind, Velocity};
-use sim::ShipIntent;
+use sim::{FixedDt, ShipIntent};
 
 use crate::input::{build_client_input, InputSequencer};
 use crate::render_sync::{interpolate_transforms, RemoteEntity, RenderInterp};
@@ -249,11 +249,16 @@ fn net_fixed_update(
 /// mesh/material for its `kind`+`flags` and tagged [`RemoteEntity`]. Rendered
 /// entities whose id is no longer in `render_state` (destroyed targets, expired
 /// projectiles) are despawned, so they vanish immediately.
+// A Bevy system with the params it genuinely needs (transport host, net state,
+// render assets, fixed dt, the id→entity map, and the interp/velocity queries);
+// the count is inherent to the system, not a smell.
+#[allow(clippy::too_many_arguments)]
 fn capture_render_state(
     mut commands: Commands,
     mut host: NonSendMut<LoopbackHost>,
     state: NonSend<NetClientState>,
     assets: Res<RenderAssets>,
+    dt: Res<FixedDt>,
     mut render_map: ResMut<NetRenderMap>,
     mut interp_q: Query<&mut RenderInterp>,
     mut vel_q: Query<&mut Velocity, With<LocalShip>>,
@@ -283,8 +288,12 @@ fn capture_render_state(
             }
         } else {
             // Newly-appeared entity (never the local ship — it is pre-registered):
-            // spawn a rendered remote with the right look, snapped to its pose.
-            let spawned = spawn_render_entity(&mut commands, &assets, e);
+            // spawn a rendered remote with the right look. Its interp `prev` is
+            // seeded one tick back (`pos − vel·dt`) so it renders FROM where it was
+            // a tick ago — for a fresh projectile that is the muzzle, so the bullet
+            // visibly travels out of the ship instead of popping in ~a tick ahead
+            // (≈ the reticle distance for a fast round).
+            let spawned = spawn_render_entity(&mut commands, &assets, e, dt.0);
             render_map.map.insert(e.id, spawned);
         }
     }
@@ -308,9 +317,17 @@ fn capture_render_state(
 /// Spawn a rendered Bevy entity for a newly-appeared [`RenderEntity`], picking the
 /// mesh/material by `kind` (+ `flags` for the target sub-kind) from the shared
 /// [`RenderAssets`] — the same look the old `net_update` produced. It is tagged
-/// [`RemoteEntity`] and given a [`RenderInterp`] snapped to its current pose (no
-/// interpolation on its first frame), so [`interpolate_transforms`] drives it.
-fn spawn_render_entity(commands: &mut Commands, assets: &RenderAssets, e: &RenderEntity) -> Entity {
+/// [`RemoteEntity`] and given a [`RenderInterp`] whose `prev` is one tick back
+/// (`pos − vel·dt`) and `curr` is the current pose, so its first rendered frame
+/// interpolates FROM where it was a tick ago. For a freshly-fired projectile that
+/// previous position is the muzzle, so the bullet visibly emerges from the ship
+/// rather than appearing a tick's travel ahead (≈ the reticle for a fast round).
+fn spawn_render_entity(
+    commands: &mut Commands,
+    assets: &RenderAssets,
+    e: &RenderEntity,
+    dt: f32,
+) -> Entity {
     let (mesh, material) = match e.kind {
         EntityKind::Ship => (assets.ship_mesh.clone(), assets.ship_material.clone()),
         // The wire `EntityKind` only says "Target"; the sub-kind rides in `flags`
@@ -338,7 +355,14 @@ fn spawn_render_entity(commands: &mut Commands, assets: &RenderAssets, e: &Rende
                 id: e.id,
                 kind: e.kind,
             },
-            RenderInterp::snapped(e.pos, e.heading),
+            RenderInterp {
+                // `prev` one tick back (the muzzle for a fresh projectile) so the
+                // first rendered frame interpolates out from the ship.
+                prev_pos: e.pos - e.vel * dt,
+                curr_pos: e.pos,
+                prev_heading: e.heading,
+                curr_heading: e.heading,
+            },
             Mesh3d(mesh),
             MeshMaterial3d(material),
             Transform::from_rotation(Quat::from_rotation_z(e.heading))
