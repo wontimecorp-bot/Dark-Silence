@@ -102,3 +102,50 @@ fn swap_requires_no_consumer_change_step_many() {
         .unwrap();
     assert_eq!(r, r_manual, "step_many must equal repeated step");
 }
+
+/// The E002 trait growth — `swept_cast` (projectile CCD) and `contact`
+/// (ship↔asteroid) — must also be swap-equal: the Rapier-backed and stub
+/// backends return identical results for identical inputs (FR-006/FR-009,
+/// CHK031). Covers clean hit, miss, tangent, start-inside, and contact
+/// overlap/separation.
+#[test]
+fn swept_cast_and_contact_agree_across_backends() {
+    let rapier = RapierPhysics::new();
+    let stub = StubPhysics;
+
+    let segments = [
+        (
+            Vec2::new(-100.0, 0.0),
+            Vec2::new(100.0, 0.0),
+            Vec2::ZERO,
+            0.5,
+        ), // fast clean hit
+        (
+            Vec2::new(-100.0, 5.0),
+            Vec2::new(100.0, 5.0),
+            Vec2::ZERO,
+            0.5,
+        ), // miss
+        (Vec2::new(-10.0, 1.0), Vec2::new(10.0, 1.0), Vec2::ZERO, 1.0), // tangent
+        (Vec2::ZERO, Vec2::new(1.0, 0.0), Vec2::ZERO, 1.0),             // start inside
+    ];
+    for (p0, p1, c, r) in segments {
+        assert_eq!(
+            rapier.swept_cast(p0, p1, c, r),
+            stub.swept_cast(p0, p1, c, r),
+            "swept_cast diverged for p0={p0:?} p1={p1:?} c={c:?} r={r}"
+        );
+    }
+
+    let contacts = [
+        (Vec2::ZERO, 1.0, Vec2::new(1.5, 0.0), 1.0), // overlap
+        (Vec2::ZERO, 1.0, Vec2::new(3.0, 0.0), 1.0), // separate
+    ];
+    for (a, ar, b, br) in contacts {
+        assert_eq!(
+            rapier.contact(a, ar, b, br),
+            stub.contact(a, ar, b, br),
+            "contact diverged for a={a:?} b={b:?}"
+        );
+    }
+}

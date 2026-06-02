@@ -135,11 +135,11 @@ N/A — local single-player client; no API, external services, or untrusted-inpu
 | FR-005 | Weapon, Input | `crates/sim/src/weapon.rs`; `crates/client/src/input.rs` | fire along heading; fire key |
 | FR-006 | Collision, Physics, Weapon | `crates/sim/src/{collision,physics,weapon}.rs` | swept segment-cast CCD; {AD-002} |
 | FR-007 | Combat, HUD | `crates/sim/src/combat.rs`; `crates/client/src/{hud,scene}.rs` | health→damage→despawn + feedback |
-| FR-008 | Targets, Sim motion | `crates/sim/src/{targets,motion}.rs` | Dummy (static) + Asteroid (drift) |
+| FR-008 | AI (drift), Scene | `crates/sim/src/{ai,motion}.rs`; `crates/client/src/scene.rs` | Dummy (static) + Asteroid (drift) |
 | FR-009 | Collision, Physics | `crates/sim/src/{collision,physics}.rs` | contact query + elastic impulse; {AD-003} |
 | FR-010 | Collision, Combat | `crates/sim/src/{collision,combat}.rs` | lethal ram-speed threshold |
 | FR-011 | HUD | `crates/client/src/hud.rs` | speed/throttle, assist mode, reticle, hit feedback |
-| FR-012 | AI, Targets | `crates/sim/src/{ai,targets}.rs` | `Seeker` thrust-toward-player |
+| FR-012 | AI, Scene | `crates/sim/src/ai.rs`; `crates/client/src/scene.rs` | `Seeker` thrust-toward-player |
 | FR-013 | Input | `crates/client/src/input.rs` | keyboard mapping (thrust/rotate/strafe/assist/fire) |
 | FR-014 | App | `crates/client/src/main.rs` | standalone session; no net/persistence |
 | FR-015 | Tuning | `crates/sim/src/tuning.rs` | grounded-scaled tunable magnitudes; {ADR-0012} |

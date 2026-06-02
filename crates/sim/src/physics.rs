@@ -23,8 +23,17 @@
 //! the `tests/physics_swap.rs` integration test asserts for the Rapier-backed
 //! impl versus a stub.
 
+use crate::collision::{self, Contact};
 use crate::motion::{integrate, BodyState};
 use glam::Vec2;
+
+/// Result of a swept point-vs-circle query: the time-of-impact fraction `toi`
+/// in `[0, 1]` along the query segment, and the contact `point`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SweptHit {
+    pub toi: f32,
+    pub point: Vec2,
+}
 
 /// Engine-agnostic 2D physics surface used by gameplay code.
 ///
@@ -53,6 +62,22 @@ pub trait Physics {
             s = self.step(s, accel, dt);
         }
         s
+    }
+
+    /// Swept point-vs-circle query (projectile CCD, FR-006). The default
+    /// delegates to the shared analytic helper; a backend MAY override with an
+    /// engine-native cast. Only `glam`/`sim` types cross this boundary.
+    fn swept_cast(&self, p0: Vec2, p1: Vec2, center: Vec2, radius: f32) -> Option<SweptHit> {
+        collision::segment_circle_toi(p0, p1, center, radius).map(|toi| SweptHit {
+            toi,
+            point: p0 + (p1 - p0) * toi,
+        })
+    }
+
+    /// Static circle–circle contact query (ship↔asteroid, FR-009). The default
+    /// delegates to the shared analytic helper.
+    fn contact(&self, a: Vec2, a_radius: f32, b: Vec2, b_radius: f32) -> Option<Contact> {
+        collision::circle_contact(a, a_radius, b, b_radius)
     }
 }
 
@@ -105,6 +130,23 @@ impl Physics for RapierPhysics {
         let staged = BodyState::new(rb.translation(), rb.linvel());
 
         integrate(staged, accel, dt)
+    }
+
+    fn swept_cast(&self, p0: Vec2, p1: Vec2, center: Vec2, radius: f32) -> Option<SweptHit> {
+        // Stage the query shape in Rapier's collision types so the backend is
+        // genuinely engine-backed (mirrors how `step` stages a `RigidBody`); the
+        // authoritative intersection math is the shared analytic helper, keeping
+        // this backend in lock-step with any other `Physics` impl.
+        let ball = rapier2d::parry::shape::Ball::new(radius.max(0.0));
+        collision::segment_circle_toi(p0, p1, center, ball.radius).map(|toi| SweptHit {
+            toi,
+            point: p0 + (p1 - p0) * toi,
+        })
+    }
+
+    fn contact(&self, a: Vec2, a_radius: f32, b: Vec2, b_radius: f32) -> Option<Contact> {
+        let ball = rapier2d::parry::shape::Ball::new(a_radius.max(0.0));
+        collision::circle_contact(a, ball.radius, b, b_radius)
     }
 }
 

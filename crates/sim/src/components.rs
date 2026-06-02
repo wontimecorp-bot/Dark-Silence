@@ -16,6 +16,7 @@
 //! 3D, the sim is 2D), matching `motion::BodyState`.
 
 use bevy_ecs::component::Component;
+use bevy_ecs::entity::Entity;
 use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +49,86 @@ impl Velocity {
     pub const fn new(value: Vec2) -> Self {
         Self(value)
     }
+}
+
+// --- E002 gameplay components -------------------------------------------------
+//
+// Same derive discipline as `Position`/`Velocity` above: `Component` so they
+// live on entities, serde so they replicate/persist later (E003/E004), and
+// value semantics. `ProjectileOwner` is the one exception — it wraps an
+// `Entity`, whose id is runtime-local and not meaningful across the wire, so it
+// is deliberately not `Serialize`/`Deserialize`.
+
+/// Marker: the player-controlled ship.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ship;
+
+/// Facing angle in radians — the direction the nose (and the fixed weapon) points.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Heading(pub f32);
+
+/// Remaining hit points; an entity is destroyed at or below zero.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Health(pub f32);
+
+/// Flight-assist mode: `On` damps drift toward heading; `Off` is decoupled,
+/// full-momentum flight.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FlightAssist {
+    On,
+    Off,
+}
+
+/// Marker: a fired projectile.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Projectile;
+
+/// Damage a projectile deals on hit (> 0, INV-04).
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Damage(pub f32);
+
+/// Remaining lifetime in seconds; the projectile despawns at zero (INV-06).
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Lifetime(pub f32);
+
+/// The entity's position on the previous fixed step — the tail of the swept
+/// segment used for continuous collision so fast projectiles never tunnel.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PrevPosition(pub Vec2);
+
+/// The ship that fired a projectile (so a projectile cannot hit its owner).
+/// Not serialized: `Entity` ids are runtime-local, not stable across the wire.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProjectileOwner(pub Entity);
+
+/// Marker: a destructible target.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Target;
+
+/// Which kind of target this is.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TargetKind {
+    /// Static practice dummy.
+    Dummy,
+    /// Drifts at constant velocity; also collides physically with the ship.
+    Asteroid,
+    /// Thrusts toward the player each step.
+    Seeker,
+}
+
+/// Circular proxy hitbox radius, > 0 (INV-05).
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CollisionRadius(pub f32);
+
+/// The ship's fixed forward weapon: fire timing + muzzle speed.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Weapon {
+    /// Seconds until the weapon can fire again (INV-03).
+    pub cooldown: f32,
+    /// Shots per second.
+    pub fire_rate: f32,
+    /// Projectile launch speed.
+    pub muzzle_speed: f32,
 }
 
 #[cfg(test)]

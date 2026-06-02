@@ -1,0 +1,4 @@
+﻿Completed: 2026-06-01T23:11:41-07:00
+E002 Single-player Flight & Combat — all non-deferred tasks (T001-T042) complete.
+T043 (manual SC-008 feel gate) DEFERRED to the user.
+Gates green: build, 38 tests, clippy -D warnings, fmt --check, cargo-audit (exit 0).

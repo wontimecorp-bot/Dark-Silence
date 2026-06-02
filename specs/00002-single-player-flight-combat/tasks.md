@@ -36,9 +36,9 @@
 
 ## Phase 1: Setup (Repository / Workspace Delta)
 
-- [ ] T001 Register `crates/client` as a workspace member and add `bevy = { version = "0.18" }` to `[workspace.dependencies]` (pinned to the existing `bevy_ecs` 0.18 per HINT-004) in `~ Cargo.toml`
-- [ ] T002 {FR-014} Create new binary crate manifest `+ crates/client/Cargo.toml` with deps `bevy = { workspace = true }`, `sim = { path = "../sim" }`, `glam.workspace = true`; add the `dynamic_linking` dev convenience feature (AD-005) after:T001
-- [ ] T003 [P] {FR-014} Scaffold the Bevy app entry `+ crates/client/src/main.rs` — a `DefaultPlugins` window App with empty module stubs (`input`, `render_sync`, `camera`, `hud`, `scene`) so the crate compiles before systems land after:T002
+- [X] T001 Register `crates/client` as a workspace member and add `bevy = { version = "0.18" }` to `[workspace.dependencies]` (pinned to the existing `bevy_ecs` 0.18 per HINT-004) in `~ Cargo.toml`
+- [X] T002 {FR-014} Create new binary crate manifest `+ crates/client/Cargo.toml` with deps `bevy = { workspace = true }`, `sim = { path = "../sim" }`, `glam.workspace = true`; add the `dynamic_linking` dev convenience feature (AD-005) after:T001
+- [X] T003 [P] {FR-014} Scaffold the Bevy app entry `+ crates/client/src/main.rs` — a `DefaultPlugins` window App with empty module stubs (`input`, `render_sync`, `camera`, `hud`, `scene`) so the crate compiles before systems land after:T002
 
 ---
 
@@ -46,11 +46,11 @@
 
 **Shared model + the order-critical `Physics`-trait extension (HINT-001) and the fixed-step driver — every delivery story depends on these.**
 
-- [ ] T004 [P] {FR-015} Create `Tuning` resource (`thrust_accel`,`rotation_rate`,`strafe_accel`,`max_speed`,`muzzle_speed`,`fire_rate`,`lethal_ram_speed`,`assist_damping`; INV-10 range guards; ADR-0012 grounded-scaled) in `+ crates/sim/src/tuning.rs` → exports: Tuning{..}, Tuning::default()
-- [ ] T005 [P] {FR-002,FR-005,FR-007,FR-008,FR-012} Add gameplay components (`Ship`,`Heading`,`Health`,`FlightAssist`,`Projectile`,`Damage`,`Lifetime`,`PrevPosition`,`ProjectileOwner`,`Target`,`TargetKind`,`CollisionRadius`,`Weapon`; full `Component+serde` derive set) in `~ crates/sim/src/components.rs` → exports: Ship, Heading, Health, FlightAssist, Projectile, Damage, Lifetime, PrevPosition, ProjectileOwner, Target, TargetKind, CollisionRadius, Weapon (see data-model.md#New-Components)
-- [ ] T006 {FR-006,FR-009} Write FAILING swap-equivalence cases for the extended `Physics` (swept segment-cast + contact query: Stub vs Rapier identical) in `~ crates/sim/tests/physics_swap.rs` — mirror new methods in `StubPhysics` (CHK031)
-- [ ] T007 {FR-006,FR-009} Extend the `Physics` trait with `swept_cast(seg,circle,radius)->Option<ToiHit>` + `contact_query(a,b)->Option<Contact>` and implement both in `RapierPhysics` (Rapier symbols confined to method bodies) in `~ crates/sim/src/physics.rs` after:T006 → exports: Physics::swept_cast(), Physics::contact_query()
-- [ ] T008 {FR-004,FR-016} Create the fixed-step driver scaffold in `~ crates/client/src/main.rs`: register sim systems in `FixedUpdate` driven by `Time<Fixed>` at default 60 Hz (`dt = 1/60`, assertable), insert `Tuning`; never step in `Update` (HINT-003, AD-001) after:T003,T004 ← T004:Tuning
+- [X] T004 [P] {FR-015} Create `Tuning` resource (`thrust_accel`,`rotation_rate`,`strafe_accel`,`max_speed`,`muzzle_speed`,`fire_rate`,`lethal_ram_speed`,`assist_damping`; INV-10 range guards; ADR-0012 grounded-scaled) in `+ crates/sim/src/tuning.rs` → exports: Tuning{..}, Tuning::default()
+- [X] T005 [P] {FR-002,FR-005,FR-007,FR-008,FR-012} Add gameplay components (`Ship`,`Heading`,`Health`,`FlightAssist`,`Projectile`,`Damage`,`Lifetime`,`PrevPosition`,`ProjectileOwner`,`Target`,`TargetKind`,`CollisionRadius`,`Weapon`; full `Component+serde` derive set) in `~ crates/sim/src/components.rs` → exports: Ship, Heading, Health, FlightAssist, Projectile, Damage, Lifetime, PrevPosition, ProjectileOwner, Target, TargetKind, CollisionRadius, Weapon (see data-model.md#New-Components)
+- [X] T006 {FR-006,FR-009} Write FAILING swap-equivalence cases for the extended `Physics` (swept segment-cast + contact query: Stub vs Rapier identical) in `~ crates/sim/tests/physics_swap.rs` — mirror new methods in `StubPhysics` (CHK031)
+- [X] T007 {FR-006,FR-009} Extend the `Physics` trait with `swept_cast(seg,circle,radius)->Option<ToiHit>` + `contact_query(a,b)->Option<Contact>` and implement both in `RapierPhysics` (Rapier symbols confined to method bodies) in `~ crates/sim/src/physics.rs` after:T006 → exports: Physics::swept_cast(), Physics::contact_query()
+- [X] T008 {FR-004,FR-016} Create the fixed-step driver scaffold in `~ crates/client/src/main.rs`: register sim systems in `FixedUpdate` driven by `Time<Fixed>` at default 60 Hz (`dt = 1/60`, assertable), insert `Tuning`; never step in `Update` (HINT-003, AD-001) after:T003,T004 ← T004:Tuning
 
 ---
 
@@ -58,15 +58,15 @@
 
 **Goal**: Newtonian thrust/rotate/strafe with coasting, a flight-assist toggle, and frame-rate-independent feel via fixed-step + interpolated render.
 
-- [ ] T009 [P] [US1] {FR-003} Write FAILING pure-fn unit test for the flight-assist transform (OFF: heading change leaves velocity vector unchanged; ON: velocity trends toward heading by `assist_damping`; toggle never snaps velocity, INV-07) in `+ crates/sim/src/flight.rs` `#[cfg(test)]`
-- [ ] T010 [P] [US1] {FR-002,FR-016,FR-017} Write FAILING headless `bevy_ecs`/`Time<Fixed>` integration test: thrust→accelerate then release→coast at constant velocity (FR-002 steady-state, CHK025), speed clamp INV-02, in `+ crates/sim/tests/gameplay.rs`
-- [ ] T011 [US1] {FR-002,FR-003,FR-015} Implement flight module — `apply_thrust`/`rotate`/`strafe` (reuse `sim::integrate`, NOT a new integrator) + `flight_assist` transform reading `Tuning` in `+ crates/sim/src/flight.rs` after:T005,T004 ← T004:Tuning → exports: flight_assist(vel,heading,mode,damping), flight_step()
-- [ ] T012 [US1] {FR-002} Implement the fixed-step ship-motion system (assemble `BodyState` from `Position`+`Velocity`, `integrate`, write back, clamp to `Tuning.max_speed` INV-02) in `+ crates/sim/src/flight.rs` after:T011 ← T011:flight_step → exports: ship_motion_system
-- [ ] T013 [P] [US1] {FR-013} Implement keyboard input mapping (thrust/reverse/rotate/strafe/assist-toggle/fire → sim intents; assist toggle is no-snap INV-07) in `+ crates/client/src/input.rs` after:T003 → exports: read_input_system, ShipIntent
-- [ ] T014 [US1] {FR-001,FR-004} Implement render-sync: maintain `RenderInterp` (prev/curr per fixed step) and lerp the rendered `Transform` by `overstep_fraction()` (interpolated, not raw state — CHK006/INV-11) in `+ crates/client/src/render_sync.rs` after:T008,T012 ← T012:ship_motion_system → exports: RenderInterp, interpolate_transforms_system
-- [ ] T015 [US1] {FR-001} Implement top-down follow camera with zoom (`Camera3d` follows Ship `Position`; renders the 2D plane in 3D) in `+ crates/client/src/camera.rs` after:T003 → exports: camera_follow_system, camera_zoom_system
-- [ ] T016 [US1] {FR-001} Implement scene spawn — tinted composed-primitive ship mesh/material + initial `Position`/`Velocity`/`Heading`/`Health`/`FlightAssist`/`Weapon`/`CollisionRadius` (+`RenderInterp`) in `+ crates/client/src/scene.rs` after:T005,T008 ← T005:Ship,Weapon → exports: spawn_ship
-- [ ] T017 [US1] {FR-002,FR-003,FR-004} [COMPLETES FR-002] [COMPLETES FR-003] [COMPLETES FR-004] Wire input→flight→motion→render-sync into the App (`FixedUpdate` order); confirm T009/T010 pass in `~ crates/client/src/main.rs` after:T011,T012,T013,T014,T015,T016
+- [X] T009 [P] [US1] {FR-003} Write FAILING pure-fn unit test for the flight-assist transform (OFF: heading change leaves velocity vector unchanged; ON: velocity trends toward heading by `assist_damping`; toggle never snaps velocity, INV-07) in `+ crates/sim/src/flight.rs` `#[cfg(test)]`
+- [X] T010 [P] [US1] {FR-002,FR-016,FR-017} Write FAILING headless `bevy_ecs`/`Time<Fixed>` integration test: thrust→accelerate then release→coast at constant velocity (FR-002 steady-state, CHK025), speed clamp INV-02, in `+ crates/sim/tests/gameplay.rs`
+- [X] T011 [US1] {FR-002,FR-003,FR-015} Implement flight module — `apply_thrust`/`rotate`/`strafe` (reuse `sim::integrate`, NOT a new integrator) + `flight_assist` transform reading `Tuning` in `+ crates/sim/src/flight.rs` after:T005,T004 ← T004:Tuning → exports: flight_assist(vel,heading,mode,damping), flight_step()
+- [X] T012 [US1] {FR-002} Implement the fixed-step ship-motion system (assemble `BodyState` from `Position`+`Velocity`, `integrate`, write back, clamp to `Tuning.max_speed` INV-02) in `+ crates/sim/src/flight.rs` after:T011 ← T011:flight_step → exports: ship_motion_system
+- [X] T013 [P] [US1] {FR-013} Implement keyboard input mapping (thrust/reverse/rotate/strafe/assist-toggle/fire → sim intents; assist toggle is no-snap INV-07) in `+ crates/client/src/input.rs` after:T003 → exports: read_input_system, ShipIntent
+- [X] T014 [US1] {FR-001,FR-004} Implement render-sync: maintain `RenderInterp` (prev/curr per fixed step) and lerp the rendered `Transform` by `overstep_fraction()` (interpolated, not raw state — CHK006/INV-11) in `+ crates/client/src/render_sync.rs` after:T008,T012 ← T012:ship_motion_system → exports: RenderInterp, interpolate_transforms_system
+- [X] T015 [US1] {FR-001} Implement top-down follow camera with zoom (`Camera3d` follows Ship `Position`; renders the 2D plane in 3D) in `+ crates/client/src/camera.rs` after:T003 → exports: camera_follow_system, camera_zoom_system
+- [X] T016 [US1] {FR-001} Implement scene spawn — tinted composed-primitive ship mesh/material + initial `Position`/`Velocity`/`Heading`/`Health`/`FlightAssist`/`Weapon`/`CollisionRadius` (+`RenderInterp`) in `+ crates/client/src/scene.rs` after:T005,T008 ← T005:Ship,Weapon → exports: spawn_ship
+- [X] T017 [US1] {FR-002,FR-003,FR-004} [COMPLETES FR-002] [COMPLETES FR-003] [COMPLETES FR-004] Wire input→flight→motion→render-sync into the App (`FixedUpdate` order); confirm T009/T010 pass in `~ crates/client/src/main.rs` after:T011,T012,T013,T014,T015,T016
 
 ---
 
@@ -74,16 +74,16 @@
 
 **Goal**: fixed forward weapon firing swept (CCD) projectiles in the heading direction; targets with health take damage and are destroyed with feedback; static dummies + drifting asteroids force leading.
 
-- [ ] T018 [P] [US2] {FR-005} Write FAILING pure-fn unit test for weapon cooldown (fires only when `cooldown<=0`; firing sets `cooldown=1/fire_rate`; fire while cooling is ignored, INV-03) in `+ crates/sim/src/weapon.rs` `#[cfg(test)]`
-- [ ] T019 [P] [US2] {FR-006} Write FAILING pure-fn unit tests for swept segment-vs-circle CCD, all four edge cases — high-velocity no-tunnel (to `Tuning.muzzle_speed`); grazing/tangent closest-approach `<=CollisionRadius`=hit, no flicker (CHK027); thin-target min-radius (CHK028); simultaneous multi-hit — in `+ crates/sim/src/collision.rs`
-- [ ] T020 [P] [US2] {FR-007} Write FAILING pure-fn unit test for damage application (`Health -= Damage`, clamp `>=0` INV-01; destroy at `Health<=0`; despawn-exactly-once under overkill INV-09) in `+ crates/sim/src/combat.rs` `#[cfg(test)]`
-- [ ] T021 [US2] {FR-006,FR-008} Write FAILING headless `Time<Fixed>` integration test: fire→swept-hit→despawn projectile; correctly-led shot connects with a drifting asteroid (CHK012); target-despawns-mid-flight resolves harmlessly (CHK017) in `~ crates/sim/tests/gameplay.rs` after:T010
-- [ ] T022 [US2] {FR-006} Implement swept segment-vs-circle CCD (`PrevPosition→Position` segment) + order-independent multi-hit resolution via `Physics::swept_cast` in `+ crates/sim/src/collision.rs` after:T007,T019 ← T007:Physics::swept_cast → exports: swept_segment_circle(), collision_detect_system
-- [ ] T023 [US2] {FR-005,FR-015} [COMPLETES FR-015] Implement weapon firing + cooldown gate (spawn `Projectile` along `Heading` at `Tuning.muzzle_speed`; cooldown INV-03; `Damage>0` INV-04) in `+ crates/sim/src/weapon.rs` after:T005,T004,T018 ← T004:Tuning → exports: weapon_fire_system, spawn_projectile()
-- [ ] T024 [US2] {FR-006} Implement projectile lifetime/advance system (`PrevPosition=Position`; `integrate`; `Lifetime-=dt`; despawn at `<=0` INV-06) in `+ crates/sim/src/weapon.rs` after:T023 ← T023:spawn_projectile → exports: projectile_step_system
-- [ ] T025 [US2] {FR-007} Implement combat module — apply damage on hit, clamp Health INV-01, destroy + despawn-once INV-09 + emit a test-detectable destroy/hit event for feedback (CHK016) in `+ crates/sim/src/combat.rs` after:T022,T020 ← T022:collision_detect_system → exports: damage_system, destruction_system, HitEvent
-- [ ] T026 [P] [US2] {FR-008} Implement target spawning — static `Dummy` + constant-velocity `Asteroid` (drift via `sim` motion, FR-008) tinted primitives in `~ crates/client/src/scene.rs` after:T005,T016 ← T005:Target,TargetKind → exports: spawn_dummy, spawn_asteroid
-- [ ] T027 [US2] {FR-006,FR-007} [COMPLETES FR-006] [COMPLETES FR-007] Wire weapon→projectile-step→swept-collision→damage→destruction into `FixedUpdate` (after motion, before render-sync) + render projectiles + hit/destroy feedback hook in `~ crates/client/src/main.rs` after:T022,T023,T024,T025,T026
+- [X] T018 [P] [US2] {FR-005} Write FAILING pure-fn unit test for weapon cooldown (fires only when `cooldown<=0`; firing sets `cooldown=1/fire_rate`; fire while cooling is ignored, INV-03) in `+ crates/sim/src/weapon.rs` `#[cfg(test)]`
+- [X] T019 [P] [US2] {FR-006} Write FAILING pure-fn unit tests for swept segment-vs-circle CCD, all four edge cases — high-velocity no-tunnel (to `Tuning.muzzle_speed`); grazing/tangent closest-approach `<=CollisionRadius`=hit, no flicker (CHK027); thin-target min-radius (CHK028); simultaneous multi-hit — in `+ crates/sim/src/collision.rs`
+- [X] T020 [P] [US2] {FR-007} Write FAILING pure-fn unit test for damage application (`Health -= Damage`, clamp `>=0` INV-01; destroy at `Health<=0`; despawn-exactly-once under overkill INV-09) in `+ crates/sim/src/combat.rs` `#[cfg(test)]`
+- [X] T021 [US2] {FR-006,FR-008} Write FAILING headless `Time<Fixed>` integration test: fire→swept-hit→despawn projectile; correctly-led shot connects with a drifting asteroid (CHK012); target-despawns-mid-flight resolves harmlessly (CHK017) in `~ crates/sim/tests/gameplay.rs` after:T010
+- [X] T022 [US2] {FR-006} Implement swept segment-vs-circle CCD (`PrevPosition→Position` segment) + order-independent multi-hit resolution via `Physics::swept_cast` in `+ crates/sim/src/collision.rs` after:T007,T019 ← T007:Physics::swept_cast → exports: swept_segment_circle(), collision_detect_system
+- [X] T023 [US2] {FR-005,FR-015} [COMPLETES FR-015] Implement weapon firing + cooldown gate (spawn `Projectile` along `Heading` at `Tuning.muzzle_speed`; cooldown INV-03; `Damage>0` INV-04) in `+ crates/sim/src/weapon.rs` after:T005,T004,T018 ← T004:Tuning → exports: weapon_fire_system, spawn_projectile()
+- [X] T024 [US2] {FR-006} Implement projectile lifetime/advance system (`PrevPosition=Position`; `integrate`; `Lifetime-=dt`; despawn at `<=0` INV-06) in `+ crates/sim/src/weapon.rs` after:T023 ← T023:spawn_projectile → exports: projectile_step_system
+- [X] T025 [US2] {FR-007} Implement combat module — apply damage on hit, clamp Health INV-01, destroy + despawn-once INV-09 + emit a test-detectable destroy/hit event for feedback (CHK016) in `+ crates/sim/src/combat.rs` after:T022,T020 ← T022:collision_detect_system → exports: damage_system, destruction_system, HitEvent
+- [X] T026 [P] [US2] {FR-008} Implement target spawning — static `Dummy` + constant-velocity `Asteroid` (drift via `sim` motion, FR-008) tinted primitives in `~ crates/client/src/scene.rs` after:T005,T016 ← T005:Target,TargetKind → exports: spawn_dummy, spawn_asteroid
+- [X] T027 [US2] {FR-006,FR-007} [COMPLETES FR-006] [COMPLETES FR-007] Wire weapon→projectile-step→swept-collision→damage→destruction into `FixedUpdate` (after motion, before render-sync) + render projectiles + hit/destroy feedback hook in `~ crates/client/src/main.rs` after:T022,T023,T024,T025,T026
 
 ---
 
@@ -91,12 +91,12 @@
 
 **Goal**: ship↔asteroid rigid-body bounce (momentum transfer, closed-form elastic impulse) plus lethal-ram destruction above a tunable speed threshold.
 
-- [ ] T028 [P] [US3] {FR-009} Write FAILING pure-fn unit test for the closed-form elastic 2-body impulse (post-collision velocities conserve total linear momentum; bodies separate, no overlap/sticking — AD-003 / SC-005 / CHK011) in `+ crates/sim/src/collision.rs` `#[cfg(test)]`
-- [ ] T029 [US3] {FR-010} Write FAILING pure-fn unit test for the lethal-ram threshold (closing speed `>=Tuning.lethal_ram_speed` → destroy; below → bounce/survive; boundary inclusive at threshold — CHK010) in `+ crates/sim/src/collision.rs` `#[cfg(test)]`
-- [ ] T030 [US3] {FR-009,FR-010} Write FAILING headless `Time<Fixed>` integration test: sub-lethal ram → both bodies bounce + momentum conserved + ship survives; at/above threshold → ship destroyed in `~ crates/sim/tests/gameplay.rs` after:T021
-- [ ] T031 [US3] {FR-009} Implement ship↔asteroid contact + elastic bounce (`Physics::contact_query` for detection; closed-form elastic 2-body impulse applied in `sim`; motion stays authoritative AD-003) in `~ crates/sim/src/collision.rs` after:T007,T028 ← T007:Physics::contact_query → exports: elastic_impulse(), ram_collision_system
-- [ ] T032 [US3] {FR-010} Implement lethal-ram check (closing speed vs `Tuning.lethal_ram_speed`: at/above → destroy Ship via combat destruction; below → bounce only) in `~ crates/sim/src/collision.rs` after:T031,T025 ← T025:destruction_system → exports: ram_damage_system
-- [ ] T033 [US3] {FR-009,FR-010} [COMPLETES FR-009] [COMPLETES FR-010] Wire ram-collision + lethal-ram systems into `FixedUpdate` (after motion, before combat destruction) in `~ crates/client/src/main.rs` after:T032
+- [X] T028 [P] [US3] {FR-009} Write FAILING pure-fn unit test for the closed-form elastic 2-body impulse (post-collision velocities conserve total linear momentum; bodies separate, no overlap/sticking — AD-003 / SC-005 / CHK011) in `+ crates/sim/src/collision.rs` `#[cfg(test)]`
+- [X] T029 [US3] {FR-010} Write FAILING pure-fn unit test for the lethal-ram threshold (closing speed `>=Tuning.lethal_ram_speed` → destroy; below → bounce/survive; boundary inclusive at threshold — CHK010) in `+ crates/sim/src/collision.rs` `#[cfg(test)]`
+- [X] T030 [US3] {FR-009,FR-010} Write FAILING headless `Time<Fixed>` integration test: sub-lethal ram → both bodies bounce + momentum conserved + ship survives; at/above threshold → ship destroyed in `~ crates/sim/tests/gameplay.rs` after:T021
+- [X] T031 [US3] {FR-009} Implement ship↔asteroid contact + elastic bounce (`Physics::contact_query` for detection; closed-form elastic 2-body impulse applied in `sim`; motion stays authoritative AD-003) in `~ crates/sim/src/collision.rs` after:T007,T028 ← T007:Physics::contact_query → exports: elastic_impulse(), ram_collision_system
+- [X] T032 [US3] {FR-010} Implement lethal-ram check (closing speed vs `Tuning.lethal_ram_speed`: at/above → destroy Ship via combat destruction; below → bounce only) in `~ crates/sim/src/collision.rs` after:T031,T025 ← T025:destruction_system → exports: ram_damage_system
+- [X] T033 [US3] {FR-009,FR-010} [COMPLETES FR-009] [COMPLETES FR-010] Wire ram-collision + lethal-ram systems into `FixedUpdate` (after motion, before combat destruction) in `~ crates/client/src/main.rs` after:T032
 
 ---
 
@@ -104,8 +104,8 @@
 
 **Goal**: a restrained HUD showing speed/throttle, active flight-assist mode, an aiming reticle, and hit/destroy feedback — no number spam.
 
-- [ ] T034 [US4] {FR-011} Implement the minimal HUD (Bevy UI): speed/throttle readout, active `FlightAssist` mode, aiming reticle aligned to `Heading`, and hit/destroy feedback subscribing to `HitEvent` (CHK023, no number spam SC-006) in `+ crates/client/src/hud.rs` after:T017,T025 ← T025:HitEvent → exports: hud_update_system, spawn_hud
-- [ ] T035 [US4] {FR-011} [COMPLETES FR-011] Wire the HUD systems into the App `Update` schedule (reads interpolated ship state + assist mode + hit events) in `~ crates/client/src/main.rs` after:T034
+- [X] T034 [US4] {FR-011} Implement the minimal HUD (Bevy UI): speed/throttle readout, active `FlightAssist` mode, aiming reticle aligned to `Heading`, and hit/destroy feedback subscribing to `HitEvent` (CHK023, no number spam SC-006) in `+ crates/client/src/hud.rs` after:T017,T025 ← T025:HitEvent → exports: hud_update_system, spawn_hud
+- [X] T035 [US4] {FR-011} [COMPLETES FR-011] Wire the HUD systems into the App `Update` schedule (reads interpolated ship state + assist mode + hit events) in `~ crates/client/src/main.rs` after:T034
 
 ---
 
@@ -113,19 +113,19 @@
 
 **Goal**: a single dumb seeking-AI target that thrusts toward the player and is destroyable like other targets.
 
-- [ ] T036 [P] [US5] {FR-012} Write FAILING pure-fn unit test for seek steering (thrust direction points from seeker `Position` toward player `Position`; magnitude from `Tuning.thrust_accel` — observable behavior, algorithm-independent CHK013) in `+ crates/sim/src/ai.rs` `#[cfg(test)]`
-- [ ] T037 [US5] {FR-012} Write FAILING headless `Time<Fixed>` integration test: seeker closes distance toward a moving player and is hit/destroyed like other targets (SC-007, shared destroy lifecycle CHK014) in `~ crates/sim/tests/gameplay.rs` after:T030
-- [ ] T038 [US5] {FR-012} Implement seek steering system (`Seeker` thrusts toward player each step via `sim` motion; destroyable through the shared combat path) in `+ crates/sim/src/ai.rs` after:T005,T004,T036 ← T005:Target,TargetKind ← T004:Tuning → exports: seek_system
-- [ ] T039 [US5] {FR-012} [COMPLETES FR-012] Spawn the single seeker target (tinted primitive) and wire `seek_system` into `FixedUpdate` (before motion) in `~ crates/client/src/{scene,main}.rs` after:T038,T026 ← T038:seek_system
+- [X] T036 [P] [US5] {FR-012} Write FAILING pure-fn unit test for seek steering (thrust direction points from seeker `Position` toward player `Position`; magnitude from `Tuning.thrust_accel` — observable behavior, algorithm-independent CHK013) in `+ crates/sim/src/ai.rs` `#[cfg(test)]`
+- [X] T037 [US5] {FR-012} Write FAILING headless `Time<Fixed>` integration test: seeker closes distance toward a moving player and is hit/destroyed like other targets (SC-007, shared destroy lifecycle CHK014) in `~ crates/sim/tests/gameplay.rs` after:T030
+- [X] T038 [US5] {FR-012} Implement seek steering system (`Seeker` thrusts toward player each step via `sim` motion; destroyable through the shared combat path) in `+ crates/sim/src/ai.rs` after:T005,T004,T036 ← T005:Target,TargetKind ← T004:Tuning → exports: seek_system
+- [X] T039 [US5] {FR-012} [COMPLETES FR-012] Spawn the single seeker target (tinted primitive) and wire `seek_system` into `FixedUpdate` (before motion) in `~ crates/client/src/{scene,main}.rs` after:T038,T026 ← T038:seek_system
 
 ---
 
 ## Phase 8: Polish & Cross-Cutting Concerns
 
-- [ ] T040 {FR-016,FR-017} [COMPLETES FR-016] [COMPLETES FR-017] Bit-identical determinism test: same start + same N per-tick inputs → byte-equal `sim` state; assert 60 Hz tick in `~ crates/sim/tests/gameplay.rs` after:T017,T027,T033,T039
-- [ ] T041 {FR-001,FR-005,FR-013} [COMPLETES FR-001] [COMPLETES FR-005] [COMPLETES FR-013] Export new `sim` gameplay modules from `~ crates/sim/src/lib.rs` (`flight`,`collision`,`weapon`,`combat`,`ai`,`tuning`); audit that no Rapier/Bevy types leak into `sim` public signatures (HINT-002) after:T011,T022,T023,T025,T031,T038
-- [ ] T042 Run the full workspace gate suite green — `cargo build`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `cargo audit` — applying the build-env workarounds (`CARGO_HTTP_CHECK_REVOKE=false`, sandbox off, AV exclusion for `target/`); fix any failures across `crates/sim` + `crates/client` after:T040,T041
-- [ ] T043 {SC-008} [COMPLETES SC-008] Manual SC-008 "feels good" gate (Principle-VII): run the pilot→aim→fire→hit→destroy loop hands-on in BOTH assist modes (ON drift-damped, OFF decoupled), confirm live 30/60/144 FPS consistent feel (SC-001b), rate flight/combat feel positive, and log any negative findings for tuning after:T042
+- [X] T040 {FR-016,FR-017} [COMPLETES FR-016] [COMPLETES FR-017] Bit-identical determinism test: same start + same N per-tick inputs → byte-equal `sim` state; assert 60 Hz tick in `~ crates/sim/tests/gameplay.rs` after:T017,T027,T033,T039
+- [X] T041 {FR-001,FR-005,FR-013} [COMPLETES FR-001] [COMPLETES FR-005] [COMPLETES FR-013] Export new `sim` gameplay modules from `~ crates/sim/src/lib.rs` (`flight`,`collision`,`weapon`,`combat`,`ai`,`tuning`); audit that no Rapier/Bevy types leak into `sim` public signatures (HINT-002) after:T011,T022,T023,T025,T031,T038
+- [X] T042 Run the full workspace gate suite green — `cargo build`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `cargo audit` — applying the build-env workarounds (`CARGO_HTTP_CHECK_REVOKE=false`, sandbox off, AV exclusion for `target/`); fix any failures across `crates/sim` + `crates/client` after:T040,T041
+- [ ] T043 [DEFERRED] {SC-008} [COMPLETES SC-008] Manual SC-008 "feels good" gate (Principle-VII): run the pilot→aim→fire→hit→destroy loop hands-on in BOTH assist modes (ON drift-damped, OFF decoupled), confirm live 30/60/144 FPS consistent feel (SC-001b), rate flight/combat feel positive, and log any negative findings for tuning after:T042
 
 ---
 
@@ -173,3 +173,7 @@ Every FR-001…FR-017 and the SC-008 manual gate maps to at least one task.
 | FR-016 | T008, T040 |
 | FR-017 | T010, T040 |
 | SC-008 | T043 |
+
+## Deferred Issues
+
+- **T043 [DEFERRED] {SC-008}** — The SC-008 "feels good" gate is a **hands-on human playtest** (fly the loop in both assist modes, judge feel, confirm live 30/60/144 FPS consistency). It cannot be executed inside the automated implement→QC loop, so it is deferred to the user. The slice is code-complete and runnable: launch with `cargo run -p client` (MSVC toolchain). All automated coverage for the underlying behaviour (determinism, assist on/off, swept hits, ram, seek) passes; only the subjective feel verdict remains.
