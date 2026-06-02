@@ -3,9 +3,17 @@
 //! independent. Also attaches visuals to projectiles the sim spawns at runtime.
 
 use bevy::prelude::*;
-use sim::components::{Heading, Position, Projectile};
+use sim::components::{Heading, Position, Projectile, Ship};
 
 use crate::scene::RenderAssets;
+
+/// How far ahead of the ship's nose the gunsight pip sits, in sim units.
+const AIM_DISTANCE: f32 = 5.0;
+
+/// Marker for the forward gunsight pip — a world-space marker placed ahead of
+/// the ship along its heading, showing where the fixed weapon will fire.
+#[derive(Component)]
+pub struct AimPip;
 
 /// Previous + current sim snapshots for one entity. `interpolate_transforms`
 /// blends between them by the fixed-step overstep fraction.
@@ -72,6 +80,23 @@ pub fn add_projectile_visuals(
             Transform::from_xyz(pos.0.x, pos.0.y, 0.0),
             RenderInterp::snapped(pos.0, 0.0),
         ));
+    }
+}
+
+/// Keep the gunsight pip a fixed distance ahead of the ship's nose, along the
+/// (interpolated) heading — so it shows the actual firing line for the fixed
+/// forward weapon. Runs after `interpolate_transforms` so it reads the smoothed
+/// ship pose.
+pub fn update_aim_pip(
+    ship_q: Query<&Transform, (With<Ship>, Without<AimPip>)>,
+    mut pip_q: Query<&mut Transform, With<AimPip>>,
+) {
+    let Ok(ship) = ship_q.single() else {
+        return;
+    };
+    let forward = ship.rotation * Vec3::X; // ship nose is +X local
+    for mut pip in &mut pip_q {
+        pip.translation = ship.translation + forward * AIM_DISTANCE;
     }
 }
 

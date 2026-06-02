@@ -61,6 +61,7 @@ fn main() -> AppExit {
                 (
                     render_sync::add_projectile_visuals,
                     render_sync::interpolate_transforms,
+                    render_sync::update_aim_pip,
                     camera::follow_camera,
                 )
                     .chain(),

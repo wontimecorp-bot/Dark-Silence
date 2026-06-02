@@ -39,7 +39,10 @@ impl Default for Tuning {
             muzzle_speed: 200.0,
             fire_rate: 5.0,
             lethal_ram_speed: 40.0,
-            assist_damping: 4.0,
+            // Gentle: even in ASSIST mode the ship keeps visible inertia/drift
+            // and eases toward the nose over ~1 s rather than snapping (which
+            // read as "car-like"). MANUAL mode ignores this entirely.
+            assist_damping: 2.5,
         }
     }
 }

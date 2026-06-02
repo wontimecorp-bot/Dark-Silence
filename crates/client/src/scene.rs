@@ -10,7 +10,7 @@ use sim::components::{
 };
 use sim::Tuning;
 
-use crate::render_sync::RenderInterp;
+use crate::render_sync::{AimPip, RenderInterp};
 
 /// Render assets reused for every runtime-spawned projectile.
 #[derive(Resource)]
@@ -58,7 +58,9 @@ pub fn setup_scene(
         Velocity(Vec2::ZERO),
         Heading(0.0),
         Health(100.0),
-        FlightAssist::On,
+        // Default to decoupled Newtonian flight (true "space" feel — velocity is
+        // independent of facing, so you drift). Press F for the assisted mode.
+        FlightAssist::Off,
         CollisionRadius(0.8),
         Weapon {
             cooldown: 0.0,
@@ -69,6 +71,19 @@ pub fn setup_scene(
         MeshMaterial3d(ship_material),
         Transform::from_xyz(0.0, 0.0, 0.0),
         RenderInterp::snapped(Vec2::ZERO, 0.0),
+    ));
+
+    // Forward gunsight pip — a glowing marker ahead of the nose showing the
+    // fixed weapon's firing line (positioned each frame by `update_aim_pip`).
+    commands.spawn((
+        AimPip,
+        Mesh3d(meshes.add(Sphere::new(0.18))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.4, 1.0, 0.9),
+            emissive: LinearRgba::rgb(0.2, 1.0, 0.8),
+            ..default()
+        })),
+        Transform::from_xyz(5.0, 0.0, 0.0),
     ));
 
     // Targets.

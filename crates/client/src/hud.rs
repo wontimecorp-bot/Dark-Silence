@@ -9,10 +9,12 @@ use sim::HitFeedback;
 #[derive(Component)]
 pub struct HudText;
 
-/// Spawn the readout line (top-left) and a centred aiming reticle.
+/// Spawn the readout line (top-left). The aiming reticle is a world-space
+/// gunsight pip ahead of the nose (see `render_sync::AimPip`), not a screen
+/// overlay — the weapon fires along the heading, not at screen centre.
 pub fn setup_hud(mut commands: Commands) {
     commands.spawn((
-        Text::new("SPD   0.0   ASSIST   HP 100"),
+        Text::new("SPD   0.0   MANUAL   HP 100"),
         TextFont {
             font_size: 18.0,
             ..default()
@@ -25,19 +27,6 @@ pub fn setup_hud(mut commands: Commands) {
             ..default()
         },
         HudText,
-    ));
-
-    // Aiming reticle: a small dot at screen centre.
-    commands.spawn((
-        Node {
-            position_type: PositionType::Absolute,
-            left: Val::Percent(50.0),
-            top: Val::Percent(50.0),
-            width: Val::Px(6.0),
-            height: Val::Px(6.0),
-            ..default()
-        },
-        BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.6)),
     ));
 }
 
