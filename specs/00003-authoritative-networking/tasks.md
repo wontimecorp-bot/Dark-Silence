@@ -151,10 +151,10 @@
 - [X] T066 [OBJ6] {TR-014} [COMPLETES TR-014] Wire bytes/client/sec metering off NetTransport::stats into the encode/send path in crates/server/src/snapshot.rs ← T063:encode_snapshot after:T063 after:T015
 - [X] T067 [OBJ6] {TR-047} [COMPLETES TR-047] Structure the snapshot encoder as a benchmarkable unit (cargo bench / timed path) so per-client encode cost at baseline scale is observable in crates/server/benches/encode.rs ← T063:encode_snapshot
 - [X] T068 [OBJ6] {TR-015,TR-043} Build the headless bot harness: ≥2 networked clients, no rendering, fixed scripted input loops, numeric signals only (state deltas, seq/ack, stats) in crates/server/tests/harness.rs ← T045:NetClientPlugin,T022:ServerApp::loopback → exports: BotHarness, ScriptedBot
-- [ ] T069 [OBJ6] {TR-040} [COMPLETES TR-040] Loopback-equivalence test across the four named paths under matched loss-free/zero-latency conditions; ignore transport-only diffs (SC-008) in crates/server/tests/equivalence.rs ← T068:BotHarness,T025:RenetTransport,T014:LoopbackTransport
-- [ ] T070 [OBJ6] {TR-042,TR-046} [COMPLETES TR-042] [COMPLETES TR-046] Bandwidth baseline: fixed 30 s / 2 bots + 4 ships / 20 Hz / seed over renet UDP; emit mean+peak bytes/client/sec (out, payload) + encode cost, recorded-only (SC-005) in crates/server/tests/bandwidth.rs ← T068:BotHarness after:T066 after:T067 after:T031
-- [ ] T071 [OBJ6] {TR-031,TR-043} [COMPLETES TR-031] Bot scenario — disconnect-mid-session: a client drops, server frees only that slot, others continue (Edge Cases) in crates/server/tests/harness.rs ← T068:BotHarness after:T057
-- [ ] T072 [OBJ6] {TR-015,TR-032,TR-043} [COMPLETES TR-015] [COMPLETES TR-016] [COMPLETES TR-032] [COMPLETES TR-034] [COMPLETES TR-035] [COMPLETES TR-043] Assemble the scenario set; assert each P1 SC + OBJ2 round-trip traces to a named tier in crates/server/tests/harness.rs after:T068 after:T070 after:T071
+- [X] T069 [OBJ6] {TR-040} [COMPLETES TR-040] Loopback-equivalence test across the four named paths under matched loss-free/zero-latency conditions; ignore transport-only diffs (SC-008) in crates/server/tests/equivalence.rs ← T068:BotHarness,T025:RenetTransport,T014:LoopbackTransport
+- [X] T070 [OBJ6] {TR-042,TR-046} [COMPLETES TR-042] [COMPLETES TR-046] Bandwidth baseline: fixed 30 s / 2 bots + 4 ships / 20 Hz / seed over renet UDP; emit mean+peak bytes/client/sec (out, payload) + encode cost, recorded-only (SC-005) in crates/server/tests/bandwidth.rs ← T068:BotHarness after:T066 after:T067 after:T031
+- [X] T071 [OBJ6] {TR-031,TR-043} [COMPLETES TR-031] Bot scenario — disconnect-mid-session: a client drops, server frees only that slot, others continue (Edge Cases) in crates/server/tests/harness.rs ← T068:BotHarness after:T057
+- [X] T072 [OBJ6] {TR-015,TR-032,TR-043} [COMPLETES TR-015] [COMPLETES TR-016] [COMPLETES TR-032] [COMPLETES TR-034] [COMPLETES TR-035] [COMPLETES TR-043] Assemble the scenario set; assert each P1 SC + OBJ2 round-trip traces to a named tier in crates/server/tests/harness.rs after:T068 after:T070 after:T071
 
 ---
 
@@ -162,9 +162,9 @@
 
 **Full workspace gate suite + the recorded bandwidth/encode-cost baseline run. Cross-cutting; runs after all delivery phases.**
 
-- [ ] T073 Run the full workspace QC gate green: `cargo build`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `cargo audit` — with the MSVC + build-env workarounds (see T005) after:T072
-- [ ] T074 [P] Execute the bandwidth + encode-cost baseline run (T070) and record the figure as a structured artifact under the harness output (SC-005 asserted-as-satisfied by presence) after:T070
-- [ ] T075 [P] Verify E001/E002 regression: existing crates/sim + crates/client tests still pass unchanged (no keystone rewrite) after:T073
+- [X] T073 Run the full workspace QC gate green: `cargo build`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `cargo audit` — with the MSVC + build-env workarounds (see T005) after:T072
+- [X] T074 [P] Execute the bandwidth + encode-cost baseline run (T070) and record the figure as a structured artifact under the harness output (SC-005 asserted-as-satisfied by presence) after:T070
+- [X] T075 [P] Verify E001/E002 regression: existing crates/sim + crates/client tests still pass unchanged (no keystone rewrite) after:T073
 
 ---
 

@@ -536,8 +536,7 @@ fn harness_scenario_set_runs_headlessly_with_numeric_signals_only() {
             "bot {i} reconstructs authoritative snapshots (numeric liveness)"
         );
         assert!(
-            h.bot(i).reconstructed_pos(id0).is_some()
-                && h.bot(i).reconstructed_pos(id1).is_some(),
+            h.bot(i).reconstructed_pos(id0).is_some() && h.bot(i).reconstructed_pos(id1).is_some(),
             "bot {i} sees both ships in the shared authoritative world"
         );
     }

@@ -213,8 +213,7 @@ fn four_named_paths_are_equivalent_loopback_vs_renet() {
 
         // (d) remote interpolation/buffer — the reconstruction of the PEER's ship
         // (the same snapshot-buffer/delta path) matches across transports.
-        let dd =
-            (loop_sig.remote_reconstructed[i] - renet_sig.remote_reconstructed[i]).length();
+        let dd = (loop_sig.remote_reconstructed[i] - renet_sig.remote_reconstructed[i]).length();
         assert!(
             dd < tol,
             "path (d) remote interpolation must match loopback↔renet: bot {i} \

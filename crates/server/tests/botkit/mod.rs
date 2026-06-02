@@ -437,6 +437,14 @@ pub struct BotHarness {
     dt_secs: f32,
 }
 
+/// The per-tick renet pump driver: given the bots, the server, and the fixed
+/// step (seconds), it flushes bot inputs out, runs the authoritative tick, and
+/// delivers snapshots back (via each transport's `pump`). Boxed so the non-udp
+/// build needs no renet types here and the renet harness can capture its own
+/// state. Aliased to keep [`Pump`] / [`BotHarness::from_parts`] off the
+/// `clippy::type_complexity` radar.
+pub type PumpFn = Box<dyn FnMut(&mut [ScriptedBot], &mut ServerApp, f32)>;
+
 /// How [`BotHarness::step_all`] moves bytes between the bot transports and the
 /// server transport for a tick. Loopback is synchronous (a send is immediately
 /// visible to the peer's recv), so it needs no pump. Renet drives the netcode
@@ -446,9 +454,7 @@ enum Pump {
     /// In-memory loopback: synchronous, no pump needed.
     Loopback,
     /// Renet UDP: a renet pump driver supplied by the renet harness constructor.
-    /// Boxed so the non-udp build needs no renet types here (the closure captures
-    /// the server-side pump and a per-client pump list).
-    Renet(Box<dyn FnMut(&mut [ScriptedBot], &mut ServerApp, f32)>),
+    Renet(PumpFn),
 }
 
 impl BotHarness {
@@ -522,7 +528,7 @@ impl BotHarness {
         server: ServerApp,
         bots: Vec<ScriptedBot>,
         server_conns: Vec<ServerConn>,
-        pump: Box<dyn FnMut(&mut [ScriptedBot], &mut ServerApp, f32)>,
+        pump: PumpFn,
         dt_secs: f32,
     ) -> Self {
         assert_eq!(
@@ -793,7 +799,7 @@ mod renet {
             for c in clients.iter_mut() {
                 let _ = c.update(dt_dur);
             }
-            let _ = server.pump_transport(dt_dur);
+            server.pump_transport(dt_dur);
             if clients.iter().all(|c| c.is_connected()) {
                 break;
             }
@@ -879,32 +885,37 @@ mod renet {
         // a few micro-pump rounds + tiny sleeps each direction so the datagrams
         // actually traverse the sockets within the step. Bounded (PUMP_ROUNDS),
         // NOT a real 30 s wall-clock.
-        let pump: Box<dyn FnMut(&mut [ScriptedBot], &mut ServerApp, f32)> =
-            Box::new(move |bots: &mut [ScriptedBot], server: &mut ServerApp, dt: f32| {
+        let pump: PumpFn = Box::new(
+            move |bots: &mut [ScriptedBot], server: &mut ServerApp, dt: f32| {
                 let dt_dur = Duration::from_secs_f32(dt);
                 // Push the just-queued bot inputs/acks out toward the server.
                 for _ in 0..PUMP_ROUNDS {
                     for bot in bots.iter_mut() {
                         bot.transport.pump(dt_dur);
                     }
-                    let _ = server.pump_transport(dt_dur);
+                    server.pump_transport(dt_dur);
                     std::thread::sleep(STEP_SLEEP);
                 }
                 // The authoritative step: recv inputs → step sim → queue snapshots.
                 server.tick();
                 // Flush queued snapshots out and deliver them to the bots.
                 for _ in 0..PUMP_ROUNDS {
-                    let _ = server.pump_transport(dt_dur);
+                    server.pump_transport(dt_dur);
                     for bot in bots.iter_mut() {
                         bot.transport.pump(dt_dur);
                     }
                     std::thread::sleep(STEP_SLEEP);
                 }
-            });
+            },
+        );
 
         BotHarness::from_parts(server, bots, server_conns, pump, dt)
     }
 }
 
+// Re-exported for the udp-gated equivalence/bandwidth tests. `allow(unused)`
+// because the `harness` test crate (loopback-only) compiles `botkit` too but
+// never uses the renet constructor.
 #[cfg(feature = "udp")]
+#[allow(unused_imports)]
 pub use renet::renet_harness;
