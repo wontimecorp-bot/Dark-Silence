@@ -37,6 +37,10 @@ pub struct InterpolatedEntity {
     pub id: EntityId,
     /// What kind of entity it is (picks the prefab/visual).
     pub kind: EntityKind,
+    /// Wire sub-kind tag (`EntityRecord.flags`) — e.g. the `TargetKind` for a
+    /// `Target`, so the renderer can pick dummy/asteroid/seeker visuals that the
+    /// coarse `EntityKind` cannot distinguish.
+    pub flags: u8,
     /// Interpolated position in sim units.
     pub pos: Vec2,
     /// Interpolated heading in radians (shortest-arc blended).
@@ -203,7 +207,9 @@ impl SnapshotBuffer {
                 if seen.insert(record.id.0, ()).is_some() {
                     continue; // already produced this id
                 }
-                if let Some(e) = self.interp_one(record.id, record.kind, lo, hi, render_ms) {
+                if let Some(e) =
+                    self.interp_one(record.id, record.kind, record.flags, lo, hi, render_ms)
+                {
                     out.push(e);
                 }
             }
@@ -222,6 +228,7 @@ impl SnapshotBuffer {
         &self,
         id: EntityId,
         kind: EntityKind,
+        flags: u8,
         lo: Option<&Snapshot>,
         hi: Option<&Snapshot>,
         render_ms: f64,
@@ -247,6 +254,7 @@ impl SnapshotBuffer {
                 Some(InterpolatedEntity {
                     id,
                     kind,
+                    flags,
                     pos,
                     heading,
                 })
@@ -258,6 +266,7 @@ impl SnapshotBuffer {
             (_, _, Some(lr), None) => Some(InterpolatedEntity {
                 id,
                 kind,
+                flags,
                 pos: lr.pos.dequantize_pos(),
                 heading: lr.heading.dequantize(),
             }),
@@ -267,6 +276,7 @@ impl SnapshotBuffer {
             (_, _, None, Some(hr)) => Some(InterpolatedEntity {
                 id,
                 kind,
+                flags,
                 pos: hr.pos.dequantize_pos(),
                 heading: hr.heading.dequantize(),
             }),

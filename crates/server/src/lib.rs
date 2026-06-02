@@ -824,22 +824,24 @@ impl ServerApp {
             });
         }
 
-        // Targets (dummies, asteroids, seekers).
+        // Targets (dummies, asteroids, seekers). The target sub-kind rides in
+        // `flags` so the client can pick the right mesh (the wire `EntityKind`
+        // only says "Target"); see `TargetKind::as_u8`.
         let mut targets = self
             .world
-            .query_filtered::<(Entity, &Position, &Velocity), With<Target>>();
-        let target_rows: Vec<(Entity, Vec2, Vec2)> = targets
+            .query_filtered::<(Entity, &Position, &Velocity, &TargetKind), With<Target>>();
+        let target_rows: Vec<(Entity, Vec2, Vec2, u8)> = targets
             .iter(&self.world)
-            .map(|(e, p, v)| (e, p.0, v.0))
+            .map(|(e, p, v, k)| (e, p.0, v.0, k.as_u8()))
             .collect();
-        for (entity, pos, vel) in target_rows {
+        for (entity, pos, vel, kind_flag) in target_rows {
             records.push(EntityRecord {
                 id: self.entity_ids.id_for(entity),
                 kind: EntityKind::Target,
                 pos: QVec2::quantize_pos(pos),
                 vel: QVec2::quantize_vel(vel),
                 heading: QAngle::quantize(0.0),
-                flags: 0,
+                flags: kind_flag,
             });
         }
 

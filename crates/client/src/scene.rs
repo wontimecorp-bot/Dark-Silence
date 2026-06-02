@@ -33,11 +33,16 @@ pub struct RenderAssets {
     /// E002 player-ship look so a remote ship reads identically to the local one.
     pub ship_mesh: Handle<Mesh>,
     pub ship_material: Handle<StandardMaterial>,
-    /// Mesh/material for a remote target (dummy / asteroid / seeker). One generic
-    /// destructible look; the kind is carried on the [`crate::render_sync::RemoteEntity`]
-    /// for any future per-kind visual split.
-    pub target_mesh: Handle<Mesh>,
-    pub target_material: Handle<StandardMaterial>,
+    /// Per-`TargetKind` remote looks, picked by `EntityRecord.flags` in
+    /// [`crate::net::net_update`] (the wire `EntityKind` only says "Target"):
+    /// reddish dummy cube, grey asteroid sphere, green seeker dart — matching the
+    /// E002 scene so networked targets read the same as the old local ones.
+    pub dummy_mesh: Handle<Mesh>,
+    pub dummy_material: Handle<StandardMaterial>,
+    pub asteroid_mesh: Handle<Mesh>,
+    pub asteroid_material: Handle<StandardMaterial>,
+    pub seeker_mesh: Handle<Mesh>,
+    pub seeker_material: Handle<StandardMaterial>,
 }
 
 /// Spawn lighting, the gunsight pip, and the LOCAL player ship; register the
@@ -70,18 +75,26 @@ pub fn setup_scene(
     let ship_mesh = meshes.add(Cuboid::new(1.6, 0.6, 0.3));
     let ship_material = materials.add(Color::srgb(0.30, 0.65, 1.0));
 
-    // Generic destructible-target look for remote targets (dummies/asteroids/
-    // seeker now come from the network, not the scene).
-    let target_mesh = meshes.add(Cuboid::new(1.4, 1.4, 1.4));
-    let target_material = materials.add(Color::srgb(0.75, 0.35, 0.30));
+    // Per-kind remote target looks (dummies/asteroids/seeker now arrive over the
+    // network; these mirror the original E002 scene meshes/colours).
+    let dummy_mesh = meshes.add(Cuboid::new(1.4, 1.4, 1.4)); // reddish practice cube
+    let dummy_material = materials.add(Color::srgb(0.75, 0.35, 0.30));
+    let asteroid_mesh = meshes.add(Sphere::new(0.9)); // grey drifting rock
+    let asteroid_material = materials.add(Color::srgb(0.55, 0.5, 0.45));
+    let seeker_mesh = meshes.add(Cuboid::new(1.2, 0.6, 0.3)); // green seeker dart
+    let seeker_material = materials.add(Color::srgb(0.35, 0.85, 0.40));
 
     commands.insert_resource(RenderAssets {
         projectile_mesh,
         projectile_material,
         ship_mesh: ship_mesh.clone(),
         ship_material: ship_material.clone(),
-        target_mesh,
-        target_material,
+        dummy_mesh,
+        dummy_material,
+        asteroid_mesh,
+        asteroid_material,
+        seeker_mesh,
+        seeker_material,
     });
 
     // The LOCAL player ship — spawned here deterministically so the `LocalShip`

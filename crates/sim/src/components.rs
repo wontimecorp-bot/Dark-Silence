@@ -121,6 +121,30 @@ pub enum TargetKind {
     Seeker,
 }
 
+impl TargetKind {
+    /// Stable wire tag for the target sub-kind, carried in
+    /// `protocol::EntityRecord.flags` so a networked client can pick the right
+    /// visual — the wire `EntityKind` only distinguishes Ship/Projectile/Target.
+    /// Additive; not part of any gameplay invariant.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            TargetKind::Dummy => 0,
+            TargetKind::Asteroid => 1,
+            TargetKind::Seeker => 2,
+        }
+    }
+
+    /// Inverse of [`TargetKind::as_u8`]; `None` for an unknown tag.
+    pub fn from_u8(v: u8) -> Option<TargetKind> {
+        match v {
+            0 => Some(TargetKind::Dummy),
+            1 => Some(TargetKind::Asteroid),
+            2 => Some(TargetKind::Seeker),
+            _ => None,
+        }
+    }
+}
+
 /// Circular proxy hitbox radius, > 0 (INV-05).
 #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CollisionRadius(pub f32);

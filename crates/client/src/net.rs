@@ -31,7 +31,7 @@ use protocol::{
     NetTransport, Snapshot, SnapshotAck, CLIENT_TOKEN_BYTES,
 };
 use server::{ServerApp, PROTOCOL_VERSION};
-use sim::components::Velocity;
+use sim::components::{TargetKind, Velocity};
 use sim::ShipIntent;
 
 use crate::input::{build_client_input, InputSequencer};
@@ -333,7 +333,20 @@ pub fn net_update(
         }
         let (mesh, material) = match e.kind {
             EntityKind::Ship => (assets.ship_mesh.clone(), assets.ship_material.clone()),
-            EntityKind::Target => (assets.target_mesh.clone(), assets.target_material.clone()),
+            // The wire `EntityKind` only says "Target"; the sub-kind rides in
+            // `flags` (set from `TargetKind::as_u8` server-side) so we restore the
+            // distinct E002 looks: grey asteroid sphere, green seeker dart, reddish
+            // dummy cube (the fallback for an unknown tag).
+            EntityKind::Target => match TargetKind::from_u8(e.flags) {
+                Some(TargetKind::Asteroid) => (
+                    assets.asteroid_mesh.clone(),
+                    assets.asteroid_material.clone(),
+                ),
+                Some(TargetKind::Seeker) => {
+                    (assets.seeker_mesh.clone(), assets.seeker_material.clone())
+                }
+                _ => (assets.dummy_mesh.clone(), assets.dummy_material.clone()),
+            },
             EntityKind::Projectile => (
                 assets.projectile_mesh.clone(),
                 assets.projectile_material.clone(),
