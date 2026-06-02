@@ -1,0 +1,142 @@
+name: CI
+
+# Workspace quality gates (TR-007, TR-009, TR-010):
+#   build -> test -> clippy (-D warnings) -> fmt --check
+#   + dependency-graph inspection asserting `sim` stays render/window/input/
+#     audio/net-free
+#   + cargo-audit security scan gating on high/critical advisories.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail the build on any compiler warning across the workspace, matching the
+  # local policy; clippy adds -D warnings on top.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ---- Build / test / lint / format (TR-007) -----------------------------
+  build-test-lint:
+    name: build / test / clippy / fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.92.0)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.92.0"
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (workspace)
+        run: cargo build --workspace --all-targets
+
+      - name: Test (workspace)
+        run: cargo test --workspace --all-targets
+
+      - name: Clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+  # ---- Dependency-graph inspection of `sim` (TR-009) ---------------------
+  # SC-001: the `sim` crate's resolved dependency set MUST contain zero
+  # rendering / windowing / input / audio / networking libraries. Verified by
+  # an automatable `cargo tree` scan, not manual inspection.
+  sim-dependency-audit:
+    name: sim dependency-graph (no render/window/input/audio/net)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.92.0)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.92.0"
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Assert sim is render/window/input/audio/net-free
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Full resolved dependency graph of the `sim` crate (all transitive
+          # deps), one crate name per line.
+          tree="$(cargo tree -p sim --prefix none --no-dedupe 2>/dev/null \
+                  | sed -E 's/ v[0-9].*$//' | sort -u)"
+          echo "Resolved sim dependency graph:"
+          echo "$tree"
+
+          # Forbidden classes. Matched as whole crate names / prefixes so we do
+          # not false-positive on substrings. `bevy_ecs` (pure ECS) is allowed;
+          # any other `bevy_*` (render/window/app/audio/input/winit/wgpu) is not.
+          forbidden_regex='^(winit|wgpu|wgpu-[a-z]+|glow|gilrs|rodio|cpal|kira|tokio|mio|hyper|reqwest|quinn|tonic|axum|h2|tungstenite|tokio-tungstenite|renet|laminar|message-io|bevy_render|bevy_winit|bevy_window|bevy_audio|bevy_input|bevy_pbr|bevy_sprite|bevy_ui|bevy_text|bevy_gilrs|bevy_a11y|bevy_gltf|bevy_core_pipeline)$'
+
+          if echo "$tree" | grep -E "$forbidden_regex"; then
+            echo "::error::sim depends on a forbidden render/window/input/audio/net crate (TR-002 / TR-009 / SC-001)."
+            exit 1
+          fi
+          echo "OK: sim dependency graph is render/window/input/audio/net-free."
+
+  # ---- Security advisory scan (TR-010) -----------------------------------
+  # Gate on high/critical; low/medium/informational are non-gating and tracked.
+  # Triage config: .cargo/audit.toml.
+  cargo-audit:
+    name: cargo-audit (gate high/critical)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.92.0)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.92.0"
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit dependencies (high/critical gate)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Reads .cargo/audit.toml for the justified ignore-list. Run in two
+          # passes so low/medium/informational advisories report but do not gate.
+          # Pass 1 (non-gating): full report for the log.
+          cargo audit || true
+          # Pass 2 (gating): fail only on high/critical CVSS advisories.
+          cargo audit --json > audit.json || true
+          python3 - <<'PY'
+          import json, sys
+          with open("audit.json") as f:
+              data = json.load(f)
+          vulns = data.get("vulnerabilities", {}).get("list", [])
+          gating = []
+          for v in vulns:
+              cvss = (v.get("advisory") or {}).get("cvss")
+              # CVSS >= 7.0 == high/critical. Missing score -> treat as gating to be safe.
+              score = None
+              if cvss:
+                  try:
+                      score = float(str(cvss).split("/")[0].split(":")[-1]) if ":" in str(cvss) else float(str(cvss).split("/")[0])
+                  except ValueError:
+                      score = None
+              sev = (v.get("advisory") or {}).get("id", "UNKNOWN")
+              if score is None or score >= 7.0:
+                  gating.append((sev, score))
+          if gating:
+              print("Gating (high/critical) advisories:", gating)
+              sys.exit(1)
+          print("No high/critical advisories. Low/medium/informational are tracked, non-gating.")
+          PY

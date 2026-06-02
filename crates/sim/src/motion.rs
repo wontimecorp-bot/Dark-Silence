@@ -22,13 +22,19 @@
 //! both the desired feel and what keeps the closed form a clean polynomial.
 
 use glam::Vec2;
+use serde::{Deserialize, Serialize};
 
 /// The full kinematic state of a point mass on the 2D gameplay plane.
 ///
 /// Acceleration is supplied per call rather than stored, because it is an input
 /// (thrust, gravity, etc.) that the caller owns — the same state can be advanced
 /// under different accelerations.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// `Serialize`/`Deserialize` are derived (TR-008, AD-002) so the same type can
+/// be replicated over the wire (E003) and persisted (E004) without rework; the
+/// round-trip is value-preserving under `PartialEq` (see the `serde_round_trip`
+/// test below).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BodyState {
     /// Position in sim units. At Tier 0 these are sector-relative (never large
     /// absolute world coordinates, which would lose `f32` precision).
@@ -55,6 +61,15 @@ impl BodyState {
 ///
 /// For constant `accel` this is exact: summing N of these steps equals
 /// [`analytic`] at `t = N * dt` (up to `f32` rounding). See module docs.
+///
+/// # Runtime-`dt` contract (TR-003)
+///
+/// `dt` is a *runtime* parameter, never a compile-time constant. Callers supply
+/// it per tick, so a time-dilated bubble can change its wall-clock tick rate
+/// while keeping the logical step size whatever it chooses — the equivalence
+/// with [`analytic`] holds for any `dt` (verified across {10,20,30,60,144} Hz).
+/// `dt == 0.0` is a well-defined no-op: the returned state equals the input
+/// (`pos`/`vel` unchanged), since every `dt`-scaled term vanishes.
 #[inline]
 pub fn integrate(state: BodyState, accel: Vec2, dt: f32) -> BodyState {
     // x_{n+1} = x_n + v_n·dt + ½·a·dt²
@@ -200,5 +215,51 @@ mod tests {
             err > 0.1,
             "expected Euler to diverge noticeably, but error was only {err}"
         );
+    }
+
+    /// A step with `dt == 0` must be a no-op: every `dt`-scaled term vanishes, so
+    /// the returned state equals the input exactly (TR-003 degenerate input).
+    /// This is the zero-`dt` boundary the spec calls out as a predictable no-op
+    /// tick — important because a time-dilated bubble can legitimately tick at a
+    /// logical `dt` of zero (fully paused) without corrupting state.
+    #[test]
+    fn zero_dt_step_is_a_no_op() {
+        let start = BodyState::new(Vec2::new(7.0, -2.5), Vec2::new(1.5, 9.0));
+        let accel = Vec2::new(3.0, -4.0); // non-zero accel must still not move it
+        let after = integrate(start, accel, 0.0);
+        assert_eq!(
+            after, start,
+            "dt == 0 must return the input state unchanged"
+        );
+
+        // The convenience loop is the same: zero steps OR zero dt is identity.
+        assert_eq!(simulate(start, accel, 0.0, 100), start);
+        assert_eq!(simulate(start, accel, 1.0 / 30.0, 0), start);
+    }
+
+    /// TR-008: serialize -> deserialize must round-trip to a value equal under
+    /// `PartialEq`. Guards downstream replication (E003) and persistence (E004):
+    /// a `BodyState` (and an ECS component) put on the wire and read back must be
+    /// the *same* state. We use JSON as a concrete, self-describing format; the
+    /// derive — not the format — is what TR-008 requires.
+    #[test]
+    fn serde_round_trip_preserves_value() {
+        let body = BodyState::new(Vec2::new(-3.5, 12.0), Vec2::new(4.0, -2.0));
+        let json = serde_json::to_string(&body).expect("BodyState serializes");
+        let back: BodyState = serde_json::from_str(&json).expect("BodyState deserializes");
+        assert_eq!(back, body, "BodyState must survive a serde round-trip");
+
+        // Components share the requirement (TR-008 covers BodyState + components).
+        let pos = crate::components::Position(Vec2::new(8.0, -1.0));
+        let pos_json = serde_json::to_string(&pos).expect("Position serializes");
+        let pos_back: crate::components::Position =
+            serde_json::from_str(&pos_json).expect("Position deserializes");
+        assert_eq!(pos_back, pos, "Position must survive a serde round-trip");
+
+        let vel = crate::components::Velocity(Vec2::new(-2.0, 3.5));
+        let vel_json = serde_json::to_string(&vel).expect("Velocity serializes");
+        let vel_back: crate::components::Velocity =
+            serde_json::from_str(&vel_json).expect("Velocity deserializes");
+        assert_eq!(vel_back, vel, "Velocity must survive a serde round-trip");
     }
 }

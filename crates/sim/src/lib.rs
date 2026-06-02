@@ -7,6 +7,10 @@
 //! agree, so an entity demoted to a closed-form trajectory and later promoted
 //! back into the live sim reappears exactly where the math said it would.
 
+pub mod components;
 pub mod motion;
+pub mod physics;
 
+pub use components::{Position, Velocity};
 pub use motion::{analytic, integrate, simulate, BodyState};
+pub use physics::{Physics, RapierPhysics};

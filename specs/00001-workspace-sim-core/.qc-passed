@@ -1,0 +1,3 @@
+﻿QC PASSED: E001 Workspace & Sim Core
+Marked: 2026-06-01T18:18:08-07:00
+Verdict: PASS (see qc-report.md). Build OK; 11 tests pass; clippy -D warnings clean; fmt clean; dependency-clean; cargo-audit exit 0 (1 allowed informational advisory).

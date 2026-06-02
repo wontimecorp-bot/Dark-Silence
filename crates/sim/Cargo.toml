@@ -10,3 +10,8 @@ glam.workspace = true
 serde.workspace = true
 bevy_ecs.workspace = true
 rapier2d.workspace = true
+
+[dev-dependencies]
+# A concrete serde format, used only to exercise the serialize -> deserialize
+# round-trip equality test (TR-008). Not a runtime dependency of `sim`.
+serde_json = "1.0"

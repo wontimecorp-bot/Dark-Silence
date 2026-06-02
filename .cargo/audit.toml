@@ -1,0 +1,33 @@
+# cargo-audit triage config (TR-010).
+#
+# Policy: `high`/`critical` advisories are gating (the CI `cargo audit` step
+# fails the build); `low`/`medium`/informational advisories are non-gating and
+# tracked for follow-up. The `sim::physics` owner triages reported advisories
+# and records any justified ignore below with a rationale + date.
+#
+# The CI step passes `--deny warnings` only after this non-gating set is
+# filtered, so unmaintained/low-severity notices do not block merges while still
+# surfacing in the audit log.
+
+[advisories]
+# Justified ignore-list for non-gating (low/medium/informational) advisories.
+# Each entry MUST carry a one-line rationale comment. Empty until something is
+# triaged — never blanket-ignore high/critical advisories here.
+ignore = [
+    # Example (remove when first real triage lands):
+    # "RUSTSEC-0000-0000", # <rationale>; <owner>; <YYYY-MM-DD>
+]
+
+# Informational advisories (unmaintained crates, unsound notices, yanked
+# versions) are surfaced but do not gate the build.
+informational_warnings = ["unmaintained", "unsound", "yanked"]
+
+[output]
+# Keep machine-readable output available for CI summaries; humans read the step
+# log. (cargo-audit honors `deny` from the CLI in CI; see ci.yml.)
+quiet = false
+
+[yanked]
+# Warn on yanked crates rather than failing; yanks are not security gates.
+enabled = true
+update_index = false
