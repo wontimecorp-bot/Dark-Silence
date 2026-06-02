@@ -626,7 +626,9 @@ mod tests {
             vec![record(1, EntityKind::Ship, Vec2::new(9.0, 0.0), 0.0)],
             vec![],
         );
-        let out = r.reconstruct(&d).expect("delta against held baseline applies");
+        let out = r
+            .reconstruct(&d)
+            .expect("delta against held baseline applies");
         // The reconstructed full state carries BOTH ships — ship 2 persisted from
         // the baseline (delta-by-omission), ship 1 updated.
         assert_eq!(out.full.entities.len(), 2, "unchanged ship 2 persists");
@@ -640,11 +642,10 @@ mod tests {
             (ship1.pos.dequantize_pos().x - 9.0).abs() < protocol::POS_TOLERANCE,
             "ship 1 updated to the delta value"
         );
-        assert!(out
-            .full
-            .entities
-            .iter()
-            .any(|e| e.id == EntityId(2)), "ship 2 still present");
+        assert!(
+            out.full.entities.iter().any(|e| e.id == EntityId(2)),
+            "ship 2 still present"
+        );
     }
 
     #[test]

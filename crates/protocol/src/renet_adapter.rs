@@ -612,6 +612,17 @@ impl NetTransport for RenetTransport {
             }
         }
     }
+
+    /// Drive the netcode pump one step (the [`NetTransport::pump`] override for the
+    /// renet adapter). Delegates to [`RenetTransport::update`], swallowing a
+    /// per-step transport error (e.g. a transient client-not-connected) so the
+    /// trait-level pump stays infallible — a consumer that calls `pump` each tick
+    /// over the seam works identically over loopback (no-op) and renet (real
+    /// socket pump), satisfying SC-006/SC-008. Callers needing the error detail
+    /// use [`RenetTransport::update`] directly.
+    fn pump(&mut self, dt: Duration) {
+        let _ = self.update(dt);
+    }
 }
 
 impl RenetTransport {

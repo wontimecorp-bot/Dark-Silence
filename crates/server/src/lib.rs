@@ -6,8 +6,11 @@
 //! [`sim::add_fixed_step_systems`] so server and client run bit-identical logic,
 //! Principle II / HINT-003), a [`Box<dyn NetTransport>`], and a [`Session`]. Each
 //! tick it drains the transport, validates-and-applies client input, steps the
-//! sim once at [`sim::FixedDt`], builds a full-state [`Snapshot`], and sends it to
-//! every client (recv → validate → step → encode → send).
+//! sim once at [`sim::FixedDt`], and (on snapshot ticks) **delta-encodes** a
+//! per-client [`Snapshot`] against that client's last-acked baseline, sending it
+//! to every client (recv → validate → step → delta-encode → send). The delta
+//! encoder, MTU bound, lost-ack keyframe degradation, and bytes/client/sec meter
+//! live in [`snapshot`] (OBJ6); each client's baseline is cached per connection.
 //!
 //! Loopback ([`ServerApp::loopback`]) holds the server end of a
 //! [`LoopbackTransport`] pair: an in-process client runs through the **identical**
@@ -351,6 +354,14 @@ impl ServerApp {
     /// Exposed (not just [`ServerApp::run`]) so tests can drive the server
     /// deterministically one tick at a time.
     pub fn tick(&mut self) {
+        // Drive any socket-backed transport's pump one fixed step BEFORE draining
+        // (a no-op for the in-memory loopback transport, which is synchronous; the
+        // renet UDP adapter overrides `NetTransport::pump` to run its netcode
+        // update + socket flush). This lets the SAME tick loop run over loopback
+        // and renet unchanged (SC-006/SC-008) — inbound UDP packets are applied to
+        // renet's server before `accept`/`recv` reads them this tick.
+        self.transport
+            .pump(std::time::Duration::from_secs_f32(self.rates.fixed_dt()));
         self.accept_new_connections();
         self.drain_and_apply_inputs();
         self.step_sim();
@@ -736,6 +747,18 @@ impl ServerApp {
         &self.meter
     }
 
+    /// Drive the underlying transport's pump one step (a no-op for loopback, a
+    /// netcode update + socket flush for the renet UDP adapter). [`ServerApp::tick`]
+    /// already pumps once at its top so inbound packets are applied before the
+    /// drain; this accessor lets the 8b renet harness flush OUTBOUND snapshots
+    /// after `tick` queued them (renet only flushes queued messages inside its own
+    /// update/send), so the bot transports can then receive them within the same
+    /// harness step. A no-op for loopback, so callers run unchanged over either
+    /// transport (SC-006/SC-008).
+    pub fn pump_transport(&mut self, dt: std::time::Duration) {
+        self.transport.pump(dt);
+    }
+
     /// Build the authoritative full entity set for a snapshot from the `sim` world
     /// (T065). Reads ONLY server-authoritative transforms/velocities — no
     /// client-asserted data is on this path (the server reads only its own `sim`
@@ -744,6 +767,17 @@ impl ServerApp {
     /// baseline.
     fn build_full_state(&mut self) -> FullState {
         FullState::from_records(self.full_records())
+    }
+
+    /// The current authoritative full entity set (server-`sim` only, T065) — the
+    /// public read the 8b bandwidth baseline uses to time per-client snapshot
+    /// **encode cost** (TR-047) over the real baseline world via the free
+    /// [`snapshot::encode_snapshot`] function. Same record set
+    /// [`ServerApp::broadcast_snapshots`] deltas against each client's baseline;
+    /// exposed read-only (it mints wire ids for any unbound entities, mirroring a
+    /// broadcast, but mutates no world state).
+    pub fn current_full_state(&mut self) -> FullState {
+        self.build_full_state()
     }
 
     /// The flat authoritative record list (ships, projectiles, targets), quantized
@@ -810,6 +844,38 @@ impl ServerApp {
         }
 
         records
+    }
+
+    /// Spawn a **server-controlled bot ship** at `pos` driven by a fixed
+    /// `intent` every tick — the AI ships the bandwidth baseline scenario adds
+    /// alongside the connected bot clients (TR-042: 2 networked bots + 4
+    /// server-controlled bot ships ≈ 6 ships + projectiles). The ship carries the
+    /// same gameplay bundle as a client ship (so the shared sim drives it
+    /// identically) plus a fixed [`ShipIntent`]; because the per-tick step only
+    /// re-stages intents for *connected-client* ships, this bot ship keeps its
+    /// fixed intent across ticks (it thrusts/fires on its own). Returns the spawned
+    /// entity so a test can address it; it appears in snapshots under an
+    /// auto-minted wire id like any other replicated entity.
+    pub fn spawn_bot_ship(&mut self, pos: Vec2, intent: ShipIntent) -> Entity {
+        let tuning = *self.world.resource::<Tuning>();
+        self.world
+            .spawn((
+                Ship,
+                intent,
+                Position(pos),
+                Velocity(Vec2::ZERO),
+                Heading(0.0),
+                AngularVelocity(0.0),
+                Health(100.0),
+                FlightAssist::On,
+                CollisionRadius(0.8),
+                Weapon {
+                    cooldown: 0.0,
+                    fire_rate: tuning.fire_rate,
+                    muzzle_speed: tuning.muzzle_speed,
+                },
+            ))
+            .id()
     }
 
     /// Spawn a fresh authoritative ship for a newly connected client, reusing the
@@ -880,8 +946,8 @@ impl ServerApp {
 /// - [`BaselineCache::promote`] advances the acked baseline to a sent snapshot's
 ///   stored full state when the client acks that id;
 /// - [`BaselineCache::acked_baseline`] / [`BaselineCache::acked_state`] are the id
-///   + full state the next delta is computed against (`None` id ⇒ the client has
-///   acked nothing yet ⇒ the encoder emits a keyframe).
+///   plus full state the next delta is computed against (`None` id ⇒ the client
+///   has acked nothing yet ⇒ the encoder emits a keyframe).
 #[derive(Default)]
 struct BaselineCache {
     /// The snapshot id of the currently-acked baseline (`None` until the client

@@ -91,9 +91,7 @@ impl FullState {
 
     /// Index of `id` in the sorted record vec, if present.
     fn index_of(&self, id: EntityId) -> Option<usize> {
-        self.records
-            .binary_search_by_key(&id.0, |r| r.id.0)
-            .ok()
+        self.records.binary_search_by_key(&id.0, |r| r.id.0).ok()
     }
 
     /// Materialize this full state into a [`Snapshot`] body (every record, no
@@ -216,7 +214,11 @@ mod tests {
         let reconstructed = apply_delta(&baseline, &delta(vec![record(2, 9.0)], vec![]));
         assert_eq!(reconstructed.get(EntityId(1)), Some(&record(1, 1.0)));
         assert_eq!(reconstructed.get(EntityId(2)), Some(&record(2, 9.0)));
-        assert_eq!(reconstructed.len(), 2, "an overwrite does not add an entity");
+        assert_eq!(
+            reconstructed.len(),
+            2,
+            "an overwrite does not add an entity"
+        );
     }
 
     #[test]

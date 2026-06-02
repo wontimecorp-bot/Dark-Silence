@@ -173,31 +173,44 @@ fn enforce_mtu(snapshot: &mut Snapshot, params: &EncodeParams) {
         return;
     }
 
-    // Sort changed entities by ascending priority (lowest first) so we can pop the
-    // lowest-priority entity off the end cheaply until the snapshot fits.
+    // Sort changed entities by ascending priority (lowest first) so the
+    // lowest-priority entities are at the front and shed first.
     let recipient_id = params.recipient_id;
     let origin = params.recipient_pos;
     snapshot
         .entities
-        .sort_by(|a, b| priority(a, recipient_id, origin).cmp(&priority(b, recipient_id, origin)));
+        .sort_by_key(|r| priority(r, recipient_id, origin));
 
-    // Pop the lowest-priority entity until it fits — but never drop the recipient's
-    // own ship (its priority is the maximum, so it is sorted last and only ever
-    // popped when it is the sole remaining entity, which we guard against).
-    while encoded_len(snapshot) > MAX_SNAPSHOT_BYTES {
-        // The lowest-priority entity is at the front after the ascending sort.
-        if snapshot.entities.is_empty() {
-            break;
-        }
-        // Guard: never drop the recipient's own ship.
-        if snapshot.entities.len() == 1 {
-            if let (Some(rid), Some(only)) = (recipient_id, snapshot.entities.first()) {
-                if only.id == rid {
-                    break;
-                }
-            }
-        }
+    // Estimate how many entities to shed up front from the average per-entity wire
+    // cost, so a heavily-over-MTU snapshot does not pay an O(n²) re-encode by
+    // removing one entity at a time. We over-shed by the estimate, then add back
+    // toward the boundary, so the result is still the maximal fitting prefix.
+    let over = encoded_len(snapshot).saturating_sub(MAX_SNAPSHOT_BYTES);
+    if over > 0 && !snapshot.entities.is_empty() {
+        let per_entity = (encoded_len(snapshot) / snapshot.entities.len().max(1)).max(1);
+        // Drop a batch a little larger than the strict estimate so one re-encode
+        // usually lands under the bound; the fine loop below handles the remainder.
+        let estimate = (over / per_entity) + 1;
+        let max_droppable = droppable_count(snapshot, recipient_id);
+        let bulk = estimate.min(max_droppable);
+        snapshot.entities.drain(0..bulk);
+    }
+
+    // Fine adjustment: pop the lowest-priority entity until it fits — but never
+    // drop the recipient's own ship (its priority is the maximum, so it sorts last
+    // and is only ever reached when it is the sole remaining entity).
+    while encoded_len(snapshot) > MAX_SNAPSHOT_BYTES && droppable_count(snapshot, recipient_id) > 0
+    {
         snapshot.entities.remove(0);
+    }
+}
+
+/// How many of `snapshot`'s changed entities may still be dropped — all of them
+/// except the recipient's own ship, which the MTU guard never sheds (T064).
+fn droppable_count(snapshot: &Snapshot, recipient_id: Option<EntityId>) -> usize {
+    match recipient_id {
+        Some(rid) => snapshot.entities.iter().filter(|r| r.id != rid).count(),
+        None => snapshot.entities.len(),
     }
 }
 
@@ -336,10 +349,7 @@ impl BandwidthMeter {
     /// Cumulative bytes credited to `conn` (matches [`protocol::NetStats::bytes_out`] for
     /// the snapshot path).
     pub fn total_bytes(&self, conn: ConnectionId) -> u64 {
-        self.windows
-            .get(&conn)
-            .map(|e| e.total_bytes)
-            .unwrap_or(0)
+        self.windows.get(&conn).map(|e| e.total_bytes).unwrap_or(0)
     }
 
     /// Mean bytes/client/sec across **all** metered connections over the window —
@@ -464,7 +474,11 @@ mod tests {
         let world = FullState::from_records([ship(0, 1.0)]);
         let delta = encode_snapshot(&world, &baseline, params(1, false));
         assert!(delta.entities.is_empty(), "the ship is unchanged");
-        assert_eq!(delta.removed, vec![EntityId(7)], "the projectile is removed");
+        assert_eq!(
+            delta.removed,
+            vec![EntityId(7)],
+            "the projectile is removed"
+        );
     }
 
     #[test]
@@ -487,7 +501,10 @@ mod tests {
         // Even with a populated baseline, a keyframe ignores it and emits all.
         let baseline = FullState::from_records([ship(0, 99.0)]);
         let delta = encode_snapshot(&world, &baseline, params(5, /*keyframe=*/ true));
-        assert!(delta.is_keyframe(), "a keyframe is tagged KEYFRAME_BASELINE");
+        assert!(
+            delta.is_keyframe(),
+            "a keyframe is tagged KEYFRAME_BASELINE"
+        );
         assert_eq!(delta.entities.len(), 2, "a keyframe carries every entity");
         assert!(delta.removed.is_empty(), "a keyframe lists no removals");
         // It reconstructs from an EMPTY baseline (lost-ack re-baseline).

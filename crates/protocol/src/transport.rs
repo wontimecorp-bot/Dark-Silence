@@ -13,6 +13,7 @@ use crate::messages::{ConnectionId, Message, NetStats};
 use bitcode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::time::Duration;
 
 /// Why a connection was (or is being) closed. Small, stable enum; appears on the
 /// wire inside [`Message::Disconnect`], so it derives serde + bitcode.
@@ -60,4 +61,15 @@ pub trait NetTransport {
 
     /// Bytes in/out for `conn` so far — the bandwidth baseline (TR-014).
     fn stats(&self, conn: ConnectionId) -> NetStats;
+
+    /// Advance the transport's internal pump by `dt` (drive any background
+    /// netcode/socket machinery one step). The in-memory loopback transport is
+    /// synchronous — a `send` is immediately visible to the peer's `recv` — so it
+    /// needs no pump and the default is a **no-op**. A real socket-backed
+    /// transport (the renet UDP adapter, behind the `udp` feature) overrides this
+    /// to drive its netcode update + socket flush each tick. The signature uses
+    /// only `std::time::Duration`, so no netcode-library type leaks across the
+    /// seam (SC-006); a swapped-in consumer that always calls `pump` each tick
+    /// works over loopback (no-op) and renet (real pump) unchanged (SC-008).
+    fn pump(&mut self, _dt: Duration) {}
 }

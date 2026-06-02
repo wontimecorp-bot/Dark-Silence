@@ -26,7 +26,7 @@ fn baseline_world(ships: u32, projectiles_per_ship: u32) -> FullState {
     let mut records: Vec<EntityRecord> = Vec::new();
     let mut next_id = 0u32;
     for s in 0..ships {
-        let angle = (s as f32) * 1.04719; // ~60° apart
+        let angle = (s as f32) * 0.9; // spread the ships around the sector
         let pos = Vec2::new(angle.cos() * 30.0, angle.sin() * 30.0);
         records.push(EntityRecord {
             id: EntityId(next_id),
@@ -124,7 +124,13 @@ fn main() {
     // 4) A crowded battle that exceeds the MTU, so the priority-drop path runs:
     //    8 ships + 200 projectiles. Exercises the sort + shed cost (T064).
     let crowded = baseline_world(8, 25); // 8 ships + 200 projectiles = 208 entities
-    time_encode("delta MTU-shed (208 in)", &crowded, &empty, true, ITERS / 10);
+    time_encode(
+        "delta MTU-shed (208 in)",
+        &crowded,
+        &empty,
+        true,
+        ITERS / 10,
+    );
 
     println!("[encode-bench] done (no pass/fail gate — figures are recorded for reference)");
 }
