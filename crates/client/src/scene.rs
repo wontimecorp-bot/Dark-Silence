@@ -8,7 +8,7 @@ use sim::components::{
     AngularVelocity, CollisionRadius, FlightAssist, Heading, Health, Position, Ship, Target,
     TargetKind, Velocity, Weapon,
 };
-use sim::Tuning;
+use sim::{ShipIntent, Tuning};
 
 use crate::render_sync::{AimPip, RenderInterp};
 
@@ -54,6 +54,10 @@ pub fn setup_scene(
     let ship_material = materials.add(Color::srgb(0.30, 0.65, 1.0));
     commands.spawn((
         Ship,
+        // Per-entity intent: `input::read_input` writes this each frame and the
+        // shared `sim` flight/weapon systems read it (intent is no longer a
+        // global resource).
+        ShipIntent::default(),
         Position(Vec2::ZERO),
         Velocity(Vec2::ZERO),
         Heading(0.0),

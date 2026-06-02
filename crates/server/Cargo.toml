@@ -1,0 +1,28 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Headless authoritative simulation server (E003). A synchronous fixed-tick `bevy_ecs` app that polls the transport each tick: recv -> validate -> step `sim` -> encode -> send (AD-002). Single source of gameplay truth."
+
+[dependencies]
+bevy_ecs.workspace = true
+glam.workspace = true
+serde.workspace = true
+sim = { path = "../sim" }
+protocol = { path = "../protocol" }
+
+[features]
+default = []
+# Forwards to `protocol/udp` to pull in the renet UDP adapter for the later
+# real-UDP tests (TR-041). Off by default so the deterministic loopback path
+# builds and runs without renet (HINT-001).
+udp = ["protocol/udp"]
+
+# T067 (TR-047): per-client snapshot-encode benchmark. `harness = false` because
+# it is a plain `fn main()` timing loop (stable Rust, no nightly `#[bench]`, no
+# criterion dependency) — recorded-only, no pass/fail gate. Run with
+# `cargo bench -p server` or build it with `cargo build -p server --benches`.
+[[bench]]
+name = "encode"
+harness = false

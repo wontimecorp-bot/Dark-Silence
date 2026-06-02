@@ -11,7 +11,7 @@
 ## Technical Context
 
 **Language/Version**: Rust (edition 2021; toolchain 1.92.0; MSVC toolchain on the Windows dev host)
-**Primary Dependencies**: `renet` 2.0 + `renet_netcode` (UDP) + `bevy_renet`, confined behind `protocol`'s `NetTransport` adapter, used in **secure mode** (authenticated + encrypted connect-token sessions; stub token-issuer this epic → E004 replaces) (ADR-0014); `bitcode` (snapshot encoding); reuses `sim` (E001), extends `client` (E002); `bevy_ecs` 0.18 (headless server), `bevy` 0.18 (client), `glam`, `serde`
+**Primary Dependencies**: `renet` 2.0 + `renet_netcode` (UDP; `bevy_renet` intentionally omitted per AD-002 — the headless server polls renet directly), confined behind `protocol`'s `NetTransport` adapter (renet optional behind the `udp` feature — loopback-first, HINT-001), used in **secure mode** (authenticated + encrypted connect-token sessions; stub token-issuer this epic → E004 replaces) (ADR-0014); `bitcode` (snapshot encoding); reuses `sim` (E001), extends `client` (E002); `bevy_ecs` 0.18 (headless server), `bevy` 0.18 (client), `glam`, `serde`
 **Storage**: N/A — no persistence this epic (E004)
 **Testing**: `cargo test` (pure-logic unit + headless-bot integration over the in-memory loopback, with simulated loss/jitter), `clippy -D warnings`, `rustfmt`, `cargo-audit`
 **Target Platform**: Desktop Bevy client + headless native server; Windows dev (MSVC)
@@ -207,8 +207,8 @@ Logging policy: rejected/invalid/malformed events log offending `ConnectionId`/`
 ### Source Code
 
 ```text
-~ Cargo.toml                       # + crates/protocol, crates/server members; + renet/renet_netcode/bevy_renet/bitcode deps
-+ crates/protocol/Cargo.toml       # deps: renet, renet_netcode, bevy_renet, bitcode, glam, serde, sim
+~ Cargo.toml                       # + crates/protocol, crates/server members; + renet/renet_netcode/bitcode deps
++ crates/protocol/Cargo.toml       # deps: bitcode, glam, serde, sim; renet/renet_netcode optional behind `udp` feature
     + src/lib.rs
     + src/messages.rs              # Connect/ClientInput/Snapshot/SnapshotAck/Disconnect (library-agnostic)
     + src/transport.rs            # NetTransport trait (glam/sim/protocol types only)
@@ -239,4 +239,4 @@ Logging policy: rejected/invalid/malformed events log offending `ConnectionId`/`
 - **[HINT-002]** Constraint: `protocol`'s public surface (`NetTransport`, messages) MUST name no renet type (SC-006); confine renet to `renet_adapter` (mirror the E001 `Physics`/`RapierPhysics` seam).
 - **[HINT-003]** Gotcha: reconciliation needs the client's predicted `sim` and the server's authoritative `sim` to be the **same deterministic code + `FixedDt`**; reuse `crates/sim` unchanged and re-seed from each snapshot to absorb f32 drift.
 - **[HINT-004]** Channels: map reliability per message (handshake reliable-ordered; `ClientInput` unreliable + redundant tail; `Snapshot` unreliable + delta + ack); never force everything reliable (head-of-line latency).
-- **[HINT-005]** Compatibility: pin `renet`/`renet_netcode`/`bevy_renet` to the Bevy 0.18-compatible versions; the headless server is a `bevy_ecs` app polling renet each fixed tick (no tokio/async for E003); apply the MSVC + build-env workarounds (the new deps grow the build tree).
+- **[HINT-005]** Compatibility: pin `renet`/`renet_netcode` (2.0) to compatible versions (`bevy_renet` omitted — AD-002); the headless server is a `bevy_ecs` app polling renet each fixed tick (no tokio/async for E003); apply the MSVC + build-env workarounds (the new deps grow the build tree).

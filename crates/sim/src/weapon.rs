@@ -26,18 +26,22 @@ pub fn cooldown_after_fire(fire_rate: f32) -> f32 {
     1.0 / fire_rate
 }
 
-/// Fixed-step weapon firing (FR-005): tick the cooldown down, and on a `fire`
-/// intent (when cool) spawn a projectile along the ship's heading at muzzle
-/// speed. The projectile records its spawn position as `PrevPosition` so the
-/// very first swept test has a valid segment.
+/// Fixed-step weapon firing (FR-005): tick each ship's cooldown down, and on
+/// that ship's own `fire` intent (when cool) spawn a projectile along its
+/// heading at muzzle speed. The projectile records its spawn position as
+/// `PrevPosition` so the very first swept test has a valid segment.
+///
+/// Intent is **per-entity**: the ship query carries each ship's own
+/// [`ShipIntent`] component, so N independently-controlled ships fire from their
+/// own inputs in one shared step. A ship without the component is not piloted
+/// and does not fire.
 pub fn weapon_fire_system(
-    intent: Res<ShipIntent>,
     dt: Res<FixedDt>,
     mut commands: Commands,
-    mut ship_q: Query<(Entity, &Position, &Heading, &mut Weapon), With<Ship>>,
+    mut ship_q: Query<(Entity, &ShipIntent, &Position, &Heading, &mut Weapon), With<Ship>>,
 ) {
     let dt = dt.0;
-    for (owner, pos, heading, mut weapon) in &mut ship_q {
+    for (owner, intent, pos, heading, mut weapon) in &mut ship_q {
         if weapon.cooldown > 0.0 {
             weapon.cooldown -= dt;
         }

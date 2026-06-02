@@ -1,14 +1,21 @@
 //! The pilot's per-step intent — the seam between client input and `sim`.
 //!
-//! The Bevy client's input system writes this resource each frame; `sim`
-//! systems read it. Gameplay reacts only to intents, never to raw device input
-//! (Principle II): the same systems run unchanged when E003 feeds intents from
-//! the network instead of the keyboard.
+//! Each controllable ship carries its OWN `ShipIntent` **component**: the
+//! authoritative server can drive N independently-controlled ships in one shared
+//! step (SC-001 / TR-002), the Bevy client writes the local player ship's
+//! component each frame, and `sim` systems query it per-entity. Gameplay reacts
+//! only to intents, never to raw device input (Principle II): the same systems
+//! run unchanged whether intents come from the keyboard or the network.
+//!
+//! A ship without a `ShipIntent` component simply receives no piloted thrust;
+//! AI-driven ships (and other entities) are steered by their own systems and do
+//! not need one.
 
-use bevy_ecs::prelude::Resource;
+use bevy_ecs::prelude::Component;
 
-/// Discrete pilot inputs for the current step. Axes are in `-1.0..=1.0`.
-#[derive(Resource, Clone, Copy, Debug, Default, PartialEq)]
+/// Discrete pilot inputs for the current step, attached to the ship it pilots.
+/// Axes are in `-1.0..=1.0`.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct ShipIntent {
     /// Forward (`+1`) / reverse (`-1`) thrust.
     pub forward: f32,

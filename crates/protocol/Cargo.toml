@@ -1,0 +1,23 @@
+[package]
+name = "protocol"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Library-agnostic wire protocol (messages + NetTransport seam + in-memory loopback + quantization) for the authoritative netcode (E003). No renet type appears in the public surface (SC-006); the renet UDP adapter is gated behind the `udp` feature (HINT-001/002, ADR-0014)."
+
+[dependencies]
+glam.workspace = true
+serde.workspace = true
+bitcode.workspace = true
+sim = { path = "../sim" }
+
+# renet is OPTIONAL and gated behind the `udp` feature. The loopback /
+# messages / transport / quantize modules build with no renet present
+# (HINT-001 — prove loopback before renet); the renet adapter (Phase 4) lives
+# behind `udp` so the netcode library stays confined (HINT-002, SC-006).
+renet = { workspace = true, optional = true }
+renet_netcode = { workspace = true, optional = true }
+
+[features]
+default = []
+udp = ["dep:renet", "dep:renet_netcode"]

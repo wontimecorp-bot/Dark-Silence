@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sim", "crates/client"]
+members = ["crates/sim", "crates/client", "crates/protocol", "crates/server"]
 
 # Shared, version-pinned dependencies. Crates opt in via `dep.workspace = true`.
 # Heavy deps (bevy, lightyear, sqlx, redis, tokio, bitcode, tracing)
@@ -17,6 +17,18 @@ rapier2d = { version = "0.32" }
 # to the same minor as `bevy_ecs` above so a single `bevy_ecs` version resolves
 # (HINT-004 — a second version fails to build).
 bevy = { version = "0.18" }
+# Snapshot wire encoding: bit-packed, quantized (ADR-0007, TR-013).
+bitcode = { version = "0.6" }
+# Transport-level UDP netcode (ADR-0014). renet supplies only the transport;
+# prediction/reconciliation/interpolation/snapshots are game-owned in `sim` +
+# `protocol`. Confined behind `protocol::NetTransport` / the `renet_adapter`
+# module so no renet type leaks into the public surface (HINT-002, SC-006).
+renet = { version = "2" }
+renet_netcode = { version = "2" }
+# NOTE: `bevy_renet` is intentionally OMITTED. Per AD-002 the headless server is
+# a synchronous fixed-tick `bevy_ecs` app that polls renet directly each tick;
+# it needs no Bevy plugin, which also avoids coupling renet to Bevy 0.18's app
+# layer. Add it only if a future epic moves netcode into a Bevy plugin.
 
 [workspace.package]
 edition = "2021"

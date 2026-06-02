@@ -2,9 +2,12 @@
 //!
 //! Each test builds a `bevy_ecs` `World` + a chained fixed-step `Schedule` (the
 //! same system order the client runs in `FixedUpdate`) and advances it a known
-//! number of ticks with scripted `ShipIntent` — no Bevy app, no rendering, no
-//! window. This is what makes the fixed-step sim deterministic and testable
-//! (FR-016/FR-017).
+//! number of ticks with scripted per-ship `ShipIntent` components — no Bevy app,
+//! no rendering, no window. This is what makes the fixed-step sim deterministic
+//! and testable (FR-016/FR-017).
+//!
+//! Intent is per-entity: each ship carries its own `ShipIntent` component, so a
+//! test scripts a ship by mutating that ship's component (see [`set_intent`]).
 
 use bevy_ecs::prelude::*;
 use glam::Vec2;
@@ -17,9 +20,14 @@ fn make_world() -> World {
     let mut w = World::new();
     w.insert_resource(Tuning::default());
     w.insert_resource(FixedDt(DT));
-    w.insert_resource(ShipIntent::default());
     w.insert_resource(HitFeedback::default());
     w
+}
+
+/// Mutate a ship's own `ShipIntent` component (intent is per-entity).
+fn set_intent(w: &mut World, ship: Entity, f: impl FnOnce(&mut ShipIntent)) {
+    let mut intent = w.get_mut::<ShipIntent>(ship).expect("ship has ShipIntent");
+    f(&mut intent);
 }
 
 /// The fixed-step pipeline in the same order the client schedules it.
@@ -44,6 +52,7 @@ fn make_schedule() -> Schedule {
 fn spawn_ship(w: &mut World, pos: Vec2, heading: f32, vel: Vec2) -> Entity {
     w.spawn((
         Ship,
+        ShipIntent::default(),
         Position(pos),
         Velocity(vel),
         Heading(heading),
@@ -72,7 +81,7 @@ fn thrust_accelerates_then_releasing_coasts() {
     let ship = spawn_ship(&mut w, Vec2::ZERO, 0.0, Vec2::ZERO); // nose +x
     let mut sched = make_schedule();
 
-    w.resource_mut::<ShipIntent>().forward = 1.0;
+    set_intent(&mut w, ship, |i| i.forward = 1.0);
     for _ in 0..30 {
         sched.run(&mut w);
     }
@@ -80,7 +89,7 @@ fn thrust_accelerates_then_releasing_coasts() {
     assert!(after_thrust.x > 0.0, "thrust should build +x velocity");
 
     // Release thrust → coast at constant velocity (no friction).
-    w.resource_mut::<ShipIntent>().forward = 0.0;
+    set_intent(&mut w, ship, |i| i.forward = 0.0);
     sched.run(&mut w);
     let v1 = w.get::<Velocity>(ship).unwrap().0;
     sched.run(&mut w);
@@ -94,7 +103,7 @@ fn thrust_accelerates_then_releasing_coasts() {
 #[test]
 fn firing_destroys_a_target_ahead() {
     let mut w = make_world();
-    spawn_ship(&mut w, Vec2::ZERO, 0.0, Vec2::ZERO); // nose +x
+    let ship = spawn_ship(&mut w, Vec2::ZERO, 0.0, Vec2::ZERO); // nose +x
     w.spawn((
         Target,
         TargetKind::Dummy,
@@ -105,7 +114,7 @@ fn firing_destroys_a_target_ahead() {
     ));
     let mut sched = make_schedule();
 
-    w.resource_mut::<ShipIntent>().fire = true;
+    set_intent(&mut w, ship, |i| i.fire = true);
     for _ in 0..20 {
         sched.run(&mut w);
     }
@@ -219,15 +228,14 @@ fn fixed_step_is_bit_identical_under_identical_inputs() {
         (w, make_schedule(), ship)
     }
 
-    fn step(w: &mut World, sched: &mut Schedule, input: (f32, f32, f32, bool)) {
-        {
-            let mut intent = w.resource_mut::<ShipIntent>();
+    fn step(w: &mut World, sched: &mut Schedule, ship: Entity, input: (f32, f32, f32, bool)) {
+        set_intent(w, ship, |intent| {
             intent.forward = input.0;
             intent.strafe = input.1;
             intent.turn = input.2;
             intent.fire = input.3;
             intent.toggle_assist = false;
-        }
+        });
         sched.run(w);
     }
 
@@ -241,8 +249,8 @@ fn fixed_step_is_bit_identical_under_identical_inputs() {
     let (mut wb, mut sb, ship_b) = build();
     for i in 0..120 {
         let input = inputs[i % inputs.len()];
-        step(&mut wa, &mut sa, input);
-        step(&mut wb, &mut sb, input);
+        step(&mut wa, &mut sa, ship_a, input);
+        step(&mut wb, &mut sb, ship_b, input);
     }
 
     assert_eq!(
@@ -311,7 +319,7 @@ fn shot_connects_with_a_drifting_asteroid() {
     // A straight shot must connect with a slowly drifting asteroid — the player
     // can hit moving targets (US2 scenario 4 / CHK012).
     let mut w = make_world();
-    spawn_ship(&mut w, Vec2::ZERO, 0.0, Vec2::ZERO); // nose +x
+    let ship = spawn_ship(&mut w, Vec2::ZERO, 0.0, Vec2::ZERO); // nose +x
     w.spawn((
         Target,
         TargetKind::Asteroid,
@@ -321,7 +329,7 @@ fn shot_connects_with_a_drifting_asteroid() {
         Health(15.0),
     ));
     let mut sched = make_schedule();
-    w.resource_mut::<ShipIntent>().fire = true;
+    set_intent(&mut w, ship, |i| i.fire = true);
     for _ in 0..30 {
         sched.run(&mut w);
     }
@@ -337,7 +345,7 @@ fn projectiles_resolve_harmlessly_after_target_destroyed() {
     // After its target is gone, an in-flight projectile keeps going and expires
     // with no error and no leak (CHK017).
     let mut w = make_world();
-    spawn_ship(&mut w, Vec2::ZERO, 0.0, Vec2::ZERO);
+    let ship = spawn_ship(&mut w, Vec2::ZERO, 0.0, Vec2::ZERO);
     w.spawn((
         Target,
         TargetKind::Dummy,
@@ -347,7 +355,7 @@ fn projectiles_resolve_harmlessly_after_target_destroyed() {
         Health(5.0),
     ));
     let mut sched = make_schedule();
-    w.resource_mut::<ShipIntent>().fire = true;
+    set_intent(&mut w, ship, |i| i.fire = true);
     for _ in 0..10 {
         sched.run(&mut w);
     }
@@ -355,7 +363,7 @@ fn projectiles_resolve_harmlessly_after_target_destroyed() {
 
     // Stop firing and let any in-flight projectiles fly on past the empty space
     // and expire (lifetime 3 s = 180 ticks).
-    w.resource_mut::<ShipIntent>().fire = false;
+    set_intent(&mut w, ship, |i| i.fire = false);
     for _ in 0..200 {
         sched.run(&mut w);
     }
@@ -370,6 +378,7 @@ fn projectiles_resolve_harmlessly_after_target_destroyed() {
 fn spawn_flight_model_ship(w: &mut World) -> Entity {
     w.spawn((
         Ship,
+        ShipIntent::default(),
         Position(Vec2::ZERO),
         Velocity(Vec2::ZERO),
         Heading(0.0),
@@ -391,7 +400,7 @@ fn flight_model_caps_speed_at_terminal_velocity() {
     let mut w = make_world();
     let ship = spawn_flight_model_ship(&mut w);
     let mut sched = make_schedule();
-    w.resource_mut::<ShipIntent>().forward = 1.0;
+    set_intent(&mut w, ship, |i| i.forward = 1.0);
     for _ in 0..900 {
         sched.run(&mut w); // 15 s of full thrust
     }
@@ -412,7 +421,7 @@ fn hard_turn_diverts_thrust_and_bleeds_speed() {
     let mut w = make_world();
     let ship = spawn_flight_model_ship(&mut w);
     let mut sched = make_schedule();
-    w.resource_mut::<ShipIntent>().forward = 1.0;
+    set_intent(&mut w, ship, |i| i.forward = 1.0);
     for _ in 0..900 {
         sched.run(&mut w);
     }
@@ -421,11 +430,10 @@ fn hard_turn_diverts_thrust_and_bleeds_speed() {
 
     // Hold full thrust AND full turn: the shared power budget cuts available
     // thrust to 30%, so the reduced terminal velocity bleeds speed off.
-    {
-        let mut intent = w.resource_mut::<ShipIntent>();
+    set_intent(&mut w, ship, |intent| {
         intent.forward = 1.0;
         intent.turn = 1.0;
-    }
+    });
     for _ in 0..600 {
         sched.run(&mut w);
     }

@@ -9,10 +9,29 @@ license.workspace = true
 # and scene setup. Gameplay state and systems live in `sim`.
 [dependencies]
 bevy = { workspace = true }
+# Pure ECS, the SAME crate/version `sim` uses (HINT-004 pins the minor to
+# `bevy`), so the client's predicted `World`/`Schedule` are the exact types
+# `sim::add_fixed_step_systems` expects — prediction steps the shared sim
+# bit-identically to the server (AD-005 / HINT-003).
+bevy_ecs = { workspace = true }
 sim = { path = "../sim" }
+protocol = { path = "../protocol" }
+# The default loopback solo-play path (T045) embeds an authoritative `ServerApp`
+# and steps it each FixedUpdate, so `cargo run -p client` is a runnable
+# single-player experience over the in-memory transport (Principle VII). The
+# renet transport can be swapped in later behind the same `NetTransport` seam.
+server = { path = "../server" }
 glam = { workspace = true }
 
 [features]
 # Dev-only convenience (AD-005): faster iterative linking. Never enabled in a
 # release/CI artifact.
 dynamic_linking = ["bevy/dynamic_linking"]
+
+# Integration tests drive the prediction/reconciliation layer headlessly against
+# an embedded `server` over the in-memory loopback transport (no window, no
+# renet) — proving the netcode logic before the real UDP adapter (HINT-001).
+[dev-dependencies]
+server = { path = "../server" }
+protocol = { path = "../protocol" }
+glam = { workspace = true }

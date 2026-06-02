@@ -50,12 +50,17 @@ pub fn linear_accel(vel: Vec2, thrust: Vec2, drag: f32, mass: f32) -> Vec2 {
 /// drag gives an emergent top speed and bleeds momentum when thrust is cut.
 /// **Decoupled** (assist `Off`): instant rotation, no drag — pure Newtonian
 /// free-drift for advanced pilots.
+///
+/// Intent is **per-entity**: each piloted ship carries its own [`ShipIntent`]
+/// component, so the server can drive N independently-controlled ships in one
+/// shared step. A ship without the component is simply not piloted (no thrust);
+/// AI-driven ships are steered by [`crate::ai::seek_system`] instead.
 pub fn ship_motion_system(
-    intent: Res<ShipIntent>,
     tuning: Res<Tuning>,
     dt: Res<FixedDt>,
     mut q: Query<
         (
+            &ShipIntent,
             &mut Position,
             &mut Velocity,
             &mut Heading,
@@ -67,7 +72,7 @@ pub fn ship_motion_system(
 ) {
     let dt = dt.0;
     let t = &*tuning;
-    for (mut pos, mut vel, mut heading, mut omega, mut assist) in &mut q {
+    for (intent, mut pos, mut vel, mut heading, mut omega, mut assist) in &mut q {
         if intent.toggle_assist {
             *assist = match *assist {
                 FlightAssist::On => FlightAssist::Off,
