@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize};
 use super::content::ModuleCatalog;
 use super::fit::Fit;
 use super::hull::Hull;
-use super::module::{ModuleKind, ModuleSpecifics};
+use super::layout::{CellOccupant, FitLayout};
+use super::module::{Module, ModuleKind, ModuleSpecifics};
+use crate::damage::StatScalingConfig;
 use crate::tuning::Tuning;
 
 /// Smallest thrust force a fit can derive to (FR-017): no thruster ⇒ this floor,
@@ -154,6 +156,29 @@ impl ShipStats {
     }
 }
 
+/// The live contribution factor of one installed module, read from its hit-map
+/// occupant (FR-012/013, INV-D13). **Internal to derivation.**
+///
+/// - A **destroyed** module (`health <= 0`) returns `0.0` — a hard binary-off, so
+///   it contributes nothing to any stat (FR-013).
+/// - A **damaged-but-alive** module returns `(health / health_max)` clamped to
+///   `[0, 1]` and then floored at `cfg.stat_health_floor`, so a barely-alive drive
+///   still gives *some* output (a continuous degrade, not a cliff).
+/// - At **full** health the factor is exactly `1.0`, so derivation reproduces the
+///   pre-E007 contribution bit-for-bit (the baseline guard).
+///
+/// Pure / total / finite: `health_max > 0` by construction, and the `clamp`+`max`
+/// keep the result in `[stat_health_floor, 1]` (or exactly `0` when destroyed) —
+/// never `NaN`/`inf` (INV-F07 preserved).
+fn health_factor(occupant: &CellOccupant, module: &Module, cfg: &StatScalingConfig) -> f32 {
+    if occupant.health <= 0.0 {
+        return 0.0; // destroyed = hard binary off (INV-D13)
+    }
+    (occupant.health / module.health_max)
+        .clamp(0.0, 1.0)
+        .max(cfg.stat_health_floor) // damaged-but-alive, floored
+}
+
 /// Derive a ship's effective [`ShipStats`] from its [`Fit`] (FR-014/015/016/017).
 ///
 /// **Pure** — reads only its arguments, mutates nothing — so the running flight/
@@ -181,10 +206,30 @@ impl ShipStats {
 /// A dangling [`ModuleId`](super::module::ModuleId) contributes nothing (the
 /// dangling-ref *rejection* is `validate_fit`'s concern, INV-F13); derivation
 /// stays total and finite regardless.
-pub fn derive_ship_stats(hull: &Hull, fit: &Fit, catalog: &ModuleCatalog) -> ShipStats {
+///
+/// **Emergent damage (E007, FR-012/013, INV-D13)**: each module's *output*
+/// contribution (thrust/torque/strafe, reactor `power_gen`, weapon `damage`) is
+/// scaled by its live [`health_factor`] read from `layout` — a *damaged-but-alive*
+/// module scales linearly, clamped to `[stat_health_floor, 1]`; a *destroyed*
+/// module (health `0`) contributes exactly `0` (binary off). At **full** module
+/// health every factor is `1.0`, so the derivation reproduces the pre-E007
+/// numbers bit-for-bit (the baseline-reproduces-`Tuning` guard stays green).
+/// **Costs/physical** (`mass`, `power_draw`, `cpu_draw`) are **never** scaled by
+/// health — a damaged module still weighs and draws as much (INV-D13). The
+/// INV-F07 floors stay **after** scaling, so an all-drives-destroyed ship is
+/// near-immobile-but-finite, never `NaN`/`inf`.
+pub fn derive_ship_stats(
+    hull: &Hull,
+    fit: &Fit,
+    catalog: &ModuleCatalog,
+    layout: &FitLayout,
+) -> ShipStats {
     // Flight-feel constants the modules do not supply come from the demoted
     // `Tuning` baseline (HINT-002): the seed baseline fit reproduces these.
     let base = Tuning::default();
+    // The damaged-but-alive contribution floor is a named content reference (not a
+    // hardcoded literal), keeping the signature locked while honoring INV-D13.
+    let cfg = StatScalingConfig::default();
 
     let mut thrust_force = 0.0_f32;
     let mut turn_torque = 0.0_f32;
@@ -196,18 +241,33 @@ pub fn derive_ship_stats(hull: &Hull, fit: &Fit, catalog: &ModuleCatalog) -> Shi
     let mut weapon: Option<WeaponProfile> = None;
 
     // Iterate by SlotId (BTreeMap order) so derivation is deterministic — the
-    // first weapon module by slot wins when several are fitted (Principle II).
-    for module_id in fit.assignments.values() {
+    // first *alive* weapon module by slot wins when several are fitted (Principle II).
+    for (slot_id, module_id) in fit.assignments.iter() {
         let Some(module) = catalog.get(*module_id) else {
             // Dangling id: no contribution (validate_fit rejects the fit).
             continue;
         };
 
-        // Universal budget costs apply on every kind (data-model.md).
+        // Live health factor for this module, read from the layout's occupied cell
+        // (the one carrying this slot + an installed module). A defensive miss —
+        // an installed module with no occupied cell — applies no penalty (`1.0`),
+        // so derivation stays total (FR-012, INV-D13).
+        let hf = layout
+            .cells
+            .values()
+            .find(|o| o.slot == *slot_id && o.module.is_some())
+            .map(|occ| health_factor(occ, module, &cfg))
+            .unwrap_or(1.0);
+
+        // Universal budget costs apply on every kind and are NOT scaled by health
+        // (a damaged module still has mass / draws power+cpu, INV-D13).
         total_module_mass += module.mass;
-        power_gen += module.power_gen;
         power_draw += module.power_draw;
         cpu_draw += module.cpu_draw;
+
+        // Reactor power generation is an OUTPUT — scaled by health so a destroyed
+        // reactor (hf == 0) adds no `power_gen`, collapsing `power_supply` (FR-013).
+        power_gen += module.power_gen * hf;
 
         match module.specifics {
             ModuleSpecifics::Thruster {
@@ -215,21 +275,25 @@ pub fn derive_ship_stats(hull: &Hull, fit: &Fit, catalog: &ModuleCatalog) -> Shi
                 turn_torque: tq,
                 strafe_force: s,
             } => {
-                thrust_force += t;
-                turn_torque += tq;
-                strafe_force += s;
+                // Thruster outputs scale with health (FR-012): a battered drive
+                // gives less thrust/torque/strafe; a destroyed one (hf == 0) none.
+                thrust_force += t * hf;
+                turn_torque += tq * hf;
+                strafe_force += s * hf;
             }
-            // First weapon module by deterministic slot order populates the fire
-            // profile (FR-016; multi-weapon merge is a later epic).
+            // First *alive* weapon module by deterministic slot order populates the
+            // fire profile (FR-013/016): a destroyed weapon (hf == 0) is skipped so
+            // `can_fire` stays false; the surviving profile's `damage` scales by hf
+            // (at full health hf == 1.0 → identical, baseline-preserving).
             ModuleSpecifics::Weapon {
                 muzzle_speed,
                 fire_rate,
                 damage,
-            } if module.kind == ModuleKind::Weapon && weapon.is_none() => {
+            } if module.kind == ModuleKind::Weapon && weapon.is_none() && hf > 0.0 => {
                 weapon = Some(WeaponProfile {
                     muzzle_speed,
                     fire_rate,
-                    damage,
+                    damage: damage * hf,
                 });
             }
             _ => {}
@@ -266,6 +330,7 @@ pub fn derive_ship_stats(hull: &Hull, fit: &Fit, catalog: &ModuleCatalog) -> Shi
 mod tests {
     use super::*;
     use crate::fitting::content::{baseline_fit, baseline_hull, seed_catalogs};
+    use crate::fitting::layout::build_layout;
 
     #[test]
     fn baseline_fit_reproduces_tuning_defaults() {
@@ -275,7 +340,8 @@ mod tests {
         let (modules, _) = seed_catalogs();
         let hull = baseline_hull();
         let fit = baseline_fit();
-        let stats = derive_ship_stats(&hull, &fit, &modules);
+        let layout = build_layout(&hull, &fit, &modules);
+        let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
         let t = Tuning::default();
         assert!((stats.thrust_force - t.thrust_force).abs() < 1e-4);
         assert!((stats.reverse_force - t.reverse_force).abs() < 1e-4);
@@ -300,7 +366,8 @@ mod tests {
             .unwrap()
             .clone();
         let fit = Fit::new(hull.id);
-        let stats = derive_ship_stats(&hull, &fit, &modules);
+        let layout = build_layout(&hull, &fit, &modules);
+        let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
         assert!(stats.is_finite_and_floored());
         assert_eq!(stats.thrust_force, THRUST_FLOOR);
         assert_eq!(stats.turn_torque, TORQUE_FLOOR);

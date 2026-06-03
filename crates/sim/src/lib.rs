@@ -20,6 +20,7 @@ pub mod clock;
 pub mod collision;
 pub mod combat;
 pub mod components;
+pub mod damage;
 pub mod fitting;
 pub mod flight;
 pub mod intent;

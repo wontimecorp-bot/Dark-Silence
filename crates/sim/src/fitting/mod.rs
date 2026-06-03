@@ -64,25 +64,34 @@ pub use validate::{
 
 use bevy_ecs::prelude::*;
 
-/// Re-derive a ship's [`ShipStats`] **and** rebuild its [`FitLayout`] whenever its
-/// [`Fit`] mutates (INV-F08, FR-014/019).
+/// Re-derive a ship's [`ShipStats`] whenever its [`Fit`] **or** its [`FitLayout`]
+/// changes (INV-F08, FR-012/013/014/019, INV-D13) — the E007 emergent-damage hook.
 ///
-/// The fit-change recompute system: it runs only for entities whose [`Fit`]
-/// changed this run ([`Changed<Fit>`]), resolving the hull in [`HullCatalog`] and
-/// the modules in [`ModuleCatalog`], and overwrites the ship's [`ShipStats`] with
-/// the freshly [`derive_ship_stats`]-d value — so a running ship's flight/weapon
-/// behavior always reflects its current fit. The hit/armor map ([`FitLayout`]) is
-/// rebuilt on the **same** trigger ([`build_layout`]) so the E007 hitbox stays in
-/// lock-step with the live fit (INV-F08). Pure derivation, no other state is
-/// touched.
+/// The recompute system fires on `Or<(Changed<Fit>, Changed<FitLayout>)>` and folds
+/// the two triggers carefully, because a fit re-configure and a damage event mean
+/// opposite things for the layout:
 ///
-/// Override-or-fallback contract (Phase 4/5): this attaches/updates `ShipStats`
-/// only on entities that already carry both a [`Fit`] and a [`ShipStats`]
-/// component, and rebuilds the [`FitLayout`] **only** when the entity also carries
-/// one ([`Option<&mut FitLayout>`]). Unfitted ships (E001/E002/E003 fixtures,
-/// server/bot ships) carry none of these and are untouched — they keep flying on
-/// the global [`Tuning`](crate::tuning::Tuning) via the flight system's fallback
-/// path and have no positional hit-map.
+/// - **`Changed<Fit>`** — the fit was re-configured (install/remove). The layout is
+///   **rebuilt** fresh ([`build_layout`], full health: re-fitting repairs), then
+///   stats derive from it.
+/// - **only `Changed<FitLayout>`** — `apply_damage` mutated a cell's health. The
+///   layout is **NOT** rebuilt (that would erase the damage); stats derive from the
+///   existing *damaged* layout, so a battered ship derives degraded numbers
+///   (SC-002, FR-012/013).
+///
+/// Either way the ship's [`ShipStats`] is overwritten with the freshly
+/// [`derive_ship_stats`]-d value, so flight/weapon behavior always reflects the
+/// current fit **and** its live damage. Pure derivation, no other state touched.
+///
+/// One-tick echo (harmless): rebuilding the layout on a fit change sets
+/// `Changed<FitLayout>`, so the system runs again next tick — but with `Fit`
+/// unchanged it takes the no-rebuild branch and re-derives idempotently.
+///
+/// Override-or-fallback contract: this updates only entities that carry **all** of
+/// [`Fit`] + [`ShipStats`] + [`FitLayout`] (a fitted ship always has a layout).
+/// Unfitted ships (E001/E002/E003 fixtures, server/bot ships) carry none of these
+/// and are untouched — they keep flying on the global
+/// [`Tuning`](crate::tuning::Tuning) via the flight system's fallback path.
 ///
 /// A [`Fit`] referencing an unknown hull is skipped (no panic) — derivation +
 /// layout both require a resolvable hull; the dangling-ref *rejection* is
@@ -90,18 +99,21 @@ use bevy_ecs::prelude::*;
 pub fn recompute_ship_stats_system(
     hulls: Res<HullCatalog>,
     modules: Res<ModuleCatalog>,
-    mut q: Query<(&Fit, &mut ShipStats, Option<&mut FitLayout>), Changed<Fit>>,
+    mut q: Query<
+        (Ref<Fit>, &mut ShipStats, &mut FitLayout),
+        Or<(Changed<Fit>, Changed<FitLayout>)>,
+    >,
 ) {
-    for (fit, mut stats, layout) in &mut q {
+    for (fit, mut stats, mut layout) in &mut q {
         let Some(hull) = hulls.get(fit.hull) else {
             // Unknown hull: cannot derive; leave the prior stats/layout untouched.
             continue;
         };
-        *stats = derive_ship_stats(hull, fit, &modules);
-        // Rebuild the hit/armor map on the same fit change (INV-F08), but only for
-        // a fitted ship that already carries one — an unfitted entity has no layout.
-        if let Some(mut layout) = layout {
-            *layout = build_layout(hull, fit, &modules);
+        // A fit re-configure rebuilds the layout fresh (full health = repaired);
+        // a layout-only change (damage) preserves the damaged health.
+        if fit.is_changed() {
+            *layout = build_layout(hull, &fit, &modules);
         }
+        *stats = derive_ship_stats(hull, &fit, &modules, &layout);
     }
 }

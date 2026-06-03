@@ -255,8 +255,11 @@ fn attach_starter_fit(server: &mut ServerApp, local_id: EntityId) {
     let _ = fit.install_module(SlotId(2), MODULE_THRUSTER_BASIC, &hull, &modules);
     let _ = fit.install_module(SlotId(3), MODULE_AUTOCANNON, &hull, &modules);
 
-    let stats = derive_ship_stats(&hull, &fit, &modules);
+    // Build the full-health hit/armor map first, then derive stats against it
+    // (E007 BREAKING-CHANGE: derive_ship_stats now reads per-cell health). At full
+    // health every module's health-factor is 1.0, so stats match the pre-E007 derive.
     let layout = build_layout(&hull, &fit, &modules);
+    let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
 
     let Some(ship) = server.ship_entity_for(local_id) else {
         return;

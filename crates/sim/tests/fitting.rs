@@ -559,8 +559,8 @@ mod stats_phase4 {
     use glam::Vec2;
     use sim::components::*;
     use sim::fitting::{
-        baseline_fit, baseline_hull, derive_ship_stats, recompute_ship_stats_system, seed_catalogs,
-        Fit, Hull, ModuleCatalog, ModuleSpecifics, ShipStats, SlotId, HULL_FIGHTER,
+        baseline_fit, baseline_hull, build_layout, derive_ship_stats, recompute_ship_stats_system,
+        seed_catalogs, Fit, Hull, ModuleCatalog, ModuleSpecifics, ShipStats, SlotId, HULL_FIGHTER,
         MODULE_ARMOR_PLATE, MODULE_AUTOCANNON, MODULE_THRUSTER_BASIC,
     };
     use sim::{FixedDt, ShipIntent, Tuning};
@@ -591,8 +591,10 @@ mod stats_phase4 {
         one.install_module(SlotId(1), MODULE_THRUSTER_BASIC, &hull, &modules)
             .unwrap();
 
-        let stats_one = derive_ship_stats(&hull, &one, &modules);
-        let stats_two = derive_ship_stats(&hull, &two, &modules);
+        let layout_one = build_layout(&hull, &one, &modules);
+        let layout_two = build_layout(&hull, &two, &modules);
+        let stats_one = derive_ship_stats(&hull, &one, &modules, &layout_one);
+        let stats_two = derive_ship_stats(&hull, &two, &modules, &layout_two);
         assert!(
             stats_two.thrust_force > stats_one.thrust_force,
             "two thrusters give more thrust"
@@ -617,8 +619,10 @@ mod stats_phase4 {
             .install_module(SlotId(5), MODULE_ARMOR_PLATE, &hull, &modules)
             .unwrap();
 
-        let s_light = derive_ship_stats(&hull, &light, &modules);
-        let s_heavy = derive_ship_stats(&hull, &heavy, &modules);
+        let layout_light = build_layout(&hull, &light, &modules);
+        let layout_heavy = build_layout(&hull, &heavy, &modules);
+        let s_light = derive_ship_stats(&hull, &light, &modules, &layout_light);
+        let s_heavy = derive_ship_stats(&hull, &heavy, &modules, &layout_heavy);
         assert!(s_heavy.total_mass > s_light.total_mass, "armor adds mass");
         // Same thrust, more mass ⇒ lower initial acceleration (agility).
         assert_eq!(s_heavy.thrust_force, s_light.thrust_force);
@@ -634,7 +638,8 @@ mod stats_phase4 {
     fn no_weapon_module_means_cannot_fire() {
         // A fit with thrusters but no weapon module ⇒ can_fire == false, no profile.
         let (modules, hull, fit) = two_thruster_fighter();
-        let stats = derive_ship_stats(&hull, &fit, &modules);
+        let layout = build_layout(&hull, &fit, &modules);
+        let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
         assert!(!stats.can_fire, "no weapon module ⇒ cannot fire");
         assert!(stats.weapon.is_none());
 
@@ -644,7 +649,8 @@ mod stats_phase4 {
         // covered by the US1 validation tests, not this derivation test.
         let mut armed = fit.clone();
         armed.install_raw(SlotId(3), MODULE_AUTOCANNON);
-        let armed_stats = derive_ship_stats(&hull, &armed, &modules);
+        let armed_layout = build_layout(&hull, &armed, &modules);
+        let armed_stats = derive_ship_stats(&hull, &armed, &modules, &armed_layout);
         assert!(armed_stats.can_fire, "a weapon module enables firing");
         let profile = armed_stats.weapon.expect("weapon profile present");
         let cannon = modules.get(MODULE_AUTOCANNON).unwrap();
@@ -669,7 +675,8 @@ mod stats_phase4 {
         let (modules, hulls) = seed_catalogs();
         let hull = hulls.get(HULL_FIGHTER).unwrap().clone();
         let fit = Fit::new(HULL_FIGHTER);
-        let stats = derive_ship_stats(&hull, &fit, &modules);
+        let layout = build_layout(&hull, &fit, &modules);
+        let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
 
         assert!(stats.is_finite_and_floored());
         assert!(stats.thrust_force > 0.0 && stats.thrust_force.is_finite());
@@ -688,7 +695,8 @@ mod stats_phase4 {
         let (modules, _) = seed_catalogs();
         let hull = baseline_hull();
         let fit = baseline_fit();
-        let stats = derive_ship_stats(&hull, &fit, &modules);
+        let layout = build_layout(&hull, &fit, &modules);
+        let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
         let t = Tuning::default();
 
         assert!((stats.thrust_force - t.thrust_force).abs() < 1e-4, "thrust");
@@ -737,7 +745,13 @@ mod stats_phase4 {
         // fit-derived stats — the baseline fit reaches the Tuning top speed, and
         // a higher-thrust fit reaches a measurably higher top speed.
         let (modules, _) = seed_catalogs();
-        let baseline_stats = derive_ship_stats(&baseline_hull(), &baseline_fit(), &modules);
+        let baseline_layout = build_layout(&baseline_hull(), &baseline_fit(), &modules);
+        let baseline_stats = derive_ship_stats(
+            &baseline_hull(),
+            &baseline_fit(),
+            &modules,
+            &baseline_layout,
+        );
 
         let mut w = World::new();
         // Tuning is still present (unfitted ships read it); the fitted ship
@@ -774,13 +788,16 @@ mod stats_phase4 {
         let mut fit = Fit::new(HULL_FIGHTER);
         fit.install_module(SlotId(1), MODULE_THRUSTER_BASIC, &hull, &modules)
             .unwrap();
-        let initial = derive_ship_stats(&hull, &fit, &modules);
+        let layout = build_layout(&hull, &fit, &modules);
+        let initial = derive_ship_stats(&hull, &fit, &modules, &layout);
 
         let mut w = World::new();
         let (m, h) = seed_catalogs();
         w.insert_resource(m);
         w.insert_resource(h);
-        let ship = w.spawn((Ship, fit.clone(), initial)).id();
+        // A fitted ship carries a FitLayout — the recompute system (E007) now
+        // requires it (it derives stats against the layout's live cell health).
+        let ship = w.spawn((Ship, fit.clone(), initial, layout)).id();
 
         let mut sched = Schedule::default();
         sched.add_systems(recompute_ship_stats_system);
@@ -1003,8 +1020,8 @@ mod layout_phase5 {
         let hull = hulls.get(HULL_FIGHTER).unwrap().clone();
 
         let fit = Fit::new(HULL_FIGHTER);
-        let stats = sim::fitting::derive_ship_stats(&hull, &fit, &modules);
         let layout = build_layout(&hull, &fit, &modules);
+        let stats = sim::fitting::derive_ship_stats(&hull, &fit, &modules, &layout);
         let reactor_coord = hull.slot(SlotId(0)).unwrap().coord;
         // Initially the reactor cell is empty.
         assert_eq!(layout.occupant(reactor_coord).unwrap().module, None);
@@ -1050,9 +1067,9 @@ mod layout_phase5 {
 
 mod tradeoffs_phase6 {
     use sim::fitting::{
-        budget_usage, derive_ship_stats, seed_catalogs, validate_fit, Fit, HardpointType, Hull,
-        HullCatalog, ModuleCatalog, ModuleId, HULL_CORVETTE, HULL_FIGHTER, MODULE_ARMOR_PLATE,
-        MODULE_AUTOCANNON, MODULE_REACTOR_BASIC, MODULE_THRUSTER_BASIC,
+        budget_usage, build_layout, derive_ship_stats, seed_catalogs, validate_fit, Fit,
+        HardpointType, Hull, HullCatalog, ModuleCatalog, ModuleId, HULL_CORVETTE, HULL_FIGHTER,
+        MODULE_ARMOR_PLATE, MODULE_AUTOCANNON, MODULE_REACTOR_BASIC, MODULE_THRUSTER_BASIC,
     };
 
     /// Fill every slot of `kind`-matching type on `hull` with `module` (raw install
@@ -1218,8 +1235,10 @@ mod tradeoffs_phase6 {
         // acceleration (agility = thrust / mass) is lower than the fighter's.
         let fighter_fit = max_speed(fighter);
         let corvette_fit = max_speed(corvette);
-        let fs = derive_ship_stats(fighter, &fighter_fit, &modules);
-        let cs = derive_ship_stats(corvette, &corvette_fit, &modules);
+        let fighter_layout = build_layout(fighter, &fighter_fit, &modules);
+        let corvette_layout = build_layout(corvette, &corvette_fit, &modules);
+        let fs = derive_ship_stats(fighter, &fighter_fit, &modules, &fighter_layout);
+        let cs = derive_ship_stats(corvette, &corvette_fit, &modules, &corvette_layout);
 
         assert!(
             cs.thrust_force > fs.thrust_force,
@@ -1253,8 +1272,8 @@ mod tradeoffs_phase6 {
 /// `derive_ship_stats` / `budget_usage` on the same fit.
 mod presets_phase7 {
     use sim::fitting::{
-        budget_usage, derive_ship_stats, load_preset, preview_stats, save_preset, seed_catalogs,
-        Fit, FitRejection, SlotId, HULL_CORVETTE, HULL_FIGHTER, MODULE_AUTOCANNON,
+        budget_usage, build_layout, derive_ship_stats, load_preset, preview_stats, save_preset,
+        seed_catalogs, Fit, FitRejection, SlotId, HULL_CORVETTE, HULL_FIGHTER, MODULE_AUTOCANNON,
         MODULE_REACTOR_BASIC, MODULE_THRUSTER_BASIC,
     };
 
@@ -1320,7 +1339,10 @@ mod presets_phase7 {
         let (preview_budget, preview_stats_value) = preview_stats(&hull, &fit, &modules);
 
         let committed_budget = budget_usage(&hull, &fit, &modules);
-        let committed_stats = derive_ship_stats(&hull, &fit, &modules);
+        // SC-006: a spawn-time commit derives against a full-health layout, exactly
+        // what `preview_stats` builds internally — so the two stay equal.
+        let committed_layout = build_layout(&hull, &fit, &modules);
+        let committed_stats = derive_ship_stats(&hull, &fit, &modules, &committed_layout);
 
         assert_eq!(
             preview_budget, committed_budget,

@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use super::content::ModuleCatalog;
 use super::hull::{Hull, HullId, SlotId};
+use super::layout::build_layout;
 use super::module::{Axis, ModuleId, Violation};
 use super::stats::{derive_ship_stats, ShipStats};
 use super::validate::{budget_usage, check_slot_fit, validate_fit, BudgetUsage};
@@ -287,9 +288,13 @@ pub fn load_preset(
 /// a future authoritative server derive on (Principle II) — the preview is exactly
 /// what a commit would produce.
 pub fn preview_stats(hull: &Hull, fit: &Fit, catalog: &ModuleCatalog) -> (BudgetUsage, ShipStats) {
+    // Preview is pre-commit — there is no live ship/layout yet — so build a
+    // full-health layout to derive against. At full health every module's
+    // health-factor is `1.0`, so the preview equals a spawn-time commit (SC-006).
+    let layout = build_layout(hull, fit, catalog);
     (
         budget_usage(hull, fit, catalog),
-        derive_ship_stats(hull, fit, catalog),
+        derive_ship_stats(hull, fit, catalog, &layout),
     )
 }
 

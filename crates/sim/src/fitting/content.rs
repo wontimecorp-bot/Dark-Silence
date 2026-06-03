@@ -564,11 +564,15 @@ mod tests {
     fn baseline_fit_derives_to_tuning_defaults() {
         // HINT-002: the baseline reference fit reproduces Tuning::default() — the
         // flight-feel guard. (Full assertion lives in stats.rs / tests/fitting.rs.)
+        use super::super::layout::build_layout;
         use super::super::stats::derive_ship_stats;
         let (modules, _) = seed_catalogs();
         let hull = baseline_hull();
         let fit = baseline_fit();
-        let stats = derive_ship_stats(&hull, &fit, &modules);
+        // Full-health layout: every health-factor is 1.0, so the derive reproduces
+        // the pre-E007 Tuning::default() numbers bit-for-bit (the green-keeper).
+        let layout = build_layout(&hull, &fit, &modules);
+        let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
         let t = crate::tuning::Tuning::default();
         assert!((stats.thrust_force - t.thrust_force).abs() < 1e-4);
         assert!((stats.total_mass - t.mass).abs() < 1e-4);
