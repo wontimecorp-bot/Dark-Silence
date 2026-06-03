@@ -63,9 +63,11 @@ pub struct ShieldChild {
     pub material: Handle<StandardMaterial>,
 }
 
-/// Marker for a shield-flash child entity (E007 live-demo) — the fixed-size cyan
-/// sphere parented to a rendered ship. Tagged so its [`Visibility`] can be toggled by
-/// [`crate::net::capture_render_state`] (alpha is faded via its material).
+/// Marker for a shield-flash child entity (E007 live-demo) — the glowing cyan **arc
+/// segment of the shield ring** ([`crate::scene::build_arc_band_mesh`]) parented to a
+/// rendered ship and rotated about Z to face the impact bearing. Tagged so its
+/// [`Visibility`] can be toggled by [`crate::net::capture_render_state`] (alpha is faded
+/// via its material).
 #[derive(Component, Clone, Copy, Debug)]
 pub struct ShieldBubble;
 

@@ -14,6 +14,8 @@
 //! rendered entity with the right look by [`protocol::EntityKind`] (+ the target
 //! sub-kind in `flags`).
 
+use bevy::asset::RenderAssetUsages;
+use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use sim::components::{FlightAssist, Health, Ship, Velocity};
 
@@ -42,12 +44,15 @@ pub struct RenderAssets {
     pub asteroid_material: Handle<StandardMaterial>,
     pub seeker_mesh: Handle<Mesh>,
     pub seeker_material: Handle<StandardMaterial>,
-    /// Localized shield-impact flash (FIX 0a): a small bright cyan disc/sphere spawned
-    /// once as a child of a rendered ship and placed on the shield surface AT the
-    /// bullet impact point (`hit_dir`), shown ONLY for the split-second a shot strikes
-    /// the still-up shield (`shield_flash > 0`), its alpha fading with the flash. This
-    /// REPLACES the old full-ship bubble — the user disliked the whole-ship bloom.
-    pub shield_impact_mesh: Handle<Mesh>,
+    /// Localized shield-impact flash (FIX 0a refinement): a glowing cyan **arc segment
+    /// of the shield ring** ([`build_arc_band_mesh`]) spawned once as a child of a
+    /// rendered ship and **rotated** about Z so the lit slice faces the bullet impact
+    /// bearing (`hit_dir`), shown ONLY for the split-second a shot strikes the still-up
+    /// shield (`shield_flash > 0`), its alpha fading with the flash. This REPLACES the
+    /// earlier small impact-point sphere (a flat ribbon reads as the deflector ring
+    /// flaring, not a stray dot), which itself REPLACED the old full-ship bubble — the
+    /// user disliked the whole-ship bloom.
+    pub shield_arc_mesh: Handle<Mesh>,
     pub shield_material: Handle<StandardMaterial>,
     /// Ship-fragment debris (FIX 0b): a small irregular box + a darkened, desaturated
     /// ship-faction-tinted "metal fragment" material (clearly a ship piece, not a grey
@@ -56,6 +61,82 @@ pub struct RenderAssets {
     /// do not all align.
     pub debris_mesh: Handle<Mesh>,
     pub debris_material: Handle<StandardMaterial>,
+}
+
+/// Inner radius of the shield-impact arc band, in sim units — the near edge of the
+/// glowing ring slice (just inside the deflector surface). FIX 0a refinement.
+const SHIELD_ARC_INNER: f32 = 1.3;
+/// Outer radius of the shield-impact arc band, in sim units — the far edge of the
+/// glowing ring slice (just outside the deflector surface). FIX 0a refinement.
+const SHIELD_ARC_OUTER: f32 = 1.7;
+/// Half-angle of the shield-impact arc band, in radians (40°) — the arc spans
+/// `[-SHIELD_ARC_HALF_ANGLE, +SHIELD_ARC_HALF_ANGLE]` about its centre bearing, so
+/// the lit slice covers ~80° of the ring. FIX 0a refinement.
+const SHIELD_ARC_HALF_ANGLE: f32 = std::f32::consts::PI * 40.0 / 180.0;
+/// Number of angular segments across the shield-impact arc band — more segments give
+/// a smoother curve at the cost of more triangles. FIX 0a refinement.
+const SHIELD_ARC_SEGMENTS: u32 = 12;
+
+/// Build a flat **annular sliver** (an arc segment of a ring) lying in the **XY plane**
+/// (`z = 0`), centred on the **+X axis** and spanning `[-half_angle, +half_angle]`
+/// (FIX 0a refinement — the shield-impact flash mesh).
+///
+/// For each of `segments + 1` angular steps at angle `a` it emits two vertices — an
+/// inner `(inner_r·cos a, inner_r·sin a, 0)` and an outer `(outer_r·cos a, outer_r·sin
+/// a, 0)` — and stitches consecutive inner/outer pairs into a [`PrimitiveTopology::TriangleList`]
+/// (two triangles per quad). Every normal is `+Z` (`[0, 0, 1]`) so the ribbon faces the
+/// top-down camera (which looks down `-Z` onto the XY plane), and each vertex carries a
+/// simple `[u, 0]` UV so [`StandardMaterial`] is satisfied. Triangles are wound CCW as
+/// seen from `+Z` (front face toward the camera); the shield material additionally sets
+/// `cull_mode: None` + `double_sided: true` so the slice is never culled regardless of
+/// winding.
+///
+/// The caller rotates the resulting mesh about Z to aim the centre bearing at the
+/// impact direction (see [`crate::net::update_shield_bubble`]).
+fn build_arc_band_mesh(inner_r: f32, outer_r: f32, half_angle: f32, segments: u32) -> Mesh {
+    let segments = segments.max(1);
+    let step_count = segments + 1;
+
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(step_count as usize * 2);
+    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(step_count as usize * 2);
+    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(step_count as usize * 2);
+
+    for i in 0..step_count {
+        let t = i as f32 / segments as f32;
+        let a = -half_angle + t * (2.0 * half_angle);
+        let (sin, cos) = a.sin_cos();
+        // Inner then outer vertex for this angular step.
+        positions.push([inner_r * cos, inner_r * sin, 0.0]);
+        positions.push([outer_r * cos, outer_r * sin, 0.0]);
+        // Face the top-down camera (+Z toward it).
+        normals.push([0.0, 0.0, 1.0]);
+        normals.push([0.0, 0.0, 1.0]);
+        // Simple band UVs (u across the arc, v inner→outer) — only present to satisfy
+        // `StandardMaterial`'s vertex layout.
+        uvs.push([t, 0.0]);
+        uvs.push([t, 1.0]);
+    }
+
+    // Two triangles per quad between angular steps i and i+1. Vertex layout per step:
+    // even index = inner, odd index = outer. Wound CCW as seen from +Z.
+    let mut indices: Vec<u32> = Vec::with_capacity(segments as usize * 6);
+    for i in 0..segments {
+        let inner0 = i * 2;
+        let outer0 = inner0 + 1;
+        let inner1 = inner0 + 2;
+        let outer1 = inner0 + 3;
+        indices.extend_from_slice(&[inner0, outer0, outer1]);
+        indices.extend_from_slice(&[inner0, outer1, inner1]);
+    }
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_indices(Indices::U32(indices))
 }
 
 /// Spawn lighting, the gunsight pip, and the LOCAL player ship; register the
@@ -97,20 +178,30 @@ pub fn setup_scene(
     let seeker_mesh = meshes.add(Cuboid::new(1.2, 0.6, 0.3)); // green seeker dart
     let seeker_material = materials.add(Color::srgb(0.35, 0.85, 0.40));
 
-    // Localized shield-impact flash (FIX 0a): a SMALL bright disc/sphere placed AT the
-    // bullet impact on the shield surface — NOT a full-ship bubble (the user disliked
-    // the whole-ship bloom). This is the PROTOTYPE material — each spawned flash clones
-    // its own instance so its alpha can fade per-frame with `shield_flash` (a shared
-    // handle could not fade one flash independently). Bright cyan with a strong cyan
-    // emissive so the hit point reads as a glowing deflector spark; `alpha_mode: Blend`
-    // so the alpha-driven fade is visible. Starts fully transparent (`alpha 0`) —
-    // `update_shield_bubble` raises the alpha to `shield_flash` only on an actual
-    // shield impact.
-    let shield_impact_mesh = meshes.add(Sphere::new(0.45));
+    // Localized shield-impact flash (FIX 0a refinement): a glowing cyan ARC SEGMENT of
+    // the shield ring (a flat annular sliver in the XY plane) — NOT a stray impact dot
+    // and NOT a full-ship bubble (the user disliked the whole-ship bloom). The caller
+    // rotates this child about Z so the lit slice faces the bullet impact bearing. This
+    // is the PROTOTYPE material — each spawned flash clones its own instance so its alpha
+    // can fade per-frame with `shield_flash` (a shared handle could not fade one flash
+    // independently). Bright cyan with a strong cyan emissive so the slice reads as a
+    // glowing deflector arc; `alpha_mode: Blend` so the alpha-driven fade is visible.
+    // `cull_mode: None` + `double_sided: true` so the flat ribbon shows from the top-down
+    // camera regardless of which face it presents. Starts fully transparent (`alpha 0`) —
+    // `update_shield_bubble` raises the alpha to `shield_flash` only on an actual shield
+    // impact.
+    let shield_arc_mesh = meshes.add(build_arc_band_mesh(
+        SHIELD_ARC_INNER,
+        SHIELD_ARC_OUTER,
+        SHIELD_ARC_HALF_ANGLE,
+        SHIELD_ARC_SEGMENTS,
+    ));
     let shield_material = materials.add(StandardMaterial {
         base_color: Color::srgba(0.4, 0.75, 1.0, 0.0),
         emissive: LinearRgba::rgb(0.2, 0.7, 1.2),
         alpha_mode: AlphaMode::Blend,
+        cull_mode: None,
+        double_sided: true,
         ..default()
     });
 
@@ -133,7 +224,7 @@ pub fn setup_scene(
         asteroid_material,
         seeker_mesh,
         seeker_material,
-        shield_impact_mesh,
+        shield_arc_mesh,
         shield_material,
         debris_mesh,
         debris_material,

@@ -545,33 +545,34 @@ fn debris_transform(id: EntityId, size_hint: u8) -> (Quat, f32) {
     (rot, scale)
 }
 
-/// Distance from the ship centre to the shield surface where the localized impact
-/// flash sits, in sim units (≈ the deflector radius). FIX 0a.
-const SHIELD_FLASH_RADIUS: f32 = 1.5;
-
-/// Show + fade a rendered ship's **localized shield-impact flash** at the bullet
-/// impact point (FIX 0a) — REPLACES the old full-ship deflector bubble.
+/// Show + fade a rendered ship's **localized shield-impact flash** as a glowing arc
+/// segment of the shield ring, centred on the bullet impact bearing (FIX 0a
+/// refinement) — REPLACES the earlier impact-point sphere and the old full-ship
+/// deflector bubble.
 ///
-/// There is NO persistent bubble, NO whole-ship bloom, and NO pulsing: a SMALL bright
-/// cyan disc/sphere sits on the shield surface AT the point the shot struck the
-/// still-up shield, appearing ONLY for the split-second of the hit and fading out over
-/// the flash window. Its alpha is `shield_flash` (1.0 at impact → 0.0 as the timer
-/// bleeds out). The impact point is derived from the world `hit_dir` (centre→impact,
-/// world space): rotating it into the ship-local frame by `-heading` (the child
-/// inherits the ship's rotation) and placing the child at `local_dir *
-/// SHIELD_FLASH_RADIUS`. When `hit_dir == Vec2::ZERO` (no recent shield hit) the flash
-/// is hidden regardless of `shield_flash`.
+/// There is NO persistent ring, NO whole-ship bloom, and NO pulsing: a curved cyan
+/// **arc band** of the shield ring (the flat annular sliver from
+/// [`crate::scene::build_arc_band_mesh`]) lights the slice facing the point the shot
+/// struck the still-up shield, appearing ONLY for the split-second of the hit and
+/// fading out over the flash window. Its alpha is `shield_flash` (1.0 at impact → 0.0
+/// as the timer bleeds out). The impact bearing is derived from the world `hit_dir`
+/// (centre→impact, world space): rotating it into the ship-local frame by `-heading`
+/// (the child inherits the ship's rotation) and taking that vector's angle. The child
+/// stays **centred on the ship** (local translation `Vec3::ZERO`) and is **rotated about
+/// Z** to that bearing — the arc's radii live in the mesh, so no translation is needed.
+/// When `hit_dir == Vec2::ZERO` (no recent shield hit) the flash is hidden regardless of
+/// `shield_flash`.
 ///
-/// - **No child yet**: lazily spawn the small sphere ONCE as a CHILD of `parent` (so it
-///   follows + inherits the ship's rotation), with its OWN cloned material (so its
-///   alpha can fade independently of other ships'), hidden. It is despawned
-///   automatically with its parent (Bevy despawns children recursively), so a destroyed
-///   ship's flash vanishes with the hulk. Plain practice targets / unshielded entities
-///   never get hit on the shield, so their child simply stays hidden (alpha 0).
+/// - **No child yet**: lazily spawn the arc ONCE as a CHILD of `parent` (so it follows +
+///   inherits the ship's rotation), with its OWN cloned material (so its alpha can fade
+///   independently of other ships'), hidden. It is despawned automatically with its
+///   parent (Bevy despawns children recursively), so a destroyed ship's flash vanishes
+///   with the hulk. Plain practice targets / unshielded entities never get hit on the
+///   shield, so their child simply stays hidden (alpha 0).
 /// - **Child exists**: toggle [`Visibility`] — visible while `shield_flash > 0` AND
-///   `hit_dir != 0`, hidden otherwise — set its local translation to the impact point
-///   on the shield surface, and set the cloned material's `base_color` alpha to
-///   `shield_flash` so the flash fades over the ~0.25 s window.
+///   `hit_dir != 0`, hidden otherwise — set its local rotation to face the impact
+///   bearing, and set the cloned material's `base_color` alpha to `shield_flash` so the
+///   arc fades over the ~0.25 s window.
 // One Bevy helper threading exactly the data the flash needs (commands, assets, the
 // material store for the per-flash alpha fade, the child link + the child's
 // visibility/transform query, the parent, and the flash/dir/heading inputs).
@@ -591,23 +592,25 @@ fn update_shield_bubble(
     // Visible only while flashing AND there is a real impact direction.
     let show = flash > 0.0 && hit_dir != Vec2::ZERO;
     // World→ship-local: the child inherits the ship's rotation, so undo the heading.
+    // The arc band (centred on +X local) is rotated about Z to this bearing so its lit
+    // slice faces the impact; its radii live in the mesh, so no translation is needed.
     let local_dir = Vec2::from_angle(-heading).rotate(hit_dir);
-    let local_pos = local_dir * SHIELD_FLASH_RADIUS;
+    let bearing = local_dir.to_angle();
 
     match shield_child_q.get(parent) {
         Ok(child) => {
-            // Existing flash child: toggle visibility, move it to the impact point, and
-            // fade its alpha to the flash.
+            // Existing flash child: toggle visibility, rotate it to the impact bearing,
+            // and fade its alpha to the flash.
             if let Ok((mut vis, mut tf)) = bubble_q.get_mut(child.entity) {
                 *vis = if show {
                     Visibility::Inherited
                 } else {
                     Visibility::Hidden
                 };
-                tf.translation = Vec3::new(local_pos.x, local_pos.y, 0.0);
+                tf.rotation = Quat::from_rotation_z(bearing);
             }
             if let Some(material) = materials.get_mut(&child.material) {
-                // Bright cyan spark; alpha follows the flash so the impact glow fades.
+                // Bright cyan arc; alpha follows the flash so the impact glow fades.
                 material.base_color = Color::srgba(0.4, 0.75, 1.0, flash);
             }
         }
@@ -626,17 +629,20 @@ fn update_shield_bubble(
                         base_color: Color::srgba(0.4, 0.75, 1.0, 0.0),
                         emissive: LinearRgba::rgb(0.2, 0.7, 1.2),
                         alpha_mode: AlphaMode::Blend,
+                        cull_mode: None,
+                        double_sided: true,
                         ..default()
                     })
                 });
             let bubble = commands
                 .spawn((
                     ShieldBubble,
-                    Mesh3d(assets.shield_impact_mesh.clone()),
+                    Mesh3d(assets.shield_arc_mesh.clone()),
                     MeshMaterial3d(material.clone()),
-                    // Local (child) transform: seeded at the impact point on the shield
-                    // surface (updated each tick once the child exists).
-                    Transform::from_translation(Vec3::new(local_pos.x, local_pos.y, 0.0)),
+                    // Local (child) transform: centred on the ship (ZERO translation) and
+                    // rotated about Z to face the impact bearing (updated each tick once
+                    // the child exists).
+                    Transform::from_rotation(Quat::from_rotation_z(bearing)),
                     if show {
                         Visibility::Inherited
                     } else {
