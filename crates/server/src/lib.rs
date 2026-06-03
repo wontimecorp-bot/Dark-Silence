@@ -39,8 +39,8 @@ use protocol::{
     LoopbackTransport, Message, NetTransport, QAngle, QVec2, Snapshot,
 };
 use sim::components::{
-    AngularVelocity, CollisionRadius, DamageFlash, FlightAssist, Heading, Health, Position,
-    Projectile, Ship, Target, TargetKind, Velocity, Weapon,
+    AngularVelocity, CollisionRadius, DamageFlash, FlightAssist, Heading, Health, LastShieldHit,
+    Position, Projectile, ShieldHitFlash, Ship, Target, TargetKind, Velocity, Weapon,
 };
 use sim::damage::{
     default_resistance_matrix, seed_defense_layers, PenetrationConfig, SalvageConfig, ShieldConfig,
@@ -203,14 +203,32 @@ pub struct RenderEntity {
     pub vel: Vec2,
     /// Shield charge fraction `0.0..=1.0` (E007 live-demo): `current / max` of the
     /// entity's [`Shields`], clamped. `0.0` for an entity with no shield or a
-    /// depleted one — the client shows a translucent shield bubble while `> 0` and
-    /// hides it at `0`, so the player sees the shield take fire then drop.
+    /// depleted one. Retained for HUD/diagnostic use; the client NO LONGER renders a
+    /// persistent shield bubble from it (the user disliked the constant bubble) — the
+    /// shield visual is now the brief hit-driven [`RenderEntity::shield_flash`].
     pub shield_frac: f32,
     /// Hit-flash intensity `0.0..=1.0` (E007 live-demo): the entity's live
     /// [`DamageFlash`](sim::components::DamageFlash) timer normalized by its flash
-    /// duration. `0.0` for an entity not currently flashing — the client gives a
-    /// struck ship a brief visible scale-pulse hit pop while `> 0`.
+    /// duration. `0.0` for an entity not currently flashing. The hull no longer
+    /// scale-pulses from it (the user-disliked "zoom" is gone); retained as the
+    /// hull-hit timing seam.
     pub flash: f32,
+    /// Shield-hit deflector-shimmer intensity `0.0..=1.0` (E007 live-demo): the
+    /// entity's live [`ShieldHitFlash`](sim::components::ShieldHitFlash) timer
+    /// normalized by [`SHIELD_FLASH_TIME`](sim::combat::SHIELD_FLASH_TIME). Non-zero
+    /// only for the split-second after a shot is absorbed by a still-up shield — the
+    /// client blooms a brief localized cyan shield flash AT the impact point while
+    /// `> 0` and shows nothing otherwise (no persistent bubble). `0.0` once the shield
+    /// is depleted (shots then reach the hull). Reused as the fade alpha for the
+    /// directional flash positioned by [`RenderEntity::hit_dir`].
+    pub shield_flash: f32,
+    /// World-space **direction** from this entity's centre to the most recent shield
+    /// impact (FIX 0a), surfaced from [`LastShieldHit`](sim::components::LastShieldHit).
+    /// The client rotates it into the ship's local frame and places the localized
+    /// shield flash on the shield surface along it (fading by `shield_flash`).
+    /// `Vec2::ZERO` for an entity with no recent shield hit (the client then hides the
+    /// flash). Render-only; not on any wire/snapshot path.
+    pub hit_dir: Vec2,
 }
 
 /// The [`RenderEntity::shield_frac`] of an optional [`Shields`]: `current / max`
@@ -230,6 +248,29 @@ fn flash_of(flash: Option<&DamageFlash>) -> f32 {
     match flash {
         Some(f) if f.0 > 0.0 => (f.0 / sim::combat::FLASH_TIME).clamp(0.0, 1.0),
         _ => 0.0,
+    }
+}
+
+/// The [`RenderEntity::shield_flash`] of an optional [`ShieldHitFlash`]: the live
+/// shield-hit timer normalized by [`sim::combat::SHIELD_FLASH_TIME`] and clamped to
+/// `0.0..=1.0`. `0.0` for an entity whose shield has not just taken a hit — so the
+/// client draws the brief cyan deflector flash only on a real shield impact.
+fn shield_flash_of(flash: Option<&ShieldHitFlash>) -> f32 {
+    match flash {
+        Some(f) if f.0 > 0.0 => (f.0 / sim::combat::SHIELD_FLASH_TIME).clamp(0.0, 1.0),
+        _ => 0.0,
+    }
+}
+
+/// The [`RenderEntity::hit_dir`] of an optional [`LastShieldHit`] (FIX 0a): the
+/// world-space centre→impact direction while its fade timer is live, else
+/// `Vec2::ZERO`. `Vec2::ZERO` for an entity with no recent shield hit (so the client
+/// hides the localized flash) — kept in step with [`shield_flash_of`], which gates the
+/// flash on the same timer window.
+fn hit_dir_of(hit: Option<&LastShieldHit>) -> Vec2 {
+    match hit {
+        Some(h) if h.timer > 0.0 => h.dir,
+        _ => Vec2::ZERO,
     }
 }
 
@@ -904,8 +945,9 @@ impl ServerApp {
         let mut out = Vec::new();
 
         // Ships (carry a `Heading`). A ship may carry `Shields` (E007 fitted player /
-        // enemy) → its `shield_frac`, and a live `DamageFlash` → its `flash`; both
-        // default to 0 for an unfitted/never-hit ship.
+        // enemy) → its `shield_frac`, a live `DamageFlash` → its `flash`, and a live
+        // `ShieldHitFlash` → its `shield_flash`; all default to 0 for an unfitted/
+        // never-hit ship.
         let mut ships = self.world.query_filtered::<(
             Entity,
             &Position,
@@ -913,12 +955,25 @@ impl ServerApp {
             &Heading,
             Option<&Shields>,
             Option<&DamageFlash>,
+            Option<&ShieldHitFlash>,
+            Option<&LastShieldHit>,
         ), With<Ship>>();
-        let ship_rows: Vec<(Entity, Vec2, Vec2, f32, f32, f32)> = ships
+        let ship_rows: Vec<(Entity, Vec2, Vec2, f32, f32, f32, f32, Vec2)> = ships
             .iter(&self.world)
-            .map(|(e, p, v, h, s, f)| (e, p.0, v.0, h.0, shield_frac_of(s), flash_of(f)))
+            .map(|(e, p, v, h, s, f, sf, lsh)| {
+                (
+                    e,
+                    p.0,
+                    v.0,
+                    h.0,
+                    shield_frac_of(s),
+                    flash_of(f),
+                    shield_flash_of(sf),
+                    hit_dir_of(lsh),
+                )
+            })
             .collect();
-        for (entity, pos, vel, heading, shield_frac, flash) in ship_rows {
+        for (entity, pos, vel, heading, shield_frac, flash, shield_flash, hit_dir) in ship_rows {
             out.push(RenderEntity {
                 id: self.entity_ids.id_for(entity),
                 kind: EntityKind::Ship,
@@ -928,6 +983,8 @@ impl ServerApp {
                 vel,
                 shield_frac,
                 flash,
+                shield_flash,
+                hit_dir,
             });
         }
 
@@ -949,6 +1006,8 @@ impl ServerApp {
                 vel,
                 shield_frac: 0.0,
                 flash: 0.0,
+                shield_flash: 0.0,
+                hit_dir: Vec2::ZERO,
             });
         }
 
@@ -968,10 +1027,12 @@ impl ServerApp {
             Option<&Heading>,
             Option<&Shields>,
             Option<&DamageFlash>,
+            Option<&ShieldHitFlash>,
+            Option<&LastShieldHit>,
         ), With<Target>>();
-        let target_rows: Vec<(Entity, Vec2, Vec2, u8, bool, f32, f32, f32)> = targets
+        let target_rows: Vec<(Entity, Vec2, Vec2, u8, bool, f32, f32, f32, f32, Vec2)> = targets
             .iter(&self.world)
-            .map(|(e, p, v, k, fit, h, s, f)| {
+            .map(|(e, p, v, k, fit, h, s, f, sf, lsh)| {
                 (
                     e,
                     p.0,
@@ -981,17 +1042,39 @@ impl ServerApp {
                     h.map(|h| h.0).unwrap_or(0.0),
                     shield_frac_of(s),
                     flash_of(f),
+                    shield_flash_of(sf),
+                    hit_dir_of(lsh),
                 )
             })
             .collect();
-        for (entity, pos, vel, kind_flag, fitted, heading, shield_frac, flash) in target_rows {
+        for (
+            entity,
+            pos,
+            vel,
+            kind_flag,
+            fitted,
+            heading,
+            shield_frac,
+            flash,
+            shield_flash,
+            hit_dir,
+        ) in target_rows
+        {
             // Fitted enemy → Ship mesh (distinct, obvious); plain target → its cube/
             // sphere/dart by sub-kind. Only a fitted (ship-rendered) target carries a
-            // shield bubble; a plain practice cube reports `shield_frac = 0`.
-            let (kind, flags, heading, shield_frac) = if fitted {
-                (EntityKind::Ship, 0, heading, shield_frac)
+            // shield, so the shield flash + frac (and the directional `hit_dir`) are
+            // zeroed for a plain practice cube.
+            let (kind, flags, heading, shield_frac, shield_flash, hit_dir) = if fitted {
+                (
+                    EntityKind::Ship,
+                    0,
+                    heading,
+                    shield_frac,
+                    shield_flash,
+                    hit_dir,
+                )
             } else {
-                (EntityKind::Target, kind_flag, 0.0, 0.0)
+                (EntityKind::Target, kind_flag, 0.0, 0.0, 0.0, Vec2::ZERO)
             };
             out.push(RenderEntity {
                 id: self.entity_ids.id_for(entity),
@@ -1002,6 +1085,8 @@ impl ServerApp {
                 vel,
                 shield_frac,
                 flash,
+                shield_flash,
+                hit_dir,
             });
         }
 
@@ -1011,33 +1096,42 @@ impl ServerApp {
         // Projectile — so the three queries above miss it and it would be invisible.
         // `Without<Target>` keeps the **destroyed enemy** (which keeps its `Target`
         // marker and is emitted above as a persistent hulk) out of this set, so it is
-        // not double-emitted. Each chunk renders as `Target`+`Asteroid` flag, reusing
-        // the grey asteroid mesh for drifting debris — NO protocol change, NO new
-        // `TargetKind` variant. Render-only + client-only: this does not touch
-        // `full_records`/snapshots/determinism.
+        // not double-emitted. FIX 0b: each chunk now renders as `EntityKind::Debris`
+        // (a tinted, tumbling ship-fragment box client-side) instead of reusing the
+        // grey `Asteroid` sphere; its residual `FitLayout.cells.len()` rides in `flags`
+        // (clamped to `u8`) as a size hint the client scales the fragment by. Render-
+        // only + client-only: NO `full_records`/snapshot/determinism impact (the wire
+        // path never emits `Debris`).
         let mut chunks = self
             .world
-            .query_filtered::<(Entity, &Position, &Velocity, &Heading), (
+            .query_filtered::<(Entity, &Position, &Velocity, &Heading, Option<&FitLayout>), (
                 With<Wreck>,
                 Without<Ship>,
                 Without<Target>,
                 Without<Projectile>,
             )>();
-        let chunk_rows: Vec<(Entity, Vec2, Vec2, f32)> = chunks
+        let chunk_rows: Vec<(Entity, Vec2, Vec2, f32, u8)> = chunks
             .iter(&self.world)
-            .map(|(e, p, v, h)| (e, p.0, v.0, h.0))
+            .map(|(e, p, v, h, layout)| {
+                // Residual cell-count as the size hint (≥ 1 so a fragment is never
+                // zero-sized), clamped into the `u8` flags field.
+                let cells = layout.map(|l| l.cells.len()).unwrap_or(1).max(1);
+                (e, p.0, v.0, h.0, cells.min(u8::MAX as usize) as u8)
+            })
             .collect();
-        for (entity, pos, vel, heading) in chunk_rows {
+        for (entity, pos, vel, heading, size_hint) in chunk_rows {
             out.push(RenderEntity {
                 id: self.entity_ids.id_for(entity),
-                kind: EntityKind::Target,
-                flags: TargetKind::Asteroid.as_u8(),
+                kind: EntityKind::Debris,
+                flags: size_hint,
                 pos,
                 heading,
                 vel,
-                // Drifting debris has no shield and needs no hit pop.
+                // Drifting debris has no shield, no hit pop, and no shield-impact dir.
                 shield_frac: 0.0,
                 flash: 0.0,
+                shield_flash: 0.0,
+                hit_dir: Vec2::ZERO,
             });
         }
 

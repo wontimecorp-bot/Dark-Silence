@@ -142,6 +142,29 @@ fn snapshot_with_entities_and_removed_roundtrips() {
 }
 
 #[test]
+fn entity_kind_debris_roundtrips() {
+    // FIX 0b added `EntityKind::Debris` (additive, appended last so existing variant
+    // wire indices are unchanged). It is render-only and never travels the snapshot
+    // path in practice, but the wire codec must still round-trip it — guard that here
+    // alongside the existing Ship/Projectile/Target coverage so the additive enum
+    // change stays green.
+    assert_roundtrip(Message::Snapshot(Snapshot {
+        server_tick: 11,
+        acked_input_seq: 3,
+        baseline_id: 2,
+        entities: vec![EntityRecord {
+            id: EntityId(7),
+            kind: EntityKind::Debris,
+            pos: QVec2::quantize_pos(glam::Vec2::new(5.0, -5.0)),
+            vel: QVec2::quantize_vel(glam::Vec2::new(0.5, 0.5)),
+            heading: QAngle::quantize(1.0),
+            flags: 9, // residual cell-count size hint
+        }],
+        removed: vec![],
+    }));
+}
+
+#[test]
 fn empty_snapshot_roundtrips() {
     assert_roundtrip(Message::Snapshot(Snapshot {
         server_tick: 0,

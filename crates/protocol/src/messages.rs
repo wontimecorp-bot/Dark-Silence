@@ -39,6 +39,14 @@ pub struct EntityId(pub u32);
 
 /// Which kind of replicated entity an [`EntityRecord`] describes — picks the
 /// client-side prefab/interpolation behavior.
+///
+/// `Debris` is **additive**: appended last so the bitcode variant indices of the
+/// existing variants are unchanged — the wire form of `Ship`/`Projectile`/`Target`
+/// stays byte-identical. It is currently produced **only** on the client-only
+/// in-process render path ([`server::ServerApp::render_state`]) for severed
+/// ship-fragment chunks and a destroyed hulk (FIX 0b); the networked snapshot path
+/// (`server::ServerApp::full_records`) never emits it. The roundtrip test in
+/// `tests/roundtrip.rs` covers it so the wire codec stays green.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub enum EntityKind {
     /// A player/AI ship.
@@ -47,6 +55,11 @@ pub enum EntityKind {
     Projectile,
     /// A destructible target.
     Target,
+    /// A ship-fragment debris chunk (severed wreck piece or a destroyed hulk) — the
+    /// client renders it as a tinted, tumbling ship-fragment box rather than a grey
+    /// asteroid sphere (FIX 0b). The chunk's residual cell-count rides in
+    /// [`EntityRecord::flags`] as a size hint (clamped to `u8`).
+    Debris,
 }
 
 /// Bytes sent/received on a connection so far — the bandwidth baseline (TR-014).

@@ -1994,3 +1994,213 @@ fn fitted_player_fire_destroys_fitted_enemy_via_hull_depletion() {
          (tune `seed_defense_layers`' hull/shield/armor consts or the loadout)"
     );
 }
+
+// =================================================================================
+// E007 multi-angle kill regression: the ricochet bug guard. Before the fix the armor
+// gate read the impact angle off the seeded per-section `ArmorFacet.normal` (the
+// centred core's FIXED `CORE_FALLBACK_NORMAL = -X`), but `hull_local_entry_ray`
+// routes every shot through the grid centre, so the centred core was the entry for
+// most shots. A shot from any direction but `+X` met that fixed `-X` face at a steep
+// angle → `Ricochet`; once the shield was down EVERY shot ricocheted forever and the
+// enemy could never be hull-killed. The fix derives the impact angle from the entry
+// cell's hull-radial geometry, so a head-on shot from ANY side reliably penetrates.
+//
+// This drives the REAL `add_fixed_step_systems` schedule with a fitted player firing
+// at a fitted enemy at the origin from several approach positions (+x, -x, +y, and a
+// diagonal) and asserts the enemy's `HullStructure` reaches 0 and it dies (becomes a
+// `Wreck`) from EVERY angle — no permanent-ricochet stall.
+// =================================================================================
+
+/// Spawn a fitted player at `pos` whose `Heading` points at `aim_at`, holding fire
+/// (the starter fighter loadout — reactor + 2 thrusters + autocannon — so
+/// `ShipStats::can_fire` is true). A position/heading-parametrized sibling of
+/// [`spawn_fitted_player`], used by the multi-angle kill regression.
+fn spawn_fitted_player_aimed(w: &mut World, pos: Vec2, aim_at: Vec2) -> Entity {
+    let (modules, hulls) = seed_catalogs();
+    let hull = hulls.get(HULL_FIGHTER).unwrap().clone();
+
+    let mut fit = Fit::new(HULL_FIGHTER);
+    let _ = fit.install_module(SlotId(0), MODULE_REACTOR_BASIC, &hull, &modules);
+    let _ = fit.install_module(SlotId(1), MODULE_THRUSTER_BASIC, &hull, &modules);
+    let _ = fit.install_module(SlotId(2), MODULE_THRUSTER_BASIC, &hull, &modules);
+    let _ = fit.install_module(SlotId(3), MODULE_AUTOCANNON, &hull, &modules);
+    let layout = build_layout(&hull, &fit, &modules);
+    let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
+    let (shields, section_armor, hull_structure) = seed_defense_layers(&hull, &fit, &modules);
+    assert!(
+        stats.can_fire,
+        "the starter player fit must be able to fire"
+    );
+
+    // Heading points from the player toward the target, so the fixed forward weapon
+    // (which fires along `Vec2::from_angle(heading)`) sends rounds straight at it.
+    let heading = (aim_at - pos).to_angle();
+
+    w.spawn((
+        Ship,
+        ShipIntent {
+            fire: true,
+            ..Default::default()
+        },
+        Position(pos),
+        Velocity(Vec2::ZERO),
+        Heading(heading),
+        AngularVelocity(0.0),
+        CollisionRadius(0.8),
+        Weapon {
+            cooldown: 0.0,
+            fire_rate: stats.weapon.map(|p| p.fire_rate).unwrap_or(5.0),
+            muzzle_speed: stats.weapon.map(|p| p.muzzle_speed).unwrap_or(200.0),
+        },
+        fit,
+        layout,
+        stats,
+        shields,
+        section_armor,
+        hull_structure,
+    ))
+    .id()
+}
+
+/// The per-angle repro window: a head-on shot from an off-axis approach lands on a
+/// different entry cell than the `+x` core hit, so its kill may run through the
+/// module-behind path (depleting a module then its section) rather than `+x`'s direct
+/// hull spillover — a legitimately slower-but-real death. 45 s of demo time at 30 Hz
+/// gives every geometry comfortable headroom to land WITHOUT a permanent-ricochet
+/// stall (the bug left the enemy un-damaged forever).
+const MULTI_ANGLE_MAX_TICKS: u32 = (45.0 / REPRO_DT) as u32;
+
+/// The outcome of firing at the enemy from one approach (the multi-angle regression).
+struct KillOutcome {
+    /// The tick a real penetrating hit first landed (proves shots get THROUGH — not a
+    /// perpetual ricochet). `None` if no penetration ever registered (the bug).
+    first_penetration_tick: Option<u32>,
+    /// The tick the enemy was destroyed (Wreck / despawned / shed chunks). `None` if
+    /// it survived the whole window (a stall regression).
+    destroyed_tick: Option<u32>,
+    /// The enemy's residual `HullStructure::current` at the end (informational —
+    /// hull-spillover deaths drive this to 0, module-kill deaths may not).
+    final_hull: Option<f32>,
+}
+
+/// Run the live `add_fixed_step_systems` schedule with a fitted player at `player_pos`
+/// (aimed at the origin) firing at a stationary fitted enemy at the origin, until the
+/// enemy is destroyed or the repro window elapses.
+///
+/// This is the ricochet-bug regression driver: with the fixed-normal angle, any
+/// approach but `+x` met the centred core's fixed `-X` facet at a steep angle and
+/// ricocheted forever, so the enemy took no damage from those sides. With the
+/// geometric impact angle (derived from the entry cell's hull-radial position), a
+/// head-on shot from ANY side penetrates and the enemy dies.
+fn run_kill_from(player_pos: Vec2) -> KillOutcome {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+
+    let _player = spawn_fitted_player_aimed(&mut w, player_pos, Vec2::ZERO);
+    let enemy = spawn_fitted_enemy_target(&mut w, Vec2::ZERO);
+
+    let mut schedule = Schedule::default();
+    sim::add_fixed_step_systems(&mut schedule);
+
+    let mut first_penetration_tick: Option<u32> = None;
+    let mut destroyed_tick: Option<u32> = None;
+
+    for tick in 0..MULTI_ANGLE_MAX_TICKS {
+        schedule.run(&mut w);
+
+        // A penetrating/over-penetrating hit proves the shot got THROUGH the armor gate
+        // (not a perpetual ricochet) — the core of the regression.
+        if first_penetration_tick.is_none() {
+            if let Some(k) = w.get_resource::<HitFeedback>().unwrap().last_kind {
+                if matches!(k, HitKind::Penetrated | HitKind::OverPenetrated) {
+                    first_penetration_tick = Some(tick);
+                }
+            }
+        }
+
+        if destroyed_tick.is_none() {
+            let is_wreck = w.get::<Wreck>(enemy).is_some();
+            let despawned = w.get_entity(enemy).is_err();
+            let has_chunks = w
+                .query::<&Wreck>()
+                .iter(&w)
+                .any(|wr| wr.origin == WreckOrigin::SeveredChunk);
+            if is_wreck || despawned || has_chunks {
+                destroyed_tick = Some(tick);
+                break;
+            }
+        }
+    }
+
+    let final_hull = w.get::<HullStructure>(enemy).map(|h| h.current);
+    KillOutcome {
+        first_penetration_tick,
+        destroyed_tick,
+        final_hull,
+    }
+}
+
+/// The ricochet-bug regression: a fitted player firing at a fitted enemy at the origin
+/// must DESTROY it from EVERY approach angle — +x, -x, +y, and a diagonal — with shots
+/// that PENETRATE (never a perpetual ricochet). Before the geometric-impact-angle fix,
+/// any approach but `+x` met the centred core's fixed `-X` facet normal at a steep
+/// angle and ricocheted FOREVER, so the enemy sat at full hull, unkillable and
+/// un-damaged, from those sides. Now the impact angle comes from the entry cell's
+/// hull-radial geometry, so a head-on shot from any side penetrates and the enemy
+/// reliably dies.
+///
+/// The death PATH is geometry-dependent (a legitimate, not-a-bug difference): the `+x`
+/// core hit spills straight into `HullStructure` (a fast hull-depletion kill), while an
+/// off-axis hit may enter through the armor cover and route penetrating damage to the
+/// module behind it, killing via module → section destruction (slower, but a real
+/// kill). The regression guards what matters from every angle: shots PENETRATE and the
+/// enemy DIES (no permanent-ricochet stall).
+#[test]
+fn fitted_player_kills_enemy_from_every_approach_angle() {
+    // The enemy sits at the origin; the player attacks from each of these positions,
+    // aimed straight at it. The diagonal + the ±y axes are the cases the OLD fixed-`-X`
+    // facet-normal angle mis-classified as steep ricochets (their approach is far from
+    // `+x`), so they are the load-bearing regression coverage.
+    let approaches = [
+        ("+x", Vec2::new(14.0, 0.0)),
+        ("-x", Vec2::new(-14.0, 0.0)),
+        ("+y", Vec2::new(0.0, 14.0)),
+        ("diagonal", Vec2::new(-10.0, 10.0)),
+    ];
+
+    for (label, player_pos) in approaches {
+        let out = run_kill_from(player_pos);
+
+        // Shots PENETRATED (the armor gate let damage through — not a perpetual
+        // ricochet). This is the direct guard on the fixed-normal ricochet bug.
+        let penetrated_tick = out.first_penetration_tick.unwrap_or_else(|| {
+            panic!(
+                "[{label}] no shot ever PENETRATED the enemy from approach {player_pos:?} — \
+                 the armor gate ricocheted every shot (the fixed-normal bug this guards)"
+            )
+        });
+
+        // The enemy DIED (became a Wreck / shed chunks / despawned) from this angle —
+        // no permanent-ricochet stall, regardless of the (geometry-dependent) path.
+        let destroyed_tick = out.destroyed_tick.unwrap_or_else(|| {
+            panic!(
+                "[{label}] enemy was never destroyed from approach {player_pos:?} in \
+                 {MULTI_ANGLE_MAX_TICKS} ticks (final hull {:?}) — permanent-ricochet \
+                 stall regression",
+                out.final_hull
+            )
+        });
+
+        let kill_secs = destroyed_tick as f32 * REPRO_DT;
+        let pen_secs = penetrated_tick as f32 * REPRO_DT;
+        eprintln!(
+            "[multi-angle] {label} from {player_pos:?}: first penetration at {pen_secs:.2}s, \
+             destroyed at {kill_secs:.2}s (final hull {:?})",
+            out.final_hull
+        );
+        assert!(
+            penetrated_tick <= destroyed_tick,
+            "[{label}] penetration must precede (or equal) the kill"
+        );
+    }
+}

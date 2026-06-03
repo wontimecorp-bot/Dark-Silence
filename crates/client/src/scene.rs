@@ -42,11 +42,20 @@ pub struct RenderAssets {
     pub asteroid_material: Handle<StandardMaterial>,
     pub seeker_mesh: Handle<Mesh>,
     pub seeker_material: Handle<StandardMaterial>,
-    /// Translucent shield bubble (E007 live-demo): a blue sphere ~1.6× the ship
-    /// radius, spawned as a child of any rendered ship whose `shield_frac > 0` so the
-    /// player sees the shield take fire; hidden when the shield drops to 0.
-    pub shield_mesh: Handle<Mesh>,
+    /// Localized shield-impact flash (FIX 0a): a small bright cyan disc/sphere spawned
+    /// once as a child of a rendered ship and placed on the shield surface AT the
+    /// bullet impact point (`hit_dir`), shown ONLY for the split-second a shot strikes
+    /// the still-up shield (`shield_flash > 0`), its alpha fading with the flash. This
+    /// REPLACES the old full-ship bubble — the user disliked the whole-ship bloom.
+    pub shield_impact_mesh: Handle<Mesh>,
     pub shield_material: Handle<StandardMaterial>,
+    /// Ship-fragment debris (FIX 0b): a small irregular box + a darkened, desaturated
+    /// ship-faction-tinted "metal fragment" material (clearly a ship piece, not a grey
+    /// rock). Used for [`protocol::EntityKind::Debris`] chunks, scaled by the per-chunk
+    /// size hint and given a deterministic per-id base rotation so fragments tumble and
+    /// do not all align.
+    pub debris_mesh: Handle<Mesh>,
+    pub debris_material: Handle<StandardMaterial>,
 }
 
 /// Spawn lighting, the gunsight pip, and the LOCAL player ship; register the
@@ -88,15 +97,30 @@ pub fn setup_scene(
     let seeker_mesh = meshes.add(Cuboid::new(1.2, 0.6, 0.3)); // green seeker dart
     let seeker_material = materials.add(Color::srgb(0.35, 0.85, 0.40));
 
-    // Translucent blue shield bubble (E007): a sphere ~1.6× the ship's ~1.0 radius,
-    // blended with a faint blue emissive so it reads as an energy shield taking fire.
-    let shield_mesh = meshes.add(Sphere::new(1.6));
+    // Localized shield-impact flash (FIX 0a): a SMALL bright disc/sphere placed AT the
+    // bullet impact on the shield surface — NOT a full-ship bubble (the user disliked
+    // the whole-ship bloom). This is the PROTOTYPE material — each spawned flash clones
+    // its own instance so its alpha can fade per-frame with `shield_flash` (a shared
+    // handle could not fade one flash independently). Bright cyan with a strong cyan
+    // emissive so the hit point reads as a glowing deflector spark; `alpha_mode: Blend`
+    // so the alpha-driven fade is visible. Starts fully transparent (`alpha 0`) —
+    // `update_shield_bubble` raises the alpha to `shield_flash` only on an actual
+    // shield impact.
+    let shield_impact_mesh = meshes.add(Sphere::new(0.45));
     let shield_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.3, 0.6, 1.0, 0.25),
-        emissive: LinearRgba::rgb(0.05, 0.15, 0.35),
+        base_color: Color::srgba(0.4, 0.75, 1.0, 0.0),
+        emissive: LinearRgba::rgb(0.2, 0.7, 1.2),
         alpha_mode: AlphaMode::Blend,
         ..default()
     });
+
+    // Ship-fragment debris (FIX 0b): a small irregular box that reads as a torn metal
+    // ship piece, with a darkened, desaturated ship-faction tint (clearly a fragment
+    // of the blue ship, NOT a grey asteroid). Per-chunk scale + a deterministic id-
+    // derived spin are applied at spawn (`net::spawn_render_entity`) so fragments
+    // tumble and do not all align.
+    let debris_mesh = meshes.add(Cuboid::new(0.7, 0.5, 0.4));
+    let debris_material = materials.add(Color::srgb(0.22, 0.38, 0.55));
 
     commands.insert_resource(RenderAssets {
         projectile_mesh,
@@ -109,8 +133,10 @@ pub fn setup_scene(
         asteroid_material,
         seeker_mesh,
         seeker_material,
-        shield_mesh,
+        shield_impact_mesh,
         shield_material,
+        debris_mesh,
+        debris_material,
     });
 
     // The LOCAL player ship — spawned here deterministically so the `LocalShip`

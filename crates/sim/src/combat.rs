@@ -9,6 +9,16 @@ use bevy_ecs::prelude::*;
 /// Flash duration (seconds) set when a hit or destroy occurs.
 pub const FLASH_TIME: f32 = 0.15;
 
+/// Shield-hit deflector-shimmer duration (seconds) — the split-second a shot strikes
+/// a still-up shield (E007 live-demo). Set on the target's
+/// [`ShieldHitFlash`](crate::components::ShieldHitFlash) when a hit returns
+/// [`HitKind::ShieldAbsorbed`](crate::damage::HitKind) and bled to `0` by
+/// [`shield_hit_flash_decay_system`](crate::collision::shield_hit_flash_decay_system),
+/// so the client's cyan shield flash blooms on impact and fades over this window.
+/// Slightly longer than [`FLASH_TIME`] so the deflector shimmer reads as a deliberate
+/// glowing flash rather than a single-frame blip.
+pub const SHIELD_FLASH_TIME: f32 = 0.25;
+
 /// Transient feedback for the HUD: non-zero for a short while after a hit or a
 /// destroy. A resource (not an event) keeps `sim` off Bevy's event API and
 /// makes the signal trivially testable (CHK016).

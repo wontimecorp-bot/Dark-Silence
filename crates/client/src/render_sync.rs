@@ -49,24 +49,23 @@ pub struct RemoteEntity {
 #[derive(Component)]
 pub struct AimPip;
 
-/// The latest per-entity hit-flash intensity `0.0..=1.0` for a rendered entity
-/// (E007 live-demo), set from [`server::RenderEntity::flash`] each tick by
-/// [`crate::net::capture_render_state`] and applied as a brief transform
-/// scale-pulse by [`interpolate_transforms`]. `0.0` ⇒ no pop.
-#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
-pub struct RenderFlash(pub f32);
+/// Links a rendered ship to its shield-flash child entity (E007 live-demo) and holds
+/// the per-bubble material handle so [`crate::net::capture_render_state`] can fade the
+/// flash alpha each tick. The child is spawned **once** (lazily, the first tick the
+/// ship is processed) and despawned with its parent (Bevy despawns children
+/// recursively).
+#[derive(Component, Clone, Debug)]
+pub struct ShieldChild {
+    /// The shield-bubble child entity.
+    pub entity: Entity,
+    /// The bubble's own (cloned) material, whose `base_color` alpha is faded with the
+    /// shield-hit flash each tick.
+    pub material: Handle<StandardMaterial>,
+}
 
-/// Links a rendered ship to its translucent shield-bubble child entity (E007
-/// live-demo), so [`crate::net::capture_render_state`] can toggle the bubble's
-/// visibility / scale by the ship's `shield_frac` each tick. The child is spawned
-/// once (the first tick the ship's `shield_frac > 0`) and despawned with its parent
-/// (Bevy despawns children recursively).
-#[derive(Component, Clone, Copy, Debug)]
-pub struct ShieldChild(pub Entity);
-
-/// Marker for a shield-bubble child entity (E007 live-demo) — the translucent sphere
-/// parented to a rendered ship. Tagged so its [`Visibility`]/[`Transform`] can be
-/// updated by [`crate::net::capture_render_state`].
+/// Marker for a shield-flash child entity (E007 live-demo) — the fixed-size cyan
+/// sphere parented to a rendered ship. Tagged so its [`Visibility`] can be toggled by
+/// [`crate::net::capture_render_state`] (alpha is faded via its material).
 #[derive(Component, Clone, Copy, Debug)]
 pub struct ShieldBubble;
 
@@ -105,31 +104,24 @@ pub fn capture_sim_state(mut q: Query<(&Position, Option<&Heading>, &mut RenderI
     }
 }
 
-/// How much a fully-lit [`RenderFlash`] (`1.0`) scales a struck entity up for the
-/// hit pop — `+40%` at peak, decaying to `0` as the flash bleeds out (E007).
-const FLASH_SCALE_GAIN: f32 = 0.4;
-
 /// `Update`: blend the rendered `Transform` between the two latest fixed-step
 /// poses by the fixed-timestep overstep fraction — frame-rate-independent feel.
 ///
-/// Also applies the E007 per-entity **hit pop**: an entity carrying a live
-/// [`RenderFlash`] is scaled up by `1.0 + FLASH_SCALE_GAIN * flash` for the frame (a
-/// transform-only pulse — no per-entity material cloning), so a struck ship visibly
-/// pops on each hit and settles back as the flash decays.
+/// The ship transform is position + rotation ONLY — there is NO scale animation. The
+/// old E007 hit-pop scale-pulse (`1.0 + 0.4*flash`, the "zoom in and out" the user
+/// disliked) was removed; the only damage visual is now the brief cyan shield
+/// deflector flash (driven separately via the shield-bubble child's material alpha).
 pub fn interpolate_transforms(
     fixed: Res<Time<Fixed>>,
-    mut q: Query<(&RenderInterp, &mut Transform, Option<&RenderFlash>)>,
+    mut q: Query<(&RenderInterp, &mut Transform)>,
 ) {
     let alpha = fixed.overstep_fraction();
-    for (interp, mut tf, flash) in &mut q {
+    for (interp, mut tf) in &mut q {
         let p = interp.prev_pos.lerp(interp.curr_pos, alpha);
         let h = lerp_angle(interp.prev_heading, interp.curr_heading, alpha);
         tf.translation.x = p.x;
         tf.translation.y = p.y;
         tf.rotation = Quat::from_rotation_z(h);
-        // Hit pop: scale up by the live flash intensity (1.0 ⇒ no pop).
-        let s = 1.0 + FLASH_SCALE_GAIN * flash.map(|f| f.0).unwrap_or(0.0).clamp(0.0, 1.0);
-        tf.scale = Vec3::splat(s);
     }
 }
 

@@ -93,17 +93,22 @@ impl Shields {
 /// One section's nominal plate: thickness, material, and outward face normal
 /// (data-model.md `ArmorFacet`).
 ///
-/// The armor gate reads this to compute the impact angle (`acos((-dir) · normal)`,
-/// `0` head-on → `π/2` grazing; see [`apply_damage`]) and the effective armor
-/// (`thickness * material.multiplier() / cos(angle)`). Seeded from fitted Armor
-/// module(s) + the hull section authoring. `Copy`.
+/// The armor gate reads `thickness` + `material` for the effective armor
+/// (`thickness * material.multiplier() / cos(angle)`). The impact `angle` itself is
+/// now derived from the **real hit geometry** (the entry cell's radial position on
+/// the hull), NOT from this `normal` — see [`apply_damage`]'s armor gate. The
+/// `normal` field is therefore effectively unused for the angle (kept for the
+/// data-model shape; harmless). Seeded from fitted Armor module(s) + the hull
+/// section authoring. `Copy`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ArmorFacet {
     /// Nominal plate thickness (`> 0`).
     pub thickness: f32,
     /// Plate material; multiplier on thickness (content seam).
     pub material: ArmorMaterial,
-    /// Outward face normal (unit); the angle is `acos(direction · normal)`.
+    /// Outward face normal (unit). Historically the impact-angle source; the angle is
+    /// now derived from the entry cell's hull-radial geometry in [`apply_damage`], so
+    /// this field no longer drives the angle (kept for the data-model shape).
     pub normal: Vec2,
 }
 
@@ -412,25 +417,49 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
         .and_then(|section| section_armor.facet(section).copied())
         .unwrap_or_else(|| default_facet(&ev));
 
-    // Impact angle from the (outward) surface normal. The facet `normal` points
-    // outward (toward the attacker); the shot travels *into* the surface along
-    // `dir`, so a head-on hit has `dir == -normal`. The impact angle from the
-    // normal is therefore `acos((-dir) · normal)`: head-on `(-dir)·normal == 1` →
-    // angle 0 (no deflection, no ricochet); grazing → π/2. (This is the geometric
-    // impact angle; the brief's literal `acos(dir·normal)` measures the supplement,
-    // which would mis-classify a head-on shot as a π-angle ricochet — see the
-    // implementation report.) Clamped into [-1,1] for `acos` safety.
+    // Impact angle from the REAL hit geometry, not the seeded facet `normal`.
+    //
+    // Fixes the live-demo ricochet bug: the per-section [`ArmorFacet::normal`]
+    // (e.g. the centred core's fixed `CORE_FALLBACK_NORMAL = -X` from
+    // `seed_defense_layers`) is constant, but the entry-ray transform routes every
+    // shot through the grid centre, so the centred core is the entry for shots from
+    // ANY direction. Measuring the angle off that fixed `-X` face meant a shot from
+    // any side but `+X` met it at a steep angle → permanent `Ricochet`, and once the
+    // shield was down the enemy could never be hull-killed.
+    //
+    // The obliquity should instead reflect WHERE on the hull silhouette the shot
+    // landed. Derive the outward surface normal at the entry from the entry cell's
+    // radial position on the hull: `radial = entry_cell_center − grid_centre_local`.
+    // A cell on the +x rim faces +x, one on the −y rim faces −y, etc. A shot striking
+    // the hull roughly perpendicular to that local surface penetrates from any
+    // approach; only a genuinely glancing/edge hit ricochets.
+    //
+    // The dead-centre core cell has `radial ≈ 0` (no outward direction) — a centre
+    // hit means the shot already reached the core, so treat it as **head-on**
+    // (angle 0, never a ricochet). `cos_impact = (-dir)·surface_normal` is clamped to
+    // `[0, 1]`: a negative value would mean the entry geometry put us on a back face
+    // (unphysical for an entry), so floor it at 0 (grazing) rather than letting it
+    // become a 180° bounce. `angle ∈ [0, π/2]`. The facet's `thickness`/`material`
+    // (and thus armored-section toughness) are still used below for the EFFECTIVE
+    // armor — only the ANGLE source changed, so angling still matters (edge hits
+    // ricochet, armored sections deflect more), but a head-on shot from any side
+    // reliably penetrates. (`facet.normal` is now unused for the angle.)
+    let grid_centre_local = Vec2::new(hull.grid_dims.0 as f32 * 0.5, hull.grid_dims.1 as f32 * 0.5);
+    let entry_cell_center = Vec2::new(entry.cell.0 as f32 + 0.5, entry.cell.1 as f32 + 0.5);
+    let radial = entry_cell_center - grid_centre_local;
     let dir_n = if ev.dir.length_squared() > f32::EPSILON {
         ev.dir.normalize()
     } else {
         Vec2::X
     };
-    let normal_n = if facet.normal.length_squared() > f32::EPSILON {
-        facet.normal.normalize()
+    let angle = if radial.length_squared() <= f32::EPSILON {
+        // Dead-centre core hit: no outward direction → head-on, never a ricochet.
+        0.0
     } else {
-        Vec2::X
+        let surface_normal = radial.normalize();
+        let cos_impact = (-dir_n).dot(surface_normal).clamp(0.0, 1.0);
+        cos_impact.acos()
     };
-    let angle = (-dir_n).dot(normal_n).clamp(-1.0, 1.0).acos();
 
     // Mitigate at the Armor layer before the penetration tier applies.
     m *= 1.0 - layer_resist(&matrix, DefenseLayer::Armor, channel);

@@ -9,11 +9,11 @@
 use crate::clock::FixedDt;
 use crate::combat::{self, HitFeedback};
 use crate::components::{
-    CollisionRadius, Damage, DamageFlash, Heading, Health, Position, PrevPosition, Projectile,
-    ProjectileOwner, Ship, Target, TargetKind, Velocity,
+    CollisionRadius, Damage, DamageFlash, Heading, Health, LastShieldHit, Position, PrevPosition,
+    Projectile, ProjectileOwner, ShieldHitFlash, Ship, Target, TargetKind, Velocity,
 };
 use crate::damage::{
-    apply_damage, on_section_destroyed, shatter_ship, DamageEvent, HullStructure, Wreck,
+    apply_damage, on_section_destroyed, shatter_ship, DamageEvent, HitKind, HullStructure, Wreck,
 };
 use crate::fitting::{Fit, FitLayout, HullCatalog, SectionId};
 use crate::physics::{Physics, RapierPhysics, SweptHit};
@@ -169,6 +169,11 @@ struct FittedHit {
     target: Entity,
     /// The typed event built from the shot, in the target's **hull-local cell-space**.
     event: DamageEvent,
+    /// Unit direction (world space) from the target centre toward the world impact
+    /// point — surfaced from the otherwise-discarded `hit.point`/`tpos` so the client
+    /// can flash the shield deflector AT the impact (FIX 0a). Falls back to the
+    /// reverse shot direction when the centre-to-impact vector is degenerate.
+    shield_dir: Vec2,
 }
 
 /// Build the hull-local entry ray for a world-space projectile hit on a fitted
@@ -307,9 +312,10 @@ pub fn fitted_damage_system(world: &mut World) {
     for (projectile, pos, prev, vel, dmg, src, owner) in proj_q.iter(world) {
         let owner_e = owner.map(|o| o.0);
         // First target struck along the sweep (lowest toi), skipping self-hits.
-        // Carry the target heading so the local-ray transform has it in the apply
-        // phase without re-querying.
-        let mut best: Option<(Entity, f32, SweptHit)> = None;
+        // Carry the target heading (for the local-ray transform) AND the target's
+        // world centre `tpos` (for the shield-impact direction, FIX 0a) so the apply
+        // phase has both without re-querying.
+        let mut best: Option<(Entity, f32, Vec2, SweptHit)> = None;
         for &(target, tpos, radius, heading) in &targets {
             if owner_e == Some(target) {
                 continue; // self-hit prevention (E002 ProjectileOwner)
@@ -319,16 +325,29 @@ pub fn fitted_damage_system(world: &mut World) {
             };
             let take = match best {
                 None => true,
-                Some((_, _, ref b)) => hit.toi < b.toi,
+                Some((_, _, _, ref b)) => hit.toi < b.toi,
             };
             if take {
-                best = Some((target, heading, hit));
+                best = Some((target, heading, tpos, hit));
             }
         }
-        if let Some((target, heading, hit)) = best {
+        if let Some((target, heading, tpos, hit)) = best {
             let Some(&dims) = hull_dims.get(&target) else {
                 // Hull unresolvable for this target: skip (no panic, INV-D16).
                 continue;
+            };
+            // FIX 0a: the world impact direction from the ship centre to the swept hit
+            // point — the data `update_shield_bubble` flashes at. Fall back to the
+            // reverse shot direction (`-vel`) when the centre→impact vector is
+            // degenerate (e.g. a hit at the exact centre), so the flash always has a
+            // sensible facing.
+            let shield_dir = {
+                let from_centre = (hit.point - tpos).normalize_or_zero();
+                if from_centre != Vec2::ZERO {
+                    from_centre
+                } else {
+                    (-vel.0).normalize_or_zero()
+                }
             };
             let (point, dir_local) = hull_local_entry_ray(vel.0, heading, dims);
             let local_hit = SweptHit {
@@ -340,6 +359,7 @@ pub fn fitted_damage_system(world: &mut World) {
                 projectile,
                 target,
                 event,
+                shield_dir,
             });
         }
     }
@@ -349,6 +369,7 @@ pub fn fitted_damage_system(world: &mut World) {
         projectile,
         target,
         event,
+        shield_dir,
     } in hits
     {
         let outcome = apply_damage(world, target, event);
@@ -362,12 +383,28 @@ pub fn fitted_damage_system(world: &mut World) {
             }
         }
 
-        // Per-entity hit pop (E007 live-demo): refresh a `DamageFlash` timer on the
-        // struck target so the client gives it a brief visible scale-pulse this frame.
-        // Insert-or-overwrite (a fresh hit refreshes the timer); the decay system bleeds
-        // it back to 0. Skipped if the target was despawned this hit (no entity to flag).
+        // Per-entity visual feedback (E007 live-demo): refresh the struck target's
+        // timers so the client can react this frame. The hull-hit `DamageFlash` timing
+        // seam is still refreshed (the client no longer scale-pulses from it — the
+        // user-disliked "zoom" is gone — but the timing remains available). A hit that
+        // the shield ABSORBED ([`HitKind::ShieldAbsorbed`]) additionally refreshes a
+        // `ShieldHitFlash` so the client blooms a brief cyan deflector shimmer for the
+        // split-second the shot strikes the still-up shield (then it fades; no flash
+        // once the shield is depleted and shots reach the hull). Insert-or-overwrite —
+        // a fresh hit refreshes the timer; the decay systems bleed each back to 0.
+        // Skipped if the target was despawned this hit (no entity to flag).
         if let Ok(mut entity) = world.get_entity_mut(target) {
             entity.insert(DamageFlash(combat::FLASH_TIME));
+            if outcome.result == HitKind::ShieldAbsorbed {
+                entity.insert(ShieldHitFlash(combat::SHIELD_FLASH_TIME));
+                // FIX 0a: record WHERE the shield was hit so the client flashes the
+                // deflector at the impact point (not over the whole ship). Same timer
+                // window as `ShieldHitFlash`; the two decay in lock-step.
+                entity.insert(LastShieldHit {
+                    dir: shield_dir,
+                    timer: combat::SHIELD_FLASH_TIME,
+                });
+            }
         }
 
         // --- 3. Destruction trigger (the chain T040 exercises) -------------------
@@ -431,6 +468,37 @@ pub fn damage_flash_decay_system(dt: Res<FixedDt>, mut q: Query<&mut DamageFlash
     for mut flash in &mut q {
         if flash.0 > 0.0 {
             flash.0 = (flash.0 - dt).max(0.0);
+        }
+    }
+}
+
+/// Fixed-step decay of the per-entity [`ShieldHitFlash`] deflector-shimmer timer —
+/// and the directional [`LastShieldHit`] fade timer (FIX 0a) — toward `0` (E007
+/// live-demo shield visual).
+///
+/// Bleeds every entity's `ShieldHitFlash` down by the fixed `dt` each step, clamped
+/// at `0`, exactly like [`damage_flash_decay_system`] — so the client's cyan shield
+/// flash is a brief, deterministic bloom-and-fade (server and client tick the same
+/// timer). The [`LastShieldHit::timer`] is decayed in **lock-step** by the same `dt`
+/// (they are refreshed together on a shield-absorbed hit), so the directional flash
+/// fades identically; its `dir` is left in place once the timer hits `0` (a depleted
+/// flash is simply invisible client-side and is overwritten by the next hit). Neither
+/// component is removed at `0`, keeping the system allocation-free. A world with no
+/// such entities is a no-op (graceful degradation, INV-D16).
+pub fn shield_hit_flash_decay_system(
+    dt: Res<FixedDt>,
+    mut q: Query<&mut ShieldHitFlash>,
+    mut dir_q: Query<&mut LastShieldHit>,
+) {
+    let dt = dt.0;
+    for mut flash in &mut q {
+        if flash.0 > 0.0 {
+            flash.0 = (flash.0 - dt).max(0.0);
+        }
+    }
+    for mut hit in &mut dir_q {
+        if hit.timer > 0.0 {
+            hit.timer = (hit.timer - dt).max(0.0);
         }
     }
 }

@@ -63,7 +63,7 @@ use sim::{FixedDt, HitFeedback, ShipIntent};
 
 use crate::input::{build_client_input, InputSequencer};
 use crate::render_sync::{
-    interpolate_transforms, RemoteEntity, RenderFlash, RenderInterp, ShieldBubble, ShieldChild,
+    interpolate_transforms, RemoteEntity, RenderInterp, ShieldBubble, ShieldChild,
 };
 use crate::scene::RenderAssets;
 
@@ -350,25 +350,26 @@ fn net_fixed_update(
 /// entities whose id is no longer in `render_state` (destroyed targets, expired
 /// projectiles) are despawned, so they vanish immediately.
 ///
-/// E007 live-demo visuals: each entity's [`RenderFlash`] is refreshed from
-/// `RenderEntity::flash` (the hit pop [`interpolate_transforms`] applies), and a
-/// translucent **shield bubble** child is spawned/updated for any rendered ship whose
-/// `shield_frac > 0` (visible while the shield holds, hidden when it drops to 0).
-// A Bevy system with the params it genuinely needs (transport host, net state,
-// render assets, fixed dt, the id→entity map, and the interp/velocity/shield queries);
-// the count is inherent to the system, not a smell.
+/// E007 live-demo visuals: a lazily-spawned cyan **shield deflector flash** child is
+/// shown for any rendered ship for the split-second its shield absorbs a hit
+/// (`RenderEntity::shield_flash > 0`), its alpha fading with the flash — there is NO
+/// persistent bubble and NO hull scale-pulse.
+// A Bevy system with the params it genuinely needs (transport host, net state, render
+// assets + the material store for the per-bubble alpha fade, fixed dt, the id→entity
+// map, and the interp/velocity/shield queries); the count is inherent to the system.
 #[allow(clippy::too_many_arguments)]
 fn capture_render_state(
     mut commands: Commands,
     mut host: NonSendMut<LoopbackHost>,
     state: NonSend<NetClientState>,
     assets: Res<RenderAssets>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     dt: Res<FixedDt>,
     mut render_map: ResMut<NetRenderMap>,
     mut interp_q: Query<&mut RenderInterp>,
     mut vel_q: Query<&mut Velocity, With<LocalShip>>,
     shield_child_q: Query<&ShieldChild>,
-    mut bubble_q: Query<(&mut Visibility, &mut Transform), With<ShieldBubble>>,
+    mut bubble_q: Query<(&mut Visibility, &mut Transform)>,
 ) {
     let local_id = state.local_id;
     let entities = host.server.render_state();
@@ -393,19 +394,18 @@ fn capture_render_state(
                     vel.0 = e.vel;
                 }
             }
-            // Refresh the per-entity hit-pop flash (the scale-pulse is applied in
-            // `interpolate_transforms`).
-            if let Ok(mut ec) = commands.get_entity(bevy_entity) {
-                ec.insert(RenderFlash(e.flash));
-            }
-            // Update (or lazily spawn) this entity's shield bubble from `shield_frac`.
+            // Show + fade (or lazily spawn) this entity's LOCALIZED shield-impact flash
+            // from the hit-driven `shield_flash`, placed at the impact (`hit_dir`).
             update_shield_bubble(
                 &mut commands,
                 &assets,
+                &mut materials,
                 &shield_child_q,
                 &mut bubble_q,
                 bevy_entity,
-                e.shield_frac,
+                e.shield_flash,
+                e.hit_dir,
+                e.heading,
             );
         } else {
             // Newly-appeared entity (never the local ship — it is pre-registered):
@@ -415,18 +415,18 @@ fn capture_render_state(
             // visibly travels out of the ship instead of popping in ~a tick ahead
             // (≈ the reticle distance for a fast round).
             let spawned = spawn_render_entity(&mut commands, &assets, e, dt.0);
-            // Seed its flash + (if shielded) its shield bubble immediately so the
-            // first rendered frame already shows them.
-            if let Ok(mut ec) = commands.get_entity(spawned) {
-                ec.insert(RenderFlash(e.flash));
-            }
+            // Seed (if its shield is being hit) its localized impact flash immediately
+            // so the first rendered frame already shows it at the impact point.
             update_shield_bubble(
                 &mut commands,
                 &assets,
+                &mut materials,
                 &shield_child_q,
                 &mut bubble_q,
                 spawned,
-                e.shield_frac,
+                e.shield_flash,
+                e.hit_dir,
+                e.heading,
             );
             render_map.map.insert(e.id, spawned);
         }
@@ -482,7 +482,28 @@ fn spawn_render_entity(
             assets.projectile_mesh.clone(),
             assets.projectile_material.clone(),
         ),
+        // FIX 0b: a destroyed ship's severed chunks + hulk render as tinted, tumbling
+        // ship-fragment boxes (not grey asteroid spheres).
+        EntityKind::Debris => (assets.debris_mesh.clone(), assets.debris_material.clone()),
     };
+
+    // FIX 0b: a debris fragment gets a deterministic, id-derived base rotation (so
+    // fragments don't all align) and a scale from the per-chunk size hint in `flags`
+    // (residual cell-count). `interpolate_transforms` then drives its drift + spin from
+    // the inherited COM momentum + heading. Non-debris entities keep the existing
+    // heading-only orientation + unit scale (byte-identical to before).
+    let transform = if e.kind == EntityKind::Debris {
+        let (extra_rot, scale) = debris_transform(e.id, e.flags);
+        Transform {
+            translation: Vec3::new(e.pos.x, e.pos.y, 0.0),
+            rotation: Quat::from_rotation_z(e.heading) * extra_rot,
+            scale: Vec3::splat(scale),
+        }
+    } else {
+        Transform::from_rotation(Quat::from_rotation_z(e.heading))
+            .with_translation(Vec3::new(e.pos.x, e.pos.y, 0.0))
+    };
+
     commands
         .spawn((
             RemoteEntity {
@@ -499,66 +520,136 @@ fn spawn_render_entity(
             },
             Mesh3d(mesh),
             MeshMaterial3d(material),
-            Transform::from_rotation(Quat::from_rotation_z(e.heading))
-                .with_translation(Vec3::new(e.pos.x, e.pos.y, 0.0)),
+            transform,
         ))
         .id()
 }
 
-/// Spawn-or-update the translucent shield bubble for a rendered ship from its
-/// authoritative `shield_frac` (E007 live-demo, Deliverable 2).
+/// Deterministic per-fragment orientation + scale for a [`EntityKind::Debris`] chunk
+/// (FIX 0b). The base rotation is derived from the chunk's stable wire `id` so each
+/// fragment is angled differently (they don't all align), and the scale grows with the
+/// `size_hint` (residual cell-count packed into `flags` server-side, clamped to
+/// `0.7..=1.6` so a single-cell sliver and a multi-cell wing both read sensibly). Pure
+/// + deterministic: the same id/hint always yields the same look.
+fn debris_transform(id: EntityId, size_hint: u8) -> (Quat, f32) {
+    // Hash the id into a stable angle in `[0, 2π)` — a cheap integer scramble, not RNG,
+    // so the orientation is reproducible and frame-stable.
+    let scrambled = id.0.wrapping_mul(2_654_435_761);
+    let angle = (scrambled as f32 / u32::MAX as f32) * std::f32::consts::TAU;
+    // Vary the tumble axis a little by id too, so fragments don't all spin about Z.
+    let tilt = ((id.0.wrapping_mul(40_503) & 0xFF) as f32 / 255.0 - 0.5) * 0.6;
+    let rot = Quat::from_rotation_z(angle) * Quat::from_rotation_x(tilt);
+    // Size hint ≥ 1; map to a modest scale band so fragments differ without ballooning.
+    let cells = size_hint.max(1) as f32;
+    let scale = (0.6 + 0.12 * cells).clamp(0.7, 1.6);
+    (rot, scale)
+}
+
+/// Distance from the ship centre to the shield surface where the localized impact
+/// flash sits, in sim units (≈ the deflector radius). FIX 0a.
+const SHIELD_FLASH_RADIUS: f32 = 1.5;
+
+/// Show + fade a rendered ship's **localized shield-impact flash** at the bullet
+/// impact point (FIX 0a) — REPLACES the old full-ship deflector bubble.
 ///
-/// - **No bubble yet & `shield_frac > 0`**: spawn the translucent sphere as a CHILD
-///   of `parent` (so it follows the ship) and record it via a [`ShieldChild`] on the
-///   parent. It is despawned automatically with its parent (Bevy despawns children
-///   recursively), so a destroyed ship's bubble vanishes with the hulk.
-/// - **Bubble exists**: toggle its [`Visibility`] — visible while `shield_frac > 0`,
-///   hidden at `0` — and scale it slightly by `shield_frac` so a draining shield
-///   visibly shrinks before it drops. So the player sees the bubble take fire, then
-///   vanish when the shield is down and shots reach the hull.
+/// There is NO persistent bubble, NO whole-ship bloom, and NO pulsing: a SMALL bright
+/// cyan disc/sphere sits on the shield surface AT the point the shot struck the
+/// still-up shield, appearing ONLY for the split-second of the hit and fading out over
+/// the flash window. Its alpha is `shield_flash` (1.0 at impact → 0.0 as the timer
+/// bleeds out). The impact point is derived from the world `hit_dir` (centre→impact,
+/// world space): rotating it into the ship-local frame by `-heading` (the child
+/// inherits the ship's rotation) and placing the child at `local_dir *
+/// SHIELD_FLASH_RADIUS`. When `hit_dir == Vec2::ZERO` (no recent shield hit) the flash
+/// is hidden regardless of `shield_flash`.
 ///
-/// A `parent` with no shield (`shield_frac == 0`) that never had a bubble spawns
-/// none — plain practice targets and unshielded entities stay bubble-free.
+/// - **No child yet**: lazily spawn the small sphere ONCE as a CHILD of `parent` (so it
+///   follows + inherits the ship's rotation), with its OWN cloned material (so its
+///   alpha can fade independently of other ships'), hidden. It is despawned
+///   automatically with its parent (Bevy despawns children recursively), so a destroyed
+///   ship's flash vanishes with the hulk. Plain practice targets / unshielded entities
+///   never get hit on the shield, so their child simply stays hidden (alpha 0).
+/// - **Child exists**: toggle [`Visibility`] — visible while `shield_flash > 0` AND
+///   `hit_dir != 0`, hidden otherwise — set its local translation to the impact point
+///   on the shield surface, and set the cloned material's `base_color` alpha to
+///   `shield_flash` so the flash fades over the ~0.25 s window.
+// One Bevy helper threading exactly the data the flash needs (commands, assets, the
+// material store for the per-flash alpha fade, the child link + the child's
+// visibility/transform query, the parent, and the flash/dir/heading inputs).
+#[allow(clippy::too_many_arguments)]
 fn update_shield_bubble(
     commands: &mut Commands,
     assets: &RenderAssets,
+    materials: &mut Assets<StandardMaterial>,
     shield_child_q: &Query<&ShieldChild>,
-    bubble_q: &mut Query<(&mut Visibility, &mut Transform), With<ShieldBubble>>,
+    bubble_q: &mut Query<(&mut Visibility, &mut Transform)>,
     parent: Entity,
-    shield_frac: f32,
+    shield_flash: f32,
+    hit_dir: Vec2,
+    heading: f32,
 ) {
+    let flash = shield_flash.clamp(0.0, 1.0);
+    // Visible only while flashing AND there is a real impact direction.
+    let show = flash > 0.0 && hit_dir != Vec2::ZERO;
+    // World→ship-local: the child inherits the ship's rotation, so undo the heading.
+    let local_dir = Vec2::from_angle(-heading).rotate(hit_dir);
+    let local_pos = local_dir * SHIELD_FLASH_RADIUS;
+
     match shield_child_q.get(parent) {
         Ok(child) => {
-            // Existing bubble: toggle visibility + scale by the shield charge.
-            if let Ok((mut vis, mut tf)) = bubble_q.get_mut(child.0) {
-                *vis = if shield_frac > 0.0 {
+            // Existing flash child: toggle visibility, move it to the impact point, and
+            // fade its alpha to the flash.
+            if let Ok((mut vis, mut tf)) = bubble_q.get_mut(child.entity) {
+                *vis = if show {
                     Visibility::Inherited
                 } else {
                     Visibility::Hidden
                 };
-                // Shrink slightly as the shield drains (0.85..=1.0 of the bubble size),
-                // a subtle "shield weakening" read before it pops.
-                let s = 0.85 + 0.15 * shield_frac.clamp(0.0, 1.0);
-                tf.scale = Vec3::splat(s);
+                tf.translation = Vec3::new(local_pos.x, local_pos.y, 0.0);
+            }
+            if let Some(material) = materials.get_mut(&child.material) {
+                // Bright cyan spark; alpha follows the flash so the impact glow fades.
+                material.base_color = Color::srgba(0.4, 0.75, 1.0, flash);
             }
         }
         Err(_) => {
-            // No bubble yet: spawn one only if the ship is actually shielded.
-            if shield_frac > 0.0 {
-                let bubble = commands
-                    .spawn((
-                        ShieldBubble,
-                        Mesh3d(assets.shield_mesh.clone()),
-                        MeshMaterial3d(assets.shield_material.clone()),
-                        // Local (child) transform: centered on the ship.
-                        Transform::default(),
-                        Visibility::Inherited,
-                    ))
-                    .id();
-                if let Ok(mut ec) = commands.get_entity(parent) {
-                    ec.add_child(bubble);
-                    ec.insert(ShieldChild(bubble));
-                }
+            // No child yet: lazily spawn one (hidden) with its OWN material instance —
+            // cloned from the shared prototype (`assets.shield_material`, the single
+            // source of the cyan impact look) so its alpha can fade independently of
+            // other ships'. Spawned once for any rendered ship; it stays hidden (alpha
+            // 0) until that ship's shield is actually hit.
+            let material = materials
+                .get(&assets.shield_material)
+                .cloned()
+                .map(|m| materials.add(m))
+                .unwrap_or_else(|| {
+                    materials.add(StandardMaterial {
+                        base_color: Color::srgba(0.4, 0.75, 1.0, 0.0),
+                        emissive: LinearRgba::rgb(0.2, 0.7, 1.2),
+                        alpha_mode: AlphaMode::Blend,
+                        ..default()
+                    })
+                });
+            let bubble = commands
+                .spawn((
+                    ShieldBubble,
+                    Mesh3d(assets.shield_impact_mesh.clone()),
+                    MeshMaterial3d(material.clone()),
+                    // Local (child) transform: seeded at the impact point on the shield
+                    // surface (updated each tick once the child exists).
+                    Transform::from_translation(Vec3::new(local_pos.x, local_pos.y, 0.0)),
+                    if show {
+                        Visibility::Inherited
+                    } else {
+                        Visibility::Hidden
+                    },
+                ))
+                .id();
+            if let Ok(mut ec) = commands.get_entity(parent) {
+                ec.add_child(bubble);
+                ec.insert(ShieldChild {
+                    entity: bubble,
+                    material,
+                });
             }
         }
     }

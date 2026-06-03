@@ -153,12 +153,58 @@ pub struct CollisionRadius(pub f32);
 /// lands on this entity and decayed toward `0` each fixed step
 /// ([`damage_flash_decay_system`](crate::collision::damage_flash_decay_system)).
 ///
-/// Presentation-only (E007 live-demo visual feedback): the client reads it via the
-/// render seam to give a struck ship a brief visible "hit pop" (a transform
-/// scale-pulse). Deterministic — it ticks down by the fixed `dt` like every other
-/// timer, so server and client agree. Defaults to `0` for entities never hit.
+/// Presentation-only (E007 live-demo visual feedback): retained as the hull-hit
+/// timing seam. The client no longer scale-pulses the ship from it (the "zoom in and
+/// out" the user disliked is gone); the brief deflector shimmer is driven by
+/// [`ShieldHitFlash`] instead. Deterministic — it ticks down by the fixed `dt` like
+/// every other timer, so server and client agree. Defaults to `0` for entities never
+/// hit.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DamageFlash(pub f32);
+
+/// A short-lived per-entity **shield-hit** flash timer (seconds), refreshed each time
+/// a hit is absorbed by this entity's shield while it is up
+/// ([`HitKind::ShieldAbsorbed`](crate::damage::HitKind)) and decayed toward `0` each
+/// fixed step
+/// ([`shield_hit_flash_decay_system`](crate::collision::shield_hit_flash_decay_system)).
+///
+/// Presentation-only (E007 live-demo visual feedback): the client renders a brief
+/// translucent cyan **deflector shimmer** enveloping the ship for the split-second a
+/// shot strikes the shield, fading as this timer bleeds out — a sci-fi shield flash
+/// on impact, NOT a persistent bubble. There is no flash once the shield is depleted
+/// (shots reach the hull). Deterministic — it ticks down by the fixed `dt` like every
+/// other timer, so server and client agree. Defaults to `0` for entities whose shield
+/// has not just taken a hit.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShieldHitFlash(pub f32);
+
+/// The most recent shield impact's **direction** (unit, ship-centre → impact) and a
+/// short-lived fade `timer` (seconds) — the seam the client uses to flash the
+/// deflector at WHERE the bullet hit the shield instead of over the whole ship.
+///
+/// Refreshed each time a hit is absorbed by this entity's shield
+/// ([`HitKind::ShieldAbsorbed`](crate::damage::HitKind)) in
+/// [`fitted_damage_system`](crate::collision::fitted_damage_system), and decayed
+/// toward `0` in lock-step with [`ShieldHitFlash`] by
+/// [`shield_hit_flash_decay_system`](crate::collision::shield_hit_flash_decay_system).
+///
+/// **Transient runtime render feedback — deliberately NOT serialized**, mirroring
+/// [`ProjectileOwner`] / [`crate::damage::DamageEvent`]: it is a per-frame visual cue
+/// derived from the impact geometry, not replicated or persisted state (it would be
+/// re-derived from the next hit anyway). The `dir` is a unit vector in **world space**
+/// (the client rotates it into the ship's local frame before placing the flash); it is
+/// `Vec2::ZERO` when there is no meaningful direction (the client then hides the flash).
+/// Deterministic decay (ticks by the fixed `dt` like every other timer). Defaults to a
+/// zero dir / zero timer for an entity whose shield has not just taken a hit.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+pub struct LastShieldHit {
+    /// Unit direction from the ship centre toward the impact point, in world space.
+    /// `Vec2::ZERO` when no direction could be resolved (flash hidden client-side).
+    pub dir: Vec2,
+    /// Seconds remaining on the directional-flash fade; bled toward `0` each fixed
+    /// step alongside [`ShieldHitFlash`].
+    pub timer: f32,
+}
 
 /// The ship's fixed forward weapon: fire timing + muzzle speed.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

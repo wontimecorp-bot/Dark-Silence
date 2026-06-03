@@ -228,6 +228,10 @@ fn priority(record: &EntityRecord, recipient_id: Option<EntityId>, origin: Vec2)
         EntityKind::Ship => 2u8,
         EntityKind::Target => 1u8,
         EntityKind::Projectile => 0u8,
+        // `Debris` is render-only (never on this wire/snapshot path); rank it like a
+        // target defensively so the match stays total without affecting any real
+        // snapshot ordering.
+        EntityKind::Debris => 1u8,
     };
     // Nearer the recipient ⇒ higher priority ⇒ larger key ⇒ negate the distance.
     let dist = record.pos.dequantize_pos().distance(origin);

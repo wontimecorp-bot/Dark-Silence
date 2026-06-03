@@ -30,12 +30,14 @@ pub mod tuning;
 pub mod weapon;
 
 pub use clock::FixedDt;
-pub use collision::{damage_flash_decay_system, fitted_damage_system};
+pub use collision::{
+    damage_flash_decay_system, fitted_damage_system, shield_hit_flash_decay_system,
+};
 pub use combat::HitFeedback;
 pub use components::{
     AngularVelocity, CollisionRadius, Damage, DamageFlash, FlightAssist, Heading, Health, Lifetime,
-    Position, PrevPosition, Projectile, ProjectileOwner, Ship, Target, TargetKind, Velocity,
-    Weapon,
+    Position, PrevPosition, Projectile, ProjectileOwner, ShieldHitFlash, Ship, Target, TargetKind,
+    Velocity, Weapon,
 };
 pub use fitting::{
     build_layout, cell_map, derive_ship_stats, hardpoint_arc, load_preset, module_at,
@@ -76,6 +78,7 @@ use bevy_ecs::schedule::{IntoScheduleConfigs, Schedule};
 /// 10. [`combat::destruction_system`]
 /// 11. [`combat::feedback_decay_system`]
 /// 12. [`collision::damage_flash_decay_system`] — per-entity hit-pop decay (E007)
+/// 13. [`collision::shield_hit_flash_decay_system`] — per-entity shield-flash decay (E007)
 ///
 /// **Ordering rationale (E007, FR-021/SC-002, INV-D16)**:
 /// - `fitted_damage_system` runs right after the legacy `collision_detect_system`:
@@ -137,6 +140,10 @@ pub fn add_fixed_step_systems(schedule: &mut Schedule) {
             // toward 0 alongside the global `HitFeedback` decay. Ungated: a world with
             // no `DamageFlash` entities is a no-op (graceful degradation, INV-D16).
             collision::damage_flash_decay_system,
+            // E007 shield-hit deflector-shimmer decay — bleeds each struck entity's
+            // `ShieldHitFlash` toward 0 so the client's cyan shield flash fades. Ungated:
+            // a world with no `ShieldHitFlash` entities is a no-op (INV-D16).
+            collision::shield_hit_flash_decay_system,
         )
             .chain(),
     );

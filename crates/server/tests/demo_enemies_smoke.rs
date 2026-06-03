@@ -66,12 +66,11 @@ fn fitted_enemies_render_as_distinct_ships() {
 
 /// After a fitted enemy is destroyed, the death-strip removes its `Target`/`FitLayout`
 /// so `render_state` no longer emits it as a pristine `Ship` — it renders as drifting
-/// debris (a `Target`+`Asteroid` wreck) instead, and the enemy is no longer a live
-/// damageable target (so the repeated-"KILL" loop ends). This is the server-side proof
-/// of the visible, clean death (E007, Deliverable 1).
+/// ship-fragment debris (an `EntityKind::Debris` chunk, FIX 0b) instead, and the enemy
+/// is no longer a live damageable target (so the repeated-"KILL" loop ends). This is
+/// the server-side proof of the visible, clean death (E007, Deliverable 1).
 #[test]
 fn destroyed_fitted_enemy_renders_as_debris_not_a_pristine_ship() {
-    use sim::components::TargetKind;
     use sim::damage::shatter_ship;
 
     let (mut server, _t) = ServerApp::loopback();
@@ -107,18 +106,29 @@ fn destroyed_fitted_enemy_renders_as_debris_not_a_pristine_ship() {
     );
 
     let after = server.render_state();
-    // The destroyed enemy (its body persists) now reads as debris, and severed chunks
-    // drift around it.
+    // The destroyed enemy (its body persists) now reads as ship-fragment debris, and
+    // severed chunks drift around it — all as `EntityKind::Debris` (FIX 0b), NOT grey
+    // `Asteroid` spheres.
     let debris: Vec<_> = after
         .iter()
-        .filter(|e| {
-            e.kind == EntityKind::Target
-                && TargetKind::from_u8(e.flags) == Some(TargetKind::Asteroid)
-        })
+        .filter(|e| e.kind == EntityKind::Debris)
         .collect();
     assert!(
         !debris.is_empty(),
-        "the destroyed enemy + its severed chunks render as drifting Asteroid debris"
+        "the destroyed enemy + its severed chunks render as drifting ship-fragment Debris"
+    );
+    // The size hint (residual cell-count) rides in `flags` and is always ≥ 1 so the
+    // client never scales a fragment to zero.
+    assert!(
+        debris.iter().all(|e| e.flags >= 1),
+        "each debris chunk carries a non-zero cell-count size hint in flags"
+    );
+    // No destroyed-ship debris leaks onto the path as a grey Asteroid target.
+    assert!(
+        !after.iter().any(|e| e.kind == EntityKind::Target
+            && sim::components::TargetKind::from_u8(e.flags)
+                == Some(sim::components::TargetKind::Asteroid)),
+        "destroyed-ship wreckage no longer renders as grey Asteroid spheres"
     );
     // No fitted enemy still renders as a Ship near (14,0) — it became a wreck.
     let still_ship = after
