@@ -22,7 +22,61 @@ use super::sever::{
     connected_region, core_cell, disconnected_regions, sever_chunk, Wreck, WreckOrigin,
 };
 use crate::components::{CollisionRadius, Target};
-use crate::fitting::{Fit, FitLayout, HullCatalog, ModuleCatalog, SectionId};
+use crate::fitting::{Cell, Fit, FitLayout, HullCatalog, ModuleCatalog, SectionId};
+
+/// Handle a **carve destruction event** (Phase 2 fine destruction, INV-D08): after
+/// [`apply_damage`](super::apply_damage) has already removed the carved cells from the
+/// ship's [`FitLayout`], run the connectivity flood-fill **once** and resolve the new
+/// model of death and severing.
+///
+/// `pre_carve_core` is the ship's [`core_cell`] **before** the carve (the caller
+/// captures it just before `apply_damage`, since the carve may have removed it). The
+/// resolution:
+///
+/// 1. **Core destroyed** — `pre_carve_core` is no longer present in the layout (the
+///    carve cut the core cell away): the whole ship is destroyed ([`destroy_ship`]).
+/// 2. **No core left** — the layout is empty: whole ship destroyed.
+/// 3. Else run [`connected_region`] from the (still-present) core. If a region is
+///    disconnected from the core, it **severs** into a drifting [`WreckChunk`]
+///    ([`sever_chunk`]); but if severing would isolate the **core itself** (the
+///    pre-carve core ends up in a disconnected region — i.e. the body was cut such
+///    that the core is on the smaller piece), that is **core-severed** → the whole
+///    ship is destroyed instead. In practice [`connected_region`] anchors on the
+///    present core, so any region NOT attached to it severs and the core's piece
+///    survives — the ship dies only when the core cell is itself gone (cases 1/2).
+///
+/// Event-driven, never per-frame (INV-D08). Server-authoritative (INV-D16). Total: a
+/// missing fit/hull/layout is a no-op (no panic). Returns `true` iff the ship was
+/// destroyed (so the caller can raise the kill flash).
+pub fn on_cells_carved(world: &mut World, ship: Entity, pre_carve_core: Option<Cell>) -> bool {
+    // Already a wreck → nothing further (idempotent — a later shot on a dead hulk).
+    if world.get::<Wreck>(ship).is_some() {
+        return false;
+    }
+    let Some(layout) = world.get::<FitLayout>(ship).cloned() else {
+        return false;
+    };
+
+    // --- 1/2. Core destroyed (carved away) or no cells left → whole-ship death ---
+    let core_after = core_cell(&layout);
+    let core_carved_away = pre_carve_core.is_some_and(|c| !layout.cells.contains_key(&c));
+    if core_after.is_none() || core_carved_away {
+        destroy_ship(world, ship);
+        return true;
+    }
+    // SAFETY: `core_after` is `Some` here.
+    let core = core_after.expect("core present after the non-whole-ship branch");
+
+    // --- 3. Flood-fill once + sever every region disconnected from the core ------
+    let attached = connected_region(&layout, core);
+    let regions = disconnected_regions(&layout, &attached);
+    for region in regions {
+        if !region.is_empty() {
+            sever_chunk(world, ship, &region);
+        }
+    }
+    false
+}
 
 /// Handle a section reaching `0` structural health (T028, FR-014/015/016/017): remove
 /// the section's cells from the ship's [`FitLayout`], then run the connectivity check

@@ -249,15 +249,21 @@ pub fn derive_ship_stats(
         };
 
         // Live health factor for this module, read from the layout's occupied cell
-        // (the one carrying this slot + an installed module). A defensive miss —
-        // an installed module with no occupied cell — applies no penalty (`1.0`),
-        // so derivation stays total (FR-012, INV-D13).
+        // (the one carrying this slot + an installed module). With Phase 2 carving, a
+        // module cell that has been **carved away or severed off** is no longer in the
+        // layout — that means the module is GONE, so a missing cell is treated as
+        // **destroyed** (`hf == 0`), exactly as a `health <= 0` cell. So a carved-off
+        // weapon drops `can_fire`, a carved-off reactor collapses `power_supply`, etc.
+        // (FR-012/013, INV-D13) — the emergent degrade the carving model relies on. A
+        // module that has no built cell at all (an impossible state post-`build_layout`,
+        // which authors a cell per slot) likewise contributes nothing, keeping
+        // derivation total.
         let hf = layout
             .cells
             .values()
             .find(|o| o.slot == *slot_id && o.module.is_some())
             .map(|occ| health_factor(occ, module, &cfg))
-            .unwrap_or(1.0);
+            .unwrap_or(0.0);
 
         // Universal budget costs apply on every kind and are NOT scaled by health
         // (a damaged module still has mass / draws power+cpu, INV-D13).

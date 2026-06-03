@@ -42,9 +42,10 @@ use super::penetration::{resolve_penetration, PenetrationResult};
 use super::resist::{layer_resist, DefenseLayer, ResistanceMatrix};
 use super::shields::shield_absorb;
 use crate::fitting::{
-    resolve_hit, Cell, Fit, FitLayout, HitResolution, Hull, HullCatalog, ModuleCatalog, ModuleRef,
-    SectionId,
+    resolve_hit, Cell, CellOccupant, Fit, FitLayout, HitResolution, Hull, HullCatalog,
+    ModuleCatalog, ModuleRef, SectionId,
 };
+use crate::physics::{Physics, RapierPhysics};
 
 /// The regenerating, power-linked outer shield pool — one per ship (FR-010,
 /// data-model.md `Shields`).
@@ -219,6 +220,46 @@ pub struct DamageContext {
 /// spans it).
 const REACH: f32 = 64.0;
 
+// --- Phase 2 carving (fine destruction) tuning ----------------------------------
+//
+// After the upstream Shields + Armor gate, a penetrating shot carries a `damage`
+// budget (the post-armor surviving magnitude) and a `penetration` budget down the
+// shot ray, **carving a channel** of cells from the entry inward (the "eaten-away"
+// model, ADR-0008/GDD §5). At each cell along the path:
+//   - subtract the cell's *current* `health` worth of work from the budgets;
+//   - if the cell's health reaches `<= 0`, it is destroyed (removed) and the shot
+//     continues to the next cell with reduced budgets (it spent energy punching
+//     through — see [`CARVE_FALLOFF`]);
+//   - if the cell survives (its health is only chipped), the shot **lodges** there
+//     and stops (a weak shot chips one cell; a strong/high-pen shot tunnels deep).
+// The walk stops when a cell survives, the damage OR penetration budget is spent, or
+// the ray exits the grid. Deterministic: the cells are walked in ascending time-of-
+// impact along the ray (ties broken by outer-before-inner depth, then `Cell` order).
+//
+// All consts are grounded-but-scaled tunables (Phase 3 refines feel). They are sized
+// (with `STRUCT_CELL_HP = 10`, the autocannon's `damage 12 → penetration 36`) so a
+// sustained square-on burst visibly erodes a channel and kills the demo fighter in
+// ~5–15 s, while a single weak shot only chips a cell or two.
+
+/// Penetration cost to punch *through* one destroyed cell and keep tunnelling: each
+/// cell carved subtracts this fixed amount from the shot's `penetration` budget (on
+/// top of the per-cell damage cost). Tunnelling deeper costs penetration, so a finite
+/// shot carves a finite-depth channel and a low-pen shot stops shallow even when its
+/// damage budget is large. `> 0`.
+const CARVE_PEN_COST: f32 = 8.0;
+
+/// Multiplicative damage falloff applied to the surviving `damage` budget after a
+/// cell is punched through (the shot loses energy crossing each cell). `∈ (0, 1)`: a
+/// value near `1` carves a long channel from one strong shot, near `0` chips ~one
+/// cell. With the per-cell `health` subtraction this gives a tunable, decaying
+/// channel depth.
+const CARVE_FALLOFF: f32 = 0.75;
+
+/// The per-cell `health` floor used as the carve *work cost* for an empty module-slot
+/// cell (`health == 0`, no installed device): such a cell still costs a little to
+/// punch through so the channel does not carve infinitely free through hollow slots.
+const CARVE_MIN_CELL_COST: f32 = 1.0;
+
 /// The fallback armor facet for an **unplated** entry section (no [`ArmorFacet`] in
 /// [`SectionArmor`]): a thin steel plate normal to the incoming shot. So a hit on a
 /// bare section still runs the penetration gate (it almost always penetrates), the
@@ -298,6 +339,43 @@ pub fn route_behind(
     resolve_hit(fit, p0, p1, hull, catalog)
 }
 
+/// The cells the carve ray passes through, in deterministic entry-inward order, with
+/// the radius the per-cell inscribed circle uses. Mirrors the E006
+/// [`CELL_RADIUS`](crate::fitting) inscribe so a ray through a cell centre registers.
+const CARVE_CELL_RADIUS: f32 = 0.5;
+
+/// Walk the present cells of `layout` the ray `p0 → p1` passes through, in the
+/// deterministic order the shot would carve them: ascending time-of-impact along the
+/// ray, ties broken outer-before-inner by occlusion `depth`, then by [`Cell`] order
+/// (Principle II — no `HashMap` iteration; the source map is a `BTreeMap`).
+///
+/// Reuses the **existing** swept point-vs-circle primitive
+/// ([`Physics::swept_cast`]) against each present cell's inscribed circle — the same
+/// CCD `resolve_hit` uses, no new geometry. Returns each crossed cell paired with its
+/// occupant snapshot (its live `health`/`module`), so the caller can carve it without
+/// re-borrowing the layout per step. Pure; reads only its arguments.
+fn carve_path(layout: &FitLayout, p0: Vec2, p1: Vec2) -> Vec<(Cell, CellOccupant)> {
+    let physics = RapierPhysics::new();
+    let mut hits: Vec<(f32, u16, Cell, CellOccupant)> = Vec::new();
+    for (&cell, occ) in &layout.cells {
+        let center = Vec2::new(cell.0 as f32 + 0.5, cell.1 as f32 + 0.5);
+        if let Some(hit) = physics.swept_cast(p0, p1, center, CARVE_CELL_RADIUS) {
+            hits.push((hit.toi, occ.depth, cell, *occ));
+        }
+    }
+    // Ascending toi (first crossed first); ties → outer (lower depth) first; then the
+    // BTreeMap-natural Cell order for a fully deterministic carve sequence.
+    hits.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+            .then(a.2.cmp(&b.2))
+    });
+    hits.into_iter()
+        .map(|(_, _, cell, occ)| (cell, occ))
+        .collect()
+}
+
 /// The legible "what happened" tag the HUD reads (FR-024, SC-005) — never numeric
 /// spam, advisory only (the server owns the authoritative mutation).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -316,40 +394,73 @@ pub enum HitKind {
 }
 
 /// The result of [`apply_damage`] (contracts/damage-api.md §1) — the legible
-/// outcome the HUD reads + the destruction flag the re-derive/destruction worker
-/// consumes (later phases).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// outcome the HUD reads + the carving result the destruction/sever worker consumes
+/// (Phase 2 fine destruction).
+///
+/// **Phase 2 carving shape**: `apply_damage` no longer routes a single
+/// route-behind-or-spill magnitude — it carves a **channel** of cells along the shot
+/// ray (see [`apply_damage`]). [`destroyed_cells`](DamageOutcome::destroyed_cells)
+/// lists every cell the carve removed from the target's [`FitLayout`] (deterministic
+/// entry-inward order); [`struck`](DamageOutcome::struck) is the entry module (or the
+/// first module cell carved) for the HUD; [`destroyed`](DamageOutcome::destroyed) is
+/// `true` iff at least one cell was removed (a destruction event the caller flood-
+/// fills on). `DamageOutcome` holds a `Vec`, so it is `Clone`, not `Copy`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct DamageOutcome {
-    /// The module struck (the entry module for a ricochet/non-pen, the module
-    /// behind for a clean/over penetration), or `None` on a shield-absorb / spill /
-    /// no-module hit.
+    /// The module the hit is attributed to for the HUD: the entry module (the first
+    /// module cell on the ray), or `None` on a shield-absorb / structural-only / no-
+    /// module hit.
     pub struck: Option<ModuleRef>,
-    /// The magnitude that actually landed on the struck target (the shield-absorbed
-    /// amount for a `ShieldAbsorbed`, the post-traversal damage otherwise).
+    /// The magnitude that actually landed (the shield-absorbed amount for a
+    /// `ShieldAbsorbed`, else the post-armor damage budget spent carving).
     pub applied: f32,
     /// The deepest [`DefenseLayer`] the surviving damage reached.
     pub layer_reached: DefenseLayer,
     /// The legibility tag (FR-024).
     pub result: HitKind,
-    /// Whether the struck target was destroyed (`health <= 0`) by this hit
-    /// (INV-D01).
+    /// Whether this hit removed at least one cell (a destruction event the caller
+    /// connectivity-checks / core-death-checks on). Equivalent to
+    /// `!destroyed_cells.is_empty()`.
     pub destroyed: bool,
+    /// The cells the carve removed from the target's [`FitLayout`], in the
+    /// deterministic entry-inward order they were carved (Phase 2). A module cell
+    /// among them means that module was destroyed. Empty on a ricochet / shield-
+    /// absorb / no-module hit (nothing carved).
+    pub destroyed_cells: Vec<Cell>,
 }
 
-/// Apply a [`DamageEvent`] to `target` through the full ordered traversal
-/// **Shields → Armor → Hull → Systems** (FR-002/003/004/009/011, data-model.md
-/// "Resolution Order" §254-264), mutating the live `FitLayout`/`Shields`/
-/// `HullStructure` components and returning the legible [`DamageOutcome`].
+/// Apply a [`DamageEvent`] to `target` through the upstream layers **Shields →
+/// Armor gate** and then **carve a channel of cells** along the shot ray (Phase 2
+/// fine destruction, ADR-0008/GDD §5), mutating the live `FitLayout`/`Shields`
+/// components and returning the carving [`DamageOutcome`].
 ///
-/// The running magnitude is **monotonically non-increasing** across the layers
-/// (every factor is `≤ 1`: shield absorption removes some, each matrix cell removes
-/// `layer_resist ∈ [0,1)`, each penetration tier is `≤ 1`) — T018 guards this.
+/// **Upstream (unchanged)**: the shot is absorbed by the [`Shields`] pool first; a
+/// full absorb returns `ShieldAbsorbed`. The surviving magnitude is mitigated by the
+/// Armor matrix cell, then the **armor gate** ([`resolve_penetration`], reading the
+/// entry cell's hull-radial impact angle + the section's [`ArmorFacet`]) decides the
+/// tier: a `Ricochet` deposits nothing and stops (no cell carved); otherwise the gate
+/// yields a surviving-damage fraction (the `pen_tier`) applied to the post-armor
+/// magnitude. The running magnitude stays **monotonically non-increasing** across the
+/// upstream layers (T018 guards this).
 ///
-/// Total + server-authoritative (INV-D16): a hit on an empty/structural/off-grid
-/// cell yields `DamageOutcome { result: NoModule, .. }` (never a panic). Health is
-/// clamped `>= 0` (INV-D01). The borrow checker is managed by reading the small,
+/// **Carving (Phase 2)**: the post-armor surviving magnitude becomes a **damage
+/// budget** and the event's `penetration` a **penetration budget**, walked down the
+/// ray ([`carve_path`], entry-inward, deterministic). At each cell the shot subtracts
+/// the cell's `health`-worth of work; a cell driven to `health <= 0` is **destroyed**
+/// (removed from the layout, recorded in `destroyed_cells`) and the shot continues
+/// with reduced budgets ([`CARVE_FALLOFF`]/[`CARVE_PEN_COST`]); a cell that only
+/// survives chipped **lodges** the shot (stop). The walk also stops when either budget
+/// is exhausted or the ray exits the grid. So a strong/high-pen shot carves a deeper
+/// channel; a weak shot chips one cell; a `NoModule`/structural-only entry still
+/// carves structural cells (the hull erodes where there is no module).
+///
+/// Total + server-authoritative (INV-D16): a hit with no resolvable fit/hull/resource
+/// yields `DamageOutcome { result: NoModule, .. }` (never a panic). Health is clamped
+/// `>= 0` (INV-D01). The cell removal flows to the client via the existing client-only
+/// `render_state` cell payload (the hull mesh rebuilds on the cell-set change), so the
+/// erosion renders for free. The borrow checker is managed by reading the small,
 /// `Copy`/`Clone` component snapshots up front, then writing the mutated layout/
-/// structure/shields back at the end.
+/// shields back at the end.
 pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> DamageOutcome {
     // --- 1. Read the target's components + the content resources --------------
     // Clone the small reads so the resource/component borrows do not overlap the
@@ -361,7 +472,11 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
         return no_module();
     };
     let mut shields = world.get::<Shields>(target).copied();
-    let mut hull_structure = world.get::<HullStructure>(target).copied();
+    // HullStructure is no longer mutated by carving (Phase 2 retired the structural-
+    // spill model in favour of cell carving + core-death). It is still read so the
+    // write-back leaves the (now-unchanged) component intact; kept for the unfitted/
+    // backstop seam and the seeded-but-unused INV-D14 power-link decay path.
+    let hull_structure = world.get::<HullStructure>(target).copied();
     let section_armor = world
         .get::<SectionArmor>(target)
         .cloned()
@@ -373,10 +488,13 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
     let Some(hull) = hulls.get(fit.hull).cloned() else {
         return no_module();
     };
-    let catalog = match world.get_resource::<ModuleCatalog>() {
-        Some(c) => c.clone(),
-        None => return no_module(),
-    };
+    // The carve reads only the live `FitLayout` (cell health/occupancy) + the armor/
+    // matrix content — it no longer needs the module catalog to resolve a behind-cell
+    // (the route-behind model is retired). Keep a presence guard so a world without the
+    // E007 content resources degrades to `NoModule` rather than half-resolving.
+    if world.get_resource::<ModuleCatalog>().is_none() {
+        return no_module();
+    }
     let matrix = match world.get_resource::<ResistanceMatrix>() {
         Some(m) => *m,
         None => return no_module(),
@@ -388,8 +506,16 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
 
     let channel = ev.channel;
 
-    // --- 2. Geometry: resolve the entry point --------------------------------
-    let Some(entry) = resolve_entry_point(&fit, &hull, &catalog, &ev) else {
+    // --- 2. Geometry: the carve path + its entry (surface) cell --------------
+    // The carve walks the cells the ray crosses, entry-inward (deterministic). The
+    // **entry cell** is the FIRST cell on this path — the genuine hull-surface cell
+    // the shot meets, where the armor angle is read (NOT a deep module cell). An empty
+    // path (the ray crosses no present cell — off-grid / fully eroded) is the
+    // total-pipeline `NoModule` edge (never a panic).
+    let p0 = ev.point;
+    let p1 = ev.point + ev.dir * REACH;
+    let path = carve_path(&layout, p0, p1);
+    let Some(&(entry_cell, _)) = path.first() else {
         return no_module();
     };
 
@@ -408,53 +534,68 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
                 layer_reached: DefenseLayer::Shields,
                 result: HitKind::ShieldAbsorbed,
                 destroyed: false,
+                destroyed_cells: Vec::new(),
             };
         }
         m = surviving;
     }
 
-    // --- 4. Armor gate -------------------------------------------------------
-    let facet = section_of_cell(&hull, entry.cell)
+    // --- 4. Armor gate (approach obliquity vs the hull, erosion-independent) -
+    let facet = section_of_cell(&hull, entry_cell)
         .and_then(|section| section_armor.facet(section).copied())
         .unwrap_or_else(|| default_facet(&ev));
 
-    // Impact angle from the REAL hit geometry, not the seeded facet `normal`.
+    // Impact angle = the shot's obliquity against the **original outer hull surface**
+    // at the entry cell — with a tunnel guard so a bored channel does not re-ricochet.
     //
-    // Fixes the live-demo ricochet bug: the per-section [`ArmorFacet::normal`]
-    // (e.g. the centred core's fixed `CORE_FALLBACK_NORMAL = -X` from
-    // `seed_defense_layers`) is constant, but the entry-ray transform routes every
-    // shot through the grid centre, so the centred core is the entry for shots from
-    // ANY direction. Measuring the angle off that fixed `-X` face meant a shot from
-    // any side but `+X` met it at a steep angle → permanent `Ricochet`, and once the
-    // shield was down the enemy could never be hull-killed.
+    // The entry cell's radial (`entry_cell_center − grid_centre`) is its outward
+    // surface normal: a +x-rim cell faces +x, a wing-tip faces outward, etc. A shot
+    // meeting that surface square-on (`cos_impact ≈ 1`) penetrates; a glancing edge hit
+    // (`cos_impact ≈ 0`) ricochets. BUT as a channel is carved inward, the first
+    // surviving cell recedes toward the core, whose radial is perpendicular to a
+    // side-on approach — which would wrongly flip a long-bored head-on burst into a
+    // permanent `Ricochet`. The physical truth: a shot travelling down an
+    // already-bored tunnel meets the cell at its end **head-on along the tunnel axis**
+    // (no plate obliquity).
     //
-    // The obliquity should instead reflect WHERE on the hull silhouette the shot
-    // landed. Derive the outward surface normal at the entry from the entry cell's
-    // radial position on the hull: `radial = entry_cell_center − grid_centre_local`.
-    // A cell on the +x rim faces +x, one on the −y rim faces −y, etc. A shot striking
-    // the hull roughly perpendicular to that local surface penetrates from any
-    // approach; only a genuinely glancing/edge hit ricochets.
-    //
-    // The dead-centre core cell has `radial ≈ 0` (no outward direction) — a centre
-    // hit means the shot already reached the core, so treat it as **head-on**
-    // (angle 0, never a ricochet). `cos_impact = (-dir)·surface_normal` is clamped to
-    // `[0, 1]`: a negative value would mean the entry geometry put us on a back face
-    // (unphysical for an entry), so floor it at 0 (grazing) rather than letting it
-    // become a 180° bounce. `angle ∈ [0, π/2]`. The facet's `thickness`/`material`
-    // (and thus armored-section toughness) are still used below for the EFFECTIVE
-    // armor — only the ANGLE source changed, so angling still matters (edge hits
-    // ricochet, armored sections deflect more), but a head-on shot from any side
-    // reliably penetrates. (`facet.normal` is now unused for the angle.)
-    let grid_centre_local = Vec2::new(hull.grid_dims.0 as f32 * 0.5, hull.grid_dims.1 as f32 * 0.5);
-    let entry_cell_center = Vec2::new(entry.cell.0 as f32 + 0.5, entry.cell.1 as f32 + 0.5);
-    let radial = entry_cell_center - grid_centre_local;
+    // Tunnel guard (erosion-aware, using the AUTHORED `hull`): if the **original**
+    // silhouette had a cell *in front of* the entry cell along the approach (i.e. the
+    // entry cell was buried in the intact hull and only exposed by carving), the shot
+    // is down a tunnel → head-on (`angle 0`). Only when the entry cell is on the
+    // original outer surface (no authored cell in front) does its radial obliquity
+    // apply — so fresh glancing hits ricochet, but a bored channel never re-ricochets.
     let dir_n = if ev.dir.length_squared() > f32::EPSILON {
         ev.dir.normalize()
     } else {
         Vec2::X
     };
-    let angle = if radial.length_squared() <= f32::EPSILON {
-        // Dead-centre core hit: no outward direction → head-on, never a ricochet.
+    // The cell one step in front of the entry along the approach (toward the shooter,
+    // `-dir_n`), rounded to the dominant axis — the cell the shot would have passed
+    // through just before reaching the entry on the original hull.
+    let front = {
+        let step = -dir_n;
+        let (dc, dr) = if step.x.abs() >= step.y.abs() {
+            (step.x.signum() as i32, 0)
+        } else {
+            (0, step.y.signum() as i32)
+        };
+        let fc = entry_cell.0 as i32 + dc;
+        let fr = entry_cell.1 as i32 + dr;
+        (fc, fr)
+    };
+    let buried = front.0 >= 0
+        && front.1 >= 0
+        && hull
+            .cells
+            .iter()
+            .any(|gc| gc.coord == (front.0 as u16, front.1 as u16));
+
+    let grid_centre_local = Vec2::new(hull.grid_dims.0 as f32 * 0.5, hull.grid_dims.1 as f32 * 0.5);
+    let entry_cell_center = Vec2::new(entry_cell.0 as f32 + 0.5, entry_cell.1 as f32 + 0.5);
+    let radial = entry_cell_center - grid_centre_local;
+    let angle = if buried || radial.length_squared() <= f32::EPSILON {
+        // Down a bored tunnel (entry was buried in the intact hull), or a centred
+        // surface cell with no outward direction → head-on, never a ricochet.
         0.0
     } else {
         let surface_normal = radial.normalize();
@@ -474,73 +615,113 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
         &pen_cfg,
     );
 
-    // The kind tag + the cell behind the entry the surviving damage routes to. The
-    // behind cell is resolved **once** (route_behind is re-entry-safe but pure, so
-    // a single call is enough) and reused for both the struck-ref and the mutation.
-    let result;
-    let behind = match pen {
+    // The kind tag + the post-armor surviving fraction that becomes the carve damage
+    // budget. A `Ricochet` deposits nothing and stops (no cell carved) via an early
+    // return; the other tiers scale the running magnitude `m` and yield their tag.
+    let result = match pen {
         PenetrationResult::Ricochet { .. } => {
-            // Bounced: no module-behind damage. The entry module takes nothing.
+            // Bounced: nothing carves. Write back the (untouched) layout/shields. The
+            // HUD attribution is the entry cell's module if it is a module cell.
+            let struck = layout
+                .cells
+                .get(&entry_cell)
+                .and_then(|occ| occ.module.map(|m| ModuleRef::new(occ.slot, m)));
             write_back(world, target, layout, shields, hull_structure);
             return DamageOutcome {
-                struck: Some(entry.module),
+                struck,
                 applied: 0.0,
                 layer_reached: DefenseLayer::Armor,
                 result: HitKind::Ricochet,
                 destroyed: false,
+                destroyed_cells: Vec::new(),
             };
         }
         PenetrationResult::NonPenetration { surviving, .. } => {
-            // Stopped by the plate: the tier (≈0) spills to HullStructure; nothing
-            // routes to a module behind.
+            // Stopped-ish by the plate: only the small non-pen tier survives to carve.
             m *= surviving;
-            result = HitKind::Penetrated;
-            None
+            HitKind::Penetrated
         }
         PenetrationResult::Penetration { surviving, .. } => {
-            // Clean pass-into: route the surviving tier to the cell BEHIND the entry
-            // (INV-D06, outer-before-inner).
             m *= surviving;
-            result = HitKind::Penetrated;
-            route_behind(&fit, &hull, &catalog, &entry, &ev)
+            HitKind::Penetrated
         }
         PenetrationResult::OverPenetration { surviving, .. } => {
-            // Pass-through: the reduced over tier routes to the cell behind.
             m *= surviving;
-            result = HitKind::OverPenetrated;
-            route_behind(&fit, &hull, &catalog, &entry, &ev)
+            HitKind::OverPenetrated
         }
     };
 
-    let struck_ref = behind.map(|b| b.module);
-    // The deepest layer the surviving damage reaches: Systems when a module-behind
-    // is struck, HullStructure for spillover.
+    // --- 5. Carve budget = the post-armor surviving magnitude ----------------
+    // The Hull/Systems matrix passes from the old route-behind model are **not**
+    // applied to the carve budget: the cells the channel carves ARE the hull
+    // structure / the systems behind it, so applying a Hull/Systems resist here would
+    // double-count the mitigation against the very cells being removed. The shot has
+    // already paid Shields + the Armor matrix + the penetration tier; what survives is
+    // the work it does carving cells. (The matrix's Hull/Systems columns still matter
+    // upstream via the channel's strong-vs-layer pen behavior; they are just not a
+    // second multiplier on the carve work.)
+    //
+    // --- 6. Carve a channel of cells along the shot ray (Phase 2) ------------
+    // The post-armor magnitude is the damage budget; the event penetration is the
+    // penetration budget. Walk the present cells the ray crosses (the `path` computed
+    // in step 2, entry-inward) and carve each in turn until a cell survives (lodge), a
+    // budget is spent, or the ray exits the grid. Removed cells are recorded
+    // (deterministic order) + dropped from the live FitLayout → the client erodes the
+    // hull for free via the cell payload.
+    let mut layout = layout;
+
+    let mut damage_budget = m.max(0.0);
+    let mut pen_budget = ev.penetration.max(0.0);
+    let mut destroyed_cells: Vec<Cell> = Vec::new();
+    let mut applied = 0.0_f32;
+    // The HUD attribution: the first MODULE cell the channel touches (entry module if
+    // it is a module cell, else the first module cell carved through), else `None`.
+    let mut struck_ref: Option<ModuleRef> = None;
+
+    for (cell, occ) in &path {
+        if damage_budget <= 0.0 || pen_budget <= 0.0 {
+            break;
+        }
+        // The cell's live remaining health — the work needed to DESTROY it. An already-
+        // dead cell (`health <= 0`, e.g. chipped to 0 by a prior shot) needs no work
+        // and is removed immediately.
+        let remaining = occ.health.max(0.0);
+        // Record the module attribution from the first module cell on the channel.
+        if struck_ref.is_none() {
+            if let Some(module_id) = occ.module {
+                struck_ref = Some(ModuleRef::new(occ.slot, module_id));
+            }
+        }
+
+        if damage_budget >= remaining {
+            // Punched through: the shot finishes this cell. Remove it, spend the budgets
+            // (a hollow/already-dead cell still costs a small CARVE_MIN_CELL_COST so the
+            // channel is not infinitely free), apply the falloff, and continue carving
+            // the next cell deeper with the reduced budget.
+            let cost = remaining.max(CARVE_MIN_CELL_COST);
+            applied += remaining;
+            layout.cells.remove(cell);
+            destroyed_cells.push(*cell);
+            damage_budget = (damage_budget - cost).max(0.0) * CARVE_FALLOFF;
+            pen_budget -= CARVE_PEN_COST;
+        } else {
+            // The shot lodges in this cell: chip its health (clamped >= 0) and stop.
+            applied += damage_budget;
+            if let Some(live) = layout.cells.get_mut(cell) {
+                live.health = (live.health - damage_budget).max(0.0);
+            }
+            break;
+        }
+    }
+
+    let destroyed = !destroyed_cells.is_empty();
+    // The deepest layer the carve reached: Systems if a module cell was on the channel,
+    // else HullStructure (the structural body).
     let layer_reached = if struck_ref.is_some() {
         DefenseLayer::Systems
     } else {
         DefenseLayer::HullStructure
     };
-
-    // --- 5. Hull then Systems mitigation -------------------------------------
-    m *= 1.0 - layer_resist(&matrix, DefenseLayer::HullStructure, channel);
-    m *= 1.0 - layer_resist(&matrix, DefenseLayer::Systems, channel);
-
-    // --- 6. Apply to the struck target (clamped >= 0, INV-D01) ---------------
-    let mut layout = layout;
-    let mut destroyed = false;
-    let applied = m.max(0.0);
-
-    if let Some(behind) = behind {
-        // Reduce the behind cell's live module health in the FitLayout (FR-009/011).
-        if let Some(occ) = layout.cells.get_mut(&behind.cell) {
-            occ.health = (occ.health - applied).max(0.0);
-            destroyed = occ.health <= 0.0;
-        }
-    } else if let Some(hs) = hull_structure.as_mut() {
-        // Spillover (non-pen, or nothing behind a penetration): structural HP.
-        hs.current = (hs.current - applied).max(0.0);
-        destroyed = hs.current <= 0.0;
-    }
 
     write_back(world, target, layout, shields, hull_structure);
 
@@ -550,6 +731,7 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
         layer_reached,
         result,
         destroyed,
+        destroyed_cells,
     }
 }
 
@@ -562,6 +744,7 @@ fn no_module() -> DamageOutcome {
         layer_reached: DefenseLayer::Shields,
         result: HitKind::NoModule,
         destroyed: false,
+        destroyed_cells: Vec::new(),
     }
 }
 

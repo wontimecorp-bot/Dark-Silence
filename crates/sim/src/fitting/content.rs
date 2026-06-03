@@ -89,11 +89,12 @@ pub const HULL_CORVETTE: HullId = HullId(2);
 /// installed module's `health_max`; structural filler cells take this so the dense
 /// hull body has hit points Phase 2 can carve away cell-by-cell (ADR-0008, GDD §5).
 ///
-/// Tunable: first-pass shape, not final balance (Phase 3 tunes carve feel). It is
-/// **not** wired into combat in Phase 1A — `resolve_hit` still resolves to module
-/// cells only, so structural HP changes no combat outcome this phase; it exists so the
-/// per-cell health store is populated for the Phase 2 carving model.
-pub const STRUCT_CELL_HP: f32 = 10.0;
+/// Tunable carve balance (Phase 2): sized so a sustained square-on autocannon burst
+/// (post-shield/armor/pen carve budget ≈ 3.6 per shot at 5 shots/s) erodes a visible
+/// channel and reaches the demo fighter's core in ~5–15 s — substantial, not instant,
+/// not a slog — while a single weak shot only chips a cell. Lowered from the Phase 1A
+/// placeholder 10.0 so the carve is legible against the autocannon's per-shot budget.
+pub const STRUCT_CELL_HP: f32 = 4.0;
 
 /// Seed module id: `reactor_basic` — supplies power; cost axis = mass.
 pub const MODULE_REACTOR_BASIC: ModuleId = ModuleId(1);

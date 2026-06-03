@@ -471,67 +471,74 @@ fn shields_absorb_first_then_regen_and_decay() {
     assert!(depleted);
 }
 
-// --- T020 (FR-002/009/011) [COMPLETES FR-002/009/011] (SC-001) -------------------
+// --- T020 (FR-002/009/011 → Phase 2 carving) [COMPLETES FR-002/009/011] (SC-001) --
+//
+// REVISED for the Phase 2 carving model (the old route-behind/spill semantics this
+// test asserted are retired). `apply_damage` no longer routes one post-pen magnitude
+// to a single "cell behind" — it **carves a channel** of cells along the shot ray out
+// of the live `FitLayout`. The justified re-assertions:
+//   - a strong clean-penetrating shot carves a DEEP channel: it removes the entry
+//     cover (4,5) AND the buried reactor (4,4) along the ray (the module behind is
+//     reached only after the cover — the outer-before-inner survivability property
+//     still holds, now expressed as carve order); `destroyed_cells` is non-empty;
+//   - a weak shot carves a SHALLOWER channel (fewer cells) and does NOT reach the
+//     buried reactor — it chips/eats only the outer cells (the cover survives intact);
+//   - a ricochet carves NOTHING.
 
-/// A `DamageEvent` resolves to the entry point, passes the layers, and a clean
-/// penetration drives the cell **behind** it to `health == 0` (destroyed); the
-/// buried reactor is reached only after its armor-plate cover. A shallower shot
-/// strikes the cover first.
+/// A clean penetrating shot **carves a channel** of cells along its ray — removing the
+/// entry cover and the buried reactor behind it — while a weak shot carves a shallower
+/// channel that never reaches the reactor (outer-before-inner survivability, now as
+/// carve depth). The reactor is destroyed (carved away) only by the strong shot.
 #[test]
-fn clean_penetration_destroys_the_module_behind_the_cover() {
+fn clean_penetration_carves_a_channel_to_the_module_behind() {
     // No shield (so the shot reaches the armor gate directly), thin entry facet.
     let (mut w, ship) = fitted_world(None, thin_entry_facet);
 
-    // The entry point of the downward shot is the (4,5) armor-plate cover (slot 5).
+    // A strong clean Em penetration down column 4 (from above) carves a deep channel:
+    // it eats the outer hull cells, the (4,5) armor cover, and the (4,4) reactor behind
+    // it. pen 1000 ≫ the thin plate, magnitude 4000 ≫ the per-cell HP → a deep tunnel.
     let ev = downward_shot(Channel::Em, 4000.0, 1000.0, 0.0);
-    {
-        let fit = w.get::<Fit>(ship).unwrap().clone();
-        let hulls = w.get_resource::<HullCatalog>().unwrap();
-        let hull = hulls.get(HULL_FIGHTER).unwrap();
-        let modules = w.get_resource::<ModuleCatalog>().unwrap();
-        let entry = sim::damage::resolve_entry_point(&fit, hull, modules, &ev)
-            .expect("the downward shot strikes the cover");
-        assert_eq!(
-            entry.cell,
-            (4, 5),
-            "the shallower shot strikes the cover first"
-        );
-        assert_eq!(
-            entry.module.slot,
-            SlotId(5),
-            "the cover is the armor plate (slot 5)"
-        );
-    }
-
-    // Apply: a clean Em penetration through the thin plate routes to the reactor
-    // behind (4,4) and drives its health to 0 (destroyed).
     let out = apply_damage(&mut w, ship, ev);
-    assert_eq!(out.result, HitKind::Penetrated, "a clean penetration");
-    assert_eq!(
-        out.layer_reached,
-        DefenseLayer::Systems,
-        "reached the module behind"
+    assert!(
+        matches!(out.result, HitKind::Penetrated | HitKind::OverPenetrated),
+        "a clean penetration, got {:?}",
+        out.result
     );
-    let struck = out.struck.expect("a module behind the cover was struck");
-    assert_eq!(
-        struck.slot,
-        SlotId(0),
-        "the struck module is the buried reactor"
+    assert!(
+        out.destroyed,
+        "the penetrating shot carved at least one cell"
     );
-    assert!(out.destroyed, "the clean penetration destroyed the reactor");
-
-    // The reactor cell's live health is driven to 0 in the live FitLayout.
+    // The channel removed both the (4,5) cover and the (4,4) reactor behind it.
+    assert!(
+        out.destroyed_cells.contains(&(4, 5)),
+        "the channel carved the (4,5) armor cover (got {:?})",
+        out.destroyed_cells
+    );
+    assert!(
+        out.destroyed_cells.contains(&(4, 4)),
+        "the channel carved through to the buried (4,4) reactor (got {:?})",
+        out.destroyed_cells
+    );
+    // The cover is carved before the reactor (outer-before-inner carve order).
+    let cover_idx = out.destroyed_cells.iter().position(|&c| c == (4, 5));
+    let reactor_idx = out.destroyed_cells.iter().position(|&c| c == (4, 4));
+    assert!(
+        cover_idx < reactor_idx,
+        "the outer cover is carved before the buried reactor (got {:?})",
+        out.destroyed_cells
+    );
+    // Both cells are gone from the live FitLayout (removed, not just zeroed).
     let layout = w.get::<sim::fitting::FitLayout>(ship).unwrap();
-    let reactor = layout.occupant((4, 4)).unwrap();
-    assert_eq!(
-        reactor.health, 0.0,
-        "the buried reactor health hits 0 = destroyed"
+    assert!(
+        layout.occupant((4, 4)).is_none(),
+        "the buried reactor cell was carved away"
     );
+    let strong_channel_len = out.destroyed_cells.len();
 
-    // A shallower shot (low penetration, so it cannot clean-penetrate the cover)
-    // does NOT reach the reactor — the cover is reached first and stops it. Reset.
+    // A WEAK shot carves a SHALLOWER channel: a thick plate cover + a low pen/magnitude
+    // shot eats only a couple of outer cells and never reaches the buried reactor.
     let (mut w2, ship2) = fitted_world(None, |_m, _h| {
-        // A thick plate so a low-pen shot non-penetrates the cover.
+        // A thick plate so the low-pen shot at most non-penetrates / over-pens weakly.
         let mut armor = SectionArmor::new();
         armor.sections.insert(
             SectionId(5),
@@ -543,24 +550,61 @@ fn clean_penetration_destroys_the_module_behind_the_cover() {
         );
         armor
     });
-    let shallow = downward_shot(Channel::Em, 200.0, 1.0, 0.0); // pen 1 << effective armor
-    let out2 = apply_damage(&mut w2, ship2, shallow);
-    // The reactor behind is untouched: a non-penetration spills to hull, struck=None.
-    assert!(
-        out2.struck.is_none(),
-        "a shallow shot stops at the cover, not the buried module"
-    );
+    let weak = downward_shot(Channel::Em, 12.0, 5.0, 0.0); // small magnitude + low pen
+    let out2 = apply_damage(&mut w2, ship2, weak);
+    // The buried reactor (4,4) is untouched: the shallow channel never reaches it.
     let layout2 = w2.get::<sim::fitting::FitLayout>(ship2).unwrap();
-    let reactor2 = layout2.occupant((4, 4)).unwrap();
     let reactor_max = w2
         .get_resource::<ModuleCatalog>()
         .unwrap()
         .get(MODULE_REACTOR_BASIC)
         .unwrap()
         .health_max;
+    let reactor2 = layout2
+        .occupant((4, 4))
+        .expect("the buried reactor survives a weak shot");
     assert_eq!(
         reactor2.health, reactor_max,
-        "the buried reactor is unscathed by a shallow shot"
+        "the buried reactor is unscathed by a weak shallow shot"
+    );
+    assert!(
+        !out2.destroyed_cells.contains(&(4, 4)),
+        "the weak shot never carves the buried reactor (got {:?})",
+        out2.destroyed_cells
+    );
+    // The weak channel is strictly shallower than the strong one (fewer cells eaten).
+    assert!(
+        out2.destroyed_cells.len() < strong_channel_len,
+        "a weak shot carves a shallower channel than a strong shot ({} < {})",
+        out2.destroyed_cells.len(),
+        strong_channel_len
+    );
+
+    // A RICOCHET carves nothing: a shot grazing the hull's outer surface near-tangent
+    // (obliquity > ricochet_angle) bounces. Geometry: a straight-DOWN shot through the
+    // exposed left **wing tip** (0,5) — the only cell on column 0, a genuine outer
+    // surface cell whose outward normal is `-x`, perpendicular to the downward ray
+    // (obliquity ≈ 90°) → Ricochet, with a small non-overmatching penetrator.
+    let (mut w3, ship3) = fitted_world(None, thin_entry_facet);
+    let graze = DamageEvent {
+        channel: Channel::Em,
+        magnitude: 100.0,
+        penetration: 50.0,
+        pen_size: 0.0,
+        point: Vec2::new(0.5, 12.0), // above the left wing tip column 0
+        dir: Vec2::new(0.0, -1.0),   // straight down → grazes the -x-facing wing tip
+        source: None,
+    };
+    let out3 = apply_damage(&mut w3, ship3, graze);
+    assert_eq!(
+        out3.result,
+        HitKind::Ricochet,
+        "a near-tangent grazing clip of the wing tip ricochets (carves nothing)"
+    );
+    assert!(
+        out3.destroyed_cells.is_empty(),
+        "a ricochet carves nothing (got {:?})",
+        out3.destroyed_cells
     );
 }
 
@@ -757,7 +801,8 @@ fn destroyed_weapon_disarms_and_destroyed_reactor_unpowers_shields() {
 
 use sim::components::{AngularVelocity, Heading, Position, Velocity};
 use sim::damage::{
-    connected_region, core_cell, on_section_destroyed, sever_chunk, Wreck, WreckOrigin,
+    connected_region, core_cell, on_cells_carved, on_section_destroyed, sever_chunk, Wreck,
+    WreckOrigin,
 };
 use sim::fitting::{CellMap, CellOccupant, GridCell, Hull, HullId};
 
@@ -1541,21 +1586,27 @@ fn spawn_downward_projectile(w: &mut World, owner: Option<Entity>, damage: f32) 
     e.id()
 }
 
-// --- T040: fitted end-to-end (hit → damage → stat drop → sever → wreck) -----------
+// --- T040: fitted end-to-end (hit → carve channel → core destroyed → wreck) -------
+//
+// REVISED for the Phase 2 carving model: a single powerful Kinetic shot carves a deep
+// channel down the centre column, eating the (4,5) cover and the buried (4,4) reactor
+// — which is the deepest cell, i.e. the **core**. Carving the core away is the
+// whole-ship-destroyed path → a persistent `DestroyedShip` `Wreck` with salvage. The
+// old "reactor's section destroyed → sever → wreck" route-behind chain is retired.
 
-/// The full fitted chain in a `sim` `World` driven by the shared fixed step: a
-/// fired projectile sweep-hits a fitted ship → `damage_event_from_hit` →
-/// `apply_damage` → the buried reactor's health drops to 0 → the emergent
-/// `recompute_ship_stats_system` re-derives degraded `ShipStats` (the reactor's
-/// power collapses) → the reactor's section is destroyed → connectivity/sever →
-/// a `Wreck` with salvage exists (SC-001..SC-004 e2e, FR-001/021).
+/// The full fitted chain in a `sim` `World` driven by the shared fixed step: a fired
+/// projectile sweep-hits a fitted ship → `damage_event_from_hit` → `apply_damage`
+/// **carves a channel** through the cover to the buried core reactor → carving the
+/// core cell away destroys the ship → a persistent `Wreck` with salvage exists
+/// (SC-001..SC-004 e2e, FR-001/021, Phase 2 carving-to-core).
 #[test]
-fn fitted_projectile_hit_drives_the_full_damage_to_wreck_chain() {
+fn fitted_projectile_hit_carves_to_core_and_wrecks_the_ship() {
     let mut w = World::new();
     insert_full_combat_resources(&mut w);
     let ship = fitted_fighter_at_origin(&mut w);
 
-    // Baseline: the ship is powered (alive reactor) and the reactor cell is full.
+    // Baseline: the ship is powered (alive reactor) and the reactor cell is full. The
+    // reactor (4,4) is the deepest cell on the fighter → the core.
     let reactor_max = w
         .get_resource::<ModuleCatalog>()
         .unwrap()
@@ -1569,40 +1620,50 @@ fn fitted_projectile_hit_drives_the_full_damage_to_wreck_chain() {
             .unwrap()
             .health,
         reactor_max,
-        "the buried reactor starts at full health"
+        "the buried reactor (the core) starts at full health"
+    );
+    assert_eq!(
+        sim::damage::core_cell(w.get::<FitLayout>(ship).unwrap()),
+        Some((4, 4)),
+        "the buried reactor (4,4) is the core cell"
     );
 
-    // A high-damage Kinetic shot (penetration = damage * PEN_PER_DAMAGE) clean-
-    // penetrates the thin (steel, thickness 1) cover and overkills the reactor.
-    let proj = spawn_downward_projectile(&mut w, None, 1000.0);
-
-    // Drive the shared fixed step ONCE — the same pipeline the server/client run.
+    // Drive the shared fixed step. Run ONCE with no projectile first so the spawn-tick
+    // `Changed<Fit>` is consumed (a fit-change rebuilds the layout fresh — the
+    // install/repair path; a same-tick carve would be erased by that rebuild). After
+    // this, the layout is the live damage surface.
     let mut schedule = Schedule::default();
     sim::add_fixed_step_systems(&mut schedule);
     schedule.run(&mut w);
 
-    // --- SC-001: the hit resolved through apply_damage to a real module ----------
-    // The projectile despawned (it struck exactly one target).
+    // A very-high-damage Kinetic shot (penetration = damage * PEN_PER_DAMAGE) carves a
+    // deep channel down the centre column — through the structural nose, the 40-HP
+    // armor cover, AND the core reactor (the deepest cell) — in one burst.
+    let proj = spawn_downward_projectile(&mut w, None, 5000.0);
+    schedule.run(&mut w);
+
+    // --- SC-001: the hit resolved through apply_damage and carved cells ----------
     assert!(
         w.get_entity(proj).is_err(),
         "the projectile despawned after striking the fitted target"
     );
-    // The legibility tag was set (FR-024): a clean penetration on a fitted target.
     let fb = w.get_resource::<HitFeedback>().unwrap();
     assert!(fb.hit_flash > 0.0, "a fitted hit raises the hit flash");
-    assert_eq!(
-        fb.last_kind,
-        Some(HitKind::Penetrated),
-        "the clean penetration is tagged for the HUD (FR-024)"
+    assert!(
+        matches!(
+            fb.last_kind,
+            Some(HitKind::Penetrated) | Some(HitKind::OverPenetrated)
+        ),
+        "the penetrating carve is tagged for the HUD (FR-024), got {:?}",
+        fb.last_kind
     );
 
-    // --- SC-003: the reactor's section was destroyed → the ship is a wreck --------
-    // Destroying the reactor's section (it is the deepest/most-central cell on the
-    // fighter, so its loss is the whole-ship-destroyed path) leaves a persistent
-    // DestroyedShip wreck on the (now dead) ship entity.
+    // --- SC-003: the carve reached the core → the ship is a whole-ship wreck ------
+    // The channel carved the core reactor (4,4) away (the deepest cell), which is the
+    // whole-ship-destroyed path → a persistent DestroyedShip wreck on the dead entity.
     let wreck = w
         .get::<Wreck>(ship)
-        .expect("the reactor kill destroyed the ship → a persistent Wreck (SC-003)");
+        .expect("carving the core reactor destroyed the ship → a persistent Wreck (SC-003)");
     assert_eq!(wreck.origin, WreckOrigin::DestroyedShip);
 
     // --- SC-004: the wreck carries salvage (over-kill still yields >= scrap) ------
@@ -1616,6 +1677,180 @@ fn fitted_projectile_hit_drives_the_full_damage_to_wreck_chain() {
     assert!(
         w.get::<Position>(ship).is_some(),
         "the wreck persists as a physical body"
+    );
+}
+
+// --- Phase 2 carving: a carved-away MODULE cell drops that module (emergent) ------
+
+/// Carving a **weapon's module cell** away (removing it from the `FitLayout`) drops
+/// `can_fire` and the weapon profile on the re-derive — the emergent degrade the
+/// carving model produces when a hardpoint is eaten (FR-013, Phase 2). The weapon
+/// (slot 3, a forward wing mount on the fighter) is an outer, non-core cell, so the
+/// ship survives the carve and its degraded `ShipStats` is observable.
+#[test]
+fn carving_a_weapon_cell_drops_can_fire_on_rederive() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+
+    let (modules, hulls) = seed_catalogs();
+    let hull = hulls.get(HULL_FIGHTER).unwrap();
+    // A reactor (core), a thruster, and a forward weapon (slot 3 at (2,6)) — the weapon
+    // is an outer wing mount the carve can eat without killing the core.
+    let mut fit = Fit::new(HULL_FIGHTER);
+    fit.install_raw(SlotId(0), MODULE_REACTOR_BASIC);
+    fit.install_raw(SlotId(1), MODULE_THRUSTER_BASIC);
+    fit.install_raw(SlotId(3), MODULE_AUTOCANNON);
+    let layout = build_layout(hull, &fit, &modules);
+    let stats = derive_ship_stats(hull, &fit, &modules, &layout);
+    assert!(stats.can_fire, "the installed weapon arms the ship");
+    let weapon_cell = (2u16, 6u16); // slot 3's coord on the fighter
+
+    let ship = w
+        .spawn((Ship, fit, layout, stats, HullStructure::full(500.0)))
+        .id();
+
+    let mut schedule = Schedule::default();
+    schedule.add_systems(recompute_ship_stats_system);
+    schedule.run(&mut w); // consume the spawn Changed<Fit>
+
+    // A shot aimed straight at the weapon cell (2,6) from above carves it away. The
+    // entry ray is `point → point + dir·REACH`; aim it down column 2 onto (2,6).
+    let ev = DamageEvent {
+        channel: Channel::Em,
+        magnitude: 4000.0,
+        penetration: 1000.0,
+        pen_size: 0.0,
+        point: Vec2::new(2.5, 11.0),
+        dir: Vec2::new(0.0, -1.0),
+        source: None,
+    };
+    let out = apply_damage(&mut w, ship, ev);
+    assert!(
+        out.destroyed_cells.contains(&weapon_cell),
+        "the carve removed the weapon's module cell (got {:?})",
+        out.destroyed_cells
+    );
+    assert!(
+        w.get::<FitLayout>(ship)
+            .unwrap()
+            .occupant(weapon_cell)
+            .is_none(),
+        "the weapon cell is gone from the live FitLayout"
+    );
+
+    // Re-derive (the schedule's Changed<FitLayout> path): the carved-away weapon drops
+    // can_fire + the weapon profile (the module is GONE, treated as destroyed).
+    schedule.run(&mut w);
+    let degraded = w.get::<ShipStats>(ship).unwrap();
+    assert!(
+        !degraded.can_fire,
+        "a carved-away weapon drops can_fire (FR-013, emergent carve degrade)"
+    );
+    assert!(
+        degraded.weapon.is_none(),
+        "a carved-away weapon drops the WeaponProfile"
+    );
+}
+
+// --- Phase 2 carving: a channel that disconnects a wing severs it mid-fight -------
+
+/// Carving a channel that **disconnects a region** from the core severs it into a
+/// drifting `WreckChunk` while the ship still LIVES (FR-015/016, INV-D07, Phase 2):
+/// the core survives, the ship is not a wreck, but a severed chunk drifts away — a
+/// flank/wing cut off before the kill.
+#[test]
+fn carving_disconnects_a_region_and_severs_it_while_the_ship_lives() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+
+    // The fighter's nose (rows 7..=10) connects to the body only through row 6 (cols
+    // 2..=6) ↔ row 7. Carving away ALL of row 6 cuts the nose off from the body (which
+    // holds the core reactor at (4,4) in rows 4..=5). A square-on +x burst sweeping
+    // along row 6 (head-on to the +x face, so it penetrates — no graze) eats the whole
+    // row. We carve directly via apply_damage + on_cells_carved (the same calls
+    // fitted_damage_system makes), capturing the pre-carve core first.
+    let (modules, hulls) = seed_catalogs();
+    let hull = hulls.get(HULL_FIGHTER).unwrap();
+    let mut fit = Fit::new(HULL_FIGHTER);
+    fit.install_raw(SlotId(0), MODULE_REACTOR_BASIC);
+    let layout = build_layout(hull, &fit, &modules);
+    let ship = w
+        .spawn((
+            fit,
+            layout,
+            Position(Vec2::ZERO),
+            Velocity(Vec2::ZERO),
+            Heading(0.0),
+            AngularVelocity(0.0),
+            HullStructure::full(500.0),
+        ))
+        .id();
+
+    let core_before = core_cell(w.get::<FitLayout>(ship).unwrap());
+    assert_eq!(core_before, Some((4, 4)), "the reactor (4,4) is the core");
+
+    // A strong +x burst along row 6 (entering the +x face head-on → penetrates) carves
+    // (6,6),(5,6),(4,6),(3,6),(2,6) — the whole connecting neck row between the nose
+    // and the body. Several shots' worth of budget in one big event.
+    let ev = DamageEvent {
+        channel: Channel::Em,
+        magnitude: 4000.0,
+        penetration: 1000.0,
+        pen_size: 0.0,
+        point: Vec2::new(9.0, 6.5),
+        dir: Vec2::new(-1.0, 0.0),
+        source: None,
+    };
+    let out = apply_damage(&mut w, ship, ev);
+    assert!(out.destroyed, "the carve removed cells");
+    // The carve ate the connecting row 6 (the nose↔body neck).
+    for cut in [(2u16, 6u16), (3, 6), (4, 6), (5, 6), (6, 6)] {
+        assert!(
+            !w.get::<FitLayout>(ship).unwrap().cells.contains_key(&cut),
+            "row-6 neck cell {cut:?} was carved away"
+        );
+    }
+
+    // Run the carve-destruction connectivity (what fitted_damage_system calls).
+    let ship_destroyed = on_cells_carved(&mut w, ship, core_before);
+    assert!(
+        !ship_destroyed,
+        "the ship is NOT destroyed — only the nose was cut off, the core lives"
+    );
+
+    // The ship still lives (no Wreck on it) and keeps its core.
+    assert!(
+        w.get::<Wreck>(ship).is_none(),
+        "the ship lives after the nose severs (core intact)"
+    );
+    assert_eq!(
+        core_cell(w.get::<FitLayout>(ship).unwrap()),
+        Some((4, 4)),
+        "the core reactor survives the nose sever"
+    );
+
+    // A severed-chunk WreckChunk entity drifted off carrying the disconnected nose.
+    let mut q = w.query::<(&Wreck, &FitLayout)>();
+    let severed: Vec<_> = q
+        .iter(&w)
+        .filter(|(wr, _)| wr.origin == WreckOrigin::SeveredChunk)
+        .collect();
+    assert!(
+        !severed.is_empty(),
+        "the cut-off nose severs into at least one drifting chunk"
+    );
+    // The severed chunk(s) carry the nose-tip cells (rows 7..=10), not the core.
+    let severed_cells: std::collections::BTreeSet<(u16, u16)> = severed
+        .iter()
+        .flat_map(|(_, l)| l.cells.keys().copied())
+        .collect();
+    assert!(
+        severed_cells.contains(&(4, 10)),
+        "the severed nose carries the (4,10) nose-tip cell (got {severed_cells:?})"
+    );
+    assert!(
+        !severed_cells.contains(&(4, 4)),
+        "the core reactor is NOT in a severed chunk (it stays with the living ship)"
     );
 }
 
@@ -1742,14 +1977,14 @@ fn unfitted_target_uses_the_flat_health_clamp_path() {
 }
 
 // =================================================================================
-// E007 live-demo death trigger (regression): a fitted player ship firing steadily
-// at a fitted enemy through the REAL shared schedule must DESTROY the enemy via hull
-// depletion — the live `cargo run -p client` scenario that previously left the enemy
-// at 0 hull forever (alive + intact) because nothing destroyed it when
-// `HullStructure` reached 0 (the head-on shot's entry module is the centre cell with
-// nothing behind it, so penetrating damage spilled to hull and rarely killed a
-// MODULE cell, so `on_section_destroyed` never fired). The fix: `fitted_damage_system`
-// now calls `shatter_ship` + raises the kill flash once `HullStructure` is depleted.
+// E007 Phase 2 live-demo death (carving-to-core): a fitted player ship firing
+// steadily at a fitted enemy through the REAL shared schedule must DESTROY the enemy
+// by **carving a channel to its core** — the `cargo run -p client` scenario. This is
+// the Phase 2 successor to the old hull-depletion death: `fitted_damage_system` no
+// longer waits for `HullStructure` to drain (that trigger is RETIRED for fitted
+// ships); instead `apply_damage` carves cells out of the live `FitLayout`, and when
+// the carve reaches/severs the **core cell** the ship is destroyed (`destroy_ship` →
+// persistent wreck, sheds chunks). The kill must land in the tuned ~5–15 s window.
 // =================================================================================
 
 use sim::components::Weapon;
@@ -1759,9 +1994,9 @@ use sim::ShipIntent;
 /// The fixed timestep the live server runs at (30 Hz), so the measured kill-time is
 /// in real demo seconds.
 const REPRO_DT: f32 = 1.0 / 30.0;
-/// Run the schedule for up to ~15 s of demo time at 30 Hz (the tuning window the
-/// brief wants the kill to land inside, 5–12 s, with headroom).
-const REPRO_MAX_TICKS: u32 = (15.0 / REPRO_DT) as u32;
+/// Run the schedule for up to ~20 s of demo time at 30 Hz (the tuning window the
+/// brief wants the carve-to-core kill to land inside, ~5–15 s, with headroom).
+const REPRO_MAX_TICKS: u32 = (20.0 / REPRO_DT) as u32;
 
 /// Spawn a **fitted player ship** at the origin facing +x, holding `fire`, mirroring
 /// `client::net::attach_starter_fit` (reactor + 2 thrusters + autocannon on the
@@ -1846,32 +2081,33 @@ fn spawn_fitted_enemy_target(w: &mut World, pos: Vec2) -> Entity {
 }
 
 /// The LIVE demo scenario through the REAL schedule: a fitted player ship firing
-/// steadily at a fitted enemy must DESTROY it via hull depletion within ~5–12 s.
+/// steadily at a fitted enemy must **carve a channel to its core** and DESTROY it
+/// within the tuned ~5–15 s window (Phase 2 carving-to-core death).
 ///
-/// This is the red→green proof of the death-trigger fix. Before the fix the enemy's
-/// `HullStructure` reached 0 but nothing destroyed it (no `Wreck`, no chunks), so it
-/// sat alive + intact forever — the test's destruction assertions failed. After the
-/// fix `fitted_damage_system` shatters the ship once hull is depleted, so the enemy
-/// becomes a `Wreck` and sheds drifting `WreckChunk` debris, and a kill flash fires.
+/// This replaces the old `…_via_hull_depletion` death (the `HullStructure`-drain
+/// trigger is retired for fitted ships). The proof now: the enemy's `FitLayout` cells
+/// are visibly carved away (the cell count drops as the channel erodes), and when the
+/// carve reaches/severs the **core cell** the enemy becomes a persistent `Wreck`
+/// (death-stripped of `Target`/`FitLayout`/`CollisionRadius`) and a kill flash fires.
 #[test]
-fn fitted_player_fire_destroys_fitted_enemy_via_hull_depletion() {
+fn fitted_player_fire_carves_to_core_and_destroys_fitted_enemy() {
     let mut w = World::new();
     insert_full_combat_resources(&mut w);
 
     let _player = spawn_fitted_player(&mut w);
     let enemy = spawn_fitted_enemy_target(&mut w, Vec2::new(14.0, 0.0));
 
-    // The enemy's seeded structural backstop (what hull depletion has to chew
-    // through after the shield/armor/module mitigation).
-    let hull_hp_max = w.get::<HullStructure>(enemy).unwrap().max;
-    assert!(hull_hp_max > 0.0, "the enemy has a structural backstop");
+    // The enemy's starting cell count (the dense fighter silhouette) — what the carve
+    // erodes toward the core.
+    let cells_at_start = w.get::<FitLayout>(enemy).unwrap().cells.len();
+    assert!(cells_at_start > 0, "the enemy starts with hull cells");
 
     let mut schedule = Schedule::default();
     sim::add_fixed_step_systems(&mut schedule);
 
-    let mut hull_reached_zero_tick: Option<u32> = None;
     let mut kill_flash_fired = false;
     let mut destroyed_tick: Option<u32> = None;
+    let mut cells_were_carved = false;
 
     for tick in 0..REPRO_MAX_TICKS {
         schedule.run(&mut w);
@@ -1882,27 +2118,20 @@ fn fitted_player_fire_destroys_fitted_enemy_via_hull_depletion() {
             kill_flash_fired = true;
         }
 
-        // Record when the structural backstop first reaches 0 (the depletion the
-        // diagnosis confirmed already worked).
-        if hull_reached_zero_tick.is_none() {
-            if let Some(hs) = w.get::<HullStructure>(enemy) {
-                if hs.current <= 0.0 {
-                    hull_reached_zero_tick = Some(tick);
-                }
+        // The carve visibly erodes the hull: the enemy's live cell count drops below
+        // its starting silhouette as cells are carved away (before the kill).
+        if let Some(layout) = w.get::<FitLayout>(enemy) {
+            if layout.cells.len() < cells_at_start {
+                cells_were_carved = true;
             }
         }
 
         // Record when the enemy is destroyed: it carries a `Wreck`, OR it was
-        // despawned/severed away (the entity is gone), OR drifting chunk debris
-        // exists. Any of these is "visibly destroyed".
+        // despawned/severed away. Either is "core destroyed".
         if destroyed_tick.is_none() {
             let is_wreck = w.get::<Wreck>(enemy).is_some();
             let despawned = w.get_entity(enemy).is_err();
-            let has_chunks = w
-                .query::<&Wreck>()
-                .iter(&w)
-                .any(|wr| wr.origin == WreckOrigin::SeveredChunk);
-            if is_wreck || despawned || has_chunks {
+            if is_wreck || despawned {
                 destroyed_tick = Some(tick);
             }
         }
@@ -1912,46 +2141,41 @@ fn fitted_player_fire_destroys_fitted_enemy_via_hull_depletion() {
         }
     }
 
-    // --- The hull WAS depleted along the way (the part the diagnosis said worked) ---
-    let hull_zero = hull_reached_zero_tick
-        .expect("the enemy's HullStructure must reach 0 under sustained fire");
+    // --- The carve VISIBLY eroded the hull before the kill --------------------------
+    assert!(
+        cells_were_carved,
+        "the carve eroded the enemy's hull cells (the live cell count dropped below the \
+         starting silhouette) before the kill — the 'eaten-away' Phase 2 result"
+    );
 
     // --- A hit registered (HitFeedback.last_kind became Some at least once) ---------
-    // After a kill the flash + tag persist on the final tick (the kill set them and
-    // the schedule's decay only bleeds them down), so the resolved-hit tag is present.
     let last_kind = w.get_resource::<HitFeedback>().unwrap().last_kind;
     assert!(
         last_kind.is_some(),
         "at least one hit registered (HitFeedback.last_kind became Some)"
     );
 
-    // --- A kill flash fired (the death trigger raised destroy_flash) ----------------
+    // --- A kill flash fired (core-death raised destroy_flash) -----------------------
     assert!(
         kill_flash_fired,
-        "a kill flash fired when the enemy was destroyed (destroy_flash > 0)"
+        "a kill flash fired when the core was destroyed (destroy_flash > 0)"
     );
 
-    // --- The enemy is DESTROYED (a Wreck and/or despawned/severed + debris) ---------
-    let destroyed = destroyed_tick.expect(
-        "the enemy must be destroyed by sustained fire (this is the regression the fix \
-         repairs — before it the enemy sat at 0 hull forever, alive + intact)",
-    );
-    // It is a persistent wreck (the destroyed-ship path keeps the entity as the hulk),
-    // or the whole thing severed away — assert at least one wreck artifact exists.
-    let wreck_on_enemy = w.get::<Wreck>(enemy).is_some();
-    let any_wreck = w.query::<&Wreck>().iter(&w).count() > 0;
-    assert!(
-        wreck_on_enemy || any_wreck,
-        "destruction leaves a persistent Wreck (or severed chunks)"
-    );
+    // --- The enemy is DESTROYED by carving to its core ------------------------------
+    let destroyed =
+        destroyed_tick.expect("the enemy must be destroyed by sustained carving fire to its core");
 
     // --- CLEAN death: the dead enemy is NO LONGER a live, pristine target -----------
-    // The death-strip removes `Target`/`CollisionRadius`/`FitLayout`, so the enemy can
+    // `destroy_ship` removes `Target`/`CollisionRadius`/`FitLayout`, so the enemy can
     // no longer be hit by `fitted_damage_system` (no more repeated "KILL") and no
     // longer renders as a pristine ship — it is the drifting wreck hulk.
-    assert!(
-        w.get::<Wreck>(enemy).is_some(),
-        "the destroyed enemy carries the persistent Wreck marker"
+    let wreck = w
+        .get::<Wreck>(enemy)
+        .expect("the carve-to-core kill leaves a persistent Wreck marker");
+    assert_eq!(
+        wreck.origin,
+        WreckOrigin::DestroyedShip,
+        "core-death is the whole-ship-destroyed wreck origin"
     );
     assert!(
         w.get::<Target>(enemy).is_none(),
@@ -1971,34 +2195,20 @@ fn fitted_player_fire_destroys_fitted_enemy_via_hull_depletion() {
         w.get::<Position>(enemy).is_some() && w.get::<Velocity>(enemy).is_some(),
         "the wreck persists as a drifting physical body"
     );
-
-    // --- VISIBLE death: the shatter shed drifting debris chunks (severed) -----------
-    let chunk_count = w
-        .query_filtered::<&Wreck, ()>()
-        .iter(&w)
-        .filter(|wr| wr.origin == WreckOrigin::SeveredChunk)
-        .count();
-    assert!(
-        chunk_count > 0,
-        "the death sheds drifting WreckChunk debris (non-core sections severed before \
-         the core's whole-ship wreck) — got {chunk_count} severed chunks"
-    );
-    // Each severed chunk is a drifting `WreckChunk`-shaped body; reference the type so
-    // the import is load-bearing (the chunk's drift kinematics the demo relies on).
+    // Reference the WreckChunk type so the import is load-bearing (severed chunks are
+    // exercised in the dedicated sever-during-combat test below).
     let _ = std::mem::size_of::<WreckChunk>();
 
-    // --- Record + sanity-check the kill-time (the brief's 5–12 s tuning window) ------
+    // --- Record + sanity-check the kill-time (the brief's ~5–15 s tuning window) ----
     let kill_secs = destroyed as f32 * REPRO_DT;
-    let hull_zero_secs = hull_zero as f32 * REPRO_DT;
     eprintln!(
-        "[repro] enemy hull (max {hull_hp_max:.1}) reached 0 at tick {hull_zero} \
-         ({hull_zero_secs:.2}s); destroyed at tick {destroyed} ({kill_secs:.2}s); \
-         severed chunks at kill = {chunk_count}"
+        "[carve-repro] enemy ({cells_at_start} cells) carved-to-core dead at tick \
+         {destroyed} ({kill_secs:.2}s)"
     );
     assert!(
-        (5.0..=12.0).contains(&kill_secs),
-        "the kill should feel substantial but not a slog: expected 5–12 s, got {kill_secs:.2}s \
-         (tune `seed_defense_layers`' hull/shield/armor consts or the loadout)"
+        (5.0..=15.0).contains(&kill_secs),
+        "the carve-to-core kill should feel substantial but not a slog: expected ~5–15 s, \
+         got {kill_secs:.2}s (tune STRUCT_CELL_HP / the carve consts / the loadout)"
     );
 }
 

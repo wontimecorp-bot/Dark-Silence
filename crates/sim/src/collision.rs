@@ -12,10 +12,8 @@ use crate::components::{
     CollisionRadius, Damage, DamageFlash, Heading, Health, LastShieldHit, Position, PrevPosition,
     Projectile, ProjectileOwner, ShieldHitFlash, Ship, Target, TargetKind, Velocity,
 };
-use crate::damage::{
-    apply_damage, on_section_destroyed, shatter_ship, DamageEvent, HitKind, HullStructure, Wreck,
-};
-use crate::fitting::{Fit, FitLayout, HullCatalog, SectionId};
+use crate::damage::{apply_damage, core_cell, on_cells_carved, DamageEvent, HitKind};
+use crate::fitting::{Fit, FitLayout, HullCatalog};
 use crate::physics::{Physics, RapierPhysics, SweptHit};
 use crate::tuning::Tuning;
 use crate::weapon::{damage_event_from_hit, WeaponSource};
@@ -177,29 +175,41 @@ struct FittedHit {
 }
 
 /// Build the hull-local entry ray for a world-space projectile hit on a fitted
-/// target (the local-space transform the E007 pipeline expects, T038).
+/// target (the local-space transform the E007 pipeline expects, T038; Phase 2 aims
+/// the ray through the core cell so sustained fire bores toward the core).
 ///
-/// `apply_damage`/`resolve_entry_point` trace `ev.point → ev.point + ev.dir·REACH`
-/// across the target's **hull-local cell-space** (cells at integer coords, centers
-/// at `coord + 0.5`). This maps the world hit into that space:
+/// `apply_damage` carves `ev.point → ev.point + ev.dir·REACH` across the target's
+/// **hull-local cell-space** (cells at integer coords, centers at `coord + 0.5`).
+/// This maps the world hit into that space:
 ///
 /// 1. **Direction**: rotate the projectile's world travel direction `world_dir`
 ///    into the hull frame by `-heading` (the inverse ship rotation), giving the
 ///    incoming `dir_local`.
 /// 2. **Entry point**: place it on the far side of the grid **opposite** the
-///    incoming direction, through the grid center, so the local ray sweeps the
-///    whole chassis along `dir_local` and lands on the first occupied cell it
-///    crosses (mirroring the `REACH`-extended sweep `resolve_entry_point` does).
-///    `grid_center = (cols, rows)/2`; the entry sits `span` back along `-dir_local`
-///    where `span` over-covers the grid diagonal.
+///    incoming direction, through `aim_local` (the ship's core cell center, falling
+///    back to the grid geometric center), so the local ray sweeps the whole chassis
+///    along `dir_local` **toward the core** and carves the cells it crosses. The
+///    entry sits `span` back along `-dir_local` where `span` over-covers the grid
+///    diagonal.
 ///
-/// This is the **simplest correct** transform for the e2e (the brief's documented
-/// option): it does not depend on the world hit's offset within the target circle
-/// (which the coarse unit-cell grid cannot resolve sub-cell anyway), only on the
-/// incoming direction, so a shot fired *at* a fitted ship reliably resolves to a
-/// real module along its flight line. World scale ↔ local cell scale is decoupled:
-/// the local ray is constructed in cell-space directly.
-fn hull_local_entry_ray(world_dir: Vec2, heading: f32, grid_dims: (u16, u16)) -> (Vec2, Vec2) {
+/// **Why aim at the core (Phase 2):** the carve channel follows this ray, and the
+/// death model is "core destroyed". Aiming the head-on ray through the **core cell
+/// center** (not the grid geometric center, which on the fighter is at row 5.5 while
+/// the core reactor sits at (4,4)) means a sustained head-on burst from ANY approach
+/// bores a channel straight into the core and destroys it in a reasonable time — the
+/// multi-angle kill the brief requires. A flank/wing burst (a shot that misses the
+/// core line) still carves the cells along its own line and can cut a section off.
+///
+/// This is the **simplest correct** transform for the e2e: it does not depend on the
+/// world hit's sub-cell offset within the target circle (the coarse unit-cell grid
+/// cannot resolve that anyway), only on the incoming direction + the core aim, so a
+/// shot fired *at* a fitted ship reliably carves along its flight line.
+fn hull_local_entry_ray(
+    world_dir: Vec2,
+    heading: f32,
+    grid_dims: (u16, u16),
+    aim_local: Vec2,
+) -> (Vec2, Vec2) {
     let dir_local = if world_dir.length_squared() > f32::EPSILON {
         // Inverse ship rotation: world → hull-local.
         Vec2::from_angle(-heading)
@@ -208,25 +218,11 @@ fn hull_local_entry_ray(world_dir: Vec2, heading: f32, grid_dims: (u16, u16)) ->
     } else {
         Vec2::ZERO
     };
-    let grid_center = Vec2::new(grid_dims.0 as f32 * 0.5, grid_dims.1 as f32 * 0.5);
     // Over-cover the grid diagonal so the entry sits fully outside the chassis on
-    // the incoming side; the ray then crosses the centre along `dir_local`.
+    // the incoming side; the ray then crosses `aim_local` (the core) along `dir_local`.
     let span = (grid_dims.0.max(grid_dims.1) as f32) + 2.0;
-    let point = grid_center - dir_local * span;
+    let point = aim_local - dir_local * span;
     (point, dir_local)
-}
-
-/// Map a struck cell to the [`SectionId`] it belongs to on `ship`'s hull (the same
-/// hull lookup `on_section_destroyed` uses, T038), so a destroyed module triggers
-/// its section's destruction chain. `None` for a cell the hull never authored.
-fn section_of_struck_cell(world: &World, ship: Entity, cell: (u16, u16)) -> Option<SectionId> {
-    let fit = world.get::<Fit>(ship)?;
-    let hulls = world.get_resource::<HullCatalog>()?;
-    let hull = hulls.get(fit.hull)?;
-    hull.cells
-        .iter()
-        .find(|gc| gc.coord == cell)
-        .map(|gc| gc.section)
 }
 
 /// Fixed-step per-module damage for **fitted** targets (E007, T038/T039;
@@ -235,37 +231,34 @@ fn section_of_struck_cell(world: &World, ship: Entity, cell: (u16, u16)) -> Opti
 ///
 /// It runs the **same** swept-ray CCD as [`collision_detect_system`]
 /// ([`RapierPhysics::swept_cast`] — no new geometry, no tunnel, FR-021) but routes
-/// each hit through the E007 [`apply_damage`] pipeline (Shields → Armor → Hull →
-/// Systems, per-module health). It is exclusive because `apply_damage` needs
-/// `&mut World`; the projectile/target sweep is therefore collected **first** (the
-/// query borrow released) and the mutations applied after.
+/// each hit through the E007 [`apply_damage`] pipeline (Shields → Armor gate → carve,
+/// Phase 2). It is exclusive because `apply_damage` needs `&mut World`; the
+/// projectile/target sweep is therefore collected **first** (the query borrow
+/// released) and the mutations applied after.
 ///
 /// Steps:
 /// 1. **Sweep** every `(Projectile, WeaponSource)` vs every fitted target
 ///    (`With<FitLayout>`), skipping self-hits via [`ProjectileOwner`] (E002), and
 ///    record the **first** target struck per projectile (lowest `toi`).
-/// 2. For each recorded hit: transform the world hit into the target's hull-local
-///    cell-space ([`hull_local_entry_ray`]), build the [`DamageEvent`]
-///    ([`damage_event_from_hit`]), and apply it ([`apply_damage`]). Set the hit/
-///    destroy flash + the legibility tag ([`HitFeedback::last_kind`], FR-024) and
-///    despawn the projectile.
-/// 3. **Destruction trigger**: if the outcome destroyed a struck module, map its
-///    cell → [`SectionId`] and call [`on_section_destroyed`] (connectivity → sever
-///    → wreck → salvage). MVP coupling: a destroyed module destroys its section
-///    (coarse, documented).
-/// 4. **Hull-death trigger (live-combat death)**: AFTER the per-module destruction
-///    block, if the target still exists, is not already a [`Wreck`], and its
-///    [`HullStructure::current`] has reached `0`, call [`shatter_ship`] and raise the
-///    kill flash. This is the additive death trigger that makes sustained fire
-///    reliably DESTROY a fitted enemy: on a head-on shot the entry module is the
-///    centre cell with nothing behind it, so penetrating damage spills into
-///    `HullStructure` and almost never kills a *module* cell (so step 3 rarely
-///    fires) — without this the enemy sits at `0` hull forever, alive and intact.
-///    It does NOT touch [`apply_damage`]'s core routing or the E007 invariant tests.
+/// 2. For each recorded hit: capture the target's pre-carve [`core_cell`], transform
+///    the world hit into the target's hull-local cell-space ([`hull_local_entry_ray`]),
+///    build the [`DamageEvent`] ([`damage_event_from_hit`]), and apply it
+///    ([`apply_damage`] — which **carves** the cells along the shot ray out of the live
+///    `FitLayout`). Set the hit flash + the legibility tag
+///    ([`HitFeedback::last_kind`], FR-024) and despawn the projectile.
+/// 3. **Carve destruction event (Phase 2)**: if the carve removed any cell
+///    (`outcome.destroyed`), call [`on_cells_carved`] with the pre-carve core — it
+///    runs the connectivity flood-fill **once** (INV-D08) and (a) severs each region
+///    the carve disconnected from the core into a drifting [`WreckChunk`] while the
+///    ship lives, and (b) destroys the whole ship ([`destroy_ship`](crate::damage::on_cells_carved))
+///    when the **core cell** was carved away or left coreless. A whole-ship death
+///    raises the kill flash. This is the Phase 2 death model: a ship dies when its
+///    core is destroyed/severed — the old `HullStructure`-depletion `shatter_ship`
+///    trigger is retired (carving-to-core is now the death).
 ///
 /// **Graceful degradation (INV-D16)**: a world with no fitted targets (the E002/
 /// E003/determinism worlds) records no hits and is a no-op; `apply_damage` /
-/// `on_section_destroyed` themselves bail (return `NoModule` / no-op) when an E007
+/// `on_cells_carved` themselves bail (return `NoModule` / no-op) when an E007
 /// resource or catalog is absent, so a world missing them never panics. Server-
 /// authoritative — only the server runs this; the client predicts the same path.
 pub fn fitted_damage_system(world: &mut World) {
@@ -282,16 +275,24 @@ pub fn fitted_damage_system(world: &mut World) {
         &FitLayout,
         &Fit,
     ), With<FitLayout>>();
-    // Resolve each fitted target's grid dims from its hull (so the local ray spans
-    // the chassis); a target whose hull is unresolvable is skipped (no panic).
-    let hull_dims: std::collections::BTreeMap<Entity, (u16, u16)> = {
+    // Resolve each fitted target's grid dims + its core-aim point (the carve ray aims
+    // through the **core cell center** so a head-on burst bores toward the core, the
+    // Phase 2 death model — see `hull_local_entry_ray`). A target whose hull is
+    // unresolvable is skipped (no panic). The core falls back to the grid geometric
+    // center when the layout has no cells (a coreless/empty hull — degenerate).
+    let hull_dims: std::collections::BTreeMap<Entity, ((u16, u16), Vec2)> = {
         let hulls = world.get_resource::<HullCatalog>();
         target_q
             .iter(world)
-            .filter_map(|(e, _, _, _, _, fit)| {
-                hulls
-                    .and_then(|h| h.get(fit.hull))
-                    .map(|hull| (e, hull.grid_dims))
+            .filter_map(|(e, _, _, _, layout, fit)| {
+                hulls.and_then(|h| h.get(fit.hull)).map(|hull| {
+                    let grid_center =
+                        Vec2::new(hull.grid_dims.0 as f32 * 0.5, hull.grid_dims.1 as f32 * 0.5);
+                    let aim = core_cell(layout)
+                        .map(|(c, r)| Vec2::new(c as f32 + 0.5, r as f32 + 0.5))
+                        .unwrap_or(grid_center);
+                    (e, (hull.grid_dims, aim))
+                })
             })
             .collect()
     };
@@ -332,7 +333,7 @@ pub fn fitted_damage_system(world: &mut World) {
             }
         }
         if let Some((target, heading, tpos, hit)) = best {
-            let Some(&dims) = hull_dims.get(&target) else {
+            let Some(&(dims, aim_local)) = hull_dims.get(&target) else {
                 // Hull unresolvable for this target: skip (no panic, INV-D16).
                 continue;
             };
@@ -349,7 +350,7 @@ pub fn fitted_damage_system(world: &mut World) {
                     (-vel.0).normalize_or_zero()
                 }
             };
-            let (point, dir_local) = hull_local_entry_ray(vel.0, heading, dims);
+            let (point, dir_local) = hull_local_entry_ray(vel.0, heading, dims, aim_local);
             let local_hit = SweptHit {
                 toi: hit.toi,
                 point,
@@ -372,15 +373,17 @@ pub fn fitted_damage_system(world: &mut World) {
         shield_dir,
     } in hits
     {
+        // Capture the pre-carve core cell BEFORE apply_damage carves the layout — the
+        // carve may remove the core cell, and the death model needs the original core
+        // to detect "core destroyed".
+        let pre_carve_core = world.get::<FitLayout>(target).and_then(core_cell);
+
         let outcome = apply_damage(world, target, event);
 
         // Feedback (FR-024): flash + the legibility tag the HUD reads.
         if let Some(mut feedback) = world.get_resource_mut::<HitFeedback>() {
             feedback.hit_flash = combat::FLASH_TIME;
             feedback.last_kind = Some(outcome.result);
-            if outcome.destroyed {
-                feedback.destroy_flash = combat::FLASH_TIME;
-            }
         }
 
         // Per-entity visual feedback (E007 live-demo): refresh the struck target's
@@ -407,43 +410,19 @@ pub fn fitted_damage_system(world: &mut World) {
             }
         }
 
-        // --- 3. Destruction trigger (the chain T040 exercises) -------------------
-        // A destroyed module destroys its section (MVP coupling): map the struck
-        // cell → SectionId and run connectivity → sever → wreck → salvage.
-        if outcome.destroyed {
-            if let Some(struck) = outcome.struck {
-                let cell = world.get::<FitLayout>(target).and_then(|l| {
-                    l.cells
-                        .iter()
-                        .find(|(_, occ)| {
-                            occ.slot == struck.slot && occ.module == Some(struck.module)
-                        })
-                        .map(|(&c, _)| c)
-                });
-                if let Some(cell) = cell {
-                    if let Some(section) = section_of_struck_cell(world, target, cell) {
-                        on_section_destroyed(world, target, section);
-                    }
+        // --- 3. Carve destruction event (Phase 2): sever + core-death --------------
+        // The carve removed cells from the live FitLayout. Run the connectivity
+        // flood-fill ONCE (INV-D08): sever each region the carve disconnected from the
+        // core into a drifting chunk while the ship lives, and destroy the whole ship
+        // when the CORE cell was carved away/severed (the Phase 2 death model). A
+        // whole-ship death raises the kill flash. Skipped if the target despawned this
+        // hit or is already a wreck (on_cells_carved is itself idempotent/total).
+        if outcome.destroyed && world.get_entity(target).is_ok() {
+            let ship_destroyed = on_cells_carved(world, target, pre_carve_core);
+            if ship_destroyed {
+                if let Some(mut feedback) = world.get_resource_mut::<HitFeedback>() {
+                    feedback.destroy_flash = combat::FLASH_TIME;
                 }
-            }
-        }
-
-        // --- 4. Hull-death trigger (the live-combat death the demo needs) ----------
-        // On a head-on shot the entry module is the centre cell with nothing behind
-        // it, so penetrating damage spills into HullStructure and almost never kills
-        // a module cell — so step 3 rarely fires. When sustained fire finally drains
-        // HullStructure to 0, nothing else destroys the ship, so it would sit at 0
-        // hull forever (alive + intact). Shatter it here: if the target still exists,
-        // isn't already a Wreck, and its structural backstop is depleted, break it
-        // apart (sheds chunks → persistent wreck) and raise the kill flash.
-        let depleted = world
-            .get::<HullStructure>(target)
-            .is_some_and(|hs| hs.current <= 0.0);
-        let already_wreck = world.get::<Wreck>(target).is_some();
-        if depleted && !already_wreck && world.get_entity(target).is_ok() {
-            shatter_ship(world, target);
-            if let Some(mut feedback) = world.get_resource_mut::<HitFeedback>() {
-                feedback.destroy_flash = combat::FLASH_TIME;
             }
         }
 

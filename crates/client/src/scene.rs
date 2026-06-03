@@ -93,58 +93,123 @@ const HULL_COLOR: Color = Color::srgb(0.30, 0.40, 0.52);
 /// thin lip. Tunable for feel.
 const HULL_THICKNESS: f32 = 0.1;
 
-/// Inner radius of the shield-impact arc band, in sim units — the near edge of the
-/// glowing ring slice (just inside the deflector surface). FIX 0a refinement.
-const SHIELD_ARC_INNER: f32 = 1.3;
-/// Outer radius of the shield-impact arc band, in sim units — the far edge of the
-/// glowing ring slice (just outside the deflector surface). FIX 0a refinement.
-const SHIELD_ARC_OUTER: f32 = 1.7;
-/// Half-angle of the shield-impact arc band, in radians (40°) — the arc spans
-/// `[-SHIELD_ARC_HALF_ANGLE, +SHIELD_ARC_HALF_ANGLE]` about its centre bearing, so
-/// the lit slice covers ~80° of the ring. FIX 0a refinement.
-const SHIELD_ARC_HALF_ANGLE: f32 = std::f32::consts::PI * 40.0 / 180.0;
-/// Number of angular segments across the shield-impact arc band — more segments give
-/// a smoother curve at the cost of more triangles. FIX 0a refinement.
-const SHIELD_ARC_SEGMENTS: u32 = 12;
+/// Inner radius **fraction** of the shield-impact arc band — the near edge of the
+/// glowing ring slice as a fraction of the (normalized) outer radius `1.0`. The mesh is
+/// built normalized to outer radius `1.0` so it can be **scaled per ship** to hug any
+/// hull (see [`crate::net::shield_radius_for`] / [`SHIELD_MARGIN`]); a `0.80` inner
+/// fraction makes a band `0.80..1.0` of the radius — a slim crescent, not a fat ring.
+/// Tunable for feel.
+const SHIELD_ARC_INNER_FRAC: f32 = 0.80;
+/// Half-angle of the shield-impact arc band, in radians (≈48°) — the arc spans
+/// `[-SHIELD_ARC_HALF_ANGLE, +SHIELD_ARC_HALF_ANGLE]` about its centre bearing, so the
+/// lit slice covers ~96° of the ring. Wider than the old hard-cut 80° because the ends
+/// now taper smoothly to zero alpha (the vertex-color crescent), so the *visible* glow
+/// reads narrower than the geometry. Tunable for feel.
+const SHIELD_ARC_HALF_ANGLE: f32 = std::f32::consts::PI * 48.0 / 180.0;
+/// Number of angular segments across the shield-impact arc band — more segments give a
+/// smoother curve AND a smoother angular alpha taper (the per-vertex crescent gradient is
+/// sampled at each segment boundary), at the cost of more triangles. Bumped from 12 so
+/// the cosine taper reads smooth. Tunable for feel.
+const SHIELD_ARC_SEGMENTS: u32 = 24;
+
+/// Vertex-color tuning for the sleek shield crescent (FIX 0a polish). The arc carries a
+/// per-vertex [`Mesh::ATTRIBUTE_COLOR`] (linear RGBA, premultiplied-feel for the additive
+/// blend) that shapes the glow WITHOUT extra geometry:
+///
+/// - **Angular taper (the crescent):** alpha follows a raised-cosine bell across
+///   `[-half_angle, +half_angle]` — `1.0` at the centre bearing, smoothly `0.0` at both
+///   ends. This kills the old hard rectangular cut so the slice reads as a soft crescent
+///   flare. [`SHIELD_TAPER_POWER`] sharpens (`>1`) or softens (`<1`) the bell.
+/// - **Radial gradient:** brightness rises from the inner edge toward the outer (deflector
+///   surface) edge via [`SHIELD_INNER_DIM`]..`1.0`, so the energy looks like it skins the
+///   outside of the bubble.
+/// - **White-hot core → cool blue rim:** the bright angular centre is tinted toward
+///   [`SHIELD_CORE_COLOR`] (near-white cyan) and cools to [`SHIELD_RIM_COLOR`] (saturated
+///   blue) toward the angular ends, mixed by the same bell. The whole thing is then driven
+///   by `shield_flash` at draw time (material `base_color` alpha), so it still fades over
+///   the ~0.25 s window.
+///
+/// All values are linear-space (the mesh stores `ATTRIBUTE_COLOR` linearly); the additive
+/// material multiplies them by its `base_color`, so keep peaks moderate (≈`0.8`) — pure
+/// `1.0` everywhere blows the additive blend out to white.
+const SHIELD_CORE_COLOR: [f32; 3] = [0.78, 0.95, 1.0];
+/// Cool blue the crescent rim/ends cool to (linear). See [`SHIELD_CORE_COLOR`].
+const SHIELD_RIM_COLOR: [f32; 3] = [0.10, 0.45, 0.95];
+/// Inner-edge brightness multiplier (`0..1`) for the radial gradient; the outer edge is
+/// full `1.0`. See [`build_arc_band_mesh`].
+const SHIELD_INNER_DIM: f32 = 0.35;
+/// Exponent shaping the angular raised-cosine taper — `>1` sharpens the crescent to a
+/// tighter central bloom, `<1` spreads it. See [`build_arc_band_mesh`].
+const SHIELD_TAPER_POWER: f32 = 1.4;
+/// Peak per-vertex alpha at the crescent centre/outer edge (linear). Kept below `1.0` so
+/// the additive blend reads as a crisp cyan flare with a white-hot core rather than a
+/// blown-out white blob. See [`build_arc_band_mesh`].
+const SHIELD_PEAK_ALPHA: f32 = 0.85;
 
 /// Build a flat **annular sliver** (an arc segment of a ring) lying in the **XY plane**
 /// (`z = 0`), centred on the **+X axis** and spanning `[-half_angle, +half_angle]`
-/// (FIX 0a refinement — the shield-impact flash mesh).
+/// (FIX 0a polish — the sleek shield-impact crescent mesh).
 ///
-/// For each of `segments + 1` angular steps at angle `a` it emits two vertices — an
-/// inner `(inner_r·cos a, inner_r·sin a, 0)` and an outer `(outer_r·cos a, outer_r·sin
-/// a, 0)` — and stitches consecutive inner/outer pairs into a [`PrimitiveTopology::TriangleList`]
-/// (two triangles per quad). Every normal is `+Z` (`[0, 0, 1]`) so the ribbon faces the
+/// **Normalized.** `inner_frac` is the inner radius as a fraction of the OUTER radius,
+/// which is fixed at `1.0` — so the mesh is unit-sized and the caller applies a per-ship
+/// uniform **scale** to make the band hug any hull (see [`crate::net::shield_radius_for`]).
+/// For each of `segments + 1` angular steps at angle `a` it emits two vertices — an inner
+/// `(inner_frac·cos a, inner_frac·sin a, 0)` and an outer `(cos a, sin a, 0)` — and
+/// stitches consecutive inner/outer pairs into a [`PrimitiveTopology::TriangleList`] (two
+/// triangles per quad). Every normal is `+Z` (`[0, 0, 1]`) so the ribbon faces the
 /// top-down camera (which looks down `-Z` onto the XY plane), and each vertex carries a
-/// simple `[u, 0]` UV so [`StandardMaterial`] is satisfied. Triangles are wound CCW as
-/// seen from `+Z` (front face toward the camera); the shield material additionally sets
-/// `cull_mode: None` + `double_sided: true` so the slice is never culled regardless of
-/// winding.
+/// simple UV so [`StandardMaterial`] is satisfied. Triangles are wound CCW as seen from
+/// `+Z`; the shield material additionally sets `cull_mode: None` + `double_sided: true` so
+/// the slice is never culled regardless of winding.
 ///
-/// The caller rotates the resulting mesh about Z to aim the centre bearing at the
-/// impact direction (see [`crate::net::update_shield_bubble`]).
-fn build_arc_band_mesh(inner_r: f32, outer_r: f32, half_angle: f32, segments: u32) -> Mesh {
+/// **Vertex colors shape the look** (no extra geometry) — angular cosine taper to a soft
+/// crescent, a radial inner→outer gradient, and a white-hot core cooling to a blue rim. See
+/// the [`SHIELD_CORE_COLOR`] doc block for the exact gradient terms.
+///
+/// The caller rotates the resulting mesh about Z to aim the centre bearing at the impact
+/// direction and scales it to the ship's shield radius (see
+/// [`crate::net::update_shield_bubble`]).
+fn build_arc_band_mesh(inner_frac: f32, half_angle: f32, segments: u32) -> Mesh {
     let segments = segments.max(1);
     let step_count = segments + 1;
+    let inner_r = inner_frac.clamp(0.0, 0.999);
+    let outer_r = 1.0_f32;
 
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(step_count as usize * 2);
     let mut normals: Vec<[f32; 3]> = Vec::with_capacity(step_count as usize * 2);
     let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(step_count as usize * 2);
+    let mut colors: Vec<[f32; 4]> = Vec::with_capacity(step_count as usize * 2);
 
     for i in 0..step_count {
         let t = i as f32 / segments as f32;
         let a = -half_angle + t * (2.0 * half_angle);
         let (sin, cos) = a.sin_cos();
+
         // Inner then outer vertex for this angular step.
         positions.push([inner_r * cos, inner_r * sin, 0.0]);
         positions.push([outer_r * cos, outer_r * sin, 0.0]);
-        // Face the top-down camera (+Z toward it).
         normals.push([0.0, 0.0, 1.0]);
         normals.push([0.0, 0.0, 1.0]);
-        // Simple band UVs (u across the arc, v inner→outer) — only present to satisfy
-        // `StandardMaterial`'s vertex layout.
         uvs.push([t, 0.0]);
         uvs.push([t, 1.0]);
+
+        // Angular taper: raised-cosine bell, 1.0 at centre (t = 0.5) → 0.0 at the ends.
+        // `cos²(π·(t−0.5))` is the smooth bell; powering it sharpens/softens the crescent.
+        let bell = (std::f32::consts::PI * (t - 0.5))
+            .cos()
+            .powf(2.0 * SHIELD_TAPER_POWER);
+
+        // White-hot core (high bell) cooling to a blue rim (low bell), mixed by the bell.
+        let mix = |hot: f32, cool: f32| cool + (hot - cool) * bell;
+        let r = mix(SHIELD_CORE_COLOR[0], SHIELD_RIM_COLOR[0]);
+        let g = mix(SHIELD_CORE_COLOR[1], SHIELD_RIM_COLOR[1]);
+        let b = mix(SHIELD_CORE_COLOR[2], SHIELD_RIM_COLOR[2]);
+
+        // Radial gradient: dim at the inner edge, full at the outer (deflector) edge.
+        let inner_a = SHIELD_PEAK_ALPHA * bell * SHIELD_INNER_DIM;
+        let outer_a = SHIELD_PEAK_ALPHA * bell;
+        colors.push([r, g, b, inner_a]);
+        colors.push([r, g, b, outer_a]);
     }
 
     // Two triangles per quad between angular steps i and i+1. Vertex layout per step:
@@ -166,6 +231,7 @@ fn build_arc_band_mesh(inner_r: f32, outer_r: f32, half_angle: f32, segments: u3
     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
     .with_inserted_indices(Indices::U32(indices))
 }
 
@@ -392,28 +458,32 @@ pub fn setup_scene(
     let seeker_mesh = meshes.add(Cuboid::new(1.2, 0.6, 0.3)); // green seeker dart
     let seeker_material = materials.add(Color::srgb(0.35, 0.85, 0.40));
 
-    // Localized shield-impact flash (FIX 0a refinement): a glowing cyan ARC SEGMENT of
-    // the shield ring (a flat annular sliver in the XY plane) — NOT a stray impact dot
-    // and NOT a full-ship bubble (the user disliked the whole-ship bloom). The caller
-    // rotates this child about Z so the lit slice faces the bullet impact bearing. This
-    // is the PROTOTYPE material — each spawned flash clones its own instance so its alpha
-    // can fade per-frame with `shield_flash` (a shared handle could not fade one flash
-    // independently). Bright cyan with a strong cyan emissive so the slice reads as a
-    // glowing deflector arc; `alpha_mode: Blend` so the alpha-driven fade is visible.
-    // `cull_mode: None` + `double_sided: true` so the flat ribbon shows from the top-down
-    // camera regardless of which face it presents. Starts fully transparent (`alpha 0`) —
-    // `update_shield_bubble` raises the alpha to `shield_flash` only on an actual shield
-    // impact.
+    // Localized shield-impact flash (FIX 0a polish): a sleek glowing cyan ENERGY CRESCENT
+    // of the shield ring — a flat annular sliver in the XY plane whose per-vertex colors
+    // taper it to a soft crescent with a white-hot core (NOT a stray dot, NOT a full-ship
+    // bubble, NOT a hard-cut rectangle). The mesh is built NORMALIZED to outer radius 1.0
+    // so the caller can SCALE it per ship to hug any hull (fighter 9×11, corvette 13×15);
+    // it is also rotated about Z so the lit slice faces the bullet impact bearing. This is
+    // the PROTOTYPE material — each spawned flash clones its own instance so its alpha can
+    // fade per-frame with `shield_flash` (a shared handle could not fade one flash
+    // independently).
+    //
+    // `AlphaMode::Add` makes the flare read as EMITTED energy (additive bloom) rather than
+    // a flat decal; the per-vertex colors carry the cyan/white-hot gradient, so the
+    // `base_color` is a moderate cyan that the vertex colors and the `shield_flash` alpha
+    // multiply — kept below pure white so additive doesn't blow out. `cull_mode: None` +
+    // `double_sided: true` so the flat ribbon shows from the top-down camera regardless of
+    // which face it presents. Starts fully transparent (`alpha 0`) — `update_shield_bubble`
+    // raises the alpha to `shield_flash` only on an actual shield impact.
     let shield_arc_mesh = meshes.add(build_arc_band_mesh(
-        SHIELD_ARC_INNER,
-        SHIELD_ARC_OUTER,
+        SHIELD_ARC_INNER_FRAC,
         SHIELD_ARC_HALF_ANGLE,
         SHIELD_ARC_SEGMENTS,
     ));
     let shield_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.4, 0.75, 1.0, 0.0),
+        base_color: Color::srgba(0.45, 0.8, 1.0, 0.0),
         emissive: LinearRgba::rgb(0.2, 0.7, 1.2),
-        alpha_mode: AlphaMode::Blend,
+        alpha_mode: AlphaMode::Add,
         cull_mode: None,
         double_sided: true,
         ..default()
