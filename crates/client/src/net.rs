@@ -59,10 +59,12 @@ use sim::fitting::{
     build_layout, derive_ship_stats, seed_catalogs, Fit, SlotId, HULL_FIGHTER, MODULE_AUTOCANNON,
     MODULE_REACTOR_BASIC, MODULE_THRUSTER_BASIC,
 };
-use sim::{FixedDt, ShipIntent};
+use sim::{FixedDt, HitFeedback, ShipIntent};
 
 use crate::input::{build_client_input, InputSequencer};
-use crate::render_sync::{interpolate_transforms, RemoteEntity, RenderInterp};
+use crate::render_sync::{
+    interpolate_transforms, RemoteEntity, RenderFlash, RenderInterp, ShieldBubble, ShieldChild,
+};
 use crate::scene::RenderAssets;
 
 /// The loopback solo-play host: the embedded authoritative [`ServerApp`] plus the
@@ -303,6 +305,7 @@ fn attach_starter_fit(server: &mut ServerApp, local_id: EntityId) {
 fn net_fixed_update(
     mut host: NonSendMut<LoopbackHost>,
     mut state: NonSendMut<NetClientState>,
+    mut feedback: ResMut<HitFeedback>,
     ship_q: Query<&ShipIntent, With<LocalShip>>,
 ) {
     // The intent the player is holding this tick (PreUpdate wrote it). Default to
@@ -322,6 +325,14 @@ fn net_fixed_update(
     // collision and hits resolve THIS tick and surface in `render_state` below.
     host.server.tick();
 
+    // E007 live-demo feedback surfacing: combat resolves in the embedded SERVER's
+    // world, so `fitted_damage_system` sets the SERVER's `HitFeedback` — but the HUD
+    // (`hud::update_hud`) reads THIS client app's own `HitFeedback` resource, which
+    // the server never updates. Copy the server's feedback into the client resource
+    // each tick (`HitFeedback` is `Copy`) so the SHIELD/PEN/RICOCHET/OVERPEN/MISS +
+    // HIT/KILL cues actually show when the player shoots the enemy (FR-024).
+    *feedback = host.server.hit_feedback();
+
     // Drain and discard the loopback inbox. We render from the server world
     // directly (`capture_render_state`), so snapshots are unused here; draining
     // keeps the loopback queue from growing unbounded over a long session.
@@ -338,8 +349,13 @@ fn net_fixed_update(
 /// mesh/material for its `kind`+`flags` and tagged [`RemoteEntity`]. Rendered
 /// entities whose id is no longer in `render_state` (destroyed targets, expired
 /// projectiles) are despawned, so they vanish immediately.
+///
+/// E007 live-demo visuals: each entity's [`RenderFlash`] is refreshed from
+/// `RenderEntity::flash` (the hit pop [`interpolate_transforms`] applies), and a
+/// translucent **shield bubble** child is spawned/updated for any rendered ship whose
+/// `shield_frac > 0` (visible while the shield holds, hidden when it drops to 0).
 // A Bevy system with the params it genuinely needs (transport host, net state,
-// render assets, fixed dt, the id→entity map, and the interp/velocity queries);
+// render assets, fixed dt, the id→entity map, and the interp/velocity/shield queries);
 // the count is inherent to the system, not a smell.
 #[allow(clippy::too_many_arguments)]
 fn capture_render_state(
@@ -351,6 +367,8 @@ fn capture_render_state(
     mut render_map: ResMut<NetRenderMap>,
     mut interp_q: Query<&mut RenderInterp>,
     mut vel_q: Query<&mut Velocity, With<LocalShip>>,
+    shield_child_q: Query<&ShieldChild>,
+    mut bubble_q: Query<(&mut Visibility, &mut Transform), With<ShieldBubble>>,
 ) {
     let local_id = state.local_id;
     let entities = host.server.render_state();
@@ -375,6 +393,20 @@ fn capture_render_state(
                     vel.0 = e.vel;
                 }
             }
+            // Refresh the per-entity hit-pop flash (the scale-pulse is applied in
+            // `interpolate_transforms`).
+            if let Ok(mut ec) = commands.get_entity(bevy_entity) {
+                ec.insert(RenderFlash(e.flash));
+            }
+            // Update (or lazily spawn) this entity's shield bubble from `shield_frac`.
+            update_shield_bubble(
+                &mut commands,
+                &assets,
+                &shield_child_q,
+                &mut bubble_q,
+                bevy_entity,
+                e.shield_frac,
+            );
         } else {
             // Newly-appeared entity (never the local ship — it is pre-registered):
             // spawn a rendered remote with the right look. Its interp `prev` is
@@ -383,6 +415,19 @@ fn capture_render_state(
             // visibly travels out of the ship instead of popping in ~a tick ahead
             // (≈ the reticle distance for a fast round).
             let spawned = spawn_render_entity(&mut commands, &assets, e, dt.0);
+            // Seed its flash + (if shielded) its shield bubble immediately so the
+            // first rendered frame already shows them.
+            if let Ok(mut ec) = commands.get_entity(spawned) {
+                ec.insert(RenderFlash(e.flash));
+            }
+            update_shield_bubble(
+                &mut commands,
+                &assets,
+                &shield_child_q,
+                &mut bubble_q,
+                spawned,
+                e.shield_frac,
+            );
             render_map.map.insert(e.id, spawned);
         }
     }
@@ -458,6 +503,65 @@ fn spawn_render_entity(
                 .with_translation(Vec3::new(e.pos.x, e.pos.y, 0.0)),
         ))
         .id()
+}
+
+/// Spawn-or-update the translucent shield bubble for a rendered ship from its
+/// authoritative `shield_frac` (E007 live-demo, Deliverable 2).
+///
+/// - **No bubble yet & `shield_frac > 0`**: spawn the translucent sphere as a CHILD
+///   of `parent` (so it follows the ship) and record it via a [`ShieldChild`] on the
+///   parent. It is despawned automatically with its parent (Bevy despawns children
+///   recursively), so a destroyed ship's bubble vanishes with the hulk.
+/// - **Bubble exists**: toggle its [`Visibility`] — visible while `shield_frac > 0`,
+///   hidden at `0` — and scale it slightly by `shield_frac` so a draining shield
+///   visibly shrinks before it drops. So the player sees the bubble take fire, then
+///   vanish when the shield is down and shots reach the hull.
+///
+/// A `parent` with no shield (`shield_frac == 0`) that never had a bubble spawns
+/// none — plain practice targets and unshielded entities stay bubble-free.
+fn update_shield_bubble(
+    commands: &mut Commands,
+    assets: &RenderAssets,
+    shield_child_q: &Query<&ShieldChild>,
+    bubble_q: &mut Query<(&mut Visibility, &mut Transform), With<ShieldBubble>>,
+    parent: Entity,
+    shield_frac: f32,
+) {
+    match shield_child_q.get(parent) {
+        Ok(child) => {
+            // Existing bubble: toggle visibility + scale by the shield charge.
+            if let Ok((mut vis, mut tf)) = bubble_q.get_mut(child.0) {
+                *vis = if shield_frac > 0.0 {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                };
+                // Shrink slightly as the shield drains (0.85..=1.0 of the bubble size),
+                // a subtle "shield weakening" read before it pops.
+                let s = 0.85 + 0.15 * shield_frac.clamp(0.0, 1.0);
+                tf.scale = Vec3::splat(s);
+            }
+        }
+        Err(_) => {
+            // No bubble yet: spawn one only if the ship is actually shielded.
+            if shield_frac > 0.0 {
+                let bubble = commands
+                    .spawn((
+                        ShieldBubble,
+                        Mesh3d(assets.shield_mesh.clone()),
+                        MeshMaterial3d(assets.shield_material.clone()),
+                        // Local (child) transform: centered on the ship.
+                        Transform::default(),
+                        Visibility::Inherited,
+                    ))
+                    .id();
+                if let Ok(mut ec) = commands.get_entity(parent) {
+                    ec.add_child(bubble);
+                    ec.insert(ShieldChild(bubble));
+                }
+            }
+        }
+    }
 }
 
 /// The loopback registry address (any address works for loopback — it is a

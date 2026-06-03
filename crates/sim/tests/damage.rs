@@ -1733,3 +1733,231 @@ fn unfitted_target_uses_the_flat_health_clamp_path() {
         "the unfitted degenerate path produces no E007 wreck (INV-D17)"
     );
 }
+
+// =================================================================================
+// E007 live-demo death trigger (regression): a fitted player ship firing steadily
+// at a fitted enemy through the REAL shared schedule must DESTROY the enemy via hull
+// depletion — the live `cargo run -p client` scenario that previously left the enemy
+// at 0 hull forever (alive + intact) because nothing destroyed it when
+// `HullStructure` reached 0 (the head-on shot's entry module is the centre cell with
+// nothing behind it, so penetrating damage spilled to hull and rarely killed a
+// MODULE cell, so `on_section_destroyed` never fired). The fix: `fitted_damage_system`
+// now calls `shatter_ship` + raises the kill flash once `HullStructure` is depleted.
+// =================================================================================
+
+use sim::components::Weapon;
+use sim::damage::{seed_defense_layers, WreckChunk};
+use sim::ShipIntent;
+
+/// The fixed timestep the live server runs at (30 Hz), so the measured kill-time is
+/// in real demo seconds.
+const REPRO_DT: f32 = 1.0 / 30.0;
+/// Run the schedule for up to ~15 s of demo time at 30 Hz (the tuning window the
+/// brief wants the kill to land inside, 5–12 s, with headroom).
+const REPRO_MAX_TICKS: u32 = (15.0 / REPRO_DT) as u32;
+
+/// Spawn a **fitted player ship** at the origin facing +x, holding `fire`, mirroring
+/// `client::net::attach_starter_fit` (reactor + 2 thrusters + autocannon on the
+/// fighter, so `ShipStats::can_fire` is true) + the three E007 defense layers. The
+/// `Weapon` component holds the cooldown state the `weapon_fire_system` ticks.
+fn spawn_fitted_player(w: &mut World) -> Entity {
+    let (modules, hulls) = seed_catalogs();
+    let hull = hulls.get(HULL_FIGHTER).unwrap().clone();
+
+    let mut fit = Fit::new(HULL_FIGHTER);
+    let _ = fit.install_module(SlotId(0), MODULE_REACTOR_BASIC, &hull, &modules);
+    let _ = fit.install_module(SlotId(1), MODULE_THRUSTER_BASIC, &hull, &modules);
+    let _ = fit.install_module(SlotId(2), MODULE_THRUSTER_BASIC, &hull, &modules);
+    let _ = fit.install_module(SlotId(3), MODULE_AUTOCANNON, &hull, &modules);
+    let layout = build_layout(&hull, &fit, &modules);
+    let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
+    let (shields, section_armor, hull_structure) = seed_defense_layers(&hull, &fit, &modules);
+    assert!(
+        stats.can_fire,
+        "the starter player fit must be able to fire"
+    );
+
+    w.spawn((
+        Ship,
+        ShipIntent {
+            fire: true,
+            ..Default::default()
+        },
+        Position(Vec2::ZERO),
+        Velocity(Vec2::ZERO),
+        Heading(0.0), // faces +x → fires toward the enemy at (14,0)
+        AngularVelocity(0.0),
+        CollisionRadius(0.8),
+        Weapon {
+            cooldown: 0.0,
+            fire_rate: stats.weapon.map(|p| p.fire_rate).unwrap_or(5.0),
+            muzzle_speed: stats.weapon.map(|p| p.muzzle_speed).unwrap_or(200.0),
+        },
+        fit,
+        layout,
+        stats,
+        shields,
+        section_armor,
+        hull_structure,
+    ))
+    .id()
+}
+
+/// Spawn a **fitted enemy** as a stationary `Target` at `pos`, mirroring
+/// `ServerApp::spawn_fitted_enemy` (reactor + thruster + autocannon + armor on the
+/// fighter, NO `Ship`/`Health`, the three defense layers). It is the E007
+/// `fitted_damage_system` target (`With<FitLayout>`).
+fn spawn_fitted_enemy_target(w: &mut World, pos: Vec2) -> Entity {
+    let (modules, hulls) = seed_catalogs();
+    let hull = hulls.get(HULL_FIGHTER).unwrap().clone();
+
+    let mut fit = Fit::new(HULL_FIGHTER);
+    let _ = fit.install_module(SlotId(0), MODULE_REACTOR_BASIC, &hull, &modules);
+    let _ = fit.install_module(SlotId(1), MODULE_THRUSTER_BASIC, &hull, &modules);
+    let _ = fit.install_module(SlotId(3), MODULE_AUTOCANNON, &hull, &modules);
+    let _ = fit.install_module(SlotId(5), MODULE_ARMOR_PLATE, &hull, &modules);
+    let layout = build_layout(&hull, &fit, &modules);
+    let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
+    let (shields, section_armor, hull_structure) = seed_defense_layers(&hull, &fit, &modules);
+
+    w.spawn((
+        Target,
+        TargetKind::Dummy,
+        Position(pos),
+        Velocity(Vec2::ZERO),
+        Heading(0.0),
+        AngularVelocity(0.3),
+        CollisionRadius(1.0),
+        fit,
+        layout,
+        stats,
+        shields,
+        section_armor,
+        hull_structure,
+    ))
+    .id()
+}
+
+/// The LIVE demo scenario through the REAL schedule: a fitted player ship firing
+/// steadily at a fitted enemy must DESTROY it via hull depletion within ~5–12 s.
+///
+/// This is the red→green proof of the death-trigger fix. Before the fix the enemy's
+/// `HullStructure` reached 0 but nothing destroyed it (no `Wreck`, no chunks), so it
+/// sat alive + intact forever — the test's destruction assertions failed. After the
+/// fix `fitted_damage_system` shatters the ship once hull is depleted, so the enemy
+/// becomes a `Wreck` and sheds drifting `WreckChunk` debris, and a kill flash fires.
+#[test]
+fn fitted_player_fire_destroys_fitted_enemy_via_hull_depletion() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+
+    let _player = spawn_fitted_player(&mut w);
+    let enemy = spawn_fitted_enemy_target(&mut w, Vec2::new(14.0, 0.0));
+
+    // The enemy's seeded structural backstop (what hull depletion has to chew
+    // through after the shield/armor/module mitigation).
+    let hull_hp_max = w.get::<HullStructure>(enemy).unwrap().max;
+    assert!(hull_hp_max > 0.0, "the enemy has a structural backstop");
+
+    let mut schedule = Schedule::default();
+    sim::add_fixed_step_systems(&mut schedule);
+
+    let mut hull_reached_zero_tick: Option<u32> = None;
+    let mut kill_flash_fired = false;
+    let mut destroyed_tick: Option<u32> = None;
+
+    for tick in 0..REPRO_MAX_TICKS {
+        schedule.run(&mut w);
+
+        // Did a kill flash fire this tick? (Captured per-tick because the schedule's
+        // `feedback_decay_system` bleeds the flash back down after it is raised.)
+        if w.get_resource::<HitFeedback>().unwrap().destroy_flash > 0.0 {
+            kill_flash_fired = true;
+        }
+
+        // Record when the structural backstop first reaches 0 (the depletion the
+        // diagnosis confirmed already worked).
+        if hull_reached_zero_tick.is_none() {
+            if let Some(hs) = w.get::<HullStructure>(enemy) {
+                if hs.current <= 0.0 {
+                    hull_reached_zero_tick = Some(tick);
+                }
+            }
+        }
+
+        // Record when the enemy is destroyed: it carries a `Wreck`, OR it was
+        // despawned/severed away (the entity is gone), OR drifting chunk debris
+        // exists. Any of these is "visibly destroyed".
+        if destroyed_tick.is_none() {
+            let is_wreck = w.get::<Wreck>(enemy).is_some();
+            let despawned = w.get_entity(enemy).is_err();
+            let has_chunks = w
+                .query::<&Wreck>()
+                .iter(&w)
+                .any(|wr| wr.origin == WreckOrigin::SeveredChunk);
+            if is_wreck || despawned || has_chunks {
+                destroyed_tick = Some(tick);
+            }
+        }
+
+        if destroyed_tick.is_some() {
+            break;
+        }
+    }
+
+    // --- The hull WAS depleted along the way (the part the diagnosis said worked) ---
+    let hull_zero = hull_reached_zero_tick
+        .expect("the enemy's HullStructure must reach 0 under sustained fire");
+
+    // --- A hit registered (HitFeedback.last_kind became Some at least once) ---------
+    // After a kill the flash + tag persist on the final tick (the kill set them and
+    // the schedule's decay only bleeds them down), so the resolved-hit tag is present.
+    let last_kind = w.get_resource::<HitFeedback>().unwrap().last_kind;
+    assert!(
+        last_kind.is_some(),
+        "at least one hit registered (HitFeedback.last_kind became Some)"
+    );
+
+    // --- A kill flash fired (the death trigger raised destroy_flash) ----------------
+    assert!(
+        kill_flash_fired,
+        "a kill flash fired when the enemy was destroyed (destroy_flash > 0)"
+    );
+
+    // --- The enemy is DESTROYED (a Wreck and/or despawned/severed + debris) ---------
+    let destroyed = destroyed_tick.expect(
+        "the enemy must be destroyed by sustained fire (this is the regression the fix \
+         repairs — before it the enemy sat at 0 hull forever, alive + intact)",
+    );
+    // It is a persistent wreck (the destroyed-ship path keeps the entity as the hulk),
+    // or the whole thing severed away — assert at least one wreck artifact exists.
+    let wreck_on_enemy = w.get::<Wreck>(enemy).is_some();
+    let any_wreck = w.query::<&Wreck>().iter(&w).count() > 0;
+    assert!(
+        wreck_on_enemy || any_wreck,
+        "destruction leaves a persistent Wreck (or severed chunks)"
+    );
+    // The shatter sheds the fighter's disconnected sections as drifting debris.
+    let chunk_count = w
+        .query_filtered::<&Wreck, ()>()
+        .iter(&w)
+        .filter(|wr| wr.origin == WreckOrigin::SeveredChunk)
+        .count();
+    // The `WreckChunk` value type is part of the sever surface the demo relies on;
+    // reference it so the import is load-bearing (a chunk's drift kinematics).
+    let _ = std::mem::size_of::<WreckChunk>();
+
+    // --- Record + sanity-check the kill-time (the brief's 5–12 s tuning window) ------
+    let kill_secs = destroyed as f32 * REPRO_DT;
+    let hull_zero_secs = hull_zero as f32 * REPRO_DT;
+    eprintln!(
+        "[repro] enemy hull (max {hull_hp_max:.1}) reached 0 at tick {hull_zero} \
+         ({hull_zero_secs:.2}s); destroyed at tick {destroyed} ({kill_secs:.2}s); \
+         severed chunks at kill = {chunk_count}"
+    );
+    assert!(
+        (5.0..=12.0).contains(&kill_secs),
+        "the kill should feel substantial but not a slog: expected 5–12 s, got {kill_secs:.2}s \
+         (tune `seed_defense_layers`' hull/shield/armor consts or the loadout)"
+    );
+}

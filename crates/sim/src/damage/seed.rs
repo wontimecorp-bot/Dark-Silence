@@ -31,10 +31,10 @@ use crate::fitting::{Fit, Hull, ModuleCatalog, ModuleSpecifics, SectionId};
 /// hull has a Shield hardpoint, so the demo ships take this path). A small pool so a
 /// target is shield-defended (the pipeline's Shields layer is exercised) but the
 /// shield depletes under sustained fire rather than being an impenetrable wall.
-const DEFAULT_SHIELD_HP: f32 = 25.0;
+const DEFAULT_SHIELD_HP: f32 = 12.0;
 /// Fallback shield regen/sec for the no-shield-module path — slow enough that
 /// continuous fire out-damages it (the shield does not fully tank a stream).
-const DEFAULT_SHIELD_REGEN: f32 = 3.0;
+const DEFAULT_SHIELD_REGEN: f32 = 1.0;
 
 /// Per-section plate thickness when the fit carries **no** armor module. Thin steel
 /// so the autocannon (penetration ≈ 3× damage) clean-penetrates and routes damage to
@@ -47,14 +47,26 @@ const DEFAULT_ARMOR_THICKNESS: f32 = 2.0;
 const ARMOR_THICKNESS_PER_MODULE: f32 = 6.0;
 
 /// Hull structural HP per unit of `hull_base_mass` — the structural backstop scales
-/// with the chassis size (a heavier hull is sturdier). Tuned with the autocannon's
-/// ~12 damage/shot so a corvette (`hull_base_mass 30` → `hull_hp 90`) takes a
-/// sustained burst to chew through structure once armor/modules give way — visible,
-/// not instant.
-const HULL_HP_PER_BASE_MASS: f32 = 3.0;
+/// with the chassis size (a heavier hull is sturdier). Tuned against the **measured**
+/// effective hull DPS of a square-on autocannon burst (≈ 1.6 hull/s after the
+/// shield/armor-matrix/pen-tier/hull-matrix mitigation, repro test) so the fighter
+/// (`hull_base_mass 8` → `hull_hp 12`) dies in ~8 s of steady fire — substantial but
+/// not a slog, not a one-shot. The corvette (`hull_base_mass ~16+`) is proportionally
+/// sturdier, taking longer to chew through.
+const HULL_HP_PER_BASE_MASS: f32 = 1.5;
 /// Floor on derived hull HP so any chassis has a finite, non-degenerate structural
 /// pool (defensive — `hull_base_mass > 0` always, so this is belt-and-suspenders).
-const HULL_HP_FLOOR: f32 = 30.0;
+/// Also the fighter's effective hull pool (`8 * 1.5 = 12`, at the floor) → the ~8 s
+/// kill the live demo wants.
+const HULL_HP_FLOOR: f32 = 12.0;
+
+/// Outward facet normal for a section sitting exactly on the grid centre (a *core*
+/// section with no outward direction — e.g. the fighter's central reactor). `-X`
+/// presents the core's **face** to the demo's nominal forward (+x) attacker so a
+/// head-on shot penetrates (impact angle ≈ 0) instead of striking its back face and
+/// ricocheting (the live-demo death bug). Any unit vector keeps the angle math well-
+/// defined; `-X` is the demo-correct choice.
+const CORE_FALLBACK_NORMAL: Vec2 = Vec2::NEG_X;
 
 /// Seed the three E007 defense-layer components for a fitted ship from its hull +
 /// fit (E007 live-demo wiring, shared by the player ship and the demo enemy).
@@ -75,8 +87,9 @@ const HULL_HP_FLOOR: f32 = 30.0;
 ///   ([`DEFAULT_ARMOR_THICKNESS`]); material is [`ArmorMaterial::Steel`]. Each facet's
 ///   outward `normal` is derived from the **section's mean cell position relative to
 ///   the grid centre** (a section on the +x side of the hull faces +x), so the
-///   armor-angle math has a meaningful per-section normal; a section whose cells sit
-///   exactly at the grid centre defaults to `Vec2::X`.
+///   armor-angle math has a meaningful per-section normal; a *core* section whose
+///   cells sit exactly at the grid centre (no outward direction) defaults to
+///   [`CORE_FALLBACK_NORMAL`] (`-X`), presenting its face to a head-on +x attacker.
 /// - **[`HullStructure`]** — a full backstop sized from the hull's `hull_base_mass`
 ///   ([`HULL_HP_PER_BASE_MASS`], floored at [`HULL_HP_FLOOR`]) so a bigger chassis is
 ///   sturdier; always `> 0`.
@@ -136,12 +149,20 @@ pub fn seed_defense_layers(
             if outward.length_squared() > f32::EPSILON {
                 outward.normalize()
             } else {
-                // A section sitting exactly on the grid centre has no outward
-                // direction — default to +x (documented MVP choice).
-                Vec2::X
+                // A section sitting exactly on the grid centre (the most-interior
+                // *core* — e.g. the fighter's central reactor at (2,2)) has no
+                // outward direction. Default it to face the demo's nominal **forward
+                // attacker** (`-X`), so a head-on +x shot meets it square-on (impact
+                // angle ≈ 0, it penetrates) rather than on its back face. A back-
+                // facing default (`+X`) makes a +x shot a 180° hit — past
+                // `ricochet_angle` — so a centred core would *ricochet every shot*
+                // and could never be hull-killed (the E007 live-demo death bug).
+                // `-X` keeps the core penetrable from the front while staying a unit
+                // normal the angle math can use from any direction.
+                CORE_FALLBACK_NORMAL
             }
         } else {
-            Vec2::X
+            CORE_FALLBACK_NORMAL
         };
         section_armor.sections.insert(
             section,

@@ -76,7 +76,7 @@ pub use content::{
     default_resistance_matrix, ArmorMaterial, PenetrationConfig, SalvageConfig, ShieldConfig,
     StatScalingConfig,
 };
-pub use destruction::on_section_destroyed;
+pub use destruction::{on_section_destroyed, shatter_ship};
 pub use event::{Channel, DamageEvent};
 pub use layers::{
     apply_damage, resolve_entry_point, route_behind, ArmorFacet, DamageContext, DamageOutcome,

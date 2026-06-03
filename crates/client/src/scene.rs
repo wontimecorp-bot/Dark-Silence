@@ -42,6 +42,11 @@ pub struct RenderAssets {
     pub asteroid_material: Handle<StandardMaterial>,
     pub seeker_mesh: Handle<Mesh>,
     pub seeker_material: Handle<StandardMaterial>,
+    /// Translucent shield bubble (E007 live-demo): a blue sphere ~1.6× the ship
+    /// radius, spawned as a child of any rendered ship whose `shield_frac > 0` so the
+    /// player sees the shield take fire; hidden when the shield drops to 0.
+    pub shield_mesh: Handle<Mesh>,
+    pub shield_material: Handle<StandardMaterial>,
 }
 
 /// Spawn lighting, the gunsight pip, and the LOCAL player ship; register the
@@ -83,6 +88,16 @@ pub fn setup_scene(
     let seeker_mesh = meshes.add(Cuboid::new(1.2, 0.6, 0.3)); // green seeker dart
     let seeker_material = materials.add(Color::srgb(0.35, 0.85, 0.40));
 
+    // Translucent blue shield bubble (E007): a sphere ~1.6× the ship's ~1.0 radius,
+    // blended with a faint blue emissive so it reads as an energy shield taking fire.
+    let shield_mesh = meshes.add(Sphere::new(1.6));
+    let shield_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.3, 0.6, 1.0, 0.25),
+        emissive: LinearRgba::rgb(0.05, 0.15, 0.35),
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+
     commands.insert_resource(RenderAssets {
         projectile_mesh,
         projectile_material,
@@ -94,6 +109,8 @@ pub fn setup_scene(
         asteroid_material,
         seeker_mesh,
         seeker_material,
+        shield_mesh,
+        shield_material,
     });
 
     // The LOCAL player ship — spawned here deterministically so the `LocalShip`

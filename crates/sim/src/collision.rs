@@ -6,12 +6,15 @@
 //! math behind the `Physics` trait (ADR-0004). Same inputs → same outputs, so
 //! there is never per-frame flicker.
 
+use crate::clock::FixedDt;
 use crate::combat::{self, HitFeedback};
 use crate::components::{
-    CollisionRadius, Damage, Heading, Health, Position, PrevPosition, Projectile, ProjectileOwner,
-    Ship, Target, TargetKind, Velocity,
+    CollisionRadius, Damage, DamageFlash, Heading, Health, Position, PrevPosition, Projectile,
+    ProjectileOwner, Ship, Target, TargetKind, Velocity,
 };
-use crate::damage::{apply_damage, on_section_destroyed, DamageEvent};
+use crate::damage::{
+    apply_damage, on_section_destroyed, shatter_ship, DamageEvent, HullStructure, Wreck,
+};
 use crate::fitting::{Fit, FitLayout, HullCatalog, SectionId};
 use crate::physics::{Physics, RapierPhysics, SweptHit};
 use crate::tuning::Tuning;
@@ -245,6 +248,15 @@ fn section_of_struck_cell(world: &World, ship: Entity, cell: (u16, u16)) -> Opti
 ///    cell → [`SectionId`] and call [`on_section_destroyed`] (connectivity → sever
 ///    → wreck → salvage). MVP coupling: a destroyed module destroys its section
 ///    (coarse, documented).
+/// 4. **Hull-death trigger (live-combat death)**: AFTER the per-module destruction
+///    block, if the target still exists, is not already a [`Wreck`], and its
+///    [`HullStructure::current`] has reached `0`, call [`shatter_ship`] and raise the
+///    kill flash. This is the additive death trigger that makes sustained fire
+///    reliably DESTROY a fitted enemy: on a head-on shot the entry module is the
+///    centre cell with nothing behind it, so penetrating damage spills into
+///    `HullStructure` and almost never kills a *module* cell (so step 3 rarely
+///    fires) — without this the enemy sits at `0` hull forever, alive and intact.
+///    It does NOT touch [`apply_damage`]'s core routing or the E007 invariant tests.
 ///
 /// **Graceful degradation (INV-D16)**: a world with no fitted targets (the E002/
 /// E003/determinism worlds) records no hits and is a no-op; `apply_damage` /
@@ -350,6 +362,14 @@ pub fn fitted_damage_system(world: &mut World) {
             }
         }
 
+        // Per-entity hit pop (E007 live-demo): refresh a `DamageFlash` timer on the
+        // struck target so the client gives it a brief visible scale-pulse this frame.
+        // Insert-or-overwrite (a fresh hit refreshes the timer); the decay system bleeds
+        // it back to 0. Skipped if the target was despawned this hit (no entity to flag).
+        if let Ok(mut entity) = world.get_entity_mut(target) {
+            entity.insert(DamageFlash(combat::FLASH_TIME));
+        }
+
         // --- 3. Destruction trigger (the chain T040 exercises) -------------------
         // A destroyed module destroys its section (MVP coupling): map the struck
         // cell → SectionId and run connectivity → sever → wreck → salvage.
@@ -371,9 +391,46 @@ pub fn fitted_damage_system(world: &mut World) {
             }
         }
 
+        // --- 4. Hull-death trigger (the live-combat death the demo needs) ----------
+        // On a head-on shot the entry module is the centre cell with nothing behind
+        // it, so penetrating damage spills into HullStructure and almost never kills
+        // a module cell — so step 3 rarely fires. When sustained fire finally drains
+        // HullStructure to 0, nothing else destroys the ship, so it would sit at 0
+        // hull forever (alive + intact). Shatter it here: if the target still exists,
+        // isn't already a Wreck, and its structural backstop is depleted, break it
+        // apart (sheds chunks → persistent wreck) and raise the kill flash.
+        let depleted = world
+            .get::<HullStructure>(target)
+            .is_some_and(|hs| hs.current <= 0.0);
+        let already_wreck = world.get::<Wreck>(target).is_some();
+        if depleted && !already_wreck && world.get_entity(target).is_ok() {
+            shatter_ship(world, target);
+            if let Some(mut feedback) = world.get_resource_mut::<HitFeedback>() {
+                feedback.destroy_flash = combat::FLASH_TIME;
+            }
+        }
+
         // The projectile strikes at most one target, then despawns (E002 parity).
         if let Ok(e) = world.get_entity_mut(projectile) {
             e.despawn();
+        }
+    }
+}
+
+/// Fixed-step decay of the per-entity [`DamageFlash`] hit-pop timer toward `0`
+/// (E007 live-demo visual feedback).
+///
+/// Bleeds every entity's `DamageFlash` down by the fixed `dt` each step, clamped at
+/// `0`, exactly like the global [`HitFeedback`] decay — so the client's hit-pop is
+/// brief and deterministic (server and client tick the same timer). It does not
+/// remove the component at `0` (a depleted flash is simply invisible client-side and
+/// is refreshed in place on the next hit), keeping the system allocation-free. A
+/// world with no `DamageFlash` entities is a no-op.
+pub fn damage_flash_decay_system(dt: Res<FixedDt>, mut q: Query<&mut DamageFlash>) {
+    let dt = dt.0;
+    for mut flash in &mut q {
+        if flash.0 > 0.0 {
+            flash.0 = (flash.0 - dt).max(0.0);
         }
     }
 }

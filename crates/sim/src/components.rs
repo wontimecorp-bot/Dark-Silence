@@ -149,6 +149,17 @@ impl TargetKind {
 #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CollisionRadius(pub f32);
 
+/// A short-lived per-entity hit-flash timer (seconds), refreshed each time a hit
+/// lands on this entity and decayed toward `0` each fixed step
+/// ([`damage_flash_decay_system`](crate::collision::damage_flash_decay_system)).
+///
+/// Presentation-only (E007 live-demo visual feedback): the client reads it via the
+/// render seam to give a struck ship a brief visible "hit pop" (a transform
+/// scale-pulse). Deterministic — it ticks down by the fixed `dt` like every other
+/// timer, so server and client agree. Defaults to `0` for entities never hit.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DamageFlash(pub f32);
+
 /// The ship's fixed forward weapon: fire timing + muzzle speed.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Weapon {
