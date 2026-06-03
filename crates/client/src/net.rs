@@ -63,10 +63,9 @@ use sim::{FixedDt, HitFeedback, ShipIntent};
 
 use crate::input::{build_client_input, InputSequencer};
 use crate::render_sync::{
-    interpolate_transforms, RemoteEntity, RenderInterp, ShieldBubble, ShieldChild, ShipCells,
+    interpolate_transforms, RemoteEntity, RenderInterp, ShieldBubble, ShieldChild, ShipHull,
 };
-use crate::scene::{RenderAssets, CELL_SIZE};
-use server::RenderCell;
+use crate::scene::{build_hull_mesh, RenderAssets, CELL_SIZE};
 
 /// The loopback solo-play host: the embedded authoritative [`ServerApp`] plus the
 /// client end of its [`LoopbackTransport`] and the established connection. A
@@ -375,13 +374,14 @@ fn capture_render_state(
     state: NonSend<NetClientState>,
     assets: Res<RenderAssets>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
     dt: Res<FixedDt>,
     mut render_map: ResMut<NetRenderMap>,
     mut interp_q: Query<&mut RenderInterp>,
     mut vel_q: Query<&mut Velocity, With<LocalShip>>,
     shield_child_q: Query<&ShieldChild>,
     mut bubble_q: Query<(&mut Visibility, &mut Transform)>,
-    mut ship_cells_q: Query<&mut ShipCells>,
+    mut ship_hull_q: Query<&mut ShipHull>,
 ) {
     let local_id = state.local_id;
     let entities = host.server.render_state();
@@ -415,11 +415,12 @@ fn capture_render_state(
                     vel.0 = e.vel;
                 }
             }
-            // Phase 1B: voxel cell-body LOD for a fitted ship (non-empty cell payload).
-            sync_ship_voxels(
+            // Revise-B: seamless hull-surface LOD for a fitted ship (non-empty cell payload).
+            sync_ship_hull(
                 &mut commands,
                 &assets,
-                &mut ship_cells_q,
+                &mut meshes,
+                &mut ship_hull_q,
                 bevy_entity,
                 e,
                 lod_origin,
@@ -445,12 +446,13 @@ fn capture_render_state(
             // visibly travels out of the ship instead of popping in ~a tick ahead
             // (≈ the reticle distance for a fast round).
             let spawned = spawn_render_entity(&mut commands, &assets, e, dt.0);
-            // Phase 1B: build the voxel cell-body immediately if this newly-seen fitted
-            // ship is near, so its first rendered frame already shows the cell-grid.
-            sync_ship_voxels(
+            // Revise-B: build the merged hull surface immediately if this newly-seen fitted
+            // ship is near, so its first rendered frame already shows the solid hull plate.
+            sync_ship_hull(
                 &mut commands,
                 &assets,
-                &mut ship_cells_q,
+                &mut meshes,
+                &mut ship_hull_q,
                 spawned,
                 e,
                 lod_origin,
@@ -480,6 +482,14 @@ fn capture_render_state(
         if present.contains(id) {
             true
         } else {
+            // Free a fitted ship's merged hull `Mesh` handle before despawning it, so the
+            // mesh store does not leak a mesh per destroyed ship over a long session (the
+            // hull-surface child itself is despawned recursively with the parent below).
+            if let Ok(hull) = ship_hull_q.get(*entity) {
+                if let Some(mesh) = &hull.mesh {
+                    meshes.remove(mesh);
+                }
+            }
             if let Ok(mut ec) = commands.get_entity(*entity) {
                 ec.despawn();
             }
@@ -565,42 +575,38 @@ fn spawn_render_entity(
         .id()
 }
 
-/// The shared cell-box [`StandardMaterial`] for a [`RenderCell::kind`] code (Phase 1B):
-/// `0` structural hull tint, `1..=6` per [`sim::fitting::ModuleKind`] (reactor, thruster,
-/// weapon, shield, armor, utility). All cells share this small material set so Bevy keeps
-/// them batchable; an out-of-range code (never — the server emits `0..=6`) falls back to
-/// the structural plating material so it always resolves.
-fn cell_material_for(assets: &RenderAssets, kind: u8) -> Handle<StandardMaterial> {
-    let idx = (kind as usize).min(assets.cell_materials.len() - 1);
-    assets.cell_materials[idx].clone()
-}
-
-/// Phase 1B voxel cell-body LOD + per-tick diff for one rendered ship `parent`.
+/// Revise-B seamless-hull LOD + rebuild-on-change for one rendered ship `parent`.
 ///
 /// Decides the ship's LOD from its distance to `lod_origin` (the local player ship):
-/// **near** (`<= `[`SHIP_VOXEL_LOD_DIST`]) → render as a dense cell-grid (one shared-mesh
-/// cell-box CHILD per present hull cell, colored by kind); **far** → render as the single
-/// coarse [`RenderAssets::ship_mesh`] box (the parent's own mesh). The parent transform,
-/// `LocalShip`/`RemoteEntity` markers, camera-follow, gunsight, and HUD all live on the
-/// parent and are untouched — only its VISUAL (own box mesh vs. cell-box children) changes.
+/// **near** (`<= `[`SHIP_VOXEL_LOD_DIST`]) → render as ONE merged seamless hull-surface
+/// mesh ([`build_hull_mesh`]) under a single child, wearing the single uniform
+/// [`RenderAssets::hull_material`] — so the ship reads as a solid steel plate with NO
+/// visible cells; **far** → render as the single coarse [`RenderAssets::ship_mesh`] box
+/// (the parent's own mesh). The parent transform, `LocalShip`/`RemoteEntity` markers,
+/// camera-follow, gunsight, and HUD all live on the parent and are untouched — only its
+/// VISUAL (own box mesh vs. hull-surface child) changes.
 ///
 /// A non-fitted entity (empty `cells`) is a no-op — it keeps its single mesh (asteroids,
-/// projectiles, debris, an unfitted ship are never voxelized).
+/// projectiles, debris, an unfitted ship are never given a hull surface).
 ///
-/// LOD switch is clean: crossing the threshold rebuilds. Near→ drop the parent's own
-/// `Mesh3d`/`MeshMaterial3d` (so it stops drawing the box) and spawn cell children; far→
-/// despawn the children and restore the box mesh.
+/// LOD switch is clean both ways: near → drop the parent's own `Mesh3d`/`MeshMaterial3d`
+/// (so it stops drawing the box) and spawn the hull-surface child; far → despawn the child,
+/// FREE its `Mesh` handle from [`Assets<Mesh>`] (no leak), and restore the box mesh.
 ///
-/// **Per-tick diff (Phase-2-ready, implemented now):** while voxelized, the present cell
-/// set in `e.cells` is diffed against the tracked [`ShipCells::children`] map — children
-/// are spawned for newly-present cells and **despawned for cells no longer present**. In
-/// Phase 1B no cells are carved, so after the first build the diff is a no-op; in Phase 2
-/// the server drops a carved cell from `FitLayout.cells` → it drops from `e.cells` → this
-/// diff despawns its child, and the hull visibly erodes with NO further plumbing.
-fn sync_ship_voxels(
+/// **Rebuild-on-cell-set-change hook (Phase-2 erosion seam):** while near, the present cell
+/// set's cheap hash ([`cells_hash`]) is compared to the one the current mesh was built from
+/// ([`ShipHull::cells_hash`]); the merged mesh is rebuilt ONLY when it changes. In revise-B
+/// (no destruction) the set never changes, so the mesh builds **once on first sight** and
+/// the per-tick check is a no-op. In Phase 2 a carved cell drops from `FitLayout.cells` → it
+/// drops from `e.cells` → the hash changes → the mesh is rebuilt with the hole (and new
+/// breach-edge walls) and the old `Mesh` handle is freed. That rebuild is also where Phase 2
+/// will pass a real `exposed` predicate into [`build_hull_mesh`] so a breach-exposed module
+/// cell can be tinted (today modules are hidden under the uniform hull color).
+fn sync_ship_hull(
     commands: &mut Commands,
     assets: &RenderAssets,
-    ship_cells_q: &mut Query<&mut ShipCells>,
+    meshes: &mut Assets<Mesh>,
+    ship_hull_q: &mut Query<&mut ShipHull>,
     parent: Entity,
     e: &RenderEntity,
     lod_origin: Vec2,
@@ -612,153 +618,170 @@ fn sync_ship_voxels(
 
     let near = e.pos.distance(lod_origin) <= SHIP_VOXEL_LOD_DIST;
 
-    // Resolve (or initialize) this parent's voxel tracking. A freshly-spawned parent
-    // has no `ShipCells` yet (commands are deferred), so seed an empty default and let
-    // the build branch below populate + insert it via `commands`.
-    let mut current = match ship_cells_q.get_mut(parent) {
-        Ok(c) => CellsView::Existing(c),
-        Err(_) => CellsView::New(ShipCells::default()),
+    // Resolve (or initialize) this parent's hull tracking. A freshly-spawned parent has no
+    // `ShipHull` yet (commands are deferred), so seed a default and attach it at the end.
+    let mut new_state = None;
+    let mut current = match ship_hull_q.get_mut(parent) {
+        Ok(c) => HullView::Existing(c),
+        Err(_) => {
+            new_state = Some(ShipHull::default());
+            HullView::New(new_state.as_mut().unwrap())
+        }
     };
 
     if near {
-        // Going near (or already near): ensure the parent draws cells, not its box.
+        // Cheap order-independent hash of the present `(col, row, kind)` set — the
+        // rebuild trigger.
+        let hash = cells_hash(e);
+
         if !current.voxelized() {
-            // Far→near switch: stop drawing the parent's own coarse box so only the
-            // cell-grid shows (the parent keeps its transform + markers).
+            // Far→near switch: stop drawing the parent's coarse box so only the hull
+            // surface shows (the parent keeps its transform + markers).
             if let Ok(mut ec) = commands.get_entity(parent) {
                 ec.remove::<(Mesh3d, MeshMaterial3d<StandardMaterial>)>();
             }
             current.set_voxelized(true);
         }
-        diff_voxel_cells(commands, assets, &mut current, parent, e);
-    } else {
-        // Going far (or already far): ensure the parent draws its single box, no cells.
-        if current.voxelized() {
-            // Near→far switch: despawn every cell child and restore the coarse box mesh.
-            for (_, child) in current.drain_children() {
-                if let Ok(mut ec) = commands.get_entity(child) {
+
+        // Build on first sight, or REBUILD when the cell set changed (Phase-2 erosion).
+        let needs_build = current.child().is_none() || current.cells_hash() != hash;
+        if needs_build {
+            // Free the previous mesh + child (rebuild path) so meshes/entities don't leak.
+            if let Some(old) = current.take_mesh() {
+                meshes.remove(&old);
+            }
+            if let Some(old_child) = current.take_child() {
+                if let Ok(mut ec) = commands.get_entity(old_child) {
                     ec.despawn();
                 }
             }
+
+            // Merge the present cells into ONE seamless hull surface + add it to the mesh
+            // store. Modules stay hidden: `build_hull_mesh` uses the single uniform hull
+            // material (Phase 2 will pass an `exposed` predicate to reveal breach cells).
+            let cell_tuples: Vec<(u16, u16, u8)> =
+                e.cells.iter().map(|c| (c.col, c.row, c.kind)).collect();
+            let mesh = meshes.add(build_hull_mesh(&cell_tuples, e.grid_dims, CELL_SIZE));
+
+            let child = commands
+                .spawn((
+                    Mesh3d(mesh.clone()),
+                    MeshMaterial3d(assets.hull_material.clone()),
+                    Transform::IDENTITY,
+                ))
+                .id();
             if let Ok(mut ec) = commands.get_entity(parent) {
-                ec.insert((
-                    Mesh3d(assets.ship_mesh.clone()),
-                    MeshMaterial3d(assets.ship_material.clone()),
-                ));
+                ec.add_child(child);
             }
-            current.set_voxelized(false);
+            current.set_child(Some(child));
+            current.set_mesh(Some(mesh));
+            current.set_cells_hash(hash);
         }
-    }
-
-    // If we built a fresh `ShipCells` for a newly-spawned parent, attach it now.
-    if let CellsView::New(cells) = current {
+    } else if current.voxelized() {
+        // Near→far switch: despawn the hull child, free its mesh, restore the coarse box.
+        if let Some(old) = current.take_mesh() {
+            meshes.remove(&old);
+        }
+        if let Some(old_child) = current.take_child() {
+            if let Ok(mut ec) = commands.get_entity(old_child) {
+                ec.despawn();
+            }
+        }
         if let Ok(mut ec) = commands.get_entity(parent) {
-            ec.insert(cells);
+            ec.insert((
+                Mesh3d(assets.ship_mesh.clone()),
+                MeshMaterial3d(assets.ship_material.clone()),
+            ));
+        }
+        current.set_voxelized(false);
+    }
+
+    // If we built a fresh `ShipHull` for a newly-spawned parent, attach it now.
+    if let Some(state) = new_state {
+        if let Ok(mut ec) = commands.get_entity(parent) {
+            ec.insert(state);
         }
     }
 }
 
-/// Holds either the live `&mut ShipCells` from the query or a freshly-built one for a
-/// parent spawned THIS tick (whose component is still a deferred command). Lets
-/// [`sync_ship_voxels`] treat both uniformly, then attach the new one at the end.
-enum CellsView<'a> {
-    Existing(Mut<'a, ShipCells>),
-    New(ShipCells),
+/// Cheap order-independent hash of a fitted ship's present `(col, row, kind)` cell set —
+/// the rebuild-on-change trigger for [`sync_ship_hull`]. XOR-folds a per-cell scramble so
+/// the result is independent of the payload's iteration order (it already arrives row-major,
+/// but XOR makes the check robust). Equal hash ⇒ same hull ⇒ no rebuild; in revise-B it is
+/// constant per ship (no carving), so the merged mesh is built exactly once.
+fn cells_hash(e: &RenderEntity) -> u64 {
+    let mut acc: u64 = e.cells.len() as u64;
+    for c in &e.cells {
+        // Pack (col, row, kind) and scramble; XOR-fold so order does not matter.
+        let key = ((c.col as u64) << 24) ^ ((c.row as u64) << 8) ^ (c.kind as u64);
+        acc ^= key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    acc
 }
 
-impl CellsView<'_> {
+/// Holds either the live `&mut ShipHull` from the query or a freshly-built one for a parent
+/// spawned THIS tick (whose component is still a deferred command). Lets [`sync_ship_hull`]
+/// treat both uniformly, then attach the new one at the end.
+enum HullView<'a> {
+    Existing(Mut<'a, ShipHull>),
+    New(&'a mut ShipHull),
+}
+
+impl HullView<'_> {
     fn voxelized(&self) -> bool {
         match self {
-            CellsView::Existing(c) => c.voxelized,
-            CellsView::New(c) => c.voxelized,
+            HullView::Existing(c) => c.voxelized,
+            HullView::New(c) => c.voxelized,
         }
     }
     fn set_voxelized(&mut self, v: bool) {
         match self {
-            CellsView::Existing(c) => c.voxelized = v,
-            CellsView::New(c) => c.voxelized = v,
+            HullView::Existing(c) => c.voxelized = v,
+            HullView::New(c) => c.voxelized = v,
         }
     }
-    fn children_mut(&mut self) -> &mut std::collections::HashMap<sim::fitting::Cell, Entity> {
+    fn child(&self) -> Option<Entity> {
         match self {
-            CellsView::Existing(c) => &mut c.children,
-            CellsView::New(c) => &mut c.children,
+            HullView::Existing(c) => c.child,
+            HullView::New(c) => c.child,
         }
     }
-    fn drain_children(&mut self) -> Vec<(sim::fitting::Cell, Entity)> {
-        self.children_mut().drain().collect()
-    }
-}
-
-/// Diff the server's present cell payload (`e.cells`) against the tracked child map and
-/// reconcile (Phase 1B build + Phase-2 erosion in one path): spawn a cell-box child for
-/// every newly-present cell, leave existing children in place, and despawn children whose
-/// cell is no longer present. Each child sits at the cell-centre relative to the
-/// grid-centre in the ship's LOCAL frame, so it inherits the parent's interpolated
-/// pos/heading:
-///   `local = ((col+0.5) - cols*0.5, (row+0.5) - rows*0.5, 0) * CELL_SIZE`.
-fn diff_voxel_cells(
-    commands: &mut Commands,
-    assets: &RenderAssets,
-    current: &mut CellsView,
-    parent: Entity,
-    e: &RenderEntity,
-) {
-    let (cols, rows) = e.grid_dims;
-    // The set of cells present this tick, for the despawn pass.
-    let present: std::collections::HashSet<sim::fitting::Cell> =
-        e.cells.iter().map(|c| (c.col, c.row)).collect();
-
-    // Spawn children for newly-present cells (skip cells already rendered).
-    for cell in &e.cells {
-        let key = (cell.col, cell.row);
-        if current.children_mut().contains_key(&key) {
-            continue;
-        }
-        let translation = cell_local_translation(cell, cols, rows);
-        let child = commands
-            .spawn((
-                Mesh3d(assets.cell_mesh.clone()),
-                MeshMaterial3d(cell_material_for(assets, cell.kind)),
-                Transform::from_translation(translation),
-            ))
-            .id();
-        if let Ok(mut ec) = commands.get_entity(parent) {
-            ec.add_child(child);
-        }
-        current.children_mut().insert(key, child);
-    }
-
-    // Despawn children for cells the server no longer reports (Phase 2 erosion path;
-    // a no-op in Phase 1B since nothing is carved).
-    let stale: Vec<sim::fitting::Cell> = current
-        .children_mut()
-        .keys()
-        .copied()
-        .filter(|k| !present.contains(k))
-        .collect();
-    for key in stale {
-        if let Some(child) = current.children_mut().remove(&key) {
-            if let Ok(mut ec) = commands.get_entity(child) {
-                ec.despawn();
-            }
+    fn set_child(&mut self, v: Option<Entity>) {
+        match self {
+            HullView::Existing(c) => c.child = v,
+            HullView::New(c) => c.child = v,
         }
     }
-}
-
-/// The local (child) translation of one hull cell on a `cols × rows` grid — the
-/// cell-centre relative to the grid-centre, scaled by [`CELL_SIZE`], in the ship's local
-/// frame. The child inherits the parent's interpolated pos/heading.
-///
-/// The hull silhouettes are authored with **forward = +row** (the weapons + nose sit at
-/// high rows), but the ship's local nose is **+X** (the old coarse box is long along +X;
-/// the gunsight pip + heading use `rotation * +X` as the nose). So `row` maps to the
-/// **forward (+X)** axis and `col` to the **lateral (+Y)** axis — the voxel ship then
-/// points its nose the same way the box did, and the camera/gunsight read unchanged.
-fn cell_local_translation(cell: &RenderCell, cols: u16, rows: u16) -> Vec3 {
-    let forward = ((cell.row as f32 + 0.5) - rows as f32 * 0.5) * CELL_SIZE;
-    let lateral = ((cell.col as f32 + 0.5) - cols as f32 * 0.5) * CELL_SIZE;
-    Vec3::new(forward, lateral, 0.0)
+    fn take_child(&mut self) -> Option<Entity> {
+        match self {
+            HullView::Existing(c) => c.child.take(),
+            HullView::New(c) => c.child.take(),
+        }
+    }
+    fn set_mesh(&mut self, v: Option<Handle<Mesh>>) {
+        match self {
+            HullView::Existing(c) => c.mesh = v,
+            HullView::New(c) => c.mesh = v,
+        }
+    }
+    fn take_mesh(&mut self) -> Option<Handle<Mesh>> {
+        match self {
+            HullView::Existing(c) => c.mesh.take(),
+            HullView::New(c) => c.mesh.take(),
+        }
+    }
+    fn cells_hash(&self) -> u64 {
+        match self {
+            HullView::Existing(c) => c.cells_hash,
+            HullView::New(c) => c.cells_hash,
+        }
+    }
+    fn set_cells_hash(&mut self, v: u64) {
+        match self {
+            HullView::Existing(c) => c.cells_hash = v,
+            HullView::New(c) => c.cells_hash = v,
+        }
+    }
 }
 
 /// Deterministic per-fragment orientation + scale for a [`EntityKind::Debris`] chunk

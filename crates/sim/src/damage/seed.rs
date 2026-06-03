@@ -150,7 +150,7 @@ pub fn seed_defense_layers(
                 outward.normalize()
             } else {
                 // A section sitting exactly on the grid centre (the most-interior
-                // *core* — e.g. the fighter's central reactor at (2,2)) has no
+                // *core* — e.g. the fighter's central reactor at (4,4)) has no
                 // outward direction. Default it to face the demo's nominal **forward
                 // attacker** (`-X`), so a head-on +x shot meets it square-on (impact
                 // angle ≈ 0, it penetrates) rather than on its back face. A back-

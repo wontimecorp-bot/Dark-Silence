@@ -287,17 +287,32 @@ fn seed_hulls() -> HullCatalog {
     HullCatalog { hulls: map }
 }
 
-/// `fighter` — 5×5 grid, low budgets, ~7 small slots; agile, few slots.
+/// `fighter` — 9×11 grid, low budgets, 7 small slots; agile, few slots.
+///
+/// Revise-A re-authors the fighter at **finer cell fidelity** (was a coarse 17-cell
+/// 5×5 blob): a smoother, recognizable fighter silhouette on a 9×11 grid that reads
+/// as a ship (pointed nose, swept wings, engine block) and gives Phase 2 a much
+/// finer-grained body to erode. The 7 hardpoint slots keep the **one-slot-one-cell**
+/// model and are re-placed at sensible fine-grid coords inside the silhouette.
 fn seed_fighter() -> Hull {
-    // Slot layout (col,row) on a 5×5 grid; one section per slot for the coarse
-    // section-granularity authoring (cell-upgrade-ready, HINT-004). Weapon mounts
-    // sit forward (high row) and exposed; the reactor sits central (protected).
+    // Slot layout (col,row) on the 9×11 grid; one section per slot for the coarse
+    // section-granularity authoring (cell-upgrade-ready, HINT-004). Forward = +row
+    // (the nose sits at the high rows). Placement rationale on the finer grid:
+    //   - reactor (4,4): central column, deepest interior cell (depth 4 — the max on
+    //     this silhouette and the smallest such cell), so it is the `core_cell` the
+    //     sever/shatter chain treats as the ship core (protected behind the body);
+    //   - armor (4,5): one cell FORWARD of the reactor in the same column, so a
+    //     forward→aft (decreasing-row) shot strikes the armor cover before the buried
+    //     reactor (the outer-before-inner survivability property, FR-021);
+    //   - weapons (2,6)/(6,6): forward, toward the wing-root/fore, exposed (low depth);
+    //   - thrusters (3,0)/(5,0): aft engine block (row 0), an exposed perimeter ring;
+    //   - utility (4,2): aft-central fuselage.
     let slots = vec![
         slot(
             0,
             HardpointType::Reactor,
             SlotSize::Small,
-            (2, 2),
+            (4, 4),
             0.0,
             false,
         ),
@@ -305,7 +320,7 @@ fn seed_fighter() -> Hull {
             1,
             HardpointType::Thruster,
             SlotSize::Small,
-            (1, 0),
+            (3, 0),
             0.0,
             false,
         ),
@@ -313,42 +328,52 @@ fn seed_fighter() -> Hull {
             2,
             HardpointType::Thruster,
             SlotSize::Small,
-            (3, 0),
+            (5, 0),
             0.0,
             false,
         ),
-        slot(3, HardpointType::Weapon, SlotSize::Small, (1, 4), 0.0, true),
-        slot(4, HardpointType::Weapon, SlotSize::Small, (3, 4), 0.0, true),
-        slot(5, HardpointType::Armor, SlotSize::Small, (2, 3), 0.0, false),
+        slot(3, HardpointType::Weapon, SlotSize::Small, (2, 6), 0.0, true),
+        slot(4, HardpointType::Weapon, SlotSize::Small, (6, 6), 0.0, true),
+        slot(5, HardpointType::Armor, SlotSize::Small, (4, 5), 0.0, false),
         slot(
             6,
             HardpointType::Utility,
             SlotSize::Small,
-            (2, 1),
+            (4, 2),
             0.0,
             false,
         ),
     ];
-    // Dense fighter silhouette on the 5×5 grid (forward = +row, where the weapons +
-    // nose sit). A symmetric arrow-ship: a 3-wide nose/front, a full-beam mid section
-    // (the wings, widest at the reactor row), tapering to a 3-wide engine block. 17
-    // cells; covers every slot coord (reactor (2,2), thrusters (1,0)/(3,0), weapons
-    // (1,4)/(3,4), armor (2,3), utility (2,1)). Deterministic per-row column spans:
-    //   row 4 (nose):    cols 1..=3   (weapons (1,4)/(3,4) + nose tip)
-    //   row 3 (fore):    cols 1..=3   (armor (2,3))
-    //   row 2 (beam):    cols 0..=4   (full wing span; reactor (2,2) central)
-    //   row 1 (aft):     cols 1..=3   (utility (2,1))
-    //   row 0 (engines): cols 1..=3   (thrusters (1,0)/(3,0) + centre)
+    // Dense fighter silhouette on the 9×11 grid (forward = +row; centre column = 4). A
+    // smoother, recognizable arrow-fighter (revise-A): a pointed nose tapering down into
+    // a fore fuselage, full-beam swept wings (widest at row 5, tips at cols 0/8), a
+    // narrow fuselage neck, and a wider engine block aft. 51 cells (was a 17-cell blob),
+    // covering every slot coord. Deterministic per-row column spans (row 10 = nose tip,
+    // row 0 = aft engines):
+    //   row 10 (nose tip):  col  4        (1)
+    //   row  9 (nose):      cols 3..=5    (3)
+    //   row  8 (nose):      cols 3..=5    (3)
+    //   row  7 (fore):      cols 2..=6    (5)   weapons line up just below here
+    //   row  6 (fore):      cols 2..=6    (5)   weapons (2,6)/(6,6)
+    //   row  5 (wing beam): cols 0..=8    (9)   full wing span; armor (4,5)
+    //   row  4 (wing root): cols 1..=7    (7)   reactor (4,4) central/deep
+    //   row  3 (neck):      cols 3..=5    (3)
+    //   row  2 (engines):   cols 2..=6    (5)   utility (4,2)
+    //   row  1 (engines):   cols 2..=6    (5)
+    //   row  0 (engines):   cols 2..=6    (5)   thrusters (3,0)/(5,0)
     let fighter_shape = |col: u16, row: u16| match row {
-        2 => col <= 4, // full beam (wings)
-        0 | 1 | 3 | 4 => (1..=3).contains(&col),
+        10 => col == 4,
+        9 | 8 | 3 => (3..=5).contains(&col),
+        7 | 6 | 2 | 1 | 0 => (2..=6).contains(&col),
+        5 => col <= 8, // full beam (wings)
+        4 => (1..=7).contains(&col),
         _ => false,
     };
     Hull {
         id: HULL_FIGHTER,
         name: "Fighter".to_string(),
-        grid_dims: (5, 5),
-        cells: dense_cells((5, 5), &slots, fighter_shape),
+        grid_dims: (9, 11),
+        cells: dense_cells((9, 11), &slots, fighter_shape),
         // Caps tuned (T026) so each single-axis-max fit is valid but filling every
         // slot with its strongest module over-runs a budget (cpu, here) — no fit
         // maxes tank + damage + speed at once (T027). Generous power so two
@@ -362,15 +387,30 @@ fn seed_fighter() -> Hull {
     }
 }
 
-/// `corvette` — 9×9 grid, high budgets, ~14 medium slots; tankier/more firepower,
+/// `corvette` — 13×15 grid, high budgets, 14 medium slots; tankier/more firepower,
 /// less agile (greater base mass).
+///
+/// Revise-A re-authors the corvette proportionally larger than the finer fighter (was
+/// a coarse 57-cell 9×9): a bigger, beamier capital silhouette on a 13×15 grid (103
+/// cells) with the 14 hardpoint slots re-placed at sensible fine-grid coords. Same
+/// one-slot-one-cell model and the same module-vs-structural scheme as the fighter.
 fn seed_corvette() -> Hull {
+    // Slot layout (col,row) on the 13×15 grid; one section per slot. Forward = +row;
+    // centre column = 6. Placement rationale on the finer grid:
+    //   - reactors (6,6)/(5,6): central, deep; (6,6) is the deepest interior cell
+    //     (depth 6, the smallest such cell) → the `core_cell` the sever/shatter chain
+    //     treats as the core, the second reactor flanks it;
+    //   - armor (6,7)/(5,7)/(7,7): the mid armor band one row FORWARD of the reactors
+    //     ((6,7) directly covers the core reactor in column 6 — outer-before-inner);
+    //   - weapons (4,11)/(8,11)/(5,12)/(7,12): the forward weapon prow (exposed);
+    //   - thrusters (4,0)/(6,0)/(8,0): the aft engine block (perimeter ring, depth 0);
+    //   - utility (6,4)/(6,3): the fuselage neck / engine spread, central-aft.
     let slots = vec![
         slot(
             0,
             HardpointType::Reactor,
             SlotSize::Medium,
-            (4, 4),
+            (6, 6),
             0.0,
             false,
         ),
@@ -378,7 +418,7 @@ fn seed_corvette() -> Hull {
             1,
             HardpointType::Reactor,
             SlotSize::Medium,
-            (3, 4),
+            (5, 6),
             0.0,
             false,
         ),
@@ -386,7 +426,7 @@ fn seed_corvette() -> Hull {
             2,
             HardpointType::Thruster,
             SlotSize::Medium,
-            (2, 0),
+            (4, 0),
             0.0,
             false,
         ),
@@ -394,7 +434,7 @@ fn seed_corvette() -> Hull {
             3,
             HardpointType::Thruster,
             SlotSize::Medium,
-            (4, 0),
+            (6, 0),
             0.0,
             false,
         ),
@@ -402,7 +442,7 @@ fn seed_corvette() -> Hull {
             4,
             HardpointType::Thruster,
             SlotSize::Medium,
-            (6, 0),
+            (8, 0),
             0.0,
             false,
         ),
@@ -410,7 +450,7 @@ fn seed_corvette() -> Hull {
             5,
             HardpointType::Weapon,
             SlotSize::Medium,
-            (1, 8),
+            (4, 11),
             0.0,
             true,
         ),
@@ -418,7 +458,7 @@ fn seed_corvette() -> Hull {
             6,
             HardpointType::Weapon,
             SlotSize::Medium,
-            (3, 8),
+            (8, 11),
             0.0,
             true,
         ),
@@ -426,7 +466,7 @@ fn seed_corvette() -> Hull {
             7,
             HardpointType::Weapon,
             SlotSize::Medium,
-            (5, 8),
+            (5, 12),
             0.0,
             true,
         ),
@@ -434,7 +474,7 @@ fn seed_corvette() -> Hull {
             8,
             HardpointType::Weapon,
             SlotSize::Medium,
-            (7, 8),
+            (7, 12),
             0.0,
             true,
         ),
@@ -442,7 +482,7 @@ fn seed_corvette() -> Hull {
             9,
             HardpointType::Armor,
             SlotSize::Medium,
-            (4, 6),
+            (6, 7),
             0.0,
             false,
         ),
@@ -450,7 +490,7 @@ fn seed_corvette() -> Hull {
             10,
             HardpointType::Armor,
             SlotSize::Medium,
-            (3, 6),
+            (5, 7),
             0.0,
             false,
         ),
@@ -458,7 +498,7 @@ fn seed_corvette() -> Hull {
             11,
             HardpointType::Armor,
             SlotSize::Medium,
-            (5, 6),
+            (7, 7),
             0.0,
             false,
         ),
@@ -466,7 +506,7 @@ fn seed_corvette() -> Hull {
             12,
             HardpointType::Utility,
             SlotSize::Medium,
-            (4, 2),
+            (6, 4),
             0.0,
             false,
         ),
@@ -474,37 +514,46 @@ fn seed_corvette() -> Hull {
             13,
             HardpointType::Utility,
             SlotSize::Medium,
-            (4, 3),
+            (6, 3),
             0.0,
             false,
         ),
     ];
-    // Dense corvette silhouette on the 9×9 grid (forward = +row). A larger, beamier
-    // arrow-ship proportional to the fighter: a 7-wide weapon prow, a full-beam reactor
-    // midsection (the widest, the wings), and a 5-wide engine block. 57 cells; covers
-    // every slot coord (reactors (4,4)/(3,4), thrusters (2,0)/(4,0)/(6,0), weapons
-    // (1,8)/(3,8)/(5,8)/(7,8), armor (4,6)/(3,6)/(5,6), utility (4,2)/(4,3)).
-    // Deterministic per-row column spans:
-    //   row 8 (prow):    cols 1..=7   (the four forward weapon mounts + fill)
-    //   row 7:           cols 2..=6
-    //   row 6 (armor):   cols 2..=6   (armor (3,6)/(4,6)/(5,6))
-    //   row 5:           cols 1..=7
-    //   row 4 (beam):    cols 0..=8   (full wing span; reactors (3,4)/(4,4))
-    //   row 3 (util):    cols 1..=7   (utility (4,3))
-    //   row 2 (util):    cols 1..=7   (utility (4,2))
-    //   row 1:           cols 2..=6
-    //   row 0 (engines): cols 2..=6   (thrusters (2,0)/(4,0)/(6,0))
+    // Dense corvette silhouette on the 13×15 grid (forward = +row; centre column = 6).
+    // A larger, beamier capital ship proportional to the finer fighter (revise-A): a
+    // pointed weapon prow, a full-beam swept-wing midsection (widest at row 7, tips at
+    // cols 0/12), and a broad engine block aft. 103 cells (was 57); covers every slot
+    // coord. Deterministic per-row column spans (row 14 = prow tip, row 0 = aft engines):
+    //   row 14 (prow tip):   cols 5..=7    (3)
+    //   row 13 (prow):       cols 5..=7    (3)
+    //   row 12 (prow):       cols 4..=8    (5)   weapons (5,12)/(7,12)
+    //   row 11 (prow):       cols 4..=8    (5)   weapons (4,11)/(8,11)
+    //   row 10 (fore):       cols 3..=9    (7)
+    //   row  9 (fore):       cols 3..=9    (7)
+    //   row  8 (fore):       cols 2..=10   (9)
+    //   row  7 (wing beam):  cols 0..=12   (13)  full wing span; armor (5,7)/(6,7)/(7,7)
+    //   row  6 (wing root):  cols 1..=11   (11)  reactors (5,6)/(6,6) central/deep
+    //   row  5 (mid):        cols 2..=10   (9)
+    //   row  4 (neck):       cols 4..=8    (5)   utility (6,4)
+    //   row  3 (engines):    cols 3..=9    (7)   utility (6,3)
+    //   row  2 (engines):    cols 3..=9    (7)
+    //   row  1 (engines):    cols 3..=9    (7)
+    //   row  0 (engines):    cols 4..=8    (5)   thrusters (4,0)/(6,0)/(8,0)
     let corvette_shape = |col: u16, row: u16| match row {
-        4 => col <= 8, // full beam (wings)
-        5 | 8 | 2 | 3 => (1..=7).contains(&col),
-        0 | 1 | 6 | 7 => (2..=6).contains(&col),
+        14 | 13 => (5..=7).contains(&col),
+        12 | 11 => (4..=8).contains(&col),
+        10 | 9 | 3 | 2 | 1 => (3..=9).contains(&col),
+        8 | 5 => (2..=10).contains(&col),
+        7 => col <= 12, // full beam (wings)
+        6 => (1..=11).contains(&col),
+        4 | 0 => (4..=8).contains(&col),
         _ => false,
     };
     Hull {
         id: HULL_CORVETTE,
         name: "Corvette".to_string(),
-        grid_dims: (9, 9),
-        cells: dense_cells((9, 9), &slots, corvette_shape),
+        grid_dims: (13, 15),
+        cells: dense_cells((13, 15), &slots, corvette_shape),
         // Scales OVER the fighter on every capacity (more slots/power/cpu/mass) but
         // carries far more base mass → lower agility (SC-005). Caps tuned (T026) so
         // a max-tank fit binds **mass** (heavy armor) and a max-damage fit binds
@@ -721,19 +770,21 @@ mod tests {
         let (_, hulls) = seed_catalogs();
 
         let fighter = hulls.get(HULL_FIGHTER).unwrap();
-        // 17-cell fighter silhouette (3+3+5+3+3 over rows 4..0).
+        // 51-cell fighter silhouette on the 9×11 grid (revise-A, finer fidelity):
+        // 1+3+3+5+5+9+7+3+5+5+5 over rows 10..0.
         assert_eq!(
             fighter.cells.len(),
-            17,
-            "fighter dense silhouette is 17 cells"
+            51,
+            "fighter dense silhouette is 51 cells (revise-A finer 9×11)"
         );
 
         let corvette = hulls.get(HULL_CORVETTE).unwrap();
-        // 57-cell corvette silhouette (7+5+5+7+9+7+7+5+5 over rows 8..0).
+        // 103-cell corvette silhouette on the 13×15 grid (revise-A, proportionally
+        // larger): 3+3+5+5+7+7+9+13+11+9+5+7+7+7+5 over rows 14..0.
         assert_eq!(
             corvette.cells.len(),
-            57,
-            "corvette dense silhouette is 57 cells"
+            103,
+            "corvette dense silhouette is 103 cells (revise-A finer 13×15)"
         );
 
         for hull in [fighter, corvette] {

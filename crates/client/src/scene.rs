@@ -61,32 +61,37 @@ pub struct RenderAssets {
     /// do not all align.
     pub debris_mesh: Handle<Mesh>,
     pub debris_material: Handle<StandardMaterial>,
-    /// Phase 1B voxel cell-body: the SINGLE shared cube mesh every fitted-ship cell-box
-    /// child uses ([`Cuboid`] of side [`CELL_SIZE`]`* `[`CELL_FILL`], a slight voxel gap).
-    /// Sharing ONE mesh across all cells of all near ships lets Bevy's GPU
-    /// instancing/batching collapse them to a handful of draw calls. Paired with
-    /// [`RenderAssets::cell_materials`] (one per cell kind) so the batcher groups by
-    /// (mesh, material).
-    pub cell_mesh: Handle<Mesh>,
-    /// Phase 1B: the small fixed set of cell-box materials, indexed by the server's
-    /// [`server::RenderCell::kind`] code: `[0]` structural hull tint, `[1]` reactor,
-    /// `[2]` thruster, `[3]` weapon, `[4]` shield, `[5]` armor, `[6]` utility. A fitted
-    /// ship's cell-box child picks its material by `kind` (see
-    /// [`crate::net::cell_material_for`]); a handful of shared materials keeps the cells
-    /// batchable. Distinct, readable colors so module cells stand out against the plating.
-    pub cell_materials: [Handle<StandardMaterial>; 7],
+    /// Revise-B seamless hull surface: the ONE uniform hull-plate material every near
+    /// fitted ship's merged hull mesh ([`build_hull_mesh`]) uses. A solid metallic
+    /// steel-blue/grey, normal-lit (NOT emissive) — so an undamaged ship reads as one
+    /// continuous solid plate with NO visible cells or grid lines. Module colors are
+    /// deliberately HIDDEN at this material (a fitted ship's per-cell `kind` is not used
+    /// here); Phase 2 will reveal an exposed module cell at a breach by tinting only its
+    /// quad (see [`build_hull_mesh`]'s `exposed` hook). Shared across all near ships (the
+    /// per-ship variation is the geometry, not the material).
+    pub hull_material: Handle<StandardMaterial>,
 }
 
-/// Phase 1B voxel cell size, in sim units — the side length of one hull cell as
-/// rendered by the cell-box children of a near fitted ship. Chosen so the voxel body
-/// is ~the footprint of the old single ship box: the old fighter box was `1.6` wide on
-/// a `5`-wide grid, so `1.6 / 5 = 0.32` keeps the silhouette the same size while reading
-/// as a cell-grid. Tunable for feel (Phase 3).
+/// Hull cell size, in sim units — the side length of one hull cell as laid out in the
+/// merged hull surface mesh of a near fitted ship ([`build_hull_mesh`]). Chosen so the
+/// hull body is ~the footprint of the old single ship box: the old fighter box was `1.6`
+/// wide on a `5`-wide grid, so `1.6 / 5 = 0.32` keeps the silhouette the same size while
+/// the finer dense grids (51-cell fighter on 9×11) give a crisper outline. Tunable for
+/// feel (Phase 3).
 pub const CELL_SIZE: f32 = 0.32;
 
-/// Fraction of [`CELL_SIZE`] the cell-box cube actually fills, leaving a slight gap so
-/// neighbouring cells read as distinct voxels rather than a solid slab.
-const CELL_FILL: f32 = 0.9;
+/// Revise-B: the uniform solid hull color — a metallic steel-blue/grey. Used by the ONE
+/// shared [`RenderAssets::hull_material`]; the merged hull mesh of every near fitted ship
+/// wears it so an undamaged ship reads as a single solid plate with no visible cells.
+/// Module colors are HIDDEN at this surface (revealed only at a breach in Phase 2).
+const HULL_COLOR: Color = Color::srgb(0.30, 0.40, 0.52);
+
+/// Revise-B: the merged hull surface's slab half-thickness in `+Z`, in sim units — the
+/// top face sits at `z = HULL_THICKNESS` so the plate has a touch of relief under the
+/// top-down light without looking like a flat decal. Small (the camera is top-down, so
+/// only the top face is normally seen); the side walls at the silhouette boundary give a
+/// thin lip. Tunable for feel.
+const HULL_THICKNESS: f32 = 0.1;
 
 /// Inner radius of the shield-impact arc band, in sim units — the near edge of the
 /// glowing ring slice (just inside the deflector surface). FIX 0a refinement.
@@ -152,6 +157,190 @@ fn build_arc_band_mesh(inner_r: f32, outer_r: f32, half_angle: f32, segments: u3
         let outer1 = inner0 + 3;
         indices.extend_from_slice(&[inner0, outer0, outer1]);
         indices.extend_from_slice(&[inner0, outer1, inner1]);
+    }
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
+/// Revise-B: build ONE merged **seamless solid hull surface** mesh for a fitted ship
+/// from its present cells, in the ship's LOCAL frame (XY plane), so the whole ship draws
+/// as a single mesh + the single [`RenderAssets::hull_material`].
+///
+/// **Seamless, not voxels.** This REPLACES the old per-cell-box rendering (one `Cuboid`
+/// child per cell). Each present cell emits a **gapless, coplanar** quad covering the
+/// FULL cell footprint (a `CELL_SIZE × CELL_SIZE` square, no inter-cell gap) at the
+/// cell's local position. The local position matches the existing cell-offset convention
+/// (so the nose still points `+X`): the hull silhouettes author **forward = +row** /
+/// **lateral = +col**, but the ship's local nose is `+X`, so `row` maps to the forward
+/// (`+X`) axis and `col` to the lateral (`+Y`) axis:
+///   `cx = ((row + 0.5) − rows·0.5)·CELL_SIZE`  (forward, +X)
+///   `cy = ((col + 0.5) − cols·0.5)·CELL_SIZE`  (lateral, +Y)
+/// Adjacent cells therefore share an exact edge; since every quad is the same material,
+/// coplanar at `z = HULL_THICKNESS`, and `+Z` (camera-facing) — from the top-down camera
+/// the union reads as one continuous solid plate with NO internal seams or grid lines.
+///
+/// **Thickness.** The top face sits at `z = HULL_THICKNESS` (slight relief under the
+/// top-down light, never a flat decal). Each cell also emits **boundary side walls**:
+/// for each of the cell's four edges that has NO present neighbour (a silhouette edge or
+/// a Phase-2 breach edge) a vertical quad is dropped from `z = HULL_THICKNESS` to
+/// `z = 0`, giving the plate a thin lip and giving carved holes real walls. Interior
+/// shared edges emit no wall (they are covered), so the surface stays gapless and cheap.
+/// The top-down camera mainly sees the top faces; the walls matter when the hull is
+/// carved (Phase 2).
+///
+/// **Phase-2 reveal hook.** The signature already carries each cell's `kind` and an
+/// `exposed` predicate so a later phase can color a breach-exposed module cell
+/// differently. For revise-B the mesh is geometry-only (single uniform material, no
+/// per-cell color, modules HIDDEN), so `kind`/`exposed` are accepted but unused beyond
+/// this hook; when Phase 2 lands, an exposed module cell's top quad can be split into a
+/// second submesh / vertex-color set so [`RenderAssets::hull_material`] stays the body
+/// plate and only the exposed cell shows its module hue. Documented at the call site too.
+///
+/// `cells` is the present cell list (`(col, row, kind)`); `grid_dims` is the carrier
+/// hull's `(cols, rows)`; `cell_size` is [`CELL_SIZE`]. An empty `cells` yields an empty
+/// mesh (the caller never voxelizes a non-fitted entity, so this is defensive).
+pub fn build_hull_mesh(cells: &[(u16, u16, u8)], grid_dims: (u16, u16), cell_size: f32) -> Mesh {
+    // Phase-2 reveal hook: with no breach model yet, no cell is ever exposed, so the
+    // whole surface uses the uniform hull material. Phase 2 replaces this with a real
+    // breach predicate and per-exposed-cell coloring.
+    let exposed = |_col: u16, _row: u16| -> bool { false };
+    build_hull_mesh_with(cells, grid_dims, cell_size, exposed)
+}
+
+/// [`build_hull_mesh`] with an explicit `exposed(col, row)` predicate — the Phase-2
+/// reveal seam. Today `exposed` is always `false` (modules hidden), so the merged
+/// surface is one uniform-material solid plate; the parameter exists so a breach phase
+/// can flag exposed module cells without changing this mesh-construction code. (The
+/// `_exposed` flag is threaded but not yet branched on — Phase 2 will emit a distinct
+/// vertex attribute / submesh for exposed cells.)
+fn build_hull_mesh_with(
+    cells: &[(u16, u16, u8)],
+    grid_dims: (u16, u16),
+    cell_size: f32,
+    exposed: impl Fn(u16, u16) -> bool,
+) -> Mesh {
+    let (cols, rows) = grid_dims;
+    let half = HULL_THICKNESS;
+
+    // Fast membership test for neighbour lookups (so shared interior edges emit no wall
+    // and the plate stays gapless). Keyed by `(col, row)`.
+    let present: std::collections::HashSet<(u16, u16)> =
+        cells.iter().map(|&(c, r, _)| (c, r)).collect();
+
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    // Emit one CCW-from-`+Z` quad (two triangles) given its four corner positions, a
+    // shared normal, and simple UVs. Corners are ordered v0→v1→v2→v3 counter-clockwise
+    // as seen from the side the normal points to.
+    let push_quad = |positions: &mut Vec<[f32; 3]>,
+                     normals: &mut Vec<[f32; 3]>,
+                     uvs: &mut Vec<[f32; 2]>,
+                     indices: &mut Vec<u32>,
+                     corners: [[f32; 3]; 4],
+                     normal: [f32; 3]| {
+        let base = positions.len() as u32;
+        positions.extend_from_slice(&corners);
+        for _ in 0..4 {
+            normals.push(normal);
+        }
+        uvs.push([0.0, 0.0]);
+        uvs.push([1.0, 0.0]);
+        uvs.push([1.0, 1.0]);
+        uvs.push([0.0, 1.0]);
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+
+    for &(col, row, _kind) in cells {
+        // Phase-2 hook (no-op today): a future breach phase tints `exposed` cells; for
+        // revise-B every cell is body plate (the predicate is always false).
+        let _exposed = exposed(col, row);
+
+        // Cell centre in the ship's local frame: row→forward(+X), col→lateral(+Y),
+        // matching `net::cell_local_translation` so the nose stays +X.
+        let cx = ((row as f32 + 0.5) - rows as f32 * 0.5) * cell_size;
+        let cy = ((col as f32 + 0.5) - cols as f32 * 0.5) * cell_size;
+        let h = cell_size * 0.5;
+        // Cell footprint extents (gapless — full cell, no fill gap).
+        let (x0, x1) = (cx - h, cx + h);
+        let (y0, y1) = (cy - h, cy + h);
+
+        // Top face at z = +HULL_THICKNESS, normal +Z, wound CCW seen from +Z (the
+        // top-down camera). Coplanar + same material across all cells → seamless.
+        push_quad(
+            &mut positions,
+            &mut normals,
+            &mut uvs,
+            &mut indices,
+            [
+                [x0, y0, half],
+                [x1, y0, half],
+                [x1, y1, half],
+                [x0, y1, half],
+            ],
+            [0.0, 0.0, 1.0],
+        );
+
+        // Boundary side walls: only on edges with no present neighbour (silhouette edge,
+        // or a Phase-2 carved-hole edge). Interior shared edges are covered → no wall, so
+        // the surface stays gapless. Each wall drops from z=+half to z=0.
+        // -X edge (toward a smaller row / aft). Neighbour is (col, row-1).
+        let has_neg_x = row > 0 && present.contains(&(col, row - 1));
+        if !has_neg_x {
+            push_quad(
+                &mut positions,
+                &mut normals,
+                &mut uvs,
+                &mut indices,
+                [[x0, y0, 0.0], [x0, y1, 0.0], [x0, y1, half], [x0, y0, half]],
+                [-1.0, 0.0, 0.0],
+            );
+        }
+        // +X edge (toward a larger row / nose). Neighbour is (col, row+1).
+        let has_pos_x = present.contains(&(col, row + 1));
+        if !has_pos_x {
+            push_quad(
+                &mut positions,
+                &mut normals,
+                &mut uvs,
+                &mut indices,
+                [[x1, y1, 0.0], [x1, y0, 0.0], [x1, y0, half], [x1, y1, half]],
+                [1.0, 0.0, 0.0],
+            );
+        }
+        // -Y edge (toward a smaller col). Neighbour is (col-1, row).
+        let has_neg_y = col > 0 && present.contains(&(col - 1, row));
+        if !has_neg_y {
+            push_quad(
+                &mut positions,
+                &mut normals,
+                &mut uvs,
+                &mut indices,
+                [[x1, y0, 0.0], [x0, y0, 0.0], [x0, y0, half], [x1, y0, half]],
+                [0.0, -1.0, 0.0],
+            );
+        }
+        // +Y edge (toward a larger col). Neighbour is (col+1, row).
+        let has_pos_y = present.contains(&(col + 1, row));
+        if !has_pos_y {
+            push_quad(
+                &mut positions,
+                &mut normals,
+                &mut uvs,
+                &mut indices,
+                [[x0, y1, 0.0], [x1, y1, 0.0], [x1, y1, half], [x0, y1, half]],
+                [0.0, 1.0, 0.0],
+            );
+        }
     }
 
     Mesh::new(
@@ -238,54 +427,19 @@ pub fn setup_scene(
     let debris_mesh = meshes.add(Cuboid::new(0.7, 0.5, 0.4));
     let debris_material = materials.add(Color::srgb(0.22, 0.38, 0.55));
 
-    // Phase 1B voxel cell-body: ONE shared cube mesh for every fitted-ship cell, sized
-    // `CELL_SIZE * CELL_FILL` so neighbouring cells leave a slight voxel gap. Sharing
-    // this one mesh + the small material set below lets Bevy batch the cells (a near
-    // ship's ~17 cells collapse to a few draw calls, not 17).
-    let cell_side = CELL_SIZE * CELL_FILL;
-    let cell_mesh = meshes.add(Cuboid::new(cell_side, cell_side, cell_side));
-    // The small fixed material set, indexed by `RenderCell::kind` (0 structural .. 6
-    // utility). Distinct, readable colors: a cool steel-blue plating for structural,
-    // saturated per-module hues so hardpoints stand out against the body. A modest
-    // emissive on the module cells helps them read under the top-down light. Shared
-    // across all near ships so the cells stay batchable (one material per kind, not
-    // per cell).
-    let cell_materials: [Handle<StandardMaterial>; 7] = [
-        // 0 — structural hull plating (the body tint): muted steel blue.
-        materials.add(Color::srgb(0.34, 0.46, 0.62)),
-        // 1 — reactor: warm amber/orange core.
-        materials.add(StandardMaterial {
-            base_color: Color::srgb(0.95, 0.62, 0.18),
-            emissive: LinearRgba::rgb(0.5, 0.28, 0.04),
-            ..default()
-        }),
-        // 2 — thruster: cyan engine glow.
-        materials.add(StandardMaterial {
-            base_color: Color::srgb(0.25, 0.8, 0.95),
-            emissive: LinearRgba::rgb(0.08, 0.4, 0.5),
-            ..default()
-        }),
-        // 3 — weapon: hot red.
-        materials.add(StandardMaterial {
-            base_color: Color::srgb(0.92, 0.22, 0.22),
-            emissive: LinearRgba::rgb(0.45, 0.05, 0.05),
-            ..default()
-        }),
-        // 4 — shield: bright violet/indigo.
-        materials.add(StandardMaterial {
-            base_color: Color::srgb(0.55, 0.4, 0.95),
-            emissive: LinearRgba::rgb(0.22, 0.12, 0.5),
-            ..default()
-        }),
-        // 5 — armor: pale grey plate (denser than plating).
-        materials.add(Color::srgb(0.78, 0.78, 0.8)),
-        // 6 — utility: green.
-        materials.add(StandardMaterial {
-            base_color: Color::srgb(0.4, 0.85, 0.45),
-            emissive: LinearRgba::rgb(0.1, 0.32, 0.12),
-            ..default()
-        }),
-    ];
+    // Revise-B seamless hull surface: ONE uniform hull-plate material for every near
+    // fitted ship's merged hull mesh (`build_hull_mesh`). A solid metallic steel-blue/grey,
+    // normal-lit (NOT emissive) — so an undamaged ship reads as one continuous solid plate
+    // with NO visible cells or grid lines. Module colors are HIDDEN here (the per-cell kind
+    // is not used by this material); Phase 2 will reveal an exposed module cell at a breach.
+    // A modest metallic/low-perceptual-roughness so the plate catches the top-down key
+    // light and reads as metal rather than flat paint.
+    let hull_material = materials.add(StandardMaterial {
+        base_color: HULL_COLOR,
+        metallic: 0.6,
+        perceptual_roughness: 0.55,
+        ..default()
+    });
 
     commands.insert_resource(RenderAssets {
         projectile_mesh,
@@ -302,8 +456,7 @@ pub fn setup_scene(
         shield_material,
         debris_mesh,
         debris_material,
-        cell_mesh,
-        cell_materials,
+        hull_material,
     });
 
     // The LOCAL player ship — spawned here deterministically so the `LocalShip`

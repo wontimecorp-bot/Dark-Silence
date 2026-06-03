@@ -161,17 +161,43 @@ pub fn shatter_ship(world: &mut World, ship: Entity) {
         .and_then(|core| hull.cells.iter().find(|gc| gc.coord == core))
         .map(|gc| gc.section);
 
-    // Destroy every NON-core section first (deterministic `SectionId` order). As each
-    // section's cells are removed, connectivity severs every region disconnected from
-    // the core into a drifting chunk. The core section is skipped here so the ship
-    // sheds its debris BEFORE the whole-ship wreck lands. If a non-core destruction
-    // ever takes the whole-ship path itself (it severed the core via cascade), stop —
-    // the ship already carries a `Wreck`.
-    for section in &sections {
-        if Some(*section) == core_section {
-            continue;
-        }
-        on_section_destroyed(world, ship, *section);
+    // Order the NON-core sections so the LARGEST section (by authored cell count) is
+    // destroyed first, ties broken by `SectionId` for determinism. On the revise-A
+    // dense hulls the big shared `STRUCTURAL_SECTION` (the plating body, far more cells
+    // than any single one-cell module section) therefore severs FIRST — its removal
+    // isolates the still-alive module cells (the wing weapon, the aft thruster, …) into
+    // drifting chunks BEFORE the core's whole-ship wreck lands, so the ship visibly
+    // flies apart. (On the older coarse layout destroying the one-cell module sections
+    // already fragmented the body; on the denser, more-connected body only the big
+    // structural removal disconnects anything — hence largest-first.) This refines only
+    // the within-non-core ORDER; the core-last whole-ship invariant + the per-section
+    // sever mechanism are unchanged.
+    let mut cell_count: std::collections::BTreeMap<SectionId, usize> =
+        std::collections::BTreeMap::new();
+    for gc in &hull.cells {
+        *cell_count.entry(gc.section).or_insert(0) += 1;
+    }
+    let mut noncore: Vec<SectionId> = sections
+        .iter()
+        .copied()
+        .filter(|s| Some(*s) != core_section)
+        .collect();
+    // Largest section first (descending cell count), then ascending SectionId on a tie.
+    noncore.sort_by(|a, b| {
+        cell_count
+            .get(b)
+            .cmp(&cell_count.get(a))
+            .then_with(|| a.cmp(b))
+    });
+
+    // Destroy every NON-core section (largest-first, deterministic). As each section's
+    // cells are removed, connectivity severs every region disconnected from the core
+    // into a drifting chunk. The core section is skipped here so the ship sheds its
+    // debris BEFORE the whole-ship wreck lands. If a non-core destruction ever takes the
+    // whole-ship path itself (it severed the core via cascade), stop — the ship already
+    // carries a `Wreck`.
+    for section in noncore {
+        on_section_destroyed(world, ship, section);
         if world.get::<Wreck>(ship).is_some() {
             return;
         }

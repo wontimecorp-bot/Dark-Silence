@@ -261,9 +261,10 @@ fn insert_damage_resources(w: &mut World) {
 }
 
 /// Build a `(World, ship)` with the fighter hull fitted with a central reactor at
-/// (2,2) covered by an armor plate at (2,3), plus the defense-layer components. The
-/// `make_facet` closure authors the entry section's [`ArmorFacet`] so each test
-/// controls the armor gate; `shields` is the (optional) shield pool.
+/// (4,4) covered by an armor plate at (4,5) (revise-A finer 9×11 fighter), plus the
+/// defense-layer components. The `make_facet` closure authors the entry section's
+/// [`ArmorFacet`] so each test controls the armor gate; `shields` is the (optional)
+/// shield pool.
 fn fitted_world(
     shields: Option<Shields>,
     make_facet: impl Fn(&ModuleCatalog, &HullCatalog) -> SectionArmor,
@@ -275,7 +276,7 @@ fn fitted_world(
     let hull = hulls.get(HULL_FIGHTER).unwrap();
 
     let mut fit = Fit::new(HULL_FIGHTER);
-    // Slot 0 = central reactor (2,2); slot 5 = armor plate cover (2,3) directly in
+    // Slot 0 = central reactor (4,4); slot 5 = armor plate cover (4,5) directly in
     // front of it along a downward (decreasing-row) ray.
     fit.install_raw(SlotId(0), MODULE_REACTOR_BASIC);
     fit.install_raw(SlotId(5), MODULE_ARMOR_PLATE);
@@ -291,11 +292,12 @@ fn fitted_world(
     (w, id)
 }
 
-/// A thin steel facet on the entry armor section (SectionId 5, the (2,3) plate)
+/// A thin steel facet on the entry armor section (SectionId 5, the (4,5) plate)
 /// normal-up so a downward shot hits it head-on and easily clean-penetrates.
 fn thin_entry_facet(_m: &ModuleCatalog, _h: &HullCatalog) -> SectionArmor {
     let mut armor = SectionArmor::new();
-    // Slot 5 is the 6th authored cell → SectionId(5) (cells_for_slots enumerates).
+    // Slot 5 (the armor hardpoint) is at slot index 5 → its module cell is SectionId(5)
+    // (dense_cells keys a module cell to SectionId(slot_index)).
     armor.sections.insert(
         SectionId(5),
         ArmorFacet {
@@ -307,15 +309,15 @@ fn thin_entry_facet(_m: &ModuleCatalog, _h: &HullCatalog) -> SectionArmor {
     armor
 }
 
-/// A downward (decreasing-row) shot from above column 2, entering the (2,3) cover
-/// then the (2,2) reactor behind it.
+/// A downward (decreasing-row) shot from above column 4, entering the (4,5) cover
+/// then the (4,4) reactor behind it (revise-A finer 9×11 fighter).
 fn downward_shot(channel: Channel, magnitude: f32, penetration: f32, pen_size: f32) -> DamageEvent {
     DamageEvent {
         channel,
         magnitude,
         penetration,
         pen_size,
-        point: Vec2::new(2.5, 5.0),
+        point: Vec2::new(4.5, 11.0),
         dir: Vec2::new(0.0, -1.0),
         source: None,
     }
@@ -480,7 +482,7 @@ fn clean_penetration_destroys_the_module_behind_the_cover() {
     // No shield (so the shot reaches the armor gate directly), thin entry facet.
     let (mut w, ship) = fitted_world(None, thin_entry_facet);
 
-    // The entry point of the downward shot is the (2,3) armor-plate cover (slot 5).
+    // The entry point of the downward shot is the (4,5) armor-plate cover (slot 5).
     let ev = downward_shot(Channel::Em, 4000.0, 1000.0, 0.0);
     {
         let fit = w.get::<Fit>(ship).unwrap().clone();
@@ -491,7 +493,7 @@ fn clean_penetration_destroys_the_module_behind_the_cover() {
             .expect("the downward shot strikes the cover");
         assert_eq!(
             entry.cell,
-            (2, 3),
+            (4, 5),
             "the shallower shot strikes the cover first"
         );
         assert_eq!(
@@ -502,7 +504,7 @@ fn clean_penetration_destroys_the_module_behind_the_cover() {
     }
 
     // Apply: a clean Em penetration through the thin plate routes to the reactor
-    // behind (2,2) and drives its health to 0 (destroyed).
+    // behind (4,4) and drives its health to 0 (destroyed).
     let out = apply_damage(&mut w, ship, ev);
     assert_eq!(out.result, HitKind::Penetrated, "a clean penetration");
     assert_eq!(
@@ -520,7 +522,7 @@ fn clean_penetration_destroys_the_module_behind_the_cover() {
 
     // The reactor cell's live health is driven to 0 in the live FitLayout.
     let layout = w.get::<sim::fitting::FitLayout>(ship).unwrap();
-    let reactor = layout.occupant((2, 2)).unwrap();
+    let reactor = layout.occupant((4, 4)).unwrap();
     assert_eq!(
         reactor.health, 0.0,
         "the buried reactor health hits 0 = destroyed"
@@ -549,7 +551,7 @@ fn clean_penetration_destroys_the_module_behind_the_cover() {
         "a shallow shot stops at the cover, not the buried module"
     );
     let layout2 = w2.get::<sim::fitting::FitLayout>(ship2).unwrap();
-    let reactor2 = layout2.occupant((2, 2)).unwrap();
+    let reactor2 = layout2.occupant((4, 4)).unwrap();
     let reactor_max = w2
         .get_resource::<ModuleCatalog>()
         .unwrap()
@@ -1470,19 +1472,19 @@ fn insert_full_combat_resources(w: &mut World) {
     w.insert_resource(HitFeedback::default());
 }
 
-/// A fitted fighter at world origin (heading 0): central reactor (2,2) covered by a
-/// thin armor plate (2,3), full defense-layer state + a derived `ShipStats`, body
-/// components, and a `CollisionRadius` large enough that a downward projectile
-/// sweep strikes it. A downward (`-y`) world shot transforms to a downward local
-/// ray that enters the (2,3) cover then the (2,2) reactor behind it.
+/// A fitted fighter at world origin (heading 0): central reactor (4,4) covered by a
+/// thin armor plate (4,5) (revise-A finer 9×11 fighter), full defense-layer state + a
+/// derived `ShipStats`, body components, and a `CollisionRadius` large enough that a
+/// downward projectile sweep strikes it. A downward (`-y`) world shot transforms to a
+/// downward local ray that enters the (4,5) cover then the (4,4) reactor behind it.
 fn fitted_fighter_at_origin(w: &mut World) -> Entity {
     let (modules, hulls) = seed_catalogs();
     let hull = hulls.get(HULL_FIGHTER).unwrap();
 
     let mut fit = Fit::new(HULL_FIGHTER);
-    fit.install_raw(SlotId(0), MODULE_REACTOR_BASIC); // reactor (2,2), health_max 30
+    fit.install_raw(SlotId(0), MODULE_REACTOR_BASIC); // reactor (4,4), health_max 30
     fit.install_raw(SlotId(1), MODULE_THRUSTER_BASIC); // a thruster so ShipStats has thrust
-    fit.install_raw(SlotId(5), MODULE_ARMOR_PLATE); // cover (2,3)
+    fit.install_raw(SlotId(5), MODULE_ARMOR_PLATE); // cover (4,5)
     let layout = build_layout(hull, &fit, &modules);
     let stats = derive_ship_stats(hull, &fit, &modules, &layout);
 
@@ -1563,7 +1565,7 @@ fn fitted_projectile_hit_drives_the_full_damage_to_wreck_chain() {
     assert_eq!(
         w.get::<FitLayout>(ship)
             .unwrap()
-            .occupant((2, 2))
+            .occupant((4, 4))
             .unwrap()
             .health,
         reactor_max,
@@ -1627,7 +1629,7 @@ fn fitted_damage_drops_emergent_ship_stats_after_rederive() {
     let mut w = World::new();
     insert_full_combat_resources(&mut w);
 
-    // A fighter whose ENTRY module (the (2,3) armor plate) is a non-core section, so
+    // A fighter whose ENTRY module (the (4,5) armor plate) is a non-core section, so
     // destroying it does NOT whole-ship-destroy the ship — the ship survives and its
     // re-derived ShipStats are observable. Here the shot kills the COVER itself by
     // making it the struck module: a thick-but-low-effective setup is fiddly, so we

@@ -20,12 +20,9 @@
 //! The E002 gunsight pip and follow camera continue to read the local ship's
 //! rendered `Transform`, so their feel is unchanged.
 
-use std::collections::HashMap;
-
 use bevy::prelude::*;
 use protocol::{EntityId, EntityKind};
 use sim::components::{Heading, Position, Projectile, Ship};
-use sim::fitting::Cell;
 
 use crate::scene::RenderAssets;
 
@@ -74,28 +71,41 @@ pub struct ShieldChild {
 #[derive(Component, Clone, Copy, Debug)]
 pub struct ShieldBubble;
 
-/// Phase 1B voxel cell-body tracking on a rendered fitted ship's PARENT entity.
+/// Revise-B seamless hull-surface tracking on a rendered fitted ship's PARENT entity.
 ///
 /// When a fitted ship is **near** (the camera-distance LOD gate, see
 /// [`crate::net::SHIP_VOXEL_LOD_DIST`]) it is drawn as the interpolated parent transform
-/// PLUS one shared-mesh cell-box CHILD per present hull cell; this map keys each
-/// rendered cell `(col, row)` to its child [`Entity`] so [`crate::net::capture_render_state`]
-/// can **diff** the server's cell payload against it each tick — spawning children for
-/// newly-present cells and despawning children for cells that vanished. For Phase 1B no
-/// cells are carved (the diff is a no-op after first build), but the diff is implemented
-/// now so Phase 2 carving makes cells disappear with zero further plumbing: the server
-/// drops a cell from `FitLayout.cells`, it drops from the payload, and the diff despawns
-/// its child.
+/// PLUS exactly ONE child holding the merged hull-surface mesh
+/// ([`crate::scene::build_hull_mesh`]) + the single [`RenderAssets::hull_material`] — so
+/// the whole ship reads as one solid steel plate with NO visible cells (this REPLACES the
+/// old per-cell-box voxel rendering). This tracks that single child, its [`Mesh`] handle
+/// (so the handle is freed from [`Assets<Mesh>`] on despawn/rebuild and meshes do not leak
+/// over a long session), and a cheap hash of the present cell set.
+///
+/// **Rebuild-on-cell-set-change hook (the Phase-2 erosion seam).** `cells_hash` is a cheap
+/// order-independent hash of the present `(col, row, kind)` set. [`crate::net::capture_render_state`]
+/// recomputes it from the server's cell payload each tick and rebuilds the hull mesh ONLY
+/// when it changes. In revise-B (no destruction) the set never changes, so the mesh builds
+/// **once on first sight** and the per-tick check is a no-op. In Phase 2, carving drops a
+/// cell from `FitLayout.cells` → it drops from the payload → the hash changes → the mesh is
+/// rebuilt with the hole (and side walls along the new breach edges), and the hull visibly
+/// erodes with no further plumbing.
 ///
 /// `voxelized` records the current LOD state so the capture system switches cleanly when
-/// the ship crosses the distance threshold (near → build children + drop the box mesh;
-/// far → despawn children + restore the box mesh).
+/// the ship crosses the distance threshold (near → build the hull-mesh child + drop the
+/// parent's box mesh; far → despawn the child + free its mesh + restore the box mesh).
 #[derive(Component, Default)]
-pub struct ShipCells {
-    /// Live `(col, row) -> cell-box child entity` for the currently-rendered cells.
-    pub children: HashMap<Cell, Entity>,
-    /// Whether this ship is currently drawn as voxel cells (`true`, near) or the single
-    /// coarse box (`false`, far / not yet built).
+pub struct ShipHull {
+    /// The single hull-surface child entity (`None` until first built / while far).
+    pub child: Option<Entity>,
+    /// The hull mesh's handle, kept so it can be removed from [`Assets<Mesh>`] when the
+    /// child is despawned or the mesh is rebuilt (no per-session mesh leak).
+    pub mesh: Option<Handle<Mesh>>,
+    /// Cheap order-independent hash of the present `(col, row, kind)` cell set the current
+    /// mesh was built from — the rebuild-on-change trigger (Phase-2 erosion seam).
+    pub cells_hash: u64,
+    /// Whether this ship is currently drawn as the merged hull mesh (`true`, near) or the
+    /// single coarse box (`false`, far / not yet built).
     pub voxelized: bool,
 }
 

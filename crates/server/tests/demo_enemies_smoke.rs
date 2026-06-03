@@ -64,11 +64,11 @@ fn fitted_enemies_render_as_distinct_ships() {
     );
 
     // Phase 1B (client-only voxel payload): a living fitted enemy carries a NON-EMPTY
-    // per-cell payload (the dense fighter silhouette — 17 cells on a 5×5) so the client
-    // can render it as a colored cell-grid body, with the fighter's grid_dims. A plain
-    // practice target carries no cells (it stays a single cube).
+    // per-cell payload (the revise-A dense fighter silhouette — 51 cells on a 9×11) so
+    // the client can render it as a colored cell-grid body, with the fighter's grid_dims.
+    // A plain practice target carries no cells (it stays a single cube).
     assert!(
-        e14.cells.len() == 17 && e14.grid_dims == (5, 5),
+        e14.cells.len() == 51 && e14.grid_dims == (9, 11),
         "a fitted enemy carries its dense fighter cell-grid (got {} cells, dims {:?})",
         e14.cells.len(),
         e14.grid_dims

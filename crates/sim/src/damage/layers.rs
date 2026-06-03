@@ -215,7 +215,8 @@ pub struct DamageContext {
 
 /// How far the entry ray is extended across the hull grid from the impact point
 /// along the event direction, so [`resolve_entry_point`] sweeps the whole chassis
-/// (the largest seed hull is 9×9 in cell-space, so this comfortably spans it).
+/// (the largest seed hull is the 13×15 corvette in cell-space, so this comfortably
+/// spans it).
 const REACH: f32 = 64.0;
 
 /// The fallback armor facet for an **unplated** entry section (no [`ArmorFacet`] in

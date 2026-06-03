@@ -851,9 +851,9 @@ mod layout_phase5 {
 
     #[test]
     fn resolve_hit_strikes_the_outer_module_before_the_inner_one() {
-        // INV-F10/FR-021: the fighter's armor slot (slot 5 @ (2,3)) sits one cell
-        // forward of the central reactor slot (slot 0 @ (2,2)). A line down column
-        // 2 from the forward edge enters the armor cell FIRST, so resolve_hit
+        // INV-F10/FR-021: the fighter's armor slot (slot 5 @ (4,5), revise-A) sits one
+        // cell forward of the central reactor slot (slot 0 @ (4,4)). A line down column
+        // 4 from the forward edge enters the armor cell FIRST, so resolve_hit
         // returns the armor (outer) — the reactor is shielded behind it.
         let (modules, hulls) = seed_catalogs();
         let hull = hulls.get(HULL_FIGHTER).unwrap();
@@ -861,8 +861,8 @@ mod layout_phase5 {
         fit.install_raw(SlotId(0), MODULE_REACTOR_BASIC); // central, inner
         fit.install_raw(SlotId(5), MODULE_ARMOR_PLATE); // forward of it, outer
 
-        let armor_coord = hull.slot(SlotId(5)).unwrap().coord; // (2,3)
-        let reactor_coord = hull.slot(SlotId(0)).unwrap().coord; // (2,2)
+        let armor_coord = hull.slot(SlotId(5)).unwrap().coord; // (4,5)
+        let reactor_coord = hull.slot(SlotId(0)).unwrap().coord; // (4,4)
         assert_eq!(
             armor_coord.0, reactor_coord.0,
             "same column for the test line"
@@ -889,12 +889,12 @@ mod layout_phase5 {
         let (modules, hulls) = seed_catalogs();
         let hull = hulls.get(HULL_FIGHTER).unwrap();
 
-        // Central reactor (slot 0 @ (2,2)).
+        // Central reactor (slot 0 @ (4,4), revise-A).
         let mut central = Fit::new(HULL_FIGHTER);
         central.install_raw(SlotId(0), MODULE_REACTOR_BASIC);
         let central_coord = hull.slot(SlotId(0)).unwrap().coord;
 
-        // Edge-mounted device (slot 3 is a forward-edge weapon mount @ (1,4)).
+        // Edge-mounted device (slot 3 is a forward weapon mount @ (2,6), revise-A).
         let mut edge = Fit::new(HULL_FIGHTER);
         edge.install_raw(SlotId(3), MODULE_AUTOCANNON);
         let edge_coord = hull.slot(SlotId(3)).unwrap().coord;
@@ -987,11 +987,11 @@ mod layout_phase5 {
         // Phase 1A: the dense fighter silhouette also carries STRUCTURAL filler cells
         // (the hull body, not on any slot). A structural cell is `structural: true`,
         // holds no module, and is seeded with STRUCT_CELL_HP (> 0) — so the hull has a
-        // carvable body for Phase 2 while remaining combat-invisible in 1A. (2,4) is the
-        // authored nose-tip filler cell on the 5×5 fighter (forward of the weapons).
+        // carvable body for Phase 2 while remaining combat-invisible in 1A. (4,10) is the
+        // authored nose-tip filler cell on the revise-A 9×11 fighter (forward of the guns).
         use sim::fitting::content::STRUCT_CELL_HP;
         let nose = map
-            .get(&(2, 4))
+            .get(&(4, 10))
             .expect("the nose-tip structural cell is authored");
         assert!(nose.structural, "the nose-tip cell is structural filler");
         assert_eq!(nose.module, None, "a structural cell holds no module");
@@ -1000,7 +1000,7 @@ mod layout_phase5 {
             "a structural cell is seeded with STRUCT_CELL_HP"
         );
         // `module_at` ignores structural cells (no installed device there).
-        assert!(module_at(&fit, (2, 4), hull, &modules).is_none());
+        assert!(module_at(&fit, (4, 10), hull, &modules).is_none());
     }
 
     #[test]
