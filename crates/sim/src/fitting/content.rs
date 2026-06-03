@@ -84,6 +84,17 @@ pub const HULL_FIGHTER: HullId = HullId(1);
 /// Seed hull id: the tankier, more-firepower, less-agile `corvette`.
 pub const HULL_CORVETTE: HullId = HullId(2);
 
+/// Live structural HP seeded onto every **structural** hull cell in
+/// [`build_layout`](super::layout::build_layout) (Phase 1A). Module cells take their
+/// installed module's `health_max`; structural filler cells take this so the dense
+/// hull body has hit points Phase 2 can carve away cell-by-cell (ADR-0008, GDD §5).
+///
+/// Tunable: first-pass shape, not final balance (Phase 3 tunes carve feel). It is
+/// **not** wired into combat in Phase 1A — `resolve_hit` still resolves to module
+/// cells only, so structural HP changes no combat outcome this phase; it exists so the
+/// per-cell health store is populated for the Phase 2 carving model.
+pub const STRUCT_CELL_HP: f32 = 10.0;
+
 /// Seed module id: `reactor_basic` — supplies power; cost axis = mass.
 pub const MODULE_REACTOR_BASIC: ModuleId = ModuleId(1);
 /// Seed module id: `thruster_basic` — thrust/torque; cost = power_draw + mass.
@@ -318,11 +329,26 @@ fn seed_fighter() -> Hull {
             false,
         ),
     ];
+    // Dense fighter silhouette on the 5×5 grid (forward = +row, where the weapons +
+    // nose sit). A symmetric arrow-ship: a 3-wide nose/front, a full-beam mid section
+    // (the wings, widest at the reactor row), tapering to a 3-wide engine block. 17
+    // cells; covers every slot coord (reactor (2,2), thrusters (1,0)/(3,0), weapons
+    // (1,4)/(3,4), armor (2,3), utility (2,1)). Deterministic per-row column spans:
+    //   row 4 (nose):    cols 1..=3   (weapons (1,4)/(3,4) + nose tip)
+    //   row 3 (fore):    cols 1..=3   (armor (2,3))
+    //   row 2 (beam):    cols 0..=4   (full wing span; reactor (2,2) central)
+    //   row 1 (aft):     cols 1..=3   (utility (2,1))
+    //   row 0 (engines): cols 1..=3   (thrusters (1,0)/(3,0) + centre)
+    let fighter_shape = |col: u16, row: u16| match row {
+        2 => col <= 4, // full beam (wings)
+        0 | 1 | 3 | 4 => (1..=3).contains(&col),
+        _ => false,
+    };
     Hull {
         id: HULL_FIGHTER,
         name: "Fighter".to_string(),
         grid_dims: (5, 5),
-        cells: cells_for_slots(&slots),
+        cells: dense_cells((5, 5), &slots, fighter_shape),
         // Caps tuned (T026) so each single-axis-max fit is valid but filling every
         // slot with its strongest module over-runs a budget (cpu, here) — no fit
         // maxes tank + damage + speed at once (T027). Generous power so two
@@ -453,11 +479,32 @@ fn seed_corvette() -> Hull {
             false,
         ),
     ];
+    // Dense corvette silhouette on the 9×9 grid (forward = +row). A larger, beamier
+    // arrow-ship proportional to the fighter: a 7-wide weapon prow, a full-beam reactor
+    // midsection (the widest, the wings), and a 5-wide engine block. 57 cells; covers
+    // every slot coord (reactors (4,4)/(3,4), thrusters (2,0)/(4,0)/(6,0), weapons
+    // (1,8)/(3,8)/(5,8)/(7,8), armor (4,6)/(3,6)/(5,6), utility (4,2)/(4,3)).
+    // Deterministic per-row column spans:
+    //   row 8 (prow):    cols 1..=7   (the four forward weapon mounts + fill)
+    //   row 7:           cols 2..=6
+    //   row 6 (armor):   cols 2..=6   (armor (3,6)/(4,6)/(5,6))
+    //   row 5:           cols 1..=7
+    //   row 4 (beam):    cols 0..=8   (full wing span; reactors (3,4)/(4,4))
+    //   row 3 (util):    cols 1..=7   (utility (4,3))
+    //   row 2 (util):    cols 1..=7   (utility (4,2))
+    //   row 1:           cols 2..=6
+    //   row 0 (engines): cols 2..=6   (thrusters (2,0)/(4,0)/(6,0))
+    let corvette_shape = |col: u16, row: u16| match row {
+        4 => col <= 8, // full beam (wings)
+        5 | 8 | 2 | 3 => (1..=7).contains(&col),
+        0 | 1 | 6 | 7 => (2..=6).contains(&col),
+        _ => false,
+    };
     Hull {
         id: HULL_CORVETTE,
         name: "Corvette".to_string(),
         grid_dims: (9, 9),
-        cells: cells_for_slots(&slots),
+        cells: dense_cells((9, 9), &slots, corvette_shape),
         // Scales OVER the fighter on every capacity (more slots/power/cpu/mass) but
         // carries far more base mass → lower agility (SC-005). Caps tuned (T026) so
         // a max-tank fit binds **mass** (heavy armor) and a max-damage fit binds
@@ -488,11 +535,15 @@ pub fn baseline_hull() -> Hull {
         0.0,
         false,
     )];
+    // The 1×1 baseline stays a single cell — its one cell is the Thruster slot's module
+    // cell at (0,0) (no structural filler on a 1×1 reference chassis). `baseline_fit`
+    // must still derive to `Tuning::default()` exactly, so nothing dense is added here.
+    let baseline_shape = |col: u16, row: u16| (col, row) == (0, 0);
     Hull {
         id: HULL_BASELINE,
         name: "Baseline".to_string(),
         grid_dims: (1, 1),
-        cells: cells_for_slots(&slots),
+        cells: dense_cells((1, 1), &slots, baseline_shape),
         power_capacity: 100.0,
         cpu_capacity: 100.0,
         mass_capacity: 100.0,
@@ -531,15 +582,56 @@ fn slot(
     }
 }
 
-/// Author one [`GridCell`] per slot, each its own section (coarse
-/// section-granularity, cell-upgrade-ready — HINT-004). The cell-grid IS the
-/// hit/armor map E007 reads; finer authoring is a later content upgrade.
-fn cells_for_slots(slots: &[Slot]) -> Vec<GridCell> {
-    slots
-        .iter()
-        .enumerate()
-        .map(|(i, s)| GridCell::new(s.coord, SectionId(i as u32)))
-        .collect()
+/// The single [`SectionId`] every **structural** (filler) cell shares on a dense hull
+/// (Phase 1A). It sits above the per-slot module-cell section ids (which run
+/// `0..slots.len()`), so module cells keep their historical `SectionId(slot_index)`
+/// — preserving the E007 armor-gate / kill-timing behavior, which only ever looks up
+/// the entry **module** cell's section — while all filler plating groups into one
+/// coarse structural section.
+///
+/// Grouping all filler into one section keeps section growth minimal and fully
+/// deterministic. Phase 2 moves destruction to **cell** granularity, so this coarse
+/// section grouping is transitional (GDD §5); `shatter_ship` still severs correctly
+/// because destroying this section removes all filler at once, isolating the surviving
+/// module cells into drifting chunks.
+const STRUCTURAL_SECTION: SectionId = SectionId(10_000);
+
+/// Author the **dense filled silhouette** for a hull (Phase 1A): every `(col, row)`
+/// inside `shape` becomes a [`GridCell`]. A cell on a slot's `coord` is a **module
+/// cell** ([`GridCell::new`], `structural == false`) keyed to that slot's section
+/// `SectionId(slot_index)` (the historical per-slot section, so the E007 armor gate is
+/// unchanged); every other cell in the silhouette is a **structural** filler cell
+/// ([`GridCell::structural`], `structural == true`) in the shared [`STRUCTURAL_SECTION`].
+///
+/// `shape` is a deterministic predicate `(col, row) -> bool` selecting the silhouette;
+/// the caller guarantees it covers **every** slot coord (asserted in tests via
+/// `every_slot_sits_on_an_authored_cell_and_ids_are_unique`). Cells are emitted in
+/// row-major order so authoring is reproducible (Principle II) — no `HashMap` order.
+fn dense_cells(
+    grid_dims: (u16, u16),
+    slots: &[Slot],
+    shape: impl Fn(u16, u16) -> bool,
+) -> Vec<GridCell> {
+    let (cols, rows) = grid_dims;
+    let mut cells = Vec::new();
+    for row in 0..rows {
+        for col in 0..cols {
+            if !shape(col, row) {
+                continue;
+            }
+            // A slot sitting on this cell makes it a MODULE cell in that slot's section
+            // (the historical SectionId(slot_index)); otherwise it is STRUCTURAL filler.
+            match slots.iter().position(|s| s.coord == (col, row)) {
+                Some(slot_index) => {
+                    cells.push(GridCell::new((col, row), SectionId(slot_index as u32)));
+                }
+                None => {
+                    cells.push(GridCell::structural((col, row), STRUCTURAL_SECTION));
+                }
+            }
+        }
+    }
+    cells
 }
 
 #[cfg(test)]
@@ -618,6 +710,85 @@ mod tests {
         assert!(corvette.cpu_capacity > fighter.cpu_capacity);
         assert!(corvette.mass_capacity > fighter.mass_capacity);
         assert!(corvette.hull_base_mass > fighter.hull_base_mass);
+    }
+
+    #[test]
+    fn seed_hulls_are_dense_silhouettes_with_module_and_structural_cells() {
+        // Phase 1A: each seed hull is authored as a DENSE filled silhouette — every
+        // slot coord is a module cell (structural == false), the rest of the shape is
+        // structural filler (structural == true). Lock the authored cell counts so the
+        // silhouette shapes do not silently change (the Phase 1B renderer reads them).
+        let (_, hulls) = seed_catalogs();
+
+        let fighter = hulls.get(HULL_FIGHTER).unwrap();
+        // 17-cell fighter silhouette (3+3+5+3+3 over rows 4..0).
+        assert_eq!(
+            fighter.cells.len(),
+            17,
+            "fighter dense silhouette is 17 cells"
+        );
+
+        let corvette = hulls.get(HULL_CORVETTE).unwrap();
+        // 57-cell corvette silhouette (7+5+5+7+9+7+7+5+5 over rows 8..0).
+        assert_eq!(
+            corvette.cells.len(),
+            57,
+            "corvette dense silhouette is 57 cells"
+        );
+
+        for hull in [fighter, corvette] {
+            // A module cell sits on each slot coord (structural == false); the count of
+            // module cells equals the slot count, and every other cell is structural.
+            let module_cells = hull.cells.iter().filter(|c| !c.structural).count();
+            let structural_cells = hull.cells.iter().filter(|c| c.structural).count();
+            assert_eq!(
+                module_cells,
+                hull.slots.len(),
+                "{}: one module cell per slot",
+                hull.name
+            );
+            assert!(
+                structural_cells > 0,
+                "{}: the dense body has structural filler",
+                hull.name
+            );
+            // Every NON-structural cell is exactly on a slot coord, and vice-versa.
+            for cell in hull.cells.iter().filter(|c| !c.structural) {
+                assert!(
+                    hull.slots.iter().any(|s| s.coord == cell.coord),
+                    "{}: module cell {:?} sits on a slot",
+                    hull.name,
+                    cell.coord
+                );
+            }
+            // All structural cells share the one transitional structural section.
+            for cell in hull.cells.iter().filter(|c| c.structural) {
+                assert_eq!(
+                    cell.section, STRUCTURAL_SECTION,
+                    "{}: structural cells group into STRUCTURAL_SECTION",
+                    hull.name
+                );
+            }
+            // No duplicate coords in the dense authoring.
+            let mut coords = std::collections::BTreeSet::new();
+            for cell in &hull.cells {
+                assert!(
+                    coords.insert(cell.coord),
+                    "{}: duplicate authored cell {:?}",
+                    hull.name,
+                    cell.coord
+                );
+            }
+        }
+
+        // The 1×1 baseline stays a single (module) cell — no structural filler, so
+        // baseline_fit still derives to Tuning::default() exactly.
+        let baseline = baseline_hull();
+        assert_eq!(baseline.cells.len(), 1, "baseline stays one cell");
+        assert!(
+            !baseline.cells[0].structural,
+            "baseline cell is a module cell"
+        );
     }
 
     #[test]

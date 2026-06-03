@@ -29,20 +29,55 @@ pub struct HullId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SectionId(pub u32);
 
-/// One occupiable cell on the hull grid. The set of authored cells is **sparse**:
-/// not every `cols × rows` coordinate need exist (data-model.md).
+/// One occupiable cell on the hull grid. A hull is now authored as a **dense filled
+/// silhouette** (Phase 1A): every cell inside the designed ship shape is a `GridCell`,
+/// not just the slot cells — the cell-grid is the visible hull body and the future
+/// per-cell destruction substrate (ADR-0008, GDD §5 "simulate at cell granularity").
+///
+/// Cells come in two **kinds**, distinguished by [`structural`](GridCell::structural):
+/// - a **module cell** (`structural == false`) sits on a [`Slot`]'s `coord` — it is a
+///   hardpoint where a [`Module`](super::module::Module) installs; its live health is
+///   the installed module's health (or `0` when empty).
+/// - a **structural cell** (`structural == true`) is filler hull plating — the rest of
+///   the silhouette. It carries no slot; in the layout it is seeded with a tunable
+///   structural HP ([`STRUCT_CELL_HP`](super::content::STRUCT_CELL_HP)) so Phase 2 can
+///   carve it away cell-by-cell.
+///
+/// The set of authored cells is still **sparse** in the sense that not every
+/// `cols × rows` coordinate need exist (the silhouette need not fill the bounding box).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GridCell {
     /// Grid coordinate `(col, row)`, in-bounds of the owning hull's `grid_dims`.
     pub coord: (u16, u16),
     /// The section this cell belongs to (the coarse damage unit).
     pub section: SectionId,
+    /// `false` for a **module cell** (on a [`Slot`] coord — a hardpoint), `true` for a
+    /// **structural cell** (filler hull plating). Lets downstream code (layout health
+    /// seeding, Phase 1B voxel rendering) tell the two kinds apart without re-deriving
+    /// the slot-coord match each time.
+    pub structural: bool,
 }
 
 impl GridCell {
-    /// Construct an authored cell at `coord` in `section`.
+    /// Construct a **module cell** at `coord` in `section` (on a slot/hardpoint). The
+    /// historical two-arg constructor: a slot cell is a non-structural module cell.
     pub const fn new(coord: (u16, u16), section: SectionId) -> Self {
-        Self { coord, section }
+        Self {
+            coord,
+            section,
+            structural: false,
+        }
+    }
+
+    /// Construct a **structural** filler cell at `coord` in `section` (hull plating,
+    /// no slot). Seeded with [`STRUCT_CELL_HP`](super::content::STRUCT_CELL_HP) in the
+    /// layout so Phase 2 can carve it.
+    pub const fn structural(coord: (u16, u16), section: SectionId) -> Self {
+        Self {
+            coord,
+            section,
+            structural: true,
+        }
     }
 }
 
@@ -98,7 +133,10 @@ pub struct Hull {
     pub name: String,
     /// Cell-grid dimensions `(cols, rows)`; both `> 0`.
     pub grid_dims: (u16, u16),
-    /// The authored set of occupiable cells (sparse; in-bounds, no dup coords).
+    /// The authored set of occupiable cells — a **dense filled silhouette** (every
+    /// cell inside the ship shape; in-bounds, no dup coords). Includes a [`GridCell`]
+    /// for each [`Slot`]'s coord (a module cell) plus structural filler cells for the
+    /// rest of the body (Phase 1A).
     pub cells: Vec<GridCell>,
     /// Power budget ceiling (base; reactor `power_gen` *supplies* on top, this is
     /// the structural cap; `>= 0`).

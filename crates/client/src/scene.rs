@@ -61,7 +61,32 @@ pub struct RenderAssets {
     /// do not all align.
     pub debris_mesh: Handle<Mesh>,
     pub debris_material: Handle<StandardMaterial>,
+    /// Phase 1B voxel cell-body: the SINGLE shared cube mesh every fitted-ship cell-box
+    /// child uses ([`Cuboid`] of side [`CELL_SIZE`]`* `[`CELL_FILL`], a slight voxel gap).
+    /// Sharing ONE mesh across all cells of all near ships lets Bevy's GPU
+    /// instancing/batching collapse them to a handful of draw calls. Paired with
+    /// [`RenderAssets::cell_materials`] (one per cell kind) so the batcher groups by
+    /// (mesh, material).
+    pub cell_mesh: Handle<Mesh>,
+    /// Phase 1B: the small fixed set of cell-box materials, indexed by the server's
+    /// [`server::RenderCell::kind`] code: `[0]` structural hull tint, `[1]` reactor,
+    /// `[2]` thruster, `[3]` weapon, `[4]` shield, `[5]` armor, `[6]` utility. A fitted
+    /// ship's cell-box child picks its material by `kind` (see
+    /// [`crate::net::cell_material_for`]); a handful of shared materials keeps the cells
+    /// batchable. Distinct, readable colors so module cells stand out against the plating.
+    pub cell_materials: [Handle<StandardMaterial>; 7],
 }
+
+/// Phase 1B voxel cell size, in sim units — the side length of one hull cell as
+/// rendered by the cell-box children of a near fitted ship. Chosen so the voxel body
+/// is ~the footprint of the old single ship box: the old fighter box was `1.6` wide on
+/// a `5`-wide grid, so `1.6 / 5 = 0.32` keeps the silhouette the same size while reading
+/// as a cell-grid. Tunable for feel (Phase 3).
+pub const CELL_SIZE: f32 = 0.32;
+
+/// Fraction of [`CELL_SIZE`] the cell-box cube actually fills, leaving a slight gap so
+/// neighbouring cells read as distinct voxels rather than a solid slab.
+const CELL_FILL: f32 = 0.9;
 
 /// Inner radius of the shield-impact arc band, in sim units — the near edge of the
 /// glowing ring slice (just inside the deflector surface). FIX 0a refinement.
@@ -213,6 +238,55 @@ pub fn setup_scene(
     let debris_mesh = meshes.add(Cuboid::new(0.7, 0.5, 0.4));
     let debris_material = materials.add(Color::srgb(0.22, 0.38, 0.55));
 
+    // Phase 1B voxel cell-body: ONE shared cube mesh for every fitted-ship cell, sized
+    // `CELL_SIZE * CELL_FILL` so neighbouring cells leave a slight voxel gap. Sharing
+    // this one mesh + the small material set below lets Bevy batch the cells (a near
+    // ship's ~17 cells collapse to a few draw calls, not 17).
+    let cell_side = CELL_SIZE * CELL_FILL;
+    let cell_mesh = meshes.add(Cuboid::new(cell_side, cell_side, cell_side));
+    // The small fixed material set, indexed by `RenderCell::kind` (0 structural .. 6
+    // utility). Distinct, readable colors: a cool steel-blue plating for structural,
+    // saturated per-module hues so hardpoints stand out against the body. A modest
+    // emissive on the module cells helps them read under the top-down light. Shared
+    // across all near ships so the cells stay batchable (one material per kind, not
+    // per cell).
+    let cell_materials: [Handle<StandardMaterial>; 7] = [
+        // 0 — structural hull plating (the body tint): muted steel blue.
+        materials.add(Color::srgb(0.34, 0.46, 0.62)),
+        // 1 — reactor: warm amber/orange core.
+        materials.add(StandardMaterial {
+            base_color: Color::srgb(0.95, 0.62, 0.18),
+            emissive: LinearRgba::rgb(0.5, 0.28, 0.04),
+            ..default()
+        }),
+        // 2 — thruster: cyan engine glow.
+        materials.add(StandardMaterial {
+            base_color: Color::srgb(0.25, 0.8, 0.95),
+            emissive: LinearRgba::rgb(0.08, 0.4, 0.5),
+            ..default()
+        }),
+        // 3 — weapon: hot red.
+        materials.add(StandardMaterial {
+            base_color: Color::srgb(0.92, 0.22, 0.22),
+            emissive: LinearRgba::rgb(0.45, 0.05, 0.05),
+            ..default()
+        }),
+        // 4 — shield: bright violet/indigo.
+        materials.add(StandardMaterial {
+            base_color: Color::srgb(0.55, 0.4, 0.95),
+            emissive: LinearRgba::rgb(0.22, 0.12, 0.5),
+            ..default()
+        }),
+        // 5 — armor: pale grey plate (denser than plating).
+        materials.add(Color::srgb(0.78, 0.78, 0.8)),
+        // 6 — utility: green.
+        materials.add(StandardMaterial {
+            base_color: Color::srgb(0.4, 0.85, 0.45),
+            emissive: LinearRgba::rgb(0.1, 0.32, 0.12),
+            ..default()
+        }),
+    ];
+
     commands.insert_resource(RenderAssets {
         projectile_mesh,
         projectile_material,
@@ -228,6 +302,8 @@ pub fn setup_scene(
         shield_material,
         debris_mesh,
         debris_material,
+        cell_mesh,
+        cell_materials,
     });
 
     // The LOCAL player ship — spawned here deterministically so the `LocalShip`

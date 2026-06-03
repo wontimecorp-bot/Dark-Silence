@@ -983,6 +983,24 @@ mod layout_phase5 {
         assert_eq!(r.module, MODULE_REACTOR_BASIC);
         assert_eq!(r.slot, SlotId(0));
         assert!(module_at(&fit, empty_coord, hull, &modules).is_none());
+
+        // Phase 1A: the dense fighter silhouette also carries STRUCTURAL filler cells
+        // (the hull body, not on any slot). A structural cell is `structural: true`,
+        // holds no module, and is seeded with STRUCT_CELL_HP (> 0) — so the hull has a
+        // carvable body for Phase 2 while remaining combat-invisible in 1A. (2,4) is the
+        // authored nose-tip filler cell on the 5×5 fighter (forward of the weapons).
+        use sim::fitting::content::STRUCT_CELL_HP;
+        let nose = map
+            .get(&(2, 4))
+            .expect("the nose-tip structural cell is authored");
+        assert!(nose.structural, "the nose-tip cell is structural filler");
+        assert_eq!(nose.module, None, "a structural cell holds no module");
+        assert_eq!(
+            nose.health, STRUCT_CELL_HP,
+            "a structural cell is seeded with STRUCT_CELL_HP"
+        );
+        // `module_at` ignores structural cells (no installed device there).
+        assert!(module_at(&fit, (2, 4), hull, &modules).is_none());
     }
 
     #[test]

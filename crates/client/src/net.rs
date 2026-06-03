@@ -63,9 +63,10 @@ use sim::{FixedDt, HitFeedback, ShipIntent};
 
 use crate::input::{build_client_input, InputSequencer};
 use crate::render_sync::{
-    interpolate_transforms, RemoteEntity, RenderInterp, ShieldBubble, ShieldChild,
+    interpolate_transforms, RemoteEntity, RenderInterp, ShieldBubble, ShieldChild, ShipCells,
 };
-use crate::scene::RenderAssets;
+use crate::scene::{RenderAssets, CELL_SIZE};
+use server::RenderCell;
 
 /// The loopback solo-play host: the embedded authoritative [`ServerApp`] plus the
 /// client end of its [`LoopbackTransport`] and the established connection. A
@@ -121,6 +122,16 @@ pub struct NetRenderMap {
 /// follow camera, gunsight pip, and HUD still find it by this tag.
 #[derive(Component)]
 pub struct LocalShip;
+
+/// Phase 1B voxel LOD gate (sim units): a fitted ship within this camera-relative
+/// distance is **near** (Tier-0) and rendered as its dense cell-grid (a cell-box child
+/// per hull cell); beyond it the ship renders as the single coarse [`RenderAssets::ship_mesh`]
+/// box. This caps the fine-rendered cell count to the few ships you are actually fighting
+/// (the perf lever the plan designs in from Phase 1). Distance is measured from the LOCAL
+/// player ship's world position (which the follow-camera centres on) to each ship. For
+/// the demo the handful of ships are always near, so the voxel path runs; the box path
+/// exists + switches cleanly when a ship crosses the threshold. Tunable for feel.
+pub const SHIP_VOXEL_LOD_DIST: f32 = 60.0;
 
 /// The windowed solo-client plugin (T045). Adds the embedded-server lifecycle and
 /// the render-from-server-world path, making the client runnable solo
@@ -370,9 +381,19 @@ fn capture_render_state(
     mut vel_q: Query<&mut Velocity, With<LocalShip>>,
     shield_child_q: Query<&ShieldChild>,
     mut bubble_q: Query<(&mut Visibility, &mut Transform)>,
+    mut ship_cells_q: Query<&mut ShipCells>,
 ) {
     let local_id = state.local_id;
     let entities = host.server.render_state();
+
+    // Phase 1B LOD origin: the local player ship's world position (the follow-camera
+    // centres on it). Voxelize ships within `SHIP_VOXEL_LOD_DIST` of it; box the rest.
+    // Falls back to the origin if the local ship isn't in this render set yet (startup).
+    let lod_origin = entities
+        .iter()
+        .find(|e| e.id == local_id)
+        .map(|e| e.pos)
+        .unwrap_or(Vec2::ZERO);
 
     // Track which ids are present this tick so we can despawn the rest.
     let mut present: std::collections::HashSet<EntityId> = std::collections::HashSet::new();
@@ -394,6 +415,15 @@ fn capture_render_state(
                     vel.0 = e.vel;
                 }
             }
+            // Phase 1B: voxel cell-body LOD for a fitted ship (non-empty cell payload).
+            sync_ship_voxels(
+                &mut commands,
+                &assets,
+                &mut ship_cells_q,
+                bevy_entity,
+                e,
+                lod_origin,
+            );
             // Show + fade (or lazily spawn) this entity's LOCALIZED shield-impact flash
             // from the hit-driven `shield_flash`, placed at the impact (`hit_dir`).
             update_shield_bubble(
@@ -415,6 +445,16 @@ fn capture_render_state(
             // visibly travels out of the ship instead of popping in ~a tick ahead
             // (≈ the reticle distance for a fast round).
             let spawned = spawn_render_entity(&mut commands, &assets, e, dt.0);
+            // Phase 1B: build the voxel cell-body immediately if this newly-seen fitted
+            // ship is near, so its first rendered frame already shows the cell-grid.
+            sync_ship_voxels(
+                &mut commands,
+                &assets,
+                &mut ship_cells_q,
+                spawned,
+                e,
+                lod_origin,
+            );
             // Seed (if its shield is being hit) its localized impact flash immediately
             // so the first rendered frame already shows it at the impact point.
             update_shield_bubble(
@@ -523,6 +563,202 @@ fn spawn_render_entity(
             transform,
         ))
         .id()
+}
+
+/// The shared cell-box [`StandardMaterial`] for a [`RenderCell::kind`] code (Phase 1B):
+/// `0` structural hull tint, `1..=6` per [`sim::fitting::ModuleKind`] (reactor, thruster,
+/// weapon, shield, armor, utility). All cells share this small material set so Bevy keeps
+/// them batchable; an out-of-range code (never — the server emits `0..=6`) falls back to
+/// the structural plating material so it always resolves.
+fn cell_material_for(assets: &RenderAssets, kind: u8) -> Handle<StandardMaterial> {
+    let idx = (kind as usize).min(assets.cell_materials.len() - 1);
+    assets.cell_materials[idx].clone()
+}
+
+/// Phase 1B voxel cell-body LOD + per-tick diff for one rendered ship `parent`.
+///
+/// Decides the ship's LOD from its distance to `lod_origin` (the local player ship):
+/// **near** (`<= `[`SHIP_VOXEL_LOD_DIST`]) → render as a dense cell-grid (one shared-mesh
+/// cell-box CHILD per present hull cell, colored by kind); **far** → render as the single
+/// coarse [`RenderAssets::ship_mesh`] box (the parent's own mesh). The parent transform,
+/// `LocalShip`/`RemoteEntity` markers, camera-follow, gunsight, and HUD all live on the
+/// parent and are untouched — only its VISUAL (own box mesh vs. cell-box children) changes.
+///
+/// A non-fitted entity (empty `cells`) is a no-op — it keeps its single mesh (asteroids,
+/// projectiles, debris, an unfitted ship are never voxelized).
+///
+/// LOD switch is clean: crossing the threshold rebuilds. Near→ drop the parent's own
+/// `Mesh3d`/`MeshMaterial3d` (so it stops drawing the box) and spawn cell children; far→
+/// despawn the children and restore the box mesh.
+///
+/// **Per-tick diff (Phase-2-ready, implemented now):** while voxelized, the present cell
+/// set in `e.cells` is diffed against the tracked [`ShipCells::children`] map — children
+/// are spawned for newly-present cells and **despawned for cells no longer present**. In
+/// Phase 1B no cells are carved, so after the first build the diff is a no-op; in Phase 2
+/// the server drops a carved cell from `FitLayout.cells` → it drops from `e.cells` → this
+/// diff despawns its child, and the hull visibly erodes with NO further plumbing.
+fn sync_ship_voxels(
+    commands: &mut Commands,
+    assets: &RenderAssets,
+    ship_cells_q: &mut Query<&mut ShipCells>,
+    parent: Entity,
+    e: &RenderEntity,
+    lod_origin: Vec2,
+) {
+    // Only fitted ships carry a cell payload; everything else keeps its single mesh.
+    if e.cells.is_empty() {
+        return;
+    }
+
+    let near = e.pos.distance(lod_origin) <= SHIP_VOXEL_LOD_DIST;
+
+    // Resolve (or initialize) this parent's voxel tracking. A freshly-spawned parent
+    // has no `ShipCells` yet (commands are deferred), so seed an empty default and let
+    // the build branch below populate + insert it via `commands`.
+    let mut current = match ship_cells_q.get_mut(parent) {
+        Ok(c) => CellsView::Existing(c),
+        Err(_) => CellsView::New(ShipCells::default()),
+    };
+
+    if near {
+        // Going near (or already near): ensure the parent draws cells, not its box.
+        if !current.voxelized() {
+            // Far→near switch: stop drawing the parent's own coarse box so only the
+            // cell-grid shows (the parent keeps its transform + markers).
+            if let Ok(mut ec) = commands.get_entity(parent) {
+                ec.remove::<(Mesh3d, MeshMaterial3d<StandardMaterial>)>();
+            }
+            current.set_voxelized(true);
+        }
+        diff_voxel_cells(commands, assets, &mut current, parent, e);
+    } else {
+        // Going far (or already far): ensure the parent draws its single box, no cells.
+        if current.voxelized() {
+            // Near→far switch: despawn every cell child and restore the coarse box mesh.
+            for (_, child) in current.drain_children() {
+                if let Ok(mut ec) = commands.get_entity(child) {
+                    ec.despawn();
+                }
+            }
+            if let Ok(mut ec) = commands.get_entity(parent) {
+                ec.insert((
+                    Mesh3d(assets.ship_mesh.clone()),
+                    MeshMaterial3d(assets.ship_material.clone()),
+                ));
+            }
+            current.set_voxelized(false);
+        }
+    }
+
+    // If we built a fresh `ShipCells` for a newly-spawned parent, attach it now.
+    if let CellsView::New(cells) = current {
+        if let Ok(mut ec) = commands.get_entity(parent) {
+            ec.insert(cells);
+        }
+    }
+}
+
+/// Holds either the live `&mut ShipCells` from the query or a freshly-built one for a
+/// parent spawned THIS tick (whose component is still a deferred command). Lets
+/// [`sync_ship_voxels`] treat both uniformly, then attach the new one at the end.
+enum CellsView<'a> {
+    Existing(Mut<'a, ShipCells>),
+    New(ShipCells),
+}
+
+impl CellsView<'_> {
+    fn voxelized(&self) -> bool {
+        match self {
+            CellsView::Existing(c) => c.voxelized,
+            CellsView::New(c) => c.voxelized,
+        }
+    }
+    fn set_voxelized(&mut self, v: bool) {
+        match self {
+            CellsView::Existing(c) => c.voxelized = v,
+            CellsView::New(c) => c.voxelized = v,
+        }
+    }
+    fn children_mut(&mut self) -> &mut std::collections::HashMap<sim::fitting::Cell, Entity> {
+        match self {
+            CellsView::Existing(c) => &mut c.children,
+            CellsView::New(c) => &mut c.children,
+        }
+    }
+    fn drain_children(&mut self) -> Vec<(sim::fitting::Cell, Entity)> {
+        self.children_mut().drain().collect()
+    }
+}
+
+/// Diff the server's present cell payload (`e.cells`) against the tracked child map and
+/// reconcile (Phase 1B build + Phase-2 erosion in one path): spawn a cell-box child for
+/// every newly-present cell, leave existing children in place, and despawn children whose
+/// cell is no longer present. Each child sits at the cell-centre relative to the
+/// grid-centre in the ship's LOCAL frame, so it inherits the parent's interpolated
+/// pos/heading:
+///   `local = ((col+0.5) - cols*0.5, (row+0.5) - rows*0.5, 0) * CELL_SIZE`.
+fn diff_voxel_cells(
+    commands: &mut Commands,
+    assets: &RenderAssets,
+    current: &mut CellsView,
+    parent: Entity,
+    e: &RenderEntity,
+) {
+    let (cols, rows) = e.grid_dims;
+    // The set of cells present this tick, for the despawn pass.
+    let present: std::collections::HashSet<sim::fitting::Cell> =
+        e.cells.iter().map(|c| (c.col, c.row)).collect();
+
+    // Spawn children for newly-present cells (skip cells already rendered).
+    for cell in &e.cells {
+        let key = (cell.col, cell.row);
+        if current.children_mut().contains_key(&key) {
+            continue;
+        }
+        let translation = cell_local_translation(cell, cols, rows);
+        let child = commands
+            .spawn((
+                Mesh3d(assets.cell_mesh.clone()),
+                MeshMaterial3d(cell_material_for(assets, cell.kind)),
+                Transform::from_translation(translation),
+            ))
+            .id();
+        if let Ok(mut ec) = commands.get_entity(parent) {
+            ec.add_child(child);
+        }
+        current.children_mut().insert(key, child);
+    }
+
+    // Despawn children for cells the server no longer reports (Phase 2 erosion path;
+    // a no-op in Phase 1B since nothing is carved).
+    let stale: Vec<sim::fitting::Cell> = current
+        .children_mut()
+        .keys()
+        .copied()
+        .filter(|k| !present.contains(k))
+        .collect();
+    for key in stale {
+        if let Some(child) = current.children_mut().remove(&key) {
+            if let Ok(mut ec) = commands.get_entity(child) {
+                ec.despawn();
+            }
+        }
+    }
+}
+
+/// The local (child) translation of one hull cell on a `cols × rows` grid — the
+/// cell-centre relative to the grid-centre, scaled by [`CELL_SIZE`], in the ship's local
+/// frame. The child inherits the parent's interpolated pos/heading.
+///
+/// The hull silhouettes are authored with **forward = +row** (the weapons + nose sit at
+/// high rows), but the ship's local nose is **+X** (the old coarse box is long along +X;
+/// the gunsight pip + heading use `rotation * +X` as the nose). So `row` maps to the
+/// **forward (+X)** axis and `col` to the **lateral (+Y)** axis — the voxel ship then
+/// points its nose the same way the box did, and the camera/gunsight read unchanged.
+fn cell_local_translation(cell: &RenderCell, cols: u16, rows: u16) -> Vec3 {
+    let forward = ((cell.row as f32 + 0.5) - rows as f32 * 0.5) * CELL_SIZE;
+    let lateral = ((cell.col as f32 + 0.5) - cols as f32 * 0.5) * CELL_SIZE;
+    Vec3::new(forward, lateral, 0.0)
 }
 
 /// Deterministic per-fragment orientation + scale for a [`EntityKind::Debris`] chunk

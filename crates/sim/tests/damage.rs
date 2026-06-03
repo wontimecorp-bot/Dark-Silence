@@ -804,6 +804,7 @@ fn corridor_layout() -> FitLayout {
                 module: None,
                 health: 0.0,
                 depth,
+                structural: false,
             },
         );
     }
@@ -1087,6 +1088,7 @@ fn one_module_layout(module_id: ModuleId, health: f32) -> FitLayout {
             module: Some(module_id),
             health,
             depth: 0,
+            structural: false,
         },
     );
     FitLayout {
@@ -1116,6 +1118,7 @@ fn clean_sever_yields_intact_through_kill_yields_scrap() {
         module: Some(id),
         health: 40.0,
         depth: 0,
+        structural: false,
     };
     let exactly_at = CellOccupant {
         health: 20.0,
@@ -1224,6 +1227,7 @@ fn salvage_world(module_health: f32) -> (World, Entity, ModuleId) {
             module: Some(module_id),
             health: module_health,
             depth: 0,
+            structural: false,
         },
     );
     // The core cell (deepest; in the destroyed section). Empty/structural.
@@ -1234,6 +1238,7 @@ fn salvage_world(module_health: f32) -> (World, Entity, ModuleId) {
             module: None,
             health: 0.0,
             depth: 1,
+            structural: true,
         },
     );
     let layout = FitLayout {

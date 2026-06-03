@@ -419,6 +419,7 @@ mod tests {
                     module: None,
                     health: 1.0,
                     depth,
+                    structural: false,
                 },
             );
         }

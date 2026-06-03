@@ -62,6 +62,38 @@ fn fitted_enemies_render_as_distinct_ships() {
         plain.iter().all(|e| e.shield_frac == 0.0),
         "plain practice targets carry no shield bubble (shield_frac == 0)"
     );
+
+    // Phase 1B (client-only voxel payload): a living fitted enemy carries a NON-EMPTY
+    // per-cell payload (the dense fighter silhouette — 17 cells on a 5×5) so the client
+    // can render it as a colored cell-grid body, with the fighter's grid_dims. A plain
+    // practice target carries no cells (it stays a single cube).
+    assert!(
+        e14.cells.len() == 17 && e14.grid_dims == (5, 5),
+        "a fitted enemy carries its dense fighter cell-grid (got {} cells, dims {:?})",
+        e14.cells.len(),
+        e14.grid_dims
+    );
+    assert!(
+        !e18.cells.is_empty(),
+        "a fitted enemy carries a non-empty voxel cell payload"
+    );
+    // The payload encodes module kinds: the fighter fit (reactor/thruster/weapon/armor)
+    // plus structural plating, so it carries both structural (kind 0) and module (kind
+    // 1..=6) cells.
+    assert!(
+        e14.cells.iter().any(|c| c.kind == 0),
+        "the fitted enemy has structural (hull-tint) cells"
+    );
+    assert!(
+        e14.cells.iter().any(|c| (1..=6).contains(&c.kind)),
+        "the fitted enemy has module-colored cells"
+    );
+    assert!(
+        plain
+            .iter()
+            .all(|e| e.cells.is_empty() && e.grid_dims == (0, 0)),
+        "plain practice targets carry no voxel cell payload"
+    );
 }
 
 /// After a fitted enemy is destroyed, the death-strip removes its `Target`/`FitLayout`
@@ -116,6 +148,14 @@ fn destroyed_fitted_enemy_renders_as_debris_not_a_pristine_ship() {
     assert!(
         !debris.is_empty(),
         "the destroyed enemy + its severed chunks render as drifting ship-fragment Debris"
+    );
+    // Phase 1B: debris is NOT voxelized in 1B (it renders as the single tumbling fragment
+    // box), so a destroyed enemy / its chunks carry no per-cell voxel payload.
+    assert!(
+        debris
+            .iter()
+            .all(|e| e.cells.is_empty() && e.grid_dims == (0, 0)),
+        "destroyed-ship debris carries no voxel cell payload in Phase 1B"
     );
     // The size hint (residual cell-count) rides in `flags` and is always ≥ 1 so the
     // client never scales a fragment to zero.

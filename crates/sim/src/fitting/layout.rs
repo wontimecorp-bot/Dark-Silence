@@ -47,24 +47,38 @@ pub type Cell = (u16, u16);
 /// What occupies one cell of the hull grid, its live health, and its occlusion
 /// depth (data-model.md `CellOccupant`).
 ///
-/// Empty cells (no module installed in their owning slot) are still part of the
-/// armor map — they carry `module: None` and `health: 0.0` (no installed device to
-/// have hit points), at their structural position. A cell's `depth` orders it
-/// along a hit line: **smaller depth = outer**, encountered first (INV-F10).
+/// A cell is one of two **kinds** (mirroring [`GridCell::structural`](crate::fitting::GridCell::structural)):
+/// - a **module cell** (`structural == false`) on a slot coord: when a module is
+///   installed it carries that module's id + live `health` (seeded from `health_max`);
+///   an empty module-slot cell carries `module: None`, `health: 0.0` (no installed
+///   device to damage).
+/// - a **structural cell** (`structural == true`): filler hull plating with no slot,
+///   seeded with [`STRUCT_CELL_HP`](crate::fitting::content::STRUCT_CELL_HP) so the
+///   dense hull body has hit points Phase 2 can carve away (Phase 1A).
+///
+/// A cell's `depth` orders it along a hit line: **smaller depth = outer**, encountered
+/// first (INV-F10).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CellOccupant {
-    /// The slot this cell belongs to.
+    /// The slot this cell belongs to. A structural cell carries the sentinel
+    /// `SlotId(u32::MAX)` (no slot identity).
     pub slot: SlotId,
-    /// The module installed in that slot, or `None` for an empty cell (FR-019).
+    /// The module installed in that slot, or `None` for an empty / structural cell
+    /// (FR-019).
     pub module: Option<super::module::ModuleId>,
-    /// Live hit points of the installed module (`>= 0`); seeded from the module's
-    /// `health_max`. `0.0` when the cell is empty (no device to damage). E007
-    /// mutates this as it applies damage; E006 only exposes it.
+    /// Live hit points (`>= 0`). A module cell is seeded from the installed module's
+    /// `health_max` (`0.0` when empty); a **structural** cell from `STRUCT_CELL_HP`.
+    /// E007 mutates this as it applies damage; E006 only exposes it.
     pub health: f32,
     /// Occlusion depth: **smaller = outer** (encountered first along a hit line).
     /// A fully-interior cell has a larger depth and is reached only after the
     /// covering cells (INV-F10).
     pub depth: u16,
+    /// `true` for a **structural** filler cell, `false` for a **module** (slot) cell —
+    /// mirrors [`GridCell::structural`](crate::fitting::GridCell::structural). Lets
+    /// downstream code (Phase 1B voxel rendering, Phase 2 carving) tell hull plating
+    /// from hardpoints without re-deriving the slot-coord match.
+    pub structural: bool,
 }
 
 /// The full per-cell occupant + health map E007 consumes (contracts/fitting-api.md
@@ -130,37 +144,54 @@ fn cell_depth(hull: &Hull, coord: Cell) -> u16 {
 /// future authoritative server build identical maps (Principle II).
 ///
 /// Completeness (INV-F11): **every** authored hull cell becomes a [`CellOccupant`].
-/// A cell whose owning slot holds a module carries that module's id + its `health`
-/// (seeded from `health_max`); a cell on an empty (or slot-less) position carries
-/// `module: None`, `health: 0.0`. Each occupant's `depth` is its perimeter ring
-/// ([`cell_depth`]) — outer cells lower, central cells higher (INV-F10).
+/// Health is seeded by cell **kind** (Phase 1A):
+/// - a **module cell** whose owning slot holds a module carries that module's id + its
+///   `health` (seeded from `health_max`); an empty module-slot cell carries
+///   `module: None`, `health: 0.0` (no installed device to damage — unchanged);
+/// - a **structural cell** (filler plating, no slot) carries `module: None` and
+///   `health: STRUCT_CELL_HP` so the dense hull body has hit points Phase 2 can carve
+///   (it is `structural == true`).
 ///
-/// A dangling [`ModuleId`](super::module::ModuleId) (not in `catalog`) yields an
+/// Each occupant's `depth` is its perimeter ring ([`cell_depth`]) — outer cells lower,
+/// central cells higher (INV-F10).
+///
+/// A dangling [`ModuleId`](super::module::ModuleId) (not in `catalog`) yields a module
 /// occupant with `module: None` / `health: 0.0` — the dangling-ref *rejection* is
 /// `validate_fit`'s concern (INV-F13); the map stays total regardless.
+///
+/// **Combat-invariant (Phase 1A)**: structural HP is purely additive data. `resolve_hit`
+/// iterates `hull.slots` (module cells only), so structural cells are never an entry/
+/// behind target; `derive_ship_stats`/salvage key off `module.is_some()`, so neither
+/// reads structural cells. The dense grid therefore changes **no** combat outcome this
+/// phase — it only populates the per-cell health store for Phase 2 carving.
 pub fn build_layout(hull: &Hull, fit: &Fit, catalog: &ModuleCatalog) -> FitLayout {
+    use super::content::STRUCT_CELL_HP;
+
     let mut cells: CellMap = BTreeMap::new();
 
     for grid_cell in &hull.cells {
         let coord = grid_cell.coord;
-        // The slot (if any) sitting on this authored cell drives occupancy. The
-        // seed authoring is one slot per cell; this finds it positionally so the
-        // map stays correct under any authoring.
-        let slot = hull.slots.iter().find(|s| s.coord == coord);
 
-        let (slot_id, module_id, health) = match slot {
-            Some(slot) => {
-                let module_id = fit.module_in(slot.id);
-                let health = module_id
-                    .and_then(|m| catalog.get(m))
-                    .map(|m| m.health_max)
-                    .unwrap_or(0.0);
-                (slot.id, module_id, health)
+        let (slot_id, module_id, health) = if grid_cell.structural {
+            // A structural filler cell: no slot identity, seeded with the tunable
+            // structural HP so the dense body is carvable in Phase 2.
+            (SlotId(u32::MAX), None, STRUCT_CELL_HP)
+        } else {
+            // A module cell: the slot sitting on it drives occupancy. Found positionally
+            // so the map stays correct under any authoring.
+            match hull.slots.iter().find(|s| s.coord == coord) {
+                Some(slot) => {
+                    let module_id = fit.module_in(slot.id);
+                    let health = module_id
+                        .and_then(|m| catalog.get(m))
+                        .map(|m| m.health_max)
+                        .unwrap_or(0.0);
+                    (slot.id, module_id, health)
+                }
+                // Defensive: a non-structural cell with no slot (never authored this
+                // way) is treated as an empty module-slot cell (health 0).
+                None => (SlotId(u32::MAX), None, 0.0),
             }
-            // A cell with no slot on it is still part of the armor map (structural
-            // cell); it has no slot identity, so key it by a sentinel slot id of
-            // its own coord is not possible — use the cell's own structural id.
-            None => (SlotId(u32::MAX), None, 0.0),
         };
 
         cells.insert(
@@ -170,6 +201,7 @@ pub fn build_layout(hull: &Hull, fit: &Fit, catalog: &ModuleCatalog) -> FitLayou
                 module: module_id,
                 health,
                 depth: cell_depth(hull, coord),
+                structural: grid_cell.structural,
             },
         );
     }
@@ -358,8 +390,55 @@ mod tests {
         let layout = build_layout(hull, &fit, &modules);
         assert_eq!(layout.cells.len(), hull.cells.len());
         for cell in &hull.cells {
-            assert!(layout.occupant(cell.coord).is_some());
+            let occ = layout
+                .occupant(cell.coord)
+                .expect("every authored cell present");
+            // Phase 1A: the occupant's kind mirrors the authored GridCell's kind.
+            assert_eq!(
+                occ.structural, cell.structural,
+                "occupant kind matches the authored cell kind"
+            );
         }
+    }
+
+    #[test]
+    fn dense_hull_seeds_structural_cells_with_struct_cell_hp() {
+        // Phase 1A: the fighter is now a DENSE filled silhouette — far more cells than
+        // its 7 slots. A structural (filler) cell carries no module and is seeded with
+        // STRUCT_CELL_HP so Phase 2 can carve it; an empty module-slot cell stays at 0.
+        use crate::fitting::content::STRUCT_CELL_HP;
+        let (modules, hulls) = seed_catalogs();
+        let hull = hulls.get(HULL_FIGHTER).unwrap();
+        let fit = Fit::new(HULL_FIGHTER); // empty fit: no module cell is occupied
+        let layout = build_layout(hull, &fit, &modules);
+
+        // The dense grid has many more cells than the 7 hardpoints (a real ship body).
+        assert!(
+            layout.cells.len() > hull.slots.len(),
+            "dense silhouette has more cells ({}) than slots ({})",
+            layout.cells.len(),
+            hull.slots.len()
+        );
+
+        let mut structural = 0;
+        let mut module_cells = 0;
+        for occ in layout.cells.values() {
+            if occ.structural {
+                structural += 1;
+                assert_eq!(occ.module, None, "a structural cell holds no module");
+                assert_eq!(
+                    occ.health, STRUCT_CELL_HP,
+                    "a structural cell is seeded with STRUCT_CELL_HP"
+                );
+            } else {
+                module_cells += 1;
+                // An empty (unfitted) module-slot cell keeps the historical 0 health.
+                assert_eq!(occ.health, 0.0, "an empty module-slot cell stays at 0 hp");
+            }
+        }
+        // One module cell per slot, the rest structural filler.
+        assert_eq!(module_cells, hull.slots.len(), "one module cell per slot");
+        assert!(structural > 0, "the dense body has structural filler cells");
     }
 
     #[test]

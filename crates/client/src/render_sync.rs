@@ -20,9 +20,12 @@
 //! The E002 gunsight pip and follow camera continue to read the local ship's
 //! rendered `Transform`, so their feel is unchanged.
 
+use std::collections::HashMap;
+
 use bevy::prelude::*;
 use protocol::{EntityId, EntityKind};
 use sim::components::{Heading, Position, Projectile, Ship};
+use sim::fitting::Cell;
 
 use crate::scene::RenderAssets;
 
@@ -70,6 +73,31 @@ pub struct ShieldChild {
 /// via its material).
 #[derive(Component, Clone, Copy, Debug)]
 pub struct ShieldBubble;
+
+/// Phase 1B voxel cell-body tracking on a rendered fitted ship's PARENT entity.
+///
+/// When a fitted ship is **near** (the camera-distance LOD gate, see
+/// [`crate::net::SHIP_VOXEL_LOD_DIST`]) it is drawn as the interpolated parent transform
+/// PLUS one shared-mesh cell-box CHILD per present hull cell; this map keys each
+/// rendered cell `(col, row)` to its child [`Entity`] so [`crate::net::capture_render_state`]
+/// can **diff** the server's cell payload against it each tick — spawning children for
+/// newly-present cells and despawning children for cells that vanished. For Phase 1B no
+/// cells are carved (the diff is a no-op after first build), but the diff is implemented
+/// now so Phase 2 carving makes cells disappear with zero further plumbing: the server
+/// drops a cell from `FitLayout.cells`, it drops from the payload, and the diff despawns
+/// its child.
+///
+/// `voxelized` records the current LOD state so the capture system switches cleanly when
+/// the ship crosses the distance threshold (near → build children + drop the box mesh;
+/// far → despawn children + restore the box mesh).
+#[derive(Component, Default)]
+pub struct ShipCells {
+    /// Live `(col, row) -> cell-box child entity` for the currently-rendered cells.
+    pub children: HashMap<Cell, Entity>,
+    /// Whether this ship is currently drawn as voxel cells (`true`, near) or the single
+    /// coarse box (`false`, far / not yet built).
+    pub voxelized: bool,
+}
 
 /// Previous + current sim snapshots for one entity. `interpolate_transforms`
 /// blends between them by the fixed-step overstep fraction.

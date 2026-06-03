@@ -176,6 +176,31 @@ impl ClientLink {
     }
 }
 
+/// One present hull cell of a fitted ship, in the compact form the windowed client
+/// voxel-renders from (Phase 1B). Part of [`RenderEntity::cells`] — **client-only /
+/// in-process**: built in [`ServerApp::render_state`] from the ship's [`FitLayout`],
+/// it never touches [`ServerApp::full_records`], the snapshot wire, or determinism.
+///
+/// `col`/`row` are the cell's grid coordinate (the same `(col, row)` keying the
+/// `FitLayout.cells` `BTreeMap`); the client offsets them against the carrier's
+/// [`RenderEntity::grid_dims`] to place a small cell-box child at the cell-centre
+/// relative to grid-centre, in the ship's local frame.
+///
+/// `kind` encodes how to color the cell-box (see [`render_cell_kind`]):
+/// - `0` — **structural** filler plating (the hull tint);
+/// - `1..=6` — a **module** cell, one value per [`ModuleKind`]: reactor `1`,
+///   thruster `2`, weapon `3`, shield `4`, armor `5`, utility `6`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderCell {
+    /// Grid column `(col)` of the cell on the hull (matches the `FitLayout` key).
+    pub col: u16,
+    /// Grid row `(row)` of the cell on the hull (matches the `FitLayout` key).
+    pub row: u16,
+    /// Color/role code: `0` structural; `1..=6` per [`ModuleKind`] (see
+    /// [`render_cell_kind`]).
+    pub kind: u8,
+}
+
 /// One entity's **unquantized** authoritative render pose, as read directly from
 /// the server `world` by [`ServerApp::render_state`].
 ///
@@ -185,7 +210,7 @@ impl ClientLink {
 /// predict/interpolate netcode) gives crisp, in-sync collision and hits. It is
 /// keyed by the SAME wire [`EntityId`] the snapshots use, so the client can
 /// find-or-spawn and despawn its rendered entities by stable id.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RenderEntity {
     /// Stable wire id (same mapping the snapshots use).
     pub id: EntityId,
@@ -229,6 +254,19 @@ pub struct RenderEntity {
     /// `Vec2::ZERO` for an entity with no recent shield hit (the client then hides the
     /// flash). Render-only; not on any wire/snapshot path.
     pub hit_dir: Vec2,
+    /// Phase 1B (**client-only / in-process**): the fitted ship's present hull cells, in
+    /// row-major [`FitLayout`]-key order (deterministic — built from the `BTreeMap`). One
+    /// [`RenderCell`] per live cell; the windowed client voxel-renders the ship as a small
+    /// cell-box per entry, colored by [`RenderCell::kind`]. **Empty** for any non-fitted
+    /// entity (projectiles, plain targets, debris, an unfitted ship) — those keep their
+    /// single coarse mesh. Built in [`ServerApp::render_state`]; never on
+    /// [`ServerApp::full_records`]/the snapshot wire (no determinism/AOI impact).
+    pub cells: Vec<RenderCell>,
+    /// Phase 1B (**client-only / in-process**): the carrier hull's `(cols, rows)` grid
+    /// dimensions, so the client can offset each [`RenderCell`] to the cell-centre relative
+    /// to the grid-centre in the ship's local frame. `(0, 0)` for a non-fitted entity (its
+    /// [`cells`](RenderEntity::cells) is empty, so the value is unused).
+    pub grid_dims: (u16, u16),
 }
 
 /// The [`RenderEntity::shield_frac`] of an optional [`Shields`]: `current / max`
@@ -272,6 +310,77 @@ fn hit_dir_of(hit: Option<&LastShieldHit>) -> Vec2 {
         Some(h) if h.timer > 0.0 => h.dir,
         _ => Vec2::ZERO,
     }
+}
+
+/// The [`RenderCell::kind`] color/role code for one [`CellOccupant`] (Phase 1B,
+/// client-only):
+/// - a **structural** filler cell → `0` (the hull tint);
+/// - a **module** cell → `1..=6` by the installed module's [`ModuleKind`] resolved
+///   through `modules`: reactor `1`, thruster `2`, weapon `3`, shield `4`, armor `5`,
+///   utility `6`.
+///
+/// A module cell whose module is `None` or whose id does not resolve in the catalog
+/// (an empty hardpoint, or a defensive dangling ref) falls back to `0` — it reads as
+/// hull plating, never panics. Keyed off `occ.structural` first so it stays in step
+/// with the authored [`GridCell`] kind regardless of catalog state.
+fn render_cell_kind(occ: &sim::fitting::CellOccupant, modules: &ModuleCatalog) -> u8 {
+    use sim::fitting::ModuleKind;
+    if occ.structural {
+        return 0;
+    }
+    match occ.module.and_then(|m| modules.get(m)).map(|m| m.kind) {
+        Some(ModuleKind::Reactor) => 1,
+        Some(ModuleKind::Thruster) => 2,
+        Some(ModuleKind::Weapon) => 3,
+        Some(ModuleKind::Shield) => 4,
+        Some(ModuleKind::Armor) => 5,
+        Some(ModuleKind::Utility) => 6,
+        // Empty module-slot cell or unresolved id → render as plating (no panic).
+        None => 0,
+    }
+}
+
+/// The Phase 1B per-ship cell payload for an optional [`FitLayout`] (client-only): one
+/// [`RenderCell`] per present cell, in the layout's deterministic row-major `BTreeMap`
+/// order, colored via [`render_cell_kind`]. Returns `(cells, grid_dims)` — an empty
+/// list + `(0, 0)` for a non-fitted entity (no `FitLayout`), so the client falls back
+/// to the single coarse mesh.
+///
+/// `grid_dims` is resolved from the carrier hull in `hulls`; if the hull is somehow
+/// absent (never, after `ServerApp::new` seeds the catalog) it falls back to the max
+/// `(col, row)` seen in the cell map (`+1`) so the client can still centre the body.
+fn cells_of(
+    layout: Option<&FitLayout>,
+    hulls: &HullCatalog,
+    modules: &ModuleCatalog,
+) -> (Vec<RenderCell>, (u16, u16)) {
+    let Some(layout) = layout else {
+        return (Vec::new(), (0, 0));
+    };
+    // Row-major / deterministic: the `BTreeMap` iterates by `(col, row)` key order.
+    let cells: Vec<RenderCell> = layout
+        .cells
+        .iter()
+        .map(|(&(col, row), occ)| RenderCell {
+            col,
+            row,
+            kind: render_cell_kind(occ, modules),
+        })
+        .collect();
+    // Prefer the authored hull dims; fall back to a bounding box of the live cells so a
+    // missing hull (defensive — never after seeding) still centres the body.
+    let grid_dims = hulls
+        .get(layout.hull)
+        .map(|h| h.grid_dims)
+        .unwrap_or_else(|| {
+            layout
+                .cells
+                .keys()
+                .fold((0u16, 0u16), |(c, r), &(col, row)| {
+                    (c.max(col.saturating_add(1)), r.max(row.saturating_add(1)))
+                })
+        });
+    (cells, grid_dims)
 }
 
 /// The headless authoritative server app.
@@ -944,10 +1053,26 @@ impl ServerApp {
     pub fn render_state(&mut self) -> Vec<RenderEntity> {
         let mut out = Vec::new();
 
+        // Phase 1B (client-only): the fitting catalogs back the per-ship cell payload —
+        // `HullCatalog` resolves a fitted entity's `grid_dims`, `ModuleCatalog` maps a
+        // module cell to its `ModuleKind` color code (see `cells_of`/`render_cell_kind`).
+        // Cloned (cheap `BTreeMap`s) so the `&self.world` queries below borrow freely;
+        // fall back to a fresh seed defensively if a resource is somehow absent (never
+        // after `ServerApp::new`). Built here, never on `full_records`/the wire.
+        let (catalog_modules, catalog_hulls) = match (
+            self.world.get_resource::<ModuleCatalog>().cloned(),
+            self.world.get_resource::<HullCatalog>().cloned(),
+        ) {
+            (Some(m), Some(h)) => (m, h),
+            _ => seed_catalogs(),
+        };
+
         // Ships (carry a `Heading`). A ship may carry `Shields` (E007 fitted player /
         // enemy) → its `shield_frac`, a live `DamageFlash` → its `flash`, and a live
         // `ShieldHitFlash` → its `shield_flash`; all default to 0 for an unfitted/
-        // never-hit ship.
+        // never-hit ship. A FITTED ship (it carries a `FitLayout`) also gets its
+        // Phase 1B per-cell voxel payload (`cells` + `grid_dims`); an unfitted ship
+        // carries an empty payload and renders as the single coarse box.
         let mut ships = self.world.query_filtered::<(
             Entity,
             &Position,
@@ -957,10 +1082,23 @@ impl ServerApp {
             Option<&DamageFlash>,
             Option<&ShieldHitFlash>,
             Option<&LastShieldHit>,
+            Option<&FitLayout>,
         ), With<Ship>>();
-        let ship_rows: Vec<(Entity, Vec2, Vec2, f32, f32, f32, f32, Vec2)> = ships
+        let ship_rows: Vec<(
+            Entity,
+            Vec2,
+            Vec2,
+            f32,
+            f32,
+            f32,
+            f32,
+            Vec2,
+            Vec<RenderCell>,
+            (u16, u16),
+        )> = ships
             .iter(&self.world)
-            .map(|(e, p, v, h, s, f, sf, lsh)| {
+            .map(|(e, p, v, h, s, f, sf, lsh, fit)| {
+                let (cells, grid_dims) = cells_of(fit, &catalog_hulls, &catalog_modules);
                 (
                     e,
                     p.0,
@@ -970,10 +1108,24 @@ impl ServerApp {
                     flash_of(f),
                     shield_flash_of(sf),
                     hit_dir_of(lsh),
+                    cells,
+                    grid_dims,
                 )
             })
             .collect();
-        for (entity, pos, vel, heading, shield_frac, flash, shield_flash, hit_dir) in ship_rows {
+        for (
+            entity,
+            pos,
+            vel,
+            heading,
+            shield_frac,
+            flash,
+            shield_flash,
+            hit_dir,
+            cells,
+            grid_dims,
+        ) in ship_rows
+        {
             out.push(RenderEntity {
                 id: self.entity_ids.id_for(entity),
                 kind: EntityKind::Ship,
@@ -985,6 +1137,8 @@ impl ServerApp {
                 flash,
                 shield_flash,
                 hit_dir,
+                cells,
+                grid_dims,
             });
         }
 
@@ -1008,6 +1162,9 @@ impl ServerApp {
                 flash: 0.0,
                 shield_flash: 0.0,
                 hit_dir: Vec2::ZERO,
+                // A projectile is never fitted — no voxel cell payload.
+                cells: Vec::new(),
+                grid_dims: (0, 0),
             });
         }
 
@@ -1030,9 +1187,26 @@ impl ServerApp {
             Option<&ShieldHitFlash>,
             Option<&LastShieldHit>,
         ), With<Target>>();
-        let target_rows: Vec<(Entity, Vec2, Vec2, u8, bool, f32, f32, f32, f32, Vec2)> = targets
+        let target_rows: Vec<(
+            Entity,
+            Vec2,
+            Vec2,
+            u8,
+            bool,
+            f32,
+            f32,
+            f32,
+            f32,
+            Vec2,
+            Vec<RenderCell>,
+            (u16, u16),
+        )> = targets
             .iter(&self.world)
             .map(|(e, p, v, k, fit, h, s, f, sf, lsh)| {
+                // A fitted target (the demo enemy) gets its Phase 1B voxel cell payload;
+                // a plain practice target carries an empty payload and stays its cube/
+                // sphere/dart.
+                let (cells, grid_dims) = cells_of(fit, &catalog_hulls, &catalog_modules);
                 (
                     e,
                     p.0,
@@ -1044,6 +1218,8 @@ impl ServerApp {
                     flash_of(f),
                     shield_flash_of(sf),
                     hit_dir_of(lsh),
+                    cells,
+                    grid_dims,
                 )
             })
             .collect();
@@ -1058,24 +1234,39 @@ impl ServerApp {
             flash,
             shield_flash,
             hit_dir,
+            cells,
+            grid_dims,
         ) in target_rows
         {
             // Fitted enemy → Ship mesh (distinct, obvious); plain target → its cube/
             // sphere/dart by sub-kind. Only a fitted (ship-rendered) target carries a
             // shield, so the shield flash + frac (and the directional `hit_dir`) are
-            // zeroed for a plain practice cube.
-            let (kind, flags, heading, shield_frac, shield_flash, hit_dir) = if fitted {
-                (
-                    EntityKind::Ship,
-                    0,
-                    heading,
-                    shield_frac,
-                    shield_flash,
-                    hit_dir,
-                )
-            } else {
-                (EntityKind::Target, kind_flag, 0.0, 0.0, 0.0, Vec2::ZERO)
-            };
+            // zeroed for a plain practice cube. The Phase 1B voxel cell payload rides on
+            // a fitted target (it has a `FitLayout`); a plain target's is empty + (0,0).
+            let (kind, flags, heading, shield_frac, shield_flash, hit_dir, cells, grid_dims) =
+                if fitted {
+                    (
+                        EntityKind::Ship,
+                        0,
+                        heading,
+                        shield_frac,
+                        shield_flash,
+                        hit_dir,
+                        cells,
+                        grid_dims,
+                    )
+                } else {
+                    (
+                        EntityKind::Target,
+                        kind_flag,
+                        0.0,
+                        0.0,
+                        0.0,
+                        Vec2::ZERO,
+                        Vec::new(),
+                        (0, 0),
+                    )
+                };
             out.push(RenderEntity {
                 id: self.entity_ids.id_for(entity),
                 kind,
@@ -1087,6 +1278,8 @@ impl ServerApp {
                 flash,
                 shield_flash,
                 hit_dir,
+                cells,
+                grid_dims,
             });
         }
 
@@ -1132,6 +1325,10 @@ impl ServerApp {
                 flash: 0.0,
                 shield_flash: 0.0,
                 hit_dir: Vec2::ZERO,
+                // Phase 1B renders debris as the single tumbling fragment box (no
+                // voxelization in 1B — severed chunks voxelize in Phase 2), so no cells.
+                cells: Vec::new(),
+                grid_dims: (0, 0),
             });
         }
 
