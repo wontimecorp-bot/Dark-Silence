@@ -19,6 +19,25 @@ use serde::{Deserialize, Serialize};
 
 use super::module::{HardpointType, SlotSize};
 
+/// The side length of one hull cell **in world (sim) units** — the single
+/// authoritative cell→world scale shared by the collision/carve geometry (this
+/// crate) and the client render (`crates/client/src/scene.rs::CELL_SIZE`, which is
+/// kept synchronized to this value).
+///
+/// A hull is authored as a `(cols, rows)` cell-grid (see [`Hull::grid_dims`]); this
+/// const is what turns a cell coordinate into a world distance. The collision circle
+/// and the carve entry-point mapping ([`hull_collision_radius`] and the
+/// impact→cell-space transform in `collision::fitted_damage_system`) use it so the
+/// swept-cast hit circle matches the **visible** hull footprint and a shot carves
+/// where it visually struck — not through the grid centre.
+///
+/// Value `0.32`: the old single ship box was `1.6` wide on the legacy 5-wide grid, so
+/// `1.6 / 5 = 0.32` keeps the silhouette the same physical size on the finer dense
+/// grids (the 9×11 fighter ≈ `2.88 × 3.52` world units). Tunable for feel (Phase 3);
+/// when it changes the client's `CELL_SIZE` must change with it (the client re-exports
+/// / mirrors this value with a sync comment).
+pub const CELL_WORLD_SIZE: f32 = 0.32;
+
 /// Stable, data-authored content id for a [`Hull`] catalog row (wire/save-safe).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct HullId(pub u32);
@@ -160,6 +179,35 @@ impl Hull {
     pub fn slot(&self, id: SlotId) -> Option<&Slot> {
         self.slots.iter().find(|s| s.id == id)
     }
+
+    /// The collision-circle radius (world units) that matches this hull's **visible
+    /// footprint** — the half-extent of its longest grid axis in world units
+    /// ([`hull_collision_radius`] on `grid_dims`).
+    pub fn collision_radius(&self) -> f32 {
+        hull_collision_radius(self.grid_dims)
+    }
+}
+
+/// The collision-circle radius (world units) for a hull of the given
+/// `grid_dims = (cols, rows)`, sized to the **visible hull footprint** so the
+/// swept-cast hit circle matches what the player sees (FIX: the old hardcoded
+/// `CollisionRadius(1.0)` was *smaller* than the rendered hull, so the swept hit
+/// registered inside the silhouette and the impact point was off from the visible
+/// edge).
+///
+/// It is the half-extent of the hull's **longest** grid axis in world units:
+/// `max(cols, rows) · CELL_WORLD_SIZE · 0.5` — the distance from the ship centre to
+/// the far edge of the silhouette's longest dimension. For the seed fighter (`9×11`)
+/// this is `11 · 0.32 · 0.5 = 1.76`; for the corvette (`13×15`), `15 · 0.32 · 0.5 =
+/// 2.4`. A degenerate `(0, 0)` hull yields `0.0` (defensive; never authored).
+///
+/// Using the **longest** axis (a circle that circumscribes the silhouette rather than
+/// inscribing it) guarantees a shot that visually clips any edge of the hull registers
+/// a hit; the impact→cell-space carve mapping then resolves WHERE on the hull it
+/// landed, so the channel begins at the struck cell.
+pub fn hull_collision_radius(grid_dims: (u16, u16)) -> f32 {
+    let max_dim = grid_dims.0.max(grid_dims.1) as f32;
+    max_dim * CELL_WORLD_SIZE * 0.5
 }
 
 #[cfg(test)]

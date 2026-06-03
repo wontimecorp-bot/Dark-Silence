@@ -28,9 +28,10 @@ use sim::damage::{
     PenetrationConfig, PenetrationResult, SectionArmor, ShieldConfig, Shields, StatScalingConfig,
 };
 use sim::fitting::{
-    build_layout, derive_ship_stats, seed_catalogs, Fit, FitLayout, HullCatalog, ModuleCatalog,
-    SectionId, SlotId, HULL_FIGHTER, MODULE_ARMOR_PLATE, MODULE_AUTOCANNON, MODULE_REACTOR_BASIC,
-    MODULE_SHIELD_BASIC, MODULE_THRUSTER_BASIC,
+    build_layout, derive_ship_stats, hull_collision_radius, seed_catalogs, Fit, FitLayout,
+    HullCatalog, ModuleCatalog, SectionId, SlotId, CELL_WORLD_SIZE, HULL_FIGHTER,
+    MODULE_ARMOR_PLATE, MODULE_AUTOCANNON, MODULE_REACTOR_BASIC, MODULE_SHIELD_BASIC,
+    MODULE_THRUSTER_BASIC,
 };
 
 // --- T007 (FR-022): balance is content, every matrix cell ∈ [0, 1) (INV-D02) ---
@@ -1998,58 +1999,15 @@ const REPRO_DT: f32 = 1.0 / 30.0;
 /// brief wants the carve-to-core kill to land inside, ~5–15 s, with headroom).
 const REPRO_MAX_TICKS: u32 = (20.0 / REPRO_DT) as u32;
 
-/// Spawn a **fitted player ship** at the origin facing +x, holding `fire`, mirroring
-/// `client::net::attach_starter_fit` (reactor + 2 thrusters + autocannon on the
-/// fighter, so `ShipStats::can_fire` is true) + the three E007 defense layers. The
-/// `Weapon` component holds the cooldown state the `weapon_fire_system` ticks.
-fn spawn_fitted_player(w: &mut World) -> Entity {
-    let (modules, hulls) = seed_catalogs();
-    let hull = hulls.get(HULL_FIGHTER).unwrap().clone();
-
-    let mut fit = Fit::new(HULL_FIGHTER);
-    let _ = fit.install_module(SlotId(0), MODULE_REACTOR_BASIC, &hull, &modules);
-    let _ = fit.install_module(SlotId(1), MODULE_THRUSTER_BASIC, &hull, &modules);
-    let _ = fit.install_module(SlotId(2), MODULE_THRUSTER_BASIC, &hull, &modules);
-    let _ = fit.install_module(SlotId(3), MODULE_AUTOCANNON, &hull, &modules);
-    let layout = build_layout(&hull, &fit, &modules);
-    let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
-    let (shields, section_armor, hull_structure) = seed_defense_layers(&hull, &fit, &modules);
-    assert!(
-        stats.can_fire,
-        "the starter player fit must be able to fire"
-    );
-
-    w.spawn((
-        Ship,
-        ShipIntent {
-            fire: true,
-            ..Default::default()
-        },
-        Position(Vec2::ZERO),
-        Velocity(Vec2::ZERO),
-        Heading(0.0), // faces +x → fires toward the enemy at (14,0)
-        AngularVelocity(0.0),
-        CollisionRadius(0.8),
-        Weapon {
-            cooldown: 0.0,
-            fire_rate: stats.weapon.map(|p| p.fire_rate).unwrap_or(5.0),
-            muzzle_speed: stats.weapon.map(|p| p.muzzle_speed).unwrap_or(200.0),
-        },
-        fit,
-        layout,
-        stats,
-        shields,
-        section_armor,
-        hull_structure,
-    ))
-    .id()
-}
-
-/// Spawn a **fitted enemy** as a stationary `Target` at `pos`, mirroring
+/// Spawn a **fitted enemy** as a `Target` at `pos` with a given `angvel`, mirroring
 /// `ServerApp::spawn_fitted_enemy` (reactor + thruster + autocannon + armor on the
-/// fighter, NO `Ship`/`Health`, the three defense layers). It is the E007
-/// `fitted_damage_system` target (`With<FitLayout>`).
-fn spawn_fitted_enemy_target(w: &mut World, pos: Vec2) -> Entity {
+/// fighter, NO `Ship`/`Health`, the three defense layers, the **hull-footprint**
+/// collision circle). It is the E007 `fitted_damage_system` target (`With<FitLayout>`).
+///
+/// `angvel` is a parameter so the carve-to-core kill test can use a **stationary**
+/// enemy (a centre-aimed burst bores straight to the core, the deterministic kill the
+/// brief asserts), while the multi-angle regression keeps the demo's slow spin.
+fn spawn_fitted_enemy_target_spin(w: &mut World, pos: Vec2, angvel: f32) -> Entity {
     let (modules, hulls) = seed_catalogs();
     let hull = hulls.get(HULL_FIGHTER).unwrap().clone();
 
@@ -2068,8 +2026,9 @@ fn spawn_fitted_enemy_target(w: &mut World, pos: Vec2) -> Entity {
         Position(pos),
         Velocity(Vec2::ZERO),
         Heading(0.0),
-        AngularVelocity(0.3),
-        CollisionRadius(1.0),
+        AngularVelocity(angvel),
+        // FIX (carve location): the VISIBLE hull footprint, matching `spawn_fitted_enemy`.
+        CollisionRadius(hull_collision_radius(hull.grid_dims)),
         fit,
         layout,
         stats,
@@ -2080,22 +2039,72 @@ fn spawn_fitted_enemy_target(w: &mut World, pos: Vec2) -> Entity {
     .id()
 }
 
+/// Spawn a slowly-spinning fitted enemy (the live-demo default spin) — the
+/// multi-angle regression driver's target.
+fn spawn_fitted_enemy_target(w: &mut World, pos: Vec2) -> Entity {
+    spawn_fitted_enemy_target_spin(w, pos, 0.3)
+}
+
+/// The **world position of a fitted target's core cell** (its `Position` plus the
+/// core cell's hull-local offset, un-rotated by the ship `Heading`). A burst aimed
+/// here bores straight to the core — the carve-to-core kill the brief asserts (the
+/// core reactor (4,4) sits one row aft of the silhouette's geometric centre (4.5,5.5)
+/// on the fighter, so the geometric centre alone would miss it).
+///
+/// Inverts the impact→cell-space carve mapping (`collision::hull_local_entry_ray`):
+/// `offset_local = (core − grid_centre)·CELL_WORLD_SIZE`, then world = `Position +
+/// Rot(heading)·offset_local`.
+fn core_world_pos(w: &World, target: Entity) -> Vec2 {
+    let layout = w
+        .get::<FitLayout>(target)
+        .expect("fitted target has a layout");
+    let pos = w.get::<Position>(target).unwrap().0;
+    let heading = w.get::<Heading>(target).unwrap().0;
+    let (cols, rows) = {
+        let (modules, hulls) = seed_catalogs();
+        let _ = modules;
+        hulls.get(HULL_FIGHTER).unwrap().grid_dims
+    };
+    let core = sim::damage::core_cell(layout).expect("a fitted hull has a core cell");
+    let grid_centre = Vec2::new(cols as f32 * 0.5, rows as f32 * 0.5);
+    let cell_centre = Vec2::new(core.0 as f32 + 0.5, core.1 as f32 + 0.5);
+    let offset_local = (cell_centre - grid_centre) * CELL_WORLD_SIZE;
+    pos + Vec2::from_angle(heading).rotate(offset_local)
+}
+
 /// The LIVE demo scenario through the REAL schedule: a fitted player ship firing
-/// steadily at a fitted enemy must **carve a channel to its core** and DESTROY it
-/// within the tuned ~5–15 s window (Phase 2 carving-to-core death).
+/// steadily **at the enemy's core** must **carve a channel to its core** and DESTROY
+/// it within the tuned ~5–15 s window (Phase 2 carving-to-core death).
+///
+/// REVISED for the impact-located carve (FIX carve location): the carve now begins at
+/// the cell the bullet visually struck rather than auto-boring through the centre, so
+/// the kill requires aiming **at the core** (the core reactor (4,4) sits one row aft of
+/// the silhouette's geometric centre, so a shot through the geometric centre alone
+/// would bore along the wrong row and only sever pieces). The player is aimed at the
+/// enemy's **core world position** ([`core_world_pos`]) at a **stationary** enemy, so a
+/// centre-of-mass burst bores straight to the core — the deterministic carve-to-core
+/// kill. (A flank burst severing a piece is covered by
+/// `carving_disconnects_a_region_and_severs_it_while_the_ship_lives` + the off-centre
+/// alignment test.)
 ///
 /// This replaces the old `…_via_hull_depletion` death (the `HullStructure`-drain
-/// trigger is retired for fitted ships). The proof now: the enemy's `FitLayout` cells
-/// are visibly carved away (the cell count drops as the channel erodes), and when the
-/// carve reaches/severs the **core cell** the enemy becomes a persistent `Wreck`
-/// (death-stripped of `Target`/`FitLayout`/`CollisionRadius`) and a kill flash fires.
+/// trigger is retired for fitted ships). The proof: the enemy's `FitLayout` cells are
+/// visibly carved away (the cell count drops as the channel erodes), and when the carve
+/// reaches/severs the **core cell** the enemy becomes a persistent `Wreck` (death-
+/// stripped of `Target`/`FitLayout`/`CollisionRadius`) and a kill flash fires.
 #[test]
 fn fitted_player_fire_carves_to_core_and_destroys_fitted_enemy() {
     let mut w = World::new();
     insert_full_combat_resources(&mut w);
 
-    let _player = spawn_fitted_player(&mut w);
-    let enemy = spawn_fitted_enemy_target(&mut w, Vec2::new(14.0, 0.0));
+    // A STATIONARY enemy (no spin) so a fixed core-aimed burst bores straight to the
+    // core for the deterministic carve-to-core kill the brief asserts.
+    let enemy = spawn_fitted_enemy_target_spin(&mut w, Vec2::new(14.0, 0.0), 0.0);
+    // Aim the player straight at the enemy's CORE world position (not just its centre):
+    // the impact-located carve enters where the bullet strikes, so a core-aimed shot is
+    // what bores to the core.
+    let core_at = core_world_pos(&w, enemy);
+    let _player = spawn_fitted_player_aimed(&mut w, Vec2::ZERO, core_at);
 
     // The enemy's starting cell count (the dense fighter silhouette) — what the carve
     // erodes toward the core.
@@ -2230,8 +2239,9 @@ fn fitted_player_fire_carves_to_core_and_destroys_fitted_enemy() {
 
 /// Spawn a fitted player at `pos` whose `Heading` points at `aim_at`, holding fire
 /// (the starter fighter loadout — reactor + 2 thrusters + autocannon — so
-/// `ShipStats::can_fire` is true). A position/heading-parametrized sibling of
-/// [`spawn_fitted_player`], used by the multi-angle kill regression.
+/// `ShipStats::can_fire` is true). The position/heading-parametrized player spawner
+/// used by both the carve-to-core kill test (aimed at the enemy core) and the
+/// multi-angle kill regression (aimed at the enemy from several approaches).
 fn spawn_fitted_player_aimed(w: &mut World, pos: Vec2, aim_at: Vec2) -> Entity {
     let (modules, hulls) = seed_catalogs();
     let hull = hulls.get(HULL_FIGHTER).unwrap().clone();
@@ -2420,4 +2430,127 @@ fn fitted_player_kills_enemy_from_every_approach_angle() {
             "[{label}] penetration must precede (or equal) the kill"
         );
     }
+}
+
+// =================================================================================
+// FIX (carve location) regression: the carve must begin WHERE THE BULLET STRUCK, not
+// through the ship's centre. Before the fix `hull_local_entry_ray` routed every shot
+// through the grid/core centre using only the shot DIRECTION, discarding the lateral
+// impact offset, so an off-centre shot still carved a channel down the middle. This
+// guard fires a projectile that strikes the target clearly **off-centre** (a left and
+// a right lateral offset) and asserts the destroyed cells' centroid is on the IMPACT
+// side of the hull (not the centre).
+// =================================================================================
+
+/// Run a single `fitted_damage_system` carve against a stationary fitted enemy at the
+/// origin (heading 0) struck by a powerful straight-**up** (`+Y`) projectile that
+/// enters the ship's broad, near-flat **aft engine face** (row 0, cols 2..=6) offset
+/// by `lateral_x` in world X — a clean left/right hit that meets that face nearly
+/// head-on (≈21° obliquity, well inside the penetration angle), so the shot carves up
+/// the struck column instead of grazing. Returns the destroyed cells.
+///
+/// A `+Y` shot's lateral axis is world X, which maps to cell-space **col** (axes:
+/// `x = col`, `y = row`): `entry_col ≈ lateral_x / CELL_WORLD_SIZE + 4.5`. So a `+X`
+/// offset carves a **high-col** (`+X`-side) column and a `-X` offset a **low-col**
+/// (`-X`-side) column — never the centre column. (Firing UP into the flat aft face
+/// rather than DOWN across the rounded wing avoids a glancing-ricochet, isolating the
+/// lateral-location property the FIX is about.)
+fn carve_offcentre(lateral_x: f32) -> Vec<(u16, u16)> {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    // No shield in the way: drain it so the very first carve lands on the hull (the
+    // test is about geometry, not the shield pool).
+    let enemy = spawn_fitted_enemy_target_spin(&mut w, Vec2::ZERO, 0.0);
+    if let Some(mut s) = w.get_mut::<Shields>(enemy) {
+        s.current = 0.0;
+    }
+
+    // A high-damage, high-penetration straight-UP projectile whose sweep is offset to
+    // one side in world X. It enters the bottom arc of the collision circle at
+    // `x ≈ lateral_x` (the aft engine face), so the impact (and therefore the carve
+    // entry) is on that side.
+    let prev = Vec2::new(lateral_x, -6.0);
+    let pos = Vec2::new(lateral_x, 6.0);
+    let vel = Vec2::new(0.0, 200.0);
+    let dmg = 5000.0;
+    w.spawn((
+        Projectile,
+        Position(pos),
+        PrevPosition(prev),
+        Velocity(vel),
+        Damage(dmg),
+        Lifetime(3.0),
+        WeaponSource::from_damage(dmg),
+    ));
+
+    // Snapshot the pre-carve cells, run the carve, diff to find what was removed.
+    let before: std::collections::BTreeSet<(u16, u16)> = w
+        .get::<FitLayout>(enemy)
+        .unwrap()
+        .cells
+        .keys()
+        .copied()
+        .collect();
+    sim::fitted_damage_system(&mut w);
+    let after: std::collections::BTreeSet<(u16, u16)> = w
+        .get::<FitLayout>(enemy)
+        .map(|l| l.cells.keys().copied().collect())
+        .unwrap_or_default();
+    before.difference(&after).copied().collect()
+}
+
+/// FIX (carve location) regression: a projectile striking the target **off-centre**
+/// carves cells on the IMPACT side of the hull — the destroyed cells' centroid is on
+/// the struck wing — NOT a channel through the centre. Guards the exact reported bug
+/// (the hull eroding somewhere other than where the bullet hit).
+#[test]
+fn offcentre_hit_carves_on_the_impact_side_not_the_centre() {
+    // The fighter is a 9×11 grid (cols 0..8, rows 0..10); the centre column is 4.5.
+    let centre_col = 9.0_f32 * 0.5;
+    // World-X offsets that land the carve squarely on a high-col (col ~6) and a low-col
+    // (col ~2.5) column of the aft face — both clearly off the centre column (4.5).
+    // `entry_col ≈ off / CELL_WORLD_SIZE + 4.5`, so `±0.64` ⇒ cols ~6.5 / ~2.5.
+    let off = 2.0 * CELL_WORLD_SIZE; // = 0.64
+
+    // --- A clear RIGHT (+X) offset must carve the +X (high-col) side ----------------
+    let right = carve_offcentre(off);
+    assert!(
+        !right.is_empty(),
+        "an off-centre right hit must carve at least one cell (it visually struck the hull)"
+    );
+    let right_centroid_col = right.iter().map(|&(c, _)| c as f32).sum::<f32>() / right.len() as f32;
+    assert!(
+        right_centroid_col > centre_col,
+        "a +X (right-side) hit must carve cells on the +X side (centroid col {right_centroid_col} \
+         > centre {centre_col}), not through the centre — got {right:?}"
+    );
+
+    // --- A clear LEFT (−X) offset must carve the −X (low-col) side ------------------
+    let left = carve_offcentre(-off);
+    assert!(
+        !left.is_empty(),
+        "an off-centre left hit must carve at least one cell"
+    );
+    let left_centroid_col = left.iter().map(|&(c, _)| c as f32).sum::<f32>() / left.len() as f32;
+    assert!(
+        left_centroid_col < centre_col,
+        "a −X (left-side) hit must carve cells on the −X side (centroid col {left_centroid_col} \
+         < centre {centre_col}), not through the centre — got {left:?}"
+    );
+
+    // --- The two opposite-side hits carve DIFFERENT, mirror-image regions ----------
+    // (The old centre-routing bug would carve the same central channel for both.)
+    assert!(
+        left_centroid_col < right_centroid_col,
+        "opposite-side hits carve opposite sides ({left_centroid_col} < {right_centroid_col}); \
+         the carve follows the impact, not the centre"
+    );
+    // Neither off-centre wing hit reaches the central core column on its own (the carve
+    // is laterally where the bullet struck — the brief's 'cuts a wing, does not auto-bore
+    // to the core' consequence).
+    assert!(
+        !right.contains(&(4, 4)) && !left.contains(&(4, 4)),
+        "an off-centre wing hit does NOT carve the central core cell (4,4) — it cuts the wing \
+         it struck (right {right:?}, left {left:?})"
+    );
 }

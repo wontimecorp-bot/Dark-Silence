@@ -13,7 +13,7 @@ use crate::components::{
     Projectile, ProjectileOwner, ShieldHitFlash, Ship, Target, TargetKind, Velocity,
 };
 use crate::damage::{apply_damage, core_cell, on_cells_carved, DamageEvent, HitKind};
-use crate::fitting::{Fit, FitLayout, HullCatalog};
+use crate::fitting::{Fit, FitLayout, HullCatalog, CELL_WORLD_SIZE};
 use crate::physics::{Physics, RapierPhysics, SweptHit};
 use crate::tuning::Tuning;
 use crate::weapon::{damage_event_from_hit, WeaponSource};
@@ -174,55 +174,58 @@ struct FittedHit {
     shield_dir: Vec2,
 }
 
-/// Build the hull-local entry ray for a world-space projectile hit on a fitted
-/// target (the local-space transform the E007 pipeline expects, T038; Phase 2 aims
-/// the ray through the core cell so sustained fire bores toward the core).
+/// Build the hull-local carve entry ray for a world-space projectile hit on a fitted
+/// target — anchored at **where the bullet visually struck**, not through the core
+/// (the FIX: the old version routed every shot through the grid/core centre using
+/// only the shot *direction*, so an off-centre shot still carved a channel down the
+/// middle; with the fine dense hull that is visibly wrong).
 ///
 /// `apply_damage` carves `ev.point → ev.point + ev.dir·REACH` across the target's
-/// **hull-local cell-space** (cells at integer coords, centers at `coord + 0.5`).
-/// This maps the world hit into that space:
+/// **hull-local cell-space** (cells at integer coords, centres at `coord + 0.5`,
+/// cell-space axes: `x = col`, `y = row`). This maps the real world hit into that
+/// space:
 ///
-/// 1. **Direction**: rotate the projectile's world travel direction `world_dir`
-///    into the hull frame by `-heading` (the inverse ship rotation), giving the
-///    incoming `dir_local`.
-/// 2. **Entry point**: place it on the far side of the grid **opposite** the
-///    incoming direction, through `aim_local` (the ship's core cell center, falling
-///    back to the grid geometric center), so the local ray sweeps the whole chassis
-///    along `dir_local` **toward the core** and carves the cells it crosses. The
-///    entry sits `span` back along `-dir_local` where `span` over-covers the grid
-///    diagonal.
+/// 1. **Direction** (`dir_local`): rotate the shot's world travel direction `world_dir`
+///    into the hull frame by `-heading` (the inverse ship rotation). The carve bores
+///    inward along the shot line from the impact.
+/// 2. **Entry point** (`entry_cell_pos`): map the world impact offset from the ship
+///    centre into cell-space — `offset_world = world_impact − world_centre`
+///    (the contact point's offset from the ship centre, world units); `offset_local =
+///    Rot(−heading) · offset_world` (un-rotate into the hull frame); `entry_cell_pos =
+///    offset_local / CELL_WORLD_SIZE + grid_dims · 0.5` (world→cell-space, centred on
+///    the grid — `x` over `cols`, `y` over `rows`).
 ///
-/// **Why aim at the core (Phase 2):** the carve channel follows this ray, and the
-/// death model is "core destroyed". Aiming the head-on ray through the **core cell
-/// center** (not the grid geometric center, which on the fighter is at row 5.5 while
-/// the core reactor sits at (4,4)) means a sustained head-on burst from ANY approach
-/// bores a channel straight into the core and destroys it in a reasonable time — the
-/// multi-angle kill the brief requires. A flank/wing burst (a shot that misses the
-/// core line) still carves the cells along its own line and can cut a section off.
+/// The carve ray STARTS at this impact cell (on the hull edge the shot met) and goes
+/// inward along `dir_local`, so the channel BEGINS where the bullet hit. The existing
+/// [`carve_path`](crate::damage) cell-trace walks the present cells from there inward;
+/// only the ray's lateral position changes — it is no longer forced through the centre.
 ///
-/// This is the **simplest correct** transform for the e2e: it does not depend on the
-/// world hit's sub-cell offset within the target circle (the coarse unit-cell grid
-/// cannot resolve that anyway), only on the incoming direction + the core aim, so a
-/// shot fired *at* a fitted ship reliably carves along its flight line.
+/// **Consequence (intended, more realistic):** an off-centre shot carves where it hits
+/// (e.g. cuts a wing) and does NOT auto-bore to the core; killing requires hitting the
+/// core region (centre) — a centre-aimed burst still bores to the core from any
+/// approach, while a flank burst severs a piece.
 fn hull_local_entry_ray(
     world_dir: Vec2,
+    world_impact: Vec2,
+    world_centre: Vec2,
     heading: f32,
     grid_dims: (u16, u16),
-    aim_local: Vec2,
 ) -> (Vec2, Vec2) {
+    let inv_rot = Vec2::from_angle(-heading);
     let dir_local = if world_dir.length_squared() > f32::EPSILON {
-        // Inverse ship rotation: world → hull-local.
-        Vec2::from_angle(-heading)
-            .rotate(world_dir)
-            .normalize_or_zero()
+        // Inverse ship rotation: world travel direction → hull-local.
+        inv_rot.rotate(world_dir).normalize_or_zero()
     } else {
         Vec2::ZERO
     };
-    // Over-cover the grid diagonal so the entry sits fully outside the chassis on
-    // the incoming side; the ray then crosses `aim_local` (the core) along `dir_local`.
-    let span = (grid_dims.0.max(grid_dims.1) as f32) + 2.0;
-    let point = aim_local - dir_local * span;
-    (point, dir_local)
+    // Impact offset from the ship centre, un-rotated into the hull frame, scaled from
+    // world units to cells, and centred on the grid → the cell-space position the
+    // bullet visually struck.
+    let offset_world = world_impact - world_centre;
+    let offset_local = inv_rot.rotate(offset_world);
+    let grid_centre = Vec2::new(grid_dims.0 as f32 * 0.5, grid_dims.1 as f32 * 0.5);
+    let entry_cell_pos = offset_local / CELL_WORLD_SIZE + grid_centre;
+    (entry_cell_pos, dir_local)
 }
 
 /// Fixed-step per-module damage for **fitted** targets (E007, T038/T039;
@@ -275,24 +278,17 @@ pub fn fitted_damage_system(world: &mut World) {
         &FitLayout,
         &Fit,
     ), With<FitLayout>>();
-    // Resolve each fitted target's grid dims + its core-aim point (the carve ray aims
-    // through the **core cell center** so a head-on burst bores toward the core, the
-    // Phase 2 death model — see `hull_local_entry_ray`). A target whose hull is
-    // unresolvable is skipped (no panic). The core falls back to the grid geometric
-    // center when the layout has no cells (a coreless/empty hull — degenerate).
-    let hull_dims: std::collections::BTreeMap<Entity, ((u16, u16), Vec2)> = {
+    // Resolve each fitted target's grid dims (the cell-space the carve maps the real
+    // impact into — see `hull_local_entry_ray`). A target whose hull is unresolvable is
+    // skipped in the apply loop (no panic, INV-D16).
+    let hull_dims: std::collections::BTreeMap<Entity, (u16, u16)> = {
         let hulls = world.get_resource::<HullCatalog>();
         target_q
             .iter(world)
-            .filter_map(|(e, _, _, _, layout, fit)| {
-                hulls.and_then(|h| h.get(fit.hull)).map(|hull| {
-                    let grid_center =
-                        Vec2::new(hull.grid_dims.0 as f32 * 0.5, hull.grid_dims.1 as f32 * 0.5);
-                    let aim = core_cell(layout)
-                        .map(|(c, r)| Vec2::new(c as f32 + 0.5, r as f32 + 0.5))
-                        .unwrap_or(grid_center);
-                    (e, (hull.grid_dims, aim))
-                })
+            .filter_map(|(e, _, _, _, _, fit)| {
+                hulls
+                    .and_then(|h| h.get(fit.hull))
+                    .map(|hull| (e, hull.grid_dims))
             })
             .collect()
     };
@@ -333,7 +329,7 @@ pub fn fitted_damage_system(world: &mut World) {
             }
         }
         if let Some((target, heading, tpos, hit)) = best {
-            let Some(&(dims, aim_local)) = hull_dims.get(&target) else {
+            let Some(&dims) = hull_dims.get(&target) else {
                 // Hull unresolvable for this target: skip (no panic, INV-D16).
                 continue;
             };
@@ -350,7 +346,10 @@ pub fn fitted_damage_system(world: &mut World) {
                     (-vel.0).normalize_or_zero()
                 }
             };
-            let (point, dir_local) = hull_local_entry_ray(vel.0, heading, dims, aim_local);
+            // FIX (carve location): build the carve entry ray from the REAL world impact
+            // (`hit.point` relative to the target centre `tpos`), not through the core —
+            // so the channel begins at the cell the bullet visually struck.
+            let (point, dir_local) = hull_local_entry_ray(vel.0, hit.point, tpos, heading, dims);
             let local_hit = SweptHit {
                 toi: hit.toi,
                 point,

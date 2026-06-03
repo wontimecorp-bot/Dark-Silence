@@ -53,11 +53,11 @@ use protocol::{
     NetTransport, CLIENT_TOKEN_BYTES,
 };
 use server::{RenderEntity, ServerApp, PROTOCOL_VERSION};
-use sim::components::{TargetKind, Velocity};
+use sim::components::{CollisionRadius, TargetKind, Velocity};
 use sim::damage::seed_defense_layers;
 use sim::fitting::{
-    build_layout, derive_ship_stats, seed_catalogs, Fit, SlotId, HULL_FIGHTER, MODULE_AUTOCANNON,
-    MODULE_REACTOR_BASIC, MODULE_THRUSTER_BASIC,
+    build_layout, derive_ship_stats, hull_collision_radius, seed_catalogs, Fit, SlotId,
+    HULL_FIGHTER, MODULE_AUTOCANNON, MODULE_REACTOR_BASIC, MODULE_THRUSTER_BASIC,
 };
 use sim::{FixedDt, HitFeedback, ShipIntent};
 
@@ -325,7 +325,22 @@ fn attach_starter_fit(server: &mut ServerApp, local_id: EntityId) {
         return;
     };
     if let Ok(mut entity) = server.world_mut().get_entity_mut(ship) {
-        entity.insert((fit, stats, layout, shields, section_armor, hull_structure));
+        // FIX (carve location): once the ship is fitted, grow its collision circle to
+        // the VISIBLE hull footprint (`hull_collision_radius`, ≈1.76 for the 9×11
+        // fighter) — overriding the unfitted `spawn_client_ship` `0.8` — so a shot that
+        // visually clips the fitted hull registers, matching what the player sees. (Side
+        // effect: the player ship's ram circle vs asteroids is now the same larger
+        // footprint, which is consistent with the rendered ship; combat/determinism
+        // tests still pass.)
+        entity.insert((
+            fit,
+            stats,
+            layout,
+            shields,
+            section_armor,
+            hull_structure,
+            CollisionRadius(hull_collision_radius(hull.grid_dims)),
+        ));
     }
 }
 

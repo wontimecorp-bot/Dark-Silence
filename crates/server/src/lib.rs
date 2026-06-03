@@ -47,9 +47,9 @@ use sim::damage::{
     Shields, StatScalingConfig, Wreck,
 };
 use sim::fitting::{
-    build_layout, derive_ship_stats, seed_catalogs, Fit, FitLayout, HullCatalog, ModuleCatalog,
-    SlotId, HULL_FIGHTER, MODULE_ARMOR_PLATE, MODULE_AUTOCANNON, MODULE_REACTOR_BASIC,
-    MODULE_THRUSTER_BASIC,
+    build_layout, derive_ship_stats, hull_collision_radius, seed_catalogs, Fit, FitLayout,
+    HullCatalog, ModuleCatalog, SlotId, HULL_FIGHTER, MODULE_ARMOR_PLATE, MODULE_AUTOCANNON,
+    MODULE_REACTOR_BASIC, MODULE_THRUSTER_BASIC,
 };
 use sim::{FixedDt, HitFeedback, ShipIntent, Tuning};
 
@@ -1604,7 +1604,12 @@ impl ServerApp {
                 // debris visibly flies off when the ship shatters (the `sever_chunk`
                 // momentum formula is unchanged — only this spawn spin).
                 AngularVelocity(2.0),
-                CollisionRadius(1.0),
+                // FIX (carve location): the collision circle now matches the VISIBLE
+                // hull footprint (`hull_collision_radius`, ≈1.76 for the 9×11 fighter)
+                // instead of the old hardcoded `1.0` that sat INSIDE the rendered hull —
+                // so the swept-cast impact point lands on the visible edge and the carve
+                // (which maps the real impact into cell-space) erodes where the bullet hit.
+                CollisionRadius(hull_collision_radius(hull.grid_dims)),
                 // The fitted set: fit + hit-map + derived stats + the three defense
                 // layers. NO `Ship` (flight/weapon never pilot it), NO `Health` (the
                 // legacy destruction_system never despawns it — it persists as a wreck).

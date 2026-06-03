@@ -73,12 +73,17 @@ pub struct RenderAssets {
 }
 
 /// Hull cell size, in sim units — the side length of one hull cell as laid out in the
-/// merged hull surface mesh of a near fitted ship ([`build_hull_mesh`]). Chosen so the
-/// hull body is ~the footprint of the old single ship box: the old fighter box was `1.6`
-/// wide on a `5`-wide grid, so `1.6 / 5 = 0.32` keeps the silhouette the same size while
-/// the finer dense grids (51-cell fighter on 9×11) give a crisper outline. Tunable for
-/// feel (Phase 3).
-pub const CELL_SIZE: f32 = 0.32;
+/// merged hull surface mesh of a near fitted ship ([`build_hull_mesh`]).
+///
+/// **Shared scale (FIX carve location):** this is re-exported from the sim's
+/// authoritative [`sim::fitting::CELL_WORLD_SIZE`] so the client render and the sim's
+/// collision/carve geometry (the swept hit circle + the impact→cell-space carve
+/// mapping) are in the SAME scale. If the cell size is ever retuned, change it in the
+/// sim (`crates/sim/src/fitting/hull.rs`) and it propagates here automatically. Value
+/// `0.32`: the old single fighter box was `1.6` wide on the legacy 5-wide grid, so
+/// `1.6 / 5 = 0.32` keeps the silhouette the same physical size on the finer dense
+/// grids (51-cell fighter on 9×11) while giving a crisper outline.
+pub const CELL_SIZE: f32 = sim::fitting::CELL_WORLD_SIZE;
 
 /// Revise-B: the uniform solid hull color — a metallic steel-blue/grey. Used by the ONE
 /// shared [`RenderAssets::hull_material`]; the merged hull mesh of every near fitted ship

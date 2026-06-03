@@ -49,7 +49,10 @@ pub use content::{
 pub use fit::{
     load_preset, preview_stats, save_preset, Fit, FitPreset, FitRejection, ModuleRef, PresetId,
 };
-pub use hull::{FiringArc, GridCell, Hull, HullId, SectionId, Slot, SlotId};
+pub use hull::{
+    hull_collision_radius, FiringArc, GridCell, Hull, HullId, SectionId, Slot, SlotId,
+    CELL_WORLD_SIZE,
+};
 pub use layout::{
     build_layout, cell_map, hardpoint_arc, module_at, resolve_hit, Cell, CellMap, CellOccupant,
     FitLayout, HitResolution,
