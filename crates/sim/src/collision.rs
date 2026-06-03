@@ -12,7 +12,9 @@ use crate::components::{
     CollisionRadius, Damage, DamageFlash, Destructible, Heading, Health, LastShieldHit, Position,
     PrevPosition, Projectile, ProjectileOwner, ShieldHitFlash, Ship, Target, TargetKind, Velocity,
 };
-use crate::damage::{apply_damage, core_cell, on_cells_carved, DamageEvent, HitKind, Wreck};
+use crate::damage::{
+    apply_damage, core_cell, first_cell_hit, on_cells_carved, DamageEvent, HitKind, Wreck, REACH,
+};
 use crate::fitting::{FitLayout, HullCatalog, CELL_WORLD_SIZE};
 use crate::physics::{Physics, RapierPhysics, SweptHit};
 use crate::tuning::Tuning;
@@ -308,11 +310,14 @@ pub fn fitted_damage_system(world: &mut World) {
     // not re-killed: the wreck-aware `on_cells_carved` branch handles a `Wreck` target
     // separately (sever-further / despawn-when-empty, no `destroy_ship`). Removing
     // `Destructible` per entity makes that entity inert (the user's toggle).
-    let mut target_q = world
-        .query_filtered::<(Entity, &Position, &CollisionRadius, &Heading, &FitLayout, Option<&Wreck>), (
-            With<FitLayout>,
-            With<Destructible>,
-        )>();
+    let mut target_q = world.query_filtered::<(
+        Entity,
+        &Position,
+        &CollisionRadius,
+        &Heading,
+        &FitLayout,
+        Option<&Wreck>,
+    ), (With<FitLayout>, With<Destructible>)>();
     // Resolve each target's grid dims from its **`FitLayout.hull`** (→ `HullCatalog`),
     // not a `Fit` — the `Fit`-independent lookup that lets wreckage (no `Fit`) carve too.
     // The grid is the cell-space the carve maps the real impact into (see
@@ -359,9 +364,14 @@ pub fn fitted_damage_system(world: &mut World) {
             Some((e, center))
         })
         .collect();
-    let targets: Vec<(Entity, Vec2, f32, f32)> = target_q
+    // Snapshot each target's selection inputs, INCLUDING a clone of its `FitLayout` so the
+    // narrow-phase (below) can run the cell-precise crossing test (`first_cell_hit`) without
+    // re-borrowing the world. `FitLayout` is `Clone` (a `BTreeMap` of small `Copy`
+    // occupants); the clone is released before any `&mut World` use, like the rest of the
+    // collected hit data.
+    let targets: Vec<(Entity, Vec2, f32, f32, FitLayout)> = target_q
         .iter(world)
-        .map(|(e, p, r, h, _, _)| (e, p.0, r.0, h.0))
+        .map(|(e, p, r, h, layout, _)| (e, p.0, r.0, h.0, layout.clone()))
         .collect();
 
     let mut proj_q = world.query_filtered::<(
@@ -375,58 +385,76 @@ pub fn fitted_damage_system(world: &mut World) {
     ), With<Projectile>>();
     for (projectile, pos, prev, vel, dmg, src, owner) in proj_q.iter(world) {
         let owner_e = owner.map(|o| o.0);
-        // First target struck along the sweep (lowest toi), skipping self-hits.
-        // Carry the target heading (for the local-ray transform) AND the target's
-        // world centre `tpos` (for the shield-impact direction, FIX 0a) so the apply
-        // phase has both without re-querying.
-        let mut best: Option<(Entity, f32, Vec2, SweptHit)> = None;
-        for &(target, tpos, radius, heading) in &targets {
-            if owner_e == Some(target) {
+        // **Cell-precise hit selection** (the targeting-bug fix): a projectile hits a target
+        // ONLY if its swept segment actually crosses one of that target's present CELLS —
+        // not merely the loose `CollisionRadius` circle. The circle (sized to the whole
+        // footprint) is kept as a cheap **broad-phase reject**; the truth is the cells.
+        //
+        // Among the broad-phase survivors, pick the target with the lowest **cell-crossing
+        // toi** (the first CELL the ray reaches across all candidates), NOT the lowest
+        // circle toi. A target whose cells the ray never crosses is NOT hit (the projectile
+        // passes it). So a shot aimed at a small piece sitting beside a ship — which crosses
+        // the ship's big circle first but never a ship cell — carves the PIECE (whose cell
+        // it crosses), and the ship keeps all its cells.
+        //
+        // The cell test is single-sourced with the carve: it maps the world segment into the
+        // target's cell-space (`hull_local_entry_ray`, the SAME per-target `center` the carve
+        // uses) and runs `first_cell_hit` (the SAME swept-vs-inscribed-circle test
+        // `carve_path` walks) over the REACH segment — so the selected target is guaranteed
+        // to carve a cell (no empty path, no fallback).
+        //
+        // Carries the chosen target's world centre `tpos` + the broad-phase circle impact
+        // point `world_impact` (shield-impact dir, FIX 0a) and the already-computed cell-
+        // space entry ray `(point, dir_cell)` so the apply phase reuses them.
+        let mut best: Option<(Entity, f32, Vec2, Vec2, Vec2, Vec2)> = None; // (target, cell_toi, tpos, world_impact, point, dir_cell)
+        for (target, tpos, radius, heading, layout) in &targets {
+            if owner_e == Some(*target) {
                 continue; // self-hit prevention (E002 ProjectileOwner)
             }
-            let Some(hit) = physics.swept_cast(prev.0, pos.0, tpos, radius) else {
+            // Broad-phase: cheap circle reject — skip targets the projectile clearly misses.
+            let Some(hit) = physics.swept_cast(prev.0, pos.0, *tpos, *radius) else {
                 continue;
             };
+            // The carve entry ray (and `center`) must resolve, else this target is skipped in
+            // the apply loop anyway — so it cannot be hit (INV-D16, no panic).
+            if !hull_dims.contains_key(target) {
+                continue;
+            }
+            let Some(&center) = centers.get(target) else {
+                continue;
+            };
+            // Map the world impact into the target's cell-space (same mapping the carve uses).
+            let (point, dir_cell) = hull_local_entry_ray(vel.0, hit.point, *tpos, *heading, center);
+            // Narrow-phase: does the cell-space segment actually cross one of THIS target's
+            // present cells? If not, the projectile passes this target (not a hit).
+            let Some((_, cell_toi)) = first_cell_hit(layout, point, point + dir_cell * REACH)
+            else {
+                continue;
+            };
+            // Pick the first CELL reached across all candidates (lowest cell-crossing toi).
             let take = match best {
                 None => true,
-                Some((_, _, _, ref b)) => hit.toi < b.toi,
+                Some((_, best_toi, _, _, _, _)) => cell_toi < best_toi,
             };
             if take {
-                best = Some((target, heading, tpos, hit));
+                best = Some((*target, cell_toi, *tpos, hit.point, point, dir_cell));
             }
         }
-        if let Some((target, heading, tpos, hit)) = best {
-            if !hull_dims.contains_key(&target) {
-                // Hull unresolvable for this target: skip (no panic, INV-D16).
-                continue;
-            }
-            let Some(&center) = centers.get(&target) else {
-                // No carve center (unresolvable live-ship hull): skip (no panic, INV-D16).
-                continue;
-            };
-            // FIX 0a: the world impact direction from the ship centre to the swept hit
-            // point — the data `update_shield_bubble` flashes at. Fall back to the
-            // reverse shot direction (`-vel`) when the centre→impact vector is
-            // degenerate (e.g. a hit at the exact centre), so the flash always has a
-            // sensible facing.
+        if let Some((target, cell_toi, tpos, world_impact, point, dir_cell)) = best {
+            // FIX 0a: the world impact direction from the ship centre to the swept circle hit
+            // point — the data `update_shield_bubble` flashes at. Fall back to the reverse
+            // shot direction (`-vel`) when the centre→impact vector is degenerate (e.g. a
+            // hit at the exact centre), so the flash always has a sensible facing.
             let shield_dir = {
-                let from_centre = (hit.point - tpos).normalize_or_zero();
+                let from_centre = (world_impact - tpos).normalize_or_zero();
                 if from_centre != Vec2::ZERO {
                     from_centre
                 } else {
                     (-vel.0).normalize_or_zero()
                 }
             };
-            // FIX (carve location): build the carve entry ray from the REAL world impact
-            // (`hit.point` relative to the target centre `tpos`), not through the core —
-            // so the channel begins at the cell the bullet visually struck. `center` is the
-            // per-target cell-space anchor mirroring the client's `hull_mesh_center`
-            // (cell-COM for a `Wreck`, grid centre for a live ship) so an off-centre wreck
-            // piece carves where its cells actually are (no more HIT/MISS).
-            let (point, dir_cell) =
-                hull_local_entry_ray(vel.0, hit.point, tpos, heading, center);
             let local_hit = SweptHit {
-                toi: hit.toi,
+                toi: cell_toi,
                 point,
             };
             let event = damage_event_from_hit(&local_hit, src, dmg.0, dir_cell, owner_e);

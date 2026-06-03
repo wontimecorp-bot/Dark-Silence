@@ -3194,3 +3194,587 @@ fn offcenter_wreck_piece_is_carved_where_its_cells_are() {
         "the off-centre wreck hit registers as a carve (HitKind != NoModule), got {last_kind:?}"
     );
 }
+
+// =================================================================================
+// END-TO-END (real-path) carve-of-a-severed-chunk regression: shoot a chunk that was
+// produced by the REAL `sever_chunk` (NOT a hand-built synthetic `Wreck`), and prove it
+// carves further. The `offcenter_wreck_piece_is_carved_where_its_cells_are` test above
+// hand-computes the chunk `Position`, so it cannot catch a `sever_chunk` Position ↔ carve-
+// center mismatch on the live path. This test severs an off-centre flank via the same
+// `on_section_destroyed` → `sever_chunk` calls the runtime makes, captures the SPAWNED
+// chunk (its real `Position`/`FitLayout`), then fires a projectile through its collider via
+// `fitted_damage_system` (the live system) and asserts cells were carved out of it and the
+// hit resolved as a real carve (not `NoModule`/MISS). This is the user's "HIT MISS" case.
+// =================================================================================
+
+/// A `(World, ship)` carrying the corridor hull/layout + the FULL E007 carve resources
+/// (matrix / penetration / shield / salvage configs) so a chunk severed off this ship can
+/// then be SHOT through the live `fitted_damage_system` carve path. The corridor cells are
+/// given a small structural `health` so a carve does real work removing them (a 0-health
+/// cell would be removed for free). Body components are supplied (stationary: zero
+/// velocity/angvel) so the severed chunk's real `Position` is deterministic.
+fn corridor_world_carveable(pos: Vec2, heading: f32) -> (World, Entity) {
+    let mut w = World::new();
+    // The full E007 carve content (catalogs + matrix/pen/shield/salvage configs + the base
+    // sim resources) — what `apply_damage`/`fitted_damage_system` resolve against.
+    insert_full_combat_resources(&mut w);
+    // Register the corridor hull alongside the seeded catalogs so the Fit-independent carve
+    // can resolve the severed chunk's `layout.hull` (= HULL_CORRIDOR).
+    {
+        let mut hulls = w.get_resource_mut::<HullCatalog>().unwrap();
+        hulls.hulls.insert(HULL_CORRIDOR, corridor_hull());
+    }
+
+    let fit = Fit::new(HULL_CORRIDOR);
+    let mut layout = corridor_layout();
+    // Small structural HP so a carve removes cells through real work (mirrors the live wreck).
+    for occ in layout.cells.values_mut() {
+        occ.health = 5.0;
+    }
+    let ship = w
+        .spawn((
+            fit,
+            layout,
+            Position(pos),
+            Velocity(Vec2::ZERO),
+            Heading(heading),
+            AngularVelocity(0.0),
+            HullStructure::full(100.0),
+        ))
+        .id();
+    (w, ship)
+}
+
+/// END-TO-END regression (the user's "HIT MISS" on a real severed piece): a chunk produced
+/// by the REAL `sever_chunk` path carves further when shot.
+///
+/// 1. **Sever via the real path**: destroying the corridor's connecting middle section
+///    (`SectionId(2)`, cell `(2,1)`) calls the real `on_section_destroyed` → `sever_chunk`,
+///    which spawns a `Wreck{SeveredChunk}` carrying the off-centre far-end flank
+///    `{(3,1),(4,1)}` (cell-COM `(4.0,1.5)`, off the 5×3 grid centre `(2.5,1.5)` by 1.5
+///    cells laterally) at the `Position` `sever_chunk` itself computes — NOT a hand-built one.
+/// 2. **Fire at the REAL chunk**: a projectile sweeps the chunk's collider (centred on that
+///    `Position`), entering along world `-Y` (cell-space `-col`) so the bore crosses the
+///    flank cells. One `fitted_damage_system` step runs the live carve.
+/// 3. **Assert**: the chunk's residual `FitLayout.cells` count DECREASED (cells carved out
+///    of the real chunk) — or it despawned because it emptied (also "carved") — AND the
+///    resolved `HitKind != NoModule`. If `sever_chunk`'s `Position` disagreed with the carve
+///    `center` (cell-COM) for a real severed piece, the ray would enter empty space →
+///    `NoModule`/MISS and nothing would carve (the bug this guards).
+#[test]
+fn real_severed_chunk_is_carved_further_when_shot() {
+    // A stationary ship at a non-trivial position + heading 0 (so the geometry is
+    // deterministic and the swap/scale of `sever_chunk`'s Position is exercised but readable).
+    let (mut w, ship) = corridor_world_carveable(Vec2::new(20.0, -7.0), 0.0);
+
+    // --- 1. Sever an off-centre flank via the REAL `on_section_destroyed`/`sever_chunk` ---
+    on_section_destroyed(&mut w, ship, SectionId(2));
+
+    // Capture the SPAWNED severed-chunk entity (its real `Position` + residual layout).
+    let chunk = {
+        let mut q = w.query_filtered::<(Entity, &Wreck), With<FitLayout>>();
+        let severed: Vec<Entity> = q
+            .iter(&w)
+            .filter(|(_, wr)| wr.origin == WreckOrigin::SeveredChunk)
+            .map(|(e, _)| e)
+            .collect();
+        assert_eq!(
+            severed.len(),
+            1,
+            "the connecting-section destruction severs exactly one off-centre flank chunk via \
+             the real sever_chunk path"
+        );
+        severed[0]
+    };
+
+    // The chunk is the real severed flank: its residual cells are the far end {(3,1),(4,1)},
+    // its collider + Destructible were attached by `sever_chunk`, and it is NOT at the grid
+    // centre (the off-centre case the synthetic test cannot reach).
+    let chunk_pos = w.get::<Position>(chunk).unwrap().0;
+    let cells_before: std::collections::BTreeSet<(u16, u16)> = w
+        .get::<FitLayout>(chunk)
+        .unwrap()
+        .cells
+        .keys()
+        .copied()
+        .collect();
+    assert_eq!(
+        cells_before.len(),
+        2,
+        "the severed flank carries its two far-end cells (3,1),(4,1) — got {cells_before:?}"
+    );
+    assert!(
+        w.get::<sim::components::Destructible>(chunk).is_some()
+            && w.get::<CollisionRadius>(chunk).is_some(),
+        "sever_chunk leaves the chunk carve-targetable (Destructible + a collider)"
+    );
+
+    // --- 2. Fire a projectile through the REAL chunk's collider (live system) ---------
+    // Enter from the +Y side and bore along -Y (world -Y maps to cell-space -col at heading
+    // 0), so the channel sweeps the flank's two cells. The sweep is centred on the chunk's
+    // own `Position` (its cell-COM in world) so the swept-cast strikes the collider.
+    w.spawn((
+        Projectile,
+        Position(Vec2::new(chunk_pos.x, chunk_pos.y - 6.0)),
+        PrevPosition(Vec2::new(chunk_pos.x, chunk_pos.y + 6.0)),
+        Velocity(Vec2::new(0.0, -200.0)),
+        Damage(5000.0),
+        Lifetime(3.0),
+        WeaponSource::from_damage(5000.0),
+    ));
+
+    sim::fitted_damage_system(&mut w);
+
+    // --- 3. Assert: the REAL chunk was carved further (or emptied → despawn) ----------
+    let cells_after: std::collections::BTreeSet<(u16, u16)> = w
+        .get::<FitLayout>(chunk)
+        .map(|l| l.cells.keys().copied().collect())
+        .unwrap_or_default(); // despawned-when-emptied → no layout → empty set
+    let despawned = w.get_entity(chunk).is_err();
+    let removed: std::collections::BTreeSet<(u16, u16)> =
+        cells_before.difference(&cells_after).copied().collect();
+    assert!(
+        despawned || !removed.is_empty(),
+        "shooting the REAL severed chunk carves cells out of it (removed {removed:?}) or empties \
+         + despawns it (despawned={despawned}); the bug would leave it untouched (HIT MISS)"
+    );
+
+    // The hit resolved as a real carve, NOT the `NoModule` MISS a Position↔center mismatch
+    // would produce (the ray entering empty space).
+    let last_kind = w.get_resource::<HitFeedback>().unwrap().last_kind;
+    assert!(
+        last_kind.is_some() && last_kind != Some(HitKind::NoModule),
+        "the real severed-chunk hit registers as a carve (HitKind != NoModule), got {last_kind:?} \
+         — a NoModule here is the user's HIT MISS (sever_chunk Position ↔ carve center mismatch)"
+    );
+}
+
+// =================================================================================
+// OFF-AXIS CLEAN-MISS regression (cell-precise hit detection): a chunk's collider is a
+// CIRCLE sized to its bounding-box LONGEST axis (`chunk_collision_radius` =
+// `max(bbox_w,bbox_h)·CELL_WORLD_SIZE·0.5`), but a THIN/sparse chunk's cells fill only a
+// NARROW band of it. A 1-wide × 3-tall sliver: collider radius `3·0.32·0.5 = 0.48`, cell
+// perpendicular half-width `0.5·0.32 = 0.16` → ~68% of the circle is empty. A shot that
+// crosses the loose CIRCLE but threads BETWEEN the sparse cells crosses NO present cell.
+//
+// With cell-precise narrow-phase detection that shot is a **clean MISS**: the projectile
+// passes the chunk (it is not consumed by a target whose cells it never crosses), nothing
+// is carved, and there is no phantom "HIT MISS". (The old loose-circle path picked the
+// chunk on the circle toi and the nearest-cell fallback force-carved a cell; both are
+// removed.) An ON-axis shot through the same sliver's cells DOES carve it (the legit case,
+// covered by the prior `*_severed_chunk_*` tests + the on-axis assertion here).
+// =================================================================================
+
+/// The thin-sliver hull id used by the nearest-cell-fallback regression test.
+const HULL_THINSLIVER: HullId = HullId(13);
+
+/// A **filled** 5×5 silhouette (every cell of cols `0..4` × rows `0..4`, 25 cells), each
+/// its own [`SectionId`]. The full authored silhouette makes the residual sliver's entry
+/// cell read as BURIED (the carve's tunnel guard → head-on, angle 0), so a clean
+/// penetration carves rather than ricochets — isolating the THINNESS (not the angle) as
+/// the cause of the empty carve path.
+fn thinsliver_hull() -> Hull {
+    let mut cells: Vec<GridCell> = Vec::new();
+    let mut section = 0u32;
+    for col in 0u16..5 {
+        for row in 0u16..5 {
+            cells.push(GridCell::new((col, row), SectionId(section)));
+            section += 1;
+        }
+    }
+    Hull {
+        id: HULL_THINSLIVER,
+        name: "ThinSliver".to_string(),
+        grid_dims: (5, 5),
+        cells,
+        power_capacity: 100.0,
+        cpu_capacity: 100.0,
+        mass_capacity: 100.0,
+        hull_base_mass: 1.0,
+        slots: Vec::new(),
+    }
+}
+
+/// Spawn a `Wreck` whose residual [`FitLayout`] is a 1-wide × 3-tall **sliver** — three
+/// cells in the centre column stacked along the row axis `{(2,1),(2,2),(2,3)}` of the 5×5
+/// grid (cell-COM `(2.5, 2.5)` = the grid centre, so this is NOT an off-centre case — the
+/// thinness alone drives the empty carve path). Its collider is the chunk-footprint circle
+/// (radius `max(1,3)·CELL_WORLD_SIZE·0.5 = 0.48`), far wider than the `0.16` cell
+/// half-width, so an off-axis swept-cast HITS the circle while the carve ray threads
+/// between the cells. Carries `Destructible` + `Wreck`, NO `Fit` (residual-hull wreckage).
+fn spawn_thin_sliver_wreck(w: &mut World) -> Entity {
+    {
+        let mut hulls = w.get_resource_mut::<HullCatalog>().unwrap();
+        hulls.hulls.insert(HULL_THINSLIVER, thinsliver_hull());
+    }
+    let sliver: [(u16, u16); 3] = [(2, 1), (2, 2), (2, 3)];
+    let mut cells = CellMap::new();
+    for (col, row) in sliver {
+        let depth = col.min(4 - col).min(row).min(4 - row);
+        cells.insert(
+            (col, row),
+            CellOccupant {
+                slot: SlotId(u32::MAX),
+                module: None,
+                health: 5.0, // small structural HP so a carve removes the cell
+                depth,
+                structural: true,
+            },
+        );
+    }
+    let layout = FitLayout {
+        hull: HULL_THINSLIVER,
+        cells,
+    };
+    // The sliver collider: the chunk's OWN footprint (1 col × 3 rows) → radius 0.48 world,
+    // mirroring `sever_chunk`'s `chunk_collision_radius`. The cell-COM is the grid centre,
+    // so the wreck `Position` is the origin (zero offset) — clean geometry.
+    let radius = 3.0 * CELL_WORLD_SIZE * 0.5; // max(bbox_w=1, bbox_h=3)·CELL_WORLD_SIZE·0.5
+    w.spawn((
+        Position(Vec2::ZERO),
+        Velocity(Vec2::ZERO),
+        Heading(0.0),
+        AngularVelocity(0.0),
+        CollisionRadius(radius),
+        layout,
+        Destructible,
+        Wreck::new(WreckOrigin::SeveredChunk),
+    ))
+    .id()
+}
+
+/// REGRESSION (cell-precise hit detection): an OFF-AXIS shot at a THIN sliver chunk — one
+/// that crosses the collider CIRCLE but threads BETWEEN the sparse cells, crossing NO
+/// present cell — is a **clean MISS** (the projectile passes; nothing is carved). An
+/// ON-axis shot through the sliver's cells DOES carve it (the legit case).
+///
+/// The 1×3 sliver `{(2,1),(2,2),(2,3)}` (centre column) has a collider radius `0.48` but a
+/// cell half-width of only `0.16`. A forward (`-X`) shot offset laterally by `lat = 0.30`
+/// world units (`0.16 < 0.30 < 0.48`) crosses the circle (closest approach `0.30 < 0.48`)
+/// but its carve ray sits at cell-space col `≈ 3.44`, while the cells are at col `2.5` —
+/// `> 0.5` (one cell radius) away, so it crosses NO cell.
+///
+/// With cell-precise detection that off-axis shot is a clean miss: `last_kind` is unchanged
+/// (no hit registered for this target), zero cells removed. The complementary ON-axis shot
+/// (no lateral offset) crosses the col-2 cells and carves the sliver.
+#[test]
+fn thin_sliver_wreck_off_axis_shot_is_a_clean_miss() {
+    // --- Off-axis: crosses the circle, threads between the cells → clean MISS ---------
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    let wreck = spawn_thin_sliver_wreck(&mut w);
+
+    let before: std::collections::BTreeSet<(u16, u16)> = w
+        .get::<FitLayout>(wreck)
+        .unwrap()
+        .cells
+        .keys()
+        .copied()
+        .collect();
+    assert_eq!(
+        before.len(),
+        3,
+        "the thin sliver starts with its 3 residual cells (all in col 2)"
+    );
+
+    // A forward (-X) shot offset laterally (+Y) by 0.30 world units — inside the 0.48
+    // collider radius (so it crosses the CIRCLE) but threading between the col-2 cells
+    // (0.30/0.32 ≈ 0.94 cells off the col-2 centre line → crosses NO cell). The wreck
+    // `Position` is the origin (cell-COM == grid centre), so the lateral offset is +Y.
+    let tpos = w.get::<Position>(wreck).unwrap().0;
+    let lat = 0.30_f32;
+    w.spawn((
+        Projectile,
+        Position(Vec2::new(tpos.x - 6.0, tpos.y + lat)),
+        PrevPosition(Vec2::new(tpos.x + 6.0, tpos.y + lat)),
+        Velocity(Vec2::new(-200.0, 0.0)),
+        Damage(5000.0),
+        Lifetime(3.0),
+        WeaponSource::from_damage(5000.0),
+    ));
+
+    sim::fitted_damage_system(&mut w);
+
+    // CLEAN MISS: nothing was carved (the projectile crosses no cell of the sliver).
+    let after: std::collections::BTreeSet<(u16, u16)> = w
+        .get::<FitLayout>(wreck)
+        .map(|l| l.cells.keys().copied().collect())
+        .unwrap_or_default();
+    let despawned = w.get_entity(wreck).is_err();
+    let removed: std::collections::BTreeSet<(u16, u16)> =
+        before.difference(&after).copied().collect();
+    assert!(
+        !despawned && removed.is_empty(),
+        "an off-axis shot that threads between the sliver's cells is a clean MISS \
+         (removed {removed:?}, despawned={despawned}); the loose circle is only a broad-phase \
+         reject — a target whose cells the ray never crosses is not hit"
+    );
+    // No hit registered for this target — `last_kind` was never set to a carve/NoModule.
+    let last_kind = w.get_resource::<HitFeedback>().unwrap().last_kind;
+    assert!(
+        last_kind.is_none(),
+        "an off-axis clean miss registers NO hit (last_kind stays None), got {last_kind:?}"
+    );
+
+    // --- On-axis: crosses the col-2 cells → carves the sliver (the legit case) --------
+    let mut w2 = World::new();
+    insert_full_combat_resources(&mut w2);
+    let wreck2 = spawn_thin_sliver_wreck(&mut w2);
+    let before2 = w2.get::<FitLayout>(wreck2).unwrap().cells.len();
+    let tpos2 = w2.get::<Position>(wreck2).unwrap().0;
+    // No lateral offset: the ray runs straight down col 2 through all three cells.
+    w2.spawn((
+        Projectile,
+        Position(Vec2::new(tpos2.x - 6.0, tpos2.y)),
+        PrevPosition(Vec2::new(tpos2.x + 6.0, tpos2.y)),
+        Velocity(Vec2::new(-200.0, 0.0)),
+        Damage(5000.0),
+        Lifetime(3.0),
+        WeaponSource::from_damage(5000.0),
+    ));
+    sim::fitted_damage_system(&mut w2);
+    let after2 = w2
+        .get::<FitLayout>(wreck2)
+        .map(|l| l.cells.len())
+        .unwrap_or(0);
+    let despawned2 = w2.get_entity(wreck2).is_err();
+    assert!(
+        despawned2 || after2 < before2,
+        "an ON-axis shot through the sliver's cells carves it (the legit case): \
+         before {before2}, after {after2}, despawned {despawned2}"
+    );
+    let last_kind2 = w2.get_resource::<HitFeedback>().unwrap().last_kind;
+    assert!(
+        last_kind2.is_some() && last_kind2 != Some(HitKind::NoModule),
+        "the on-axis hit registers as a real carve (HitKind != NoModule), got {last_kind2:?}"
+    );
+}
+
+// =================================================================================
+// THE TARGETING BUG (cell-precise hit selection): shooting a severed wreckage piece
+// that sits NEXT TO its parent ship must carve the PIECE, not the ship.
+//
+// The parent ship's collider is a CIRCLE the size of its whole footprint (radius ~0.8
+// here). A freshly-severed chunk sits right beside it, so a shot aimed at the small
+// adjacent piece often crosses the SHIP's big collider circle FIRST (lower circle toi)
+// even though it never crosses the ship's actual cells. The old loose-circle selection
+// picked the ship (lowest circle toi), consumed the projectile, and the nearest-cell
+// fallback then force-carved the SHIP's nearest cell — "it continues carving from the
+// original piece". The circle is a loose broad-phase; the cells are the truth.
+//
+// The fix makes hit SELECTION cell-precise: among the broad-phase survivors, pick the
+// target with the lowest CELL-crossing toi (the first cell the ray reaches), not the
+// lowest circle toi. A target whose cells the ray never crosses is NOT hit. So the
+// chunk (whose cells the ray crosses) wins; the ship (circle crossed, no cell crossed)
+// is passed over and keeps every cell.
+// =================================================================================
+
+/// The custom ship hull id for the targeting-bug reproduction.
+const HULL_REPRO_SHIP: HullId = HullId(21);
+/// The custom chunk hull id for the targeting-bug reproduction.
+const HULL_REPRO_CHUNK: HullId = HullId(22);
+
+/// A **filled** 5×5 silhouette (25 cells, each its own [`SectionId`]) — the authored
+/// silhouette for the reproduction ship (grid centre `(2.5,2.5)`, footprint collider
+/// radius `5·0.32·0.5 = 0.8`). The full silhouette makes a buried live cell read head-on
+/// for the tunnel guard, isolating the SELECTION (which target) as the bug, not the angle.
+fn repro_ship_hull() -> Hull {
+    let mut cells: Vec<GridCell> = Vec::new();
+    let mut section = 0u32;
+    for col in 0u16..5 {
+        for row in 0u16..5 {
+            cells.push(GridCell::new((col, row), SectionId(section)));
+            section += 1;
+        }
+    }
+    Hull {
+        id: HULL_REPRO_SHIP,
+        name: "ReproShip".to_string(),
+        grid_dims: (5, 5),
+        cells,
+        power_capacity: 100.0,
+        cpu_capacity: 100.0,
+        mass_capacity: 100.0,
+        hull_base_mass: 1.0,
+        slots: Vec::new(),
+    }
+}
+
+/// A 1×1 authored hull for the severed chunk (grid centre `(0.5,0.5)`, footprint collider
+/// radius `0.5·0.32 = 0.16`). The chunk's live cell IS its whole authored silhouette, so
+/// its single cell reads as a surface cell — a forward shot through it carves it.
+fn repro_chunk_hull() -> Hull {
+    Hull {
+        id: HULL_REPRO_CHUNK,
+        name: "ReproChunk".to_string(),
+        grid_dims: (1, 1),
+        cells: vec![GridCell::new((0, 0), SectionId(0))],
+        power_capacity: 100.0,
+        cpu_capacity: 100.0,
+        mass_capacity: 100.0,
+        hull_base_mass: 1.0,
+        slots: Vec::new(),
+    }
+}
+
+/// Build the targeting-bug world: a LIVE fitted ship at the origin whose live `FitLayout`
+/// is a small cluster in the BOTTOM-LEFT of its 5×5 grid (so most of its big collider
+/// circle is empty), and an adjacent severed `Wreck` chunk whose single cell sits in the
+/// ship's circle but away from the ship's cells. Returns `(world, ship, chunk)`.
+///
+/// Geometry (heading 0; render maps world X ← row offset, world Y ← col offset, scaled by
+/// `CELL_WORLD_SIZE`, grid-centre-relative for a live ship; cell-COM-relative for a chunk):
+///   * Ship grid centre `(2.5,2.5)`. Live cells `{(0,0),(1,0),(0,1)}` (bottom-left corner)
+///     render at world ≈ `(−0.5..−0.64, −0.5..−0.64)` — the LOW-X/LOW-Y quadrant.
+///   * Ship collider radius `0.8` (centred at the origin) reaches `y = +0.5` out to
+///     `x = ±√(0.8²−0.5²) ≈ ±0.62`.
+///   * Chunk single cell placed (via its `Position`) at world ≈ `(0.0, +0.5)` — inside the
+///     ship circle but in the HIGH-Y half, ~1.0 world from the ship's cells.
+///
+/// A horizontal shot at `y = +0.5` travelling `−X` then crosses the ship circle (near edge
+/// `x ≈ +0.62`) BEFORE the chunk cell (`x ≈ 0.0`) → the ship has the LOWER circle toi (the
+/// bug's mis-pick), yet the shot never crosses a ship cell while it DOES cross the chunk's.
+fn repro_targeting_bug_world() -> (World, Entity, Entity) {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    {
+        let mut hulls = w.get_resource_mut::<HullCatalog>().unwrap();
+        hulls.hulls.insert(HULL_REPRO_SHIP, repro_ship_hull());
+        hulls.hulls.insert(HULL_REPRO_CHUNK, repro_chunk_hull());
+    }
+
+    // --- The LIVE ship: a 5×5 hull with only a bottom-left cluster of live cells. ----
+    let ship_cells: [(u16, u16); 3] = [(0, 0), (1, 0), (0, 1)];
+    let mut scells = CellMap::new();
+    for (col, row) in ship_cells {
+        let depth = col.min(4 - col).min(row).min(4 - row);
+        scells.insert(
+            (col, row),
+            CellOccupant {
+                slot: SlotId(u32::MAX),
+                module: None,
+                health: 5.0,
+                depth,
+                structural: true,
+            },
+        );
+    }
+    let ship_layout = FitLayout {
+        hull: HULL_REPRO_SHIP,
+        cells: scells,
+    };
+    let ship = w
+        .spawn((
+            Target,
+            TargetKind::Dummy,
+            Position(Vec2::ZERO),
+            Velocity(Vec2::ZERO),
+            Heading(0.0),
+            AngularVelocity(0.0),
+            // The whole-footprint collider circle (the loose broad-phase): radius 0.8.
+            CollisionRadius(hull_collision_radius((5, 5))),
+            ship_layout,
+            Destructible,
+            // A live ship's defense state: a depleted shield so the very first hit would
+            // reach the hull (the test is about WHICH target, not the shield pool).
+            Shields::depleted(0.0, 0.0, false),
+            HullStructure::full(100.0),
+        ))
+        .id();
+
+    // --- The severed CHUNK: a 1-cell wreck placed at world ≈ (0.0, +0.5). -------------
+    // Its `Position` IS its cell-COM in world (how `sever_chunk` places it + how the client
+    // renders it). The single cell's COM is the grid centre (0.5,0.5), so the chunk's cells
+    // render exactly AT its `Position`. Put that at world (0.0, +0.5): inside the ship's 0.8
+    // circle (distance 0.5 < 0.8) but in the high-Y half, away from the ship's bottom-left
+    // cells.
+    let mut ccells = CellMap::new();
+    ccells.insert(
+        (0, 0),
+        CellOccupant {
+            slot: SlotId(u32::MAX),
+            module: None,
+            health: 5.0,
+            depth: 0,
+            structural: true,
+        },
+    );
+    let chunk_layout = FitLayout {
+        hull: HULL_REPRO_CHUNK,
+        cells: ccells,
+    };
+    let chunk = w
+        .spawn((
+            Position(Vec2::new(0.0, 0.5)),
+            Velocity(Vec2::ZERO),
+            Heading(0.0),
+            AngularVelocity(0.0),
+            CollisionRadius(hull_collision_radius((1, 1))),
+            chunk_layout,
+            Destructible,
+            Wreck::new(WreckOrigin::SeveredChunk),
+        ))
+        .id();
+
+    (w, ship, chunk)
+}
+
+/// THE REPRODUCTION (targeting bug): shooting a severed piece that sits next to its parent
+/// ship must carve the PIECE, not the ship.
+///
+/// The shot is aimed at the chunk's cell along a path that crosses the chunk's cell AND the
+/// ship's collider circle (the ship has the LOWER circle toi) but NEVER a ship cell. With
+/// cell-precise selection the chunk wins and the ship is untouched.
+///
+/// PRE-FIX this FAILS: the loose-circle selection picks the ship (lowest circle toi) and the
+/// nearest-cell fallback force-carves a ship cell → the ship loses cells and the chunk is
+/// untouched ("it continues carving from the original piece"). POST-FIX the chunk loses its
+/// cell and the ship keeps all of its cells.
+#[test]
+fn shooting_a_piece_next_to_the_ship_carves_the_piece_not_the_ship() {
+    let (mut w, ship, chunk) = repro_targeting_bug_world();
+
+    let ship_cells_before = w.get::<FitLayout>(ship).unwrap().cells.len();
+    let chunk_cells_before = w.get::<FitLayout>(chunk).unwrap().cells.len();
+    assert_eq!(
+        ship_cells_before, 3,
+        "the ship starts with its 3 live cells"
+    );
+    assert_eq!(chunk_cells_before, 1, "the chunk starts with its 1 cell");
+
+    // A horizontal shot at y = +0.5 travelling -X: it crosses the ship circle near edge
+    // (x ≈ +0.62) BEFORE the chunk cell at (0.0, +0.5) → the ship has the lower CIRCLE toi
+    // (the bug's mis-pick), but the shot crosses the chunk's cell and NO ship cell.
+    w.spawn((
+        Projectile,
+        Position(Vec2::new(-6.0, 0.5)),
+        PrevPosition(Vec2::new(6.0, 0.5)),
+        Velocity(Vec2::new(-200.0, 0.5)),
+        Damage(5000.0),
+        Lifetime(3.0),
+        WeaponSource::from_damage(5000.0),
+    ));
+
+    sim::fitted_damage_system(&mut w);
+
+    // --- The CHUNK was carved (its cell removed → emptied → despawned, or count dropped).
+    let chunk_after = w
+        .get::<FitLayout>(chunk)
+        .map(|l| l.cells.len())
+        .unwrap_or(0);
+    let chunk_despawned = w.get_entity(chunk).is_err();
+    assert!(
+        chunk_despawned || chunk_after < chunk_cells_before,
+        "the CHUNK (the aimed-at piece) is carved: before {chunk_cells_before}, after \
+         {chunk_after}, despawned {chunk_despawned}"
+    );
+
+    // --- The SHIP kept EVERY cell (it was never the real target — its cells weren't crossed).
+    let ship_after = w.get::<FitLayout>(ship).unwrap().cells.len();
+    assert_eq!(
+        ship_after, ship_cells_before,
+        "the SHIP keeps all {ship_cells_before} of its cells — the shot threaded past its \
+         circle without crossing a ship cell; pre-fix the loose-circle pick + nearest-cell \
+         fallback carved the SHIP instead ('continues carving from the original piece')"
+    );
+}

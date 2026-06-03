@@ -217,8 +217,11 @@ pub struct DamageContext {
 /// How far the entry ray is extended across the hull grid from the impact point
 /// along the event direction, so [`resolve_entry_point`] sweeps the whole chassis
 /// (the largest seed hull is the 13×15 corvette in cell-space, so this comfortably
-/// spans it).
-const REACH: f32 = 64.0;
+/// spans it). Public so the narrow-phase hit selection in
+/// [`fitted_damage_system`](crate::collision::fitted_damage_system) builds the SAME
+/// cell-space segment [`apply_damage`]/[`carve_path`] carve along (single-sourced reach
+/// → the selected target is exactly the one that carves).
+pub const REACH: f32 = 64.0;
 
 // --- Phase 2 carving (fine destruction) tuning ----------------------------------
 //
@@ -342,18 +345,57 @@ pub fn route_behind(
 /// The cells the carve ray passes through, in deterministic entry-inward order, with
 /// the radius the per-cell inscribed circle uses. Mirrors the E006
 /// [`CELL_RADIUS`](crate::fitting) inscribe so a ray through a cell centre registers.
-const CARVE_CELL_RADIUS: f32 = 0.5;
+pub const CARVE_CELL_RADIUS: f32 = 0.5;
+
+/// The deterministic sort key of one crossed cell: ascending time-of-impact along the
+/// ray (first crossed first), ties broken outer-before-inner by occlusion `depth`, then
+/// by [`Cell`] order (Principle II — no `HashMap` iteration; the source map is a
+/// `BTreeMap`). Shared by [`first_cell_hit`] and [`carve_path`] so the "which cell is
+/// reached first" ordering is single-sourced.
+fn carve_order(a: &(f32, u16, Cell), b: &(f32, u16, Cell)) -> std::cmp::Ordering {
+    a.0.partial_cmp(&b.0)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then(a.1.cmp(&b.1))
+        .then(a.2.cmp(&b.2))
+}
+
+/// The **first present cell** of `layout` the ray `p0 → p1` crosses, paired with its
+/// cell-crossing time-of-impact — the single-sourced "which cell does the ray reach
+/// first" test (Principle II). `None` when the ray crosses no present cell (a genuine
+/// miss against this layout's cells — NOT a hit, no fallback).
+///
+/// Reuses the **existing** swept point-vs-circle primitive ([`Physics::swept_cast`])
+/// against each present cell's inscribed circle ([`CARVE_CELL_RADIUS`]) — the same CCD
+/// `resolve_hit`/`carve_path` use, no new geometry. Used BOTH by the narrow-phase target
+/// selection in [`fitted_damage_system`](crate::collision::fitted_damage_system) (the
+/// lowest cell-toi across candidate targets is the one hit) AND by [`carve_path`] (the
+/// entry cell of the carve), so the chosen target is guaranteed to carve a cell. Pure;
+/// reads only its arguments.
+pub fn first_cell_hit(layout: &FitLayout, p0: Vec2, p1: Vec2) -> Option<(Cell, f32)> {
+    let physics = RapierPhysics::new();
+    let mut best: Option<(f32, u16, Cell)> = None;
+    for (&cell, occ) in &layout.cells {
+        let center = Vec2::new(cell.0 as f32 + 0.5, cell.1 as f32 + 0.5);
+        if let Some(hit) = physics.swept_cast(p0, p1, center, CARVE_CELL_RADIUS) {
+            let candidate = (hit.toi, occ.depth, cell);
+            if best.is_none_or(|b| carve_order(&candidate, &b) == std::cmp::Ordering::Less) {
+                best = Some(candidate);
+            }
+        }
+    }
+    best.map(|(toi, _, cell)| (cell, toi))
+}
 
 /// Walk the present cells of `layout` the ray `p0 → p1` passes through, in the
-/// deterministic order the shot would carve them: ascending time-of-impact along the
-/// ray, ties broken outer-before-inner by occlusion `depth`, then by [`Cell`] order
-/// (Principle II — no `HashMap` iteration; the source map is a `BTreeMap`).
+/// deterministic order the shot would carve them ([`carve_order`]: ascending
+/// time-of-impact, ties outer-before-inner by occlusion `depth`, then by [`Cell`]
+/// order).
 ///
-/// Reuses the **existing** swept point-vs-circle primitive
-/// ([`Physics::swept_cast`]) against each present cell's inscribed circle — the same
-/// CCD `resolve_hit` uses, no new geometry. Returns each crossed cell paired with its
-/// occupant snapshot (its live `health`/`module`), so the caller can carve it without
-/// re-borrowing the layout per step. Pure; reads only its arguments.
+/// Reuses the **same** per-cell swept point-vs-circle crossing test [`first_cell_hit`]
+/// single-sources — so `carve_path`'s entry cell is exactly the target the narrow-phase
+/// selection picked. Returns each crossed cell paired with its occupant snapshot (its
+/// live `health`/`module`), so the caller can carve it without re-borrowing the layout
+/// per step. Pure; reads only its arguments.
 fn carve_path(layout: &FitLayout, p0: Vec2, p1: Vec2) -> Vec<(Cell, CellOccupant)> {
     let physics = RapierPhysics::new();
     let mut hits: Vec<(f32, u16, Cell, CellOccupant)> = Vec::new();
@@ -363,14 +405,7 @@ fn carve_path(layout: &FitLayout, p0: Vec2, p1: Vec2) -> Vec<(Cell, CellOccupant
             hits.push((hit.toi, occ.depth, cell, *occ));
         }
     }
-    // Ascending toi (first crossed first); ties → outer (lower depth) first; then the
-    // BTreeMap-natural Cell order for a fully deterministic carve sequence.
-    hits.sort_by(|a, b| {
-        a.0.partial_cmp(&b.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.1.cmp(&b.1))
-            .then(a.2.cmp(&b.2))
-    });
+    hits.sort_by(|a, b| carve_order(&(a.0, a.1, a.2), &(b.0, b.1, b.2)));
     hits.into_iter()
         .map(|(_, _, cell, occ)| (cell, occ))
         .collect()
@@ -514,12 +549,20 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
     // --- 2. Geometry: the carve path + its entry (surface) cell --------------
     // The carve walks the cells the ray crosses, entry-inward (deterministic). The
     // **entry cell** is the FIRST cell on this path — the genuine hull-surface cell
-    // the shot meets, where the armor angle is read (NOT a deep module cell). An empty
-    // path (the ray crosses no present cell — off-grid / fully eroded) is the
-    // total-pipeline `NoModule` edge (never a panic).
+    // the shot meets, where the armor angle is read (NOT a deep module cell).
     let p0 = ev.point;
     let p1 = ev.point + ev.dir * REACH;
     let path = carve_path(&layout, p0, p1);
+
+    // With **cell-precise** hit selection (see
+    // [`fitted_damage_system`](crate::collision::fitted_damage_system)) `apply_damage` is
+    // only ever called on a target whose cells the ray actually crosses — the narrow-phase
+    // picks the target with the lowest cell-crossing toi via the SAME
+    // [`first_cell_hit`]/`carve_path` crossing test — so `carve_path` here is non-empty.
+    // An empty `path` therefore means only a degenerate case (an emptied layout mid-
+    // despawn, or a direct non-selection call with no crossing): the total-pipeline
+    // `NoModule` edge (correct, never a panic). There is NO nearest-cell fallback: a shot
+    // that crosses no cell is a clean miss, not a force-carve on the wrong/nearest cell.
     let Some(&(entry_cell, _)) = path.first() else {
         return no_module();
     };
