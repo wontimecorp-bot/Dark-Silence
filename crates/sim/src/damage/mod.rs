@@ -54,6 +54,12 @@
 //!   data-driven [`SalvageConfig`] (FR-018/019/020, INV-D09/D10/D12). The wreck spawn
 //!   sites ([`sever_chunk`]/[`destruction::on_section_destroyed`]) populate the
 //!   persistent `Wreck.contents` at spawn.
+//!
+//! E007 live-demo wiring (post-epic integration glue, not a phase):
+//! - [`seed`] — [`seed_defense_layers`], the shared helper that turns a fitted hull +
+//!   fit into the three live defense components ([`Shields`]/[`SectionArmor`]/
+//!   [`HullStructure`]) so the player ship and the windowed-demo enemy are both
+//!   damageable on one code path (Principle II).
 
 pub mod content;
 pub mod destruction;
@@ -62,6 +68,7 @@ pub mod layers;
 pub mod penetration;
 pub mod resist;
 pub mod salvage;
+pub mod seed;
 pub mod sever;
 pub mod shields;
 
@@ -78,5 +85,6 @@ pub use layers::{
 pub use penetration::{resolve_penetration, PenetrationResult};
 pub use resist::{layer_resist, DefenseLayer, ResistanceMatrix};
 pub use salvage::{intact_threshold, salvage, salvage_layout, SalvageOutcome};
+pub use seed::seed_defense_layers;
 pub use sever::{connected_region, core_cell, sever_chunk, Wreck, WreckChunk, WreckOrigin};
 pub use shields::{regen_shield, shield_absorb, shield_regen_system};

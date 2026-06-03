@@ -42,6 +42,15 @@ use sim::components::{
     AngularVelocity, CollisionRadius, FlightAssist, Heading, Health, Position, Projectile, Ship,
     Target, TargetKind, Velocity, Weapon,
 };
+use sim::damage::{
+    default_resistance_matrix, seed_defense_layers, PenetrationConfig, SalvageConfig, ShieldConfig,
+    StatScalingConfig, Wreck,
+};
+use sim::fitting::{
+    build_layout, derive_ship_stats, seed_catalogs, Fit, HullCatalog, ModuleCatalog, SlotId,
+    HULL_FIGHTER, MODULE_ARMOR_PLATE, MODULE_AUTOCANNON, MODULE_REACTOR_BASIC,
+    MODULE_THRUSTER_BASIC,
+};
 use sim::{FixedDt, HitFeedback, ShipIntent, Tuning};
 
 pub use session::{
@@ -255,6 +264,23 @@ impl ServerApp {
         // Intent is per-entity now (a `ShipIntent` component on each ship), not a
         // global resource — so each client ship is piloted by its own input.
         world.insert_resource(HitFeedback::default());
+
+        // E007 live-demo wiring: insert the data-driven damage content + the fitting
+        // catalogs so the gated E007 systems (`fitted_damage_system`,
+        // `shield_regen_system`, `recompute_ship_stats_system`) actually RUN on fitted
+        // entities. These are harmless no-ops for the unfitted/determinism worlds: the
+        // gated systems still find no fitted entities, and these are **world
+        // resources**, not entities — so the determinism + botkit comparisons (which
+        // read per-ship `sim` state) stay bit-identical. This is the change that makes
+        // the live damage pipeline resolve for a fitted player ship + demo enemy.
+        let (modules, hulls) = seed_catalogs();
+        world.insert_resource(hulls);
+        world.insert_resource(modules);
+        world.insert_resource(default_resistance_matrix());
+        world.insert_resource(PenetrationConfig::default());
+        world.insert_resource(ShieldConfig::default());
+        world.insert_resource(StatScalingConfig::default());
+        world.insert_resource(SalvageConfig::default());
 
         let mut schedule = Schedule::default();
         // The single shared entry point: server steps the SAME systems in the
@@ -813,13 +839,17 @@ impl ServerApp {
     /// that path; the embedded server IS the authoritative sim, so its world is the
     /// crisp, in-sync source of truth for collision and hits).
     ///
-    /// One [`RenderEntity`] per replicated Ship / Projectile / Target, keyed by the
-    /// SAME wire [`EntityId`] mapping ([`EntityIdAllocator::id_for`]) the snapshots
-    /// use, so the client can reconcile its rendered entities by stable id. Mirrors
+    /// One [`RenderEntity`] per replicated Ship / Projectile / Target **plus each
+    /// severed [`Wreck`] chunk** (E007 live-demo), keyed by the SAME wire
+    /// [`EntityId`] mapping ([`EntityIdAllocator::id_for`]) the snapshots use, so the
+    /// client can reconcile its rendered entities by stable id. Mirrors
     /// [`ServerApp::full_records`] but skips quantization: `flags` carries the
     /// target sub-kind ([`TargetKind::as_u8`]; `0` for ship/projectile) and
     /// `heading` is the ship `Heading` (projectile heading is derived from velocity
-    /// direction, target heading is `0.0`).
+    /// direction, target heading is `0.0`). Severed chunks (a `Wreck` body with no
+    /// Ship/Target/Projectile marker) are emitted as `Target`+`Asteroid` so the
+    /// client draws drifting grey debris — render-only, no protocol change, no
+    /// `full_records`/snapshot/determinism impact.
     ///
     /// Additive and client-only: no test depends on it, and it mutates no world
     /// state (it only mints wire ids for any not-yet-seen entity, exactly as a
@@ -880,6 +910,39 @@ impl ServerApp {
                 flags: kind_flag,
                 pos,
                 heading: 0.0,
+                vel,
+            });
+        }
+
+        // E007 live-demo: severed chunks + standalone wrecks (drifting debris). A
+        // chunk is a [`Wreck`] entity carrying a body (Position/Velocity/Heading/
+        // AngularVelocity) + a residual `FitLayout`, but NONE of Ship/Target/
+        // Projectile — so the three queries above miss it and it would be invisible.
+        // `Without<Target>` keeps the **destroyed enemy** (which keeps its `Target`
+        // marker and is emitted above as a persistent hulk) out of this set, so it is
+        // not double-emitted. Each chunk renders as `Target`+`Asteroid` flag, reusing
+        // the grey asteroid mesh for drifting debris — NO protocol change, NO new
+        // `TargetKind` variant. Render-only + client-only: this does not touch
+        // `full_records`/snapshots/determinism.
+        let mut chunks = self
+            .world
+            .query_filtered::<(Entity, &Position, &Velocity, &Heading), (
+                With<Wreck>,
+                Without<Ship>,
+                Without<Target>,
+                Without<Projectile>,
+            )>();
+        let chunk_rows: Vec<(Entity, Vec2, Vec2, f32)> = chunks
+            .iter(&self.world)
+            .map(|(e, p, v, h)| (e, p.0, v.0, h.0))
+            .collect();
+        for (entity, pos, vel, heading) in chunk_rows {
+            out.push(RenderEntity {
+                id: self.entity_ids.id_for(entity),
+                kind: EntityKind::Target,
+                flags: TargetKind::Asteroid.as_u8(),
+                pos,
+                heading,
                 vel,
             });
         }
@@ -1063,6 +1126,106 @@ impl ServerApp {
                 Velocity(vel),
                 CollisionRadius(radius),
                 Health(health),
+            ))
+            .id()
+    }
+
+    /// Spawn a **fitted** enemy combat target the player can shoot apart, exercising
+    /// the full E007 damage pipeline live (E007 live-demo wiring, OBJ4).
+    ///
+    /// This is a NEW method called **only** from the windowed client demo
+    /// (`client::net::setup_loopback_host`); it is deliberately NOT part of
+    /// [`ServerApp::spawn_demo_world`], whose contents the session/determinism tests
+    /// depend on. The fitted enemy is a stationary, slowly-spinning, fully-defended
+    /// target:
+    ///
+    /// - **Render + targeting**: `Target` + [`TargetKind::Dummy`] so
+    ///   [`ServerApp::render_state`] emits it (and the severed-chunk query renders its
+    ///   debris); the player's autocannon hits it via the E007
+    ///   [`fitted_damage_system`](sim::fitted_damage_system) path (which targets
+    ///   `With<FitLayout>`).
+    /// - **Slow spin**: a small [`AngularVelocity`] so when a section severs the
+    ///   chunk visibly **flings apart** via the inherited COM-rotation momentum
+    ///   ([`sever_chunk`](sim::damage::sever_chunk), INV-D07) rather than popping at
+    ///   zero velocity.
+    /// - **Fitted set**: a [`Fit`] (reactor + thruster + weapon + armor on the
+    ///   fighter hull), its [`build_layout`] `FitLayout` (the per-module hit-map), the
+    ///   [`derive_ship_stats`] `ShipStats`, and the three defense layers from
+    ///   [`seed_defense_layers`] (`Shields`/`SectionArmor`/`HullStructure`).
+    /// - **No [`Ship`]** — so the flight/weapon/AI systems never pilot or fire it (it
+    ///   stays put and unarmed). **No [`Health`]** — so the legacy
+    ///   `destruction_system` never despawns it; it persists as a battered hulk /
+    ///   wreck instead.
+    ///
+    /// **Loadout + tuning (why the chain fires without one-shotting)**: the fighter
+    /// hull has no Shield hardpoint, so the shield comes from the
+    /// [`seed_defense_layers`] default pool (25 HP). The autocannon delivers ~12
+    /// `Kinetic` damage/shot at 5 shots/s with penetration ≈ 3× damage — so a
+    /// sustained burst first drains the small shield, then clean-penetrates the thin
+    /// per-section steel facets and chews module health (degrading the ship's derived
+    /// stats live, SC-002), and finally destroys a section → connectivity sever →
+    /// drifting chunk → persistent wreck. The numbers are MVP **tunable content**
+    /// (`seed_defense_layers` + the seed catalog), chosen so the full pipeline is
+    /// visible over a few seconds of fire, not in a single shot.
+    ///
+    /// Reads the catalogs from the world (inserted in [`ServerApp::new`]); falls back
+    /// to [`seed_catalogs`] defensively if they are somehow absent. Returns the spawned
+    /// [`Entity`].
+    pub fn spawn_fitted_enemy(&mut self, pos: Vec2) -> Entity {
+        // Resolve the catalogs from the world (present after `ServerApp::new`); fall
+        // back to a fresh seed so this never panics on a bare world (defensive).
+        let modules = self
+            .world
+            .get_resource::<ModuleCatalog>()
+            .cloned()
+            .unwrap_or_else(|| seed_catalogs().0);
+        let hulls = self
+            .world
+            .get_resource::<HullCatalog>()
+            .cloned()
+            .unwrap_or_else(|| seed_catalogs().1);
+
+        // The fighter hull holds reactor + thruster + weapon + armor via the
+        // validate-then-apply install (slots: 0 Reactor, 1 Thruster, 3 Weapon, 5
+        // Armor). It has no Shield hardpoint, so the shield is supplied by
+        // `seed_defense_layers`' default pool — the enemy is still shield-defended.
+        let hull = hulls
+            .get(HULL_FIGHTER)
+            .cloned()
+            .expect("seed catalog always contains the fighter hull");
+        let mut fit = Fit::new(HULL_FIGHTER);
+        let _ = fit.install_module(SlotId(0), MODULE_REACTOR_BASIC, &hull, &modules);
+        let _ = fit.install_module(SlotId(1), MODULE_THRUSTER_BASIC, &hull, &modules);
+        let _ = fit.install_module(SlotId(3), MODULE_AUTOCANNON, &hull, &modules);
+        let _ = fit.install_module(SlotId(5), MODULE_ARMOR_PLATE, &hull, &modules);
+
+        // The per-module hit-map, derived stats, and the three defense layers — the
+        // full E007 target surface (the same helpers the player ship seeds from).
+        let layout = build_layout(&hull, &fit, &modules);
+        let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
+        let (shields, section_armor, hull_structure) = seed_defense_layers(&hull, &fit, &modules);
+
+        self.world
+            .spawn((
+                // Render + targeting: a Dummy target the E007 fitted path hits.
+                Target,
+                TargetKind::Dummy,
+                Position(pos),
+                Velocity(Vec2::ZERO),
+                Heading(0.0),
+                // Slow spin so a severed chunk inherits rotation momentum and visibly
+                // drifts apart (INV-D07) instead of popping at zero velocity.
+                AngularVelocity(0.3),
+                CollisionRadius(1.0),
+                // The fitted set: fit + hit-map + derived stats + the three defense
+                // layers. NO `Ship` (flight/weapon never pilot it), NO `Health` (the
+                // legacy destruction_system never despawns it — it persists as a wreck).
+                fit,
+                layout,
+                stats,
+                shields,
+                section_armor,
+                hull_structure,
             ))
             .id()
     }

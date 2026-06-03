@@ -54,6 +54,7 @@ use protocol::{
 };
 use server::{RenderEntity, ServerApp, PROTOCOL_VERSION};
 use sim::components::{TargetKind, Velocity};
+use sim::damage::seed_defense_layers;
 use sim::fitting::{
     build_layout, derive_ship_stats, seed_catalogs, Fit, SlotId, HULL_FIGHTER, MODULE_AUTOCANNON,
     MODULE_REACTOR_BASIC, MODULE_THRUSTER_BASIC,
@@ -163,6 +164,16 @@ fn setup_loopback_host(world: &mut World) {
     // tick below, so they exist the first time `capture_render_state` reads the
     // server world.
     server.spawn_demo_world();
+    // E007 live-demo: spawn fitted enemies the player can shoot apart so the whole
+    // damage pipeline (typed hits → module degrade → section sever → drifting chunks
+    // → wreck) is visible live. One is placed directly ahead of the player (which
+    // starts at the origin facing +x), a second offset for variety. Both are
+    // stationary, slowly-spinning, fully-defended `Target`+`FitLayout` entities the
+    // E007 `fitted_damage_system` resolves hits against (see
+    // `ServerApp::spawn_fitted_enemy`). They are NOT in `spawn_demo_world` (tests
+    // depend on its contents) — they are demo-only.
+    server.spawn_fitted_enemy(Vec2::new(14.0, 0.0));
+    server.spawn_fitted_enemy(Vec2::new(18.0, 6.0));
     let conn = NetTransport::connect(&mut transport, loopback_addr());
 
     // Handshake: send Connect, tick the server once so it accepts + replies, then
@@ -228,7 +239,12 @@ fn setup_loopback_host(world: &mut World) {
 ///   autocannon — a valid, within-budget loadout from the seed catalog);
 /// - the [`derive_ship_stats`] result (so flight reads fit-derived thrust/mass/turn
 ///   and the ship can fire — the autocannon makes `can_fire == true`);
-/// - the [`build_layout`] hit/armor map (the E007 surface, kept in lock-step).
+/// - the [`build_layout`] hit/armor map (the E007 surface, kept in lock-step);
+/// - the three E007 defense layers from [`seed_defense_layers`]
+///   ([`Shields`](sim::damage::Shields)/[`SectionArmor`](sim::damage::SectionArmor)/
+///   [`HullStructure`](sim::damage::HullStructure)) so the **player** ship is also
+///   damageable — symmetric with the demo enemy (nothing shoots the player yet, but
+///   the pipeline is complete; enemy fire is a follow-on).
 ///
 /// **Flight sanity:** the two seed thrusters sum to the E002 thrust/torque/strafe
 /// magnitudes (30/12/18), so emergent top speed (`thrust/linear_drag = 80`) and max
@@ -260,12 +276,18 @@ fn attach_starter_fit(server: &mut ServerApp, local_id: EntityId) {
     // health every module's health-factor is 1.0, so stats match the pre-E007 derive.
     let layout = build_layout(&hull, &fit, &modules);
     let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
+    // Seed the player ship's E007 defense layers from the same shared helper the demo
+    // enemy uses (Principle II) — so the player is damageable on identical rules. The
+    // fighter has no Shield hardpoint, so the shield is the default pool from
+    // `seed_defense_layers`. Nothing fires at the player yet (enemy AI fire is a
+    // follow-on), but the layer state is now complete and live.
+    let (shields, section_armor, hull_structure) = seed_defense_layers(&hull, &fit, &modules);
 
     let Some(ship) = server.ship_entity_for(local_id) else {
         return;
     };
     if let Ok(mut entity) = server.world_mut().get_entity_mut(ship) {
-        entity.insert((fit, stats, layout));
+        entity.insert((fit, stats, layout, shields, section_armor, hull_structure));
     }
 }
 
