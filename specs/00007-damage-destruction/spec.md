@@ -222,3 +222,14 @@ Picking a weapon, choosing a facing, and prioritizing a target are genuine decis
 | Clean sever | Severing a module whose own health is intact, detaching it operational (vs scrap from a through-kill). |
 | Wreck / chunk | A persistent, lootable physical body left by a destroyed ship or a severed hull region. |
 | Emergent damage | A module's effective-stat contribution scaling with its health, so a damaged ship flies/fights worse. |
+
+## Compliance Check
+
+Validated against `project-instructions.md` v1.1.0 — **Status: PASS** (no violations, no CRITICAL).
+
+- **I. Server-Authoritative**: PASS — FR-021 resolves all damage/penetration/destruction/severing/salvage authoritatively in the shared `sim`/server, reusing the swept-ray CCD; client feedback (FR-024) is presentation-only. No client authority over outcomes.
+- **II. Shared Deterministic Sim Core**: PASS — the model lives in `crates/sim`; it reuses E006's `FitLayout`/`resolve_hit`/per-module health and **extends** `derive_ship_stats` for emergent damage (FR-012, Assumptions) — one model, not a fork.
+- **ADR-0008**: PASS — realizes the unified data-driven domain: typed-damage pipeline (channels × ordered layers, swept rays, post-pen module damage), coarse-now/cell-ready destructible hulls (FR-014), connectivity severing → chunks (FR-015/FR-017), clean-sever salvage (FR-018); hull geometry stays designer-authored. The `Shields→Armor→Hull→Systems` stack is the in-scope subset of ADR-0008's full layer stack, with the outer avoidance layer (E010) and crew deferred.
+- **ADR-0012**: PASS — grounded relationships (`thickness/cos(angle)`, KE-style pen/over-pen tiers) with gameplay-scaled, data-driven, playtest-tuned magnitudes (FR-022, Risks); no real-world-accuracy chasing.
+- **No P2W / in-game-only economy**: PASS — E007 emits only in-world salvage entities + lootable wrecks (FR-018–020) seeding E013; no markets, currency, or real-money surface.
+- **Scope discipline**: PASS — Excluded correctly defers crew, avoidance/PD/ECM (E010), DoT/cascades, new weapon delivery types, fine per-cell destruction, the salvage economy (E013), and scaled replication (E009).
