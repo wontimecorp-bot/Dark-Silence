@@ -185,18 +185,22 @@ struct FittedHit {
 /// cell-space axes: `x = col`, `y = row`). This maps the real world hit into that
 /// space:
 ///
-/// 1. **Direction** (`dir_local`): rotate the shot's world travel direction `world_dir`
-///    into the hull frame by `-heading` (the inverse ship rotation). The carve bores
-///    inward along the shot line from the impact.
+/// 1. **Direction** (`dir_cell`): rotate the shot's world travel direction `world_dir`
+///    into the hull frame by `-heading` (the inverse ship rotation), giving ship-local
+///    `(forward, lateral)`, then map it into cell-space axes (`x = col`, `y = row`). The
+///    carve bores inward along the shot line from the impact.
 /// 2. **Entry point** (`entry_cell_pos`): map the world impact offset from the ship
 ///    centre into cell-space — `offset_world = world_impact − world_centre`
 ///    (the contact point's offset from the ship centre, world units); `offset_local =
-///    Rot(−heading) · offset_world` (un-rotate into the hull frame); `entry_cell_pos =
-///    offset_local / CELL_WORLD_SIZE + grid_dims · 0.5` (world→cell-space, centred on
-///    the grid — `x` over `cols`, `y` over `rows`).
+///    Rot(−heading) · offset_world` (un-rotate into the hull frame, so `offset_local.x`
+///    is ship-local **forward** and `offset_local.y` is ship-local **lateral**);
+///    `entry_cell_pos = offset_local / CELL_WORLD_SIZE + grid_dims · 0.5` mapped onto the
+///    cell-space axes to **match the render** ([`build_hull_mesh`] maps local **X
+///    (forward) ← row**, local **Y (lateral) ← col**): therefore **col ← lateral**
+///    (`offset_local.y`) and **row ← forward** (`offset_local.x`).
 ///
 /// The carve ray STARTS at this impact cell (on the hull edge the shot met) and goes
-/// inward along `dir_local`, so the channel BEGINS where the bullet hit. The existing
+/// inward along `dir_cell`, so the channel BEGINS where the bullet hit. The existing
 /// [`carve_path`](crate::damage) cell-trace walks the present cells from there inward;
 /// only the ray's lateral position changes — it is no longer forced through the centre.
 ///
@@ -212,20 +216,31 @@ fn hull_local_entry_ray(
     grid_dims: (u16, u16),
 ) -> (Vec2, Vec2) {
     let inv_rot = Vec2::from_angle(-heading);
+    // Inverse ship rotation: world travel direction → hull-local `(forward, lateral)`
+    // (`.x` = ship-local +X/forward, `.y` = ship-local +Y/lateral).
     let dir_local = if world_dir.length_squared() > f32::EPSILON {
-        // Inverse ship rotation: world travel direction → hull-local.
         inv_rot.rotate(world_dir).normalize_or_zero()
     } else {
         Vec2::ZERO
     };
-    // Impact offset from the ship centre, un-rotated into the hull frame, scaled from
-    // world units to cells, and centred on the grid → the cell-space position the
-    // bullet visually struck.
+    // Impact offset from the ship centre, un-rotated into the hull frame (so
+    // `offset_local.x` = forward, `offset_local.y` = lateral), scaled from world units to
+    // cells, and centred on the grid → the cell-space position the bullet visually struck.
     let offset_world = world_impact - world_centre;
     let offset_local = inv_rot.rotate(offset_world);
     let grid_centre = Vec2::new(grid_dims.0 as f32 * 0.5, grid_dims.1 as f32 * 0.5);
-    let entry_cell_pos = offset_local / CELL_WORLD_SIZE + grid_centre;
-    (entry_cell_pos, dir_local)
+    // Cell/trace space is (x = col, y = row); the render maps forward → row, lateral →
+    // col (`build_hull_mesh`: local X/nose ← row, local Y/wing ← col). Match it so a
+    // lateral wing hit lands on the col axis (the wing), not the row (fore/aft) axis.
+    let entry_cell_pos = Vec2::new(
+        offset_local.y / CELL_WORLD_SIZE + grid_centre.x, // x = col  <- lateral
+        offset_local.x / CELL_WORLD_SIZE + grid_centre.y, // y = row  <- forward
+    );
+    // The carve direction in cell space: x = col <- lateral = dir_local.y; y = row <-
+    // forward = dir_local.x — the same swap, so carve_path AND the armor-angle (entry-cell
+    // radial vs ev.dir) both operate consistently in cell space.
+    let dir_cell = Vec2::new(dir_local.y, dir_local.x).normalize_or_zero();
+    (entry_cell_pos, dir_cell)
 }
 
 /// Fixed-step per-module damage for **fitted** targets (E007, T038/T039;
@@ -349,12 +364,12 @@ pub fn fitted_damage_system(world: &mut World) {
             // FIX (carve location): build the carve entry ray from the REAL world impact
             // (`hit.point` relative to the target centre `tpos`), not through the core —
             // so the channel begins at the cell the bullet visually struck.
-            let (point, dir_local) = hull_local_entry_ray(vel.0, hit.point, tpos, heading, dims);
+            let (point, dir_cell) = hull_local_entry_ray(vel.0, hit.point, tpos, heading, dims);
             let local_hit = SweptHit {
                 toi: hit.toi,
                 point,
             };
-            let event = damage_event_from_hit(&local_hit, src, dmg.0, dir_local, owner_e);
+            let event = damage_event_from_hit(&local_hit, src, dmg.0, dir_cell, owner_e);
             hits.push(FittedHit {
                 projectile,
                 target,

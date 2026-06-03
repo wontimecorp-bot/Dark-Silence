@@ -1566,12 +1566,21 @@ fn fitted_fighter_at_origin(w: &mut World) -> Entity {
 /// Spawn a projectile positioned + aimed so its `prev → pos` sweep strikes the
 /// fitted target at origin, carrying a high-penetration `WeaponSource` (Kinetic,
 /// `from_damage`) that clean-penetrates the thin cover and destroys the reactor.
+///
+/// The enemy faces +X (heading 0), so its **nose/aft (fore-aft) axis is world X** and
+/// maps to cell-space **row** (render: forward ← row). Firing straight along the nose
+/// axis — from the +X nose side (world `x = +6`, `y = 0`) toward `-X` — enters at the
+/// centre **column** (world `y = 0 → col 4.5`) and bores down that column in `-row`,
+/// straight through the core reactor at the central (4,4) cell. (Pre-fix this fired
+/// along world `-Y`, which the swapped mapping happened to route down the centre column
+/// too; post-fix world `-Y` is the LATERAL axis, so the nose axis is world X.)
 fn spawn_downward_projectile(w: &mut World, owner: Option<Entity>, damage: f32) -> Entity {
-    // Coming straight down through the target circle at origin: prev above, pos at
-    // the centre, velocity downward (so dir_local == (0,-1) at heading 0).
-    let prev = Vec2::new(0.0, 6.0);
+    // Coming straight down the nose axis through the target circle at origin: prev on
+    // the +X nose side, pos at the centre, velocity along -X (so the carve bores down
+    // the centre column toward the aft, through the central core cell at heading 0).
+    let prev = Vec2::new(6.0, 0.0);
     let pos = Vec2::new(0.0, 0.0);
-    let vel = Vec2::new(0.0, -180.0);
+    let vel = Vec2::new(-180.0, 0.0);
     let mut e = w.spawn((
         Projectile,
         Position(pos),
@@ -2051,9 +2060,11 @@ fn spawn_fitted_enemy_target(w: &mut World, pos: Vec2) -> Entity {
 /// core reactor (4,4) sits one row aft of the silhouette's geometric centre (4.5,5.5)
 /// on the fighter, so the geometric centre alone would miss it).
 ///
-/// Inverts the impact→cell-space carve mapping (`collision::hull_local_entry_ray`):
-/// `offset_local = (core − grid_centre)·CELL_WORLD_SIZE`, then world = `Position +
-/// Rot(heading)·offset_local`.
+/// Inverts the impact→cell-space carve mapping (`collision::hull_local_entry_ray`),
+/// which maps **col ← lateral (`offset_local.y`)** and **row ← forward
+/// (`offset_local.x`)** to match the render. Inverting: `offset_local.y =
+/// (col − cols/2)·CELL_WORLD_SIZE`, `offset_local.x = (row − rows/2)·CELL_WORLD_SIZE`,
+/// then world = `Position + Rot(heading)·offset_local`.
 fn core_world_pos(w: &World, target: Entity) -> Vec2 {
     let layout = w
         .get::<FitLayout>(target)
@@ -2068,7 +2079,13 @@ fn core_world_pos(w: &World, target: Entity) -> Vec2 {
     let core = sim::damage::core_cell(layout).expect("a fitted hull has a core cell");
     let grid_centre = Vec2::new(cols as f32 * 0.5, rows as f32 * 0.5);
     let cell_centre = Vec2::new(core.0 as f32 + 0.5, core.1 as f32 + 0.5);
-    let offset_local = (cell_centre - grid_centre) * CELL_WORLD_SIZE;
+    // Swapped to match the fixed forward mapping: cell-space x=col ← local y (lateral),
+    // cell-space y=row ← local x (forward).
+    // cell_centre is a Vec2 with x = col, y = row.
+    let offset_local = Vec2::new(
+        (cell_centre.y - grid_centre.y) * CELL_WORLD_SIZE, // local x (forward) <- row
+        (cell_centre.x - grid_centre.x) * CELL_WORLD_SIZE, // local y (lateral) <- col
+    );
     pos + Vec2::from_angle(heading).rotate(offset_local)
 }
 
@@ -2433,46 +2450,52 @@ fn fitted_player_kills_enemy_from_every_approach_angle() {
 }
 
 // =================================================================================
-// FIX (carve location) regression: the carve must begin WHERE THE BULLET STRUCK, not
-// through the ship's centre. Before the fix `hull_local_entry_ray` routed every shot
-// through the grid/core centre using only the shot DIRECTION, discarding the lateral
-// impact offset, so an off-centre shot still carved a channel down the middle. This
-// guard fires a projectile that strikes the target clearly **off-centre** (a left and
-// a right lateral offset) and asserts the destroyed cells' centroid is on the IMPACT
-// side of the hull (not the centre).
+// FIX (carve axis) regression: the carve must track the ship's FACING, not a swapped
+// axis. The enemy faces +X at heading 0 (its nose is the +X/+row axis; its lateral
+// wing axis is world ±Y). The world-impact→cell mapping (`hull_local_entry_ray`) must
+// match the render (`build_hull_mesh`: local X/forward ← row, local Y/lateral ← col),
+// so:
+//   - a LATERAL (wing, world ±Y) hit carves on the COL axis (a wing), at MID row;
+//   - a FORWARD/AFT (nose/tail, world ±X) hit carves on the ROW axis (the fore/aft
+//     extreme), at MID col.
+// The previous bug swapped forward↔lateral (col ← forward, row ← lateral), so a wing
+// hit carved the TAIL. These guards fire shots in terms of the ship's facing and lock
+// the side/sign of the mapping.
 // =================================================================================
 
 /// Run a single `fitted_damage_system` carve against a stationary fitted enemy at the
-/// origin (heading 0) struck by a powerful straight-**up** (`+Y`) projectile that
-/// enters the ship's broad, near-flat **aft engine face** (row 0, cols 2..=6) offset
-/// by `lateral_x` in world X — a clean left/right hit that meets that face nearly
-/// head-on (≈21° obliquity, well inside the penetration angle), so the shot carves up
-/// the struck column instead of grazing. Returns the destroyed cells.
+/// origin **facing +X** (heading 0), struck by a projectile whose impact is offset
+/// along the chosen world axis. The projectile travels straight inward along
+/// `-axis * speed` from outside the collision circle, so it enters the hull on the
+/// `+axis` side and bores inward. Returns the destroyed cells.
 ///
-/// A `+Y` shot's lateral axis is world X, which maps to cell-space **col** (axes:
-/// `x = col`, `y = row`): `entry_col ≈ lateral_x / CELL_WORLD_SIZE + 4.5`. So a `+X`
-/// offset carves a **high-col** (`+X`-side) column and a `-X` offset a **low-col**
-/// (`-X`-side) column — never the centre column. (Firing UP into the flat aft face
-/// rather than DOWN across the rounded wing avoids a glancing-ricochet, isolating the
-/// lateral-location property the FIX is about.)
-fn carve_offcentre(lateral_x: f32) -> Vec<(u16, u16)> {
+/// `axis` is the WORLD axis the impact is offset along and the shot travels back down:
+///   - `Vec2::Y` → a LATERAL (wing) hit: world ±Y is perpendicular to the +X nose, so
+///     it maps to cell-space **col** (render: lateral ← col). A `+Y` impact carves a
+///     **high-col** wing, a `-Y` impact a **low-col** wing — both at MID row.
+///   - `Vec2::X` → a FORWARD/AFT (nose/tail) hit: world ±X is the nose axis, mapping to
+///     cell-space **row** (render: forward ← row). A `+X` impact carves the **high-row**
+///     nose, a `-X` impact the **low-row** tail — both at MID col.
+///
+/// `sign` picks the side (+1 = `+axis`, −1 = `-axis`); `dmg` bounds the carve depth so
+/// it stays on the struck side (a runaway budget would chew across the centreline).
+fn carve_on_axis(axis: Vec2, sign: f32, dmg: f32) -> Vec<(u16, u16)> {
     let mut w = World::new();
     insert_full_combat_resources(&mut w);
     // No shield in the way: drain it so the very first carve lands on the hull (the
-    // test is about geometry, not the shield pool).
+    // test is about geometry, not the shield pool). Enemy faces +X at heading 0.
     let enemy = spawn_fitted_enemy_target_spin(&mut w, Vec2::ZERO, 0.0);
     if let Some(mut s) = w.get_mut::<Shields>(enemy) {
         s.current = 0.0;
     }
 
-    // A high-damage, high-penetration straight-UP projectile whose sweep is offset to
-    // one side in world X. It enters the bottom arc of the collision circle at
-    // `x ≈ lateral_x` (the aft engine face), so the impact (and therefore the carve
-    // entry) is on that side.
-    let prev = Vec2::new(lateral_x, -6.0);
-    let pos = Vec2::new(lateral_x, 6.0);
-    let vel = Vec2::new(0.0, 200.0);
-    let dmg = 5000.0;
+    // A projectile that approaches from the `sign * axis` side and travels straight
+    // inward (`-sign * axis`) through the ship centre line on the other component, so
+    // it enters the hull on the struck side and bores toward the centre along that axis.
+    let approach = axis.normalize() * sign * 6.0; // start outside the ~1.76 circle
+    let prev = approach;
+    let pos = -approach; // sweeps across the ship → guaranteed to strike
+    let vel = (pos - prev).normalize() * 200.0;
     w.spawn((
         Projectile,
         Position(pos),
@@ -2499,58 +2522,125 @@ fn carve_offcentre(lateral_x: f32) -> Vec<(u16, u16)> {
     before.difference(&after).copied().collect()
 }
 
-/// FIX (carve location) regression: a projectile striking the target **off-centre**
-/// carves cells on the IMPACT side of the hull — the destroyed cells' centroid is on
-/// the struck wing — NOT a channel through the centre. Guards the exact reported bug
-/// (the hull eroding somewhere other than where the bullet hit).
+/// The (col_centroid, row_centroid) of a set of carved cells.
+fn centroid(cells: &[(u16, u16)]) -> (f32, f32) {
+    let n = cells.len() as f32;
+    let col = cells.iter().map(|&(c, _)| c as f32).sum::<f32>() / n;
+    let row = cells.iter().map(|&(_, r)| r as f32).sum::<f32>() / n;
+    (col, row)
+}
+
+/// FIX (carve axis) regression — the EXACT reported bug: a LATERAL (wing) hit must
+/// carve a WING (the col axis, at mid row), NOT the tail. The enemy faces +X (heading
+/// 0), so its lateral axis is world ±Y. A `+Y` wing hit must carve **high-col** cells
+/// and a `-Y` wing hit **low-col** cells, both clustered near MID row (the wing beam),
+/// never at the fore/aft row extremes. Under the old swapped mapping (col ← forward,
+/// row ← lateral) a lateral hit landed on the ROW axis → it carved the tail; this locks
+/// the fix (col ← lateral, row ← forward).
 #[test]
-fn offcentre_hit_carves_on_the_impact_side_not_the_centre() {
-    // The fighter is a 9×11 grid (cols 0..8, rows 0..10); the centre column is 4.5.
-    let centre_col = 9.0_f32 * 0.5;
-    // World-X offsets that land the carve squarely on a high-col (col ~6) and a low-col
-    // (col ~2.5) column of the aft face — both clearly off the centre column (4.5).
-    // `entry_col ≈ off / CELL_WORLD_SIZE + 4.5`, so `±0.64` ⇒ cols ~6.5 / ~2.5.
-    let off = 2.0 * CELL_WORLD_SIZE; // = 0.64
+fn lateral_wing_hit_carves_the_wing_not_the_tail() {
+    // 9×11 grid (cols 0..8, rows 0..10): centre col 4.5, centre row 5.5. The wing beam
+    // (the broad lateral extent the shot enters head-on) sits around mid row.
+    let centre_col = 9.0_f32 * 0.5; // 4.5
+    let centre_row = 11.0_f32 * 0.5; // 5.5
+                                     // A bounded budget so the carve stays on the struck wing (does not chew across the
+                                     // centreline to the far wing).
+    let dmg = 40.0;
 
-    // --- A clear RIGHT (+X) offset must carve the +X (high-col) side ----------------
-    let right = carve_offcentre(off);
+    // --- +Y lateral (right wing) hit → HIGH-COL carve, MID row ----------------------
+    let right_wing = carve_on_axis(Vec2::Y, 1.0, dmg);
     assert!(
-        !right.is_empty(),
-        "an off-centre right hit must carve at least one cell (it visually struck the hull)"
+        !right_wing.is_empty(),
+        "a +Y lateral wing hit must carve at least one cell (it struck the hull)"
     );
-    let right_centroid_col = right.iter().map(|&(c, _)| c as f32).sum::<f32>() / right.len() as f32;
+    let (rc_col, rc_row) = centroid(&right_wing);
     assert!(
-        right_centroid_col > centre_col,
-        "a +X (right-side) hit must carve cells on the +X side (centroid col {right_centroid_col} \
-         > centre {centre_col}), not through the centre — got {right:?}"
+        rc_col > centre_col,
+        "a +Y (lateral) wing hit carves the +Y WING — high-col cells (centroid col {rc_col} \
+         > centre {centre_col}); under the bug it would carve the tail — got {right_wing:?}"
     );
-
-    // --- A clear LEFT (−X) offset must carve the −X (low-col) side ------------------
-    let left = carve_offcentre(-off);
     assert!(
-        !left.is_empty(),
-        "an off-centre left hit must carve at least one cell"
-    );
-    let left_centroid_col = left.iter().map(|&(c, _)| c as f32).sum::<f32>() / left.len() as f32;
-    assert!(
-        left_centroid_col < centre_col,
-        "a −X (left-side) hit must carve cells on the −X side (centroid col {left_centroid_col} \
-         < centre {centre_col}), not through the centre — got {left:?}"
+        (rc_row - centre_row).abs() < 2.5,
+        "a wing hit carves near MID row (centroid row {rc_row} ≈ {centre_row}), NOT a fore/aft \
+         extreme — the carve is on the wing, not the nose/tail — got {right_wing:?}"
     );
 
-    // --- The two opposite-side hits carve DIFFERENT, mirror-image regions ----------
-    // (The old centre-routing bug would carve the same central channel for both.)
+    // --- −Y lateral (left wing) hit → LOW-COL carve, MID row ------------------------
+    let left_wing = carve_on_axis(Vec2::Y, -1.0, dmg);
     assert!(
-        left_centroid_col < right_centroid_col,
-        "opposite-side hits carve opposite sides ({left_centroid_col} < {right_centroid_col}); \
-         the carve follows the impact, not the centre"
+        !left_wing.is_empty(),
+        "a −Y lateral wing hit must carve at least one cell"
     );
-    // Neither off-centre wing hit reaches the central core column on its own (the carve
-    // is laterally where the bullet struck — the brief's 'cuts a wing, does not auto-bore
-    // to the core' consequence).
+    let (lc_col, lc_row) = centroid(&left_wing);
     assert!(
-        !right.contains(&(4, 4)) && !left.contains(&(4, 4)),
-        "an off-centre wing hit does NOT carve the central core cell (4,4) — it cuts the wing \
-         it struck (right {right:?}, left {left:?})"
+        lc_col < centre_col,
+        "a −Y (lateral) wing hit carves the −Y WING — low-col cells (centroid col {lc_col} \
+         < centre {centre_col}) — got {left_wing:?}"
+    );
+    assert!(
+        (lc_row - centre_row).abs() < 2.5,
+        "the opposite wing hit also carves near MID row (centroid row {lc_row} ≈ {centre_row}) — \
+         got {left_wing:?}"
+    );
+
+    // --- Opposite wings carve OPPOSITE sides (the side/sign is locked) --------------
+    assert!(
+        lc_col < rc_col,
+        "opposite-side lateral hits carve opposite wings ({lc_col} < {rc_col}); the carve tracks \
+         the impact side, not a swapped/centre axis"
+    );
+}
+
+/// The complement: a FORWARD/AFT (nose/tail) hit carves the ROW (fore/aft) axis at the
+/// row extreme, at MID col — NOT a wing. The enemy faces +X (heading 0), so its nose
+/// axis is world ±X, mapping to cell-space row (forward ← row). A `+X` (forward/nose)
+/// hit carves a HIGH-row cell near MID col; a `-X` (aft/tail) hit a LOW-row cell near
+/// MID col. Together with the lateral test this fully locks the row/col mapping.
+#[test]
+fn forward_aft_hit_carves_the_fore_aft_axis_not_a_wing() {
+    let centre_col = 9.0_f32 * 0.5; // 4.5
+    let centre_row = 11.0_f32 * 0.5; // 5.5
+    let dmg = 40.0;
+
+    // --- +X forward (nose) hit → HIGH-row carve, MID col ----------------------------
+    let nose = carve_on_axis(Vec2::X, 1.0, dmg);
+    assert!(
+        !nose.is_empty(),
+        "a +X (nose) hit must carve at least one cell"
+    );
+    let (nose_col, nose_row) = centroid(&nose);
+    assert!(
+        nose_row > centre_row,
+        "a +X (forward) hit carves the NOSE — high-row cells (centroid row {nose_row} \
+         > centre {centre_row}) — got {nose:?}"
+    );
+    assert!(
+        (nose_col - centre_col).abs() < 2.5,
+        "a fore/aft hit carves near MID col (centroid col {nose_col} ≈ {centre_col}), NOT a wing — \
+         got {nose:?}"
+    );
+
+    // --- −X aft (tail) hit → LOW-row carve, MID col ---------------------------------
+    let tail = carve_on_axis(Vec2::X, -1.0, dmg);
+    assert!(
+        !tail.is_empty(),
+        "a −X (tail) hit must carve at least one cell"
+    );
+    let (tail_col, tail_row) = centroid(&tail);
+    assert!(
+        tail_row < centre_row,
+        "a −X (aft) hit carves the TAIL — low-row cells (centroid row {tail_row} \
+         < centre {centre_row}) — got {tail:?}"
+    );
+    assert!(
+        (tail_col - centre_col).abs() < 2.5,
+        "the tail hit carves near MID col (centroid col {tail_col} ≈ {centre_col}), NOT a wing — \
+         got {tail:?}"
+    );
+
+    // --- Nose vs tail carve OPPOSITE row extremes (the fore/aft sign is locked) -----
+    assert!(
+        tail_row < nose_row,
+        "a nose hit and a tail hit carve opposite fore/aft extremes ({tail_row} < {nose_row})"
     );
 }
