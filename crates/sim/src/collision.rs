@@ -8,11 +8,14 @@
 
 use crate::combat::{self, HitFeedback};
 use crate::components::{
-    CollisionRadius, Damage, Health, Position, PrevPosition, Projectile, Ship, Target, TargetKind,
-    Velocity,
+    CollisionRadius, Damage, Heading, Health, Position, PrevPosition, Projectile, ProjectileOwner,
+    Ship, Target, TargetKind, Velocity,
 };
-use crate::physics::{Physics, RapierPhysics};
+use crate::damage::{apply_damage, on_section_destroyed, DamageEvent};
+use crate::fitting::{Fit, FitLayout, HullCatalog, SectionId};
+use crate::physics::{Physics, RapierPhysics, SweptHit};
 use crate::tuning::Tuning;
+use crate::weapon::{damage_event_from_hit, WeaponSource};
 use bevy_ecs::prelude::*;
 use glam::Vec2;
 
@@ -121,11 +124,22 @@ pub fn is_lethal_ram(closing_speed: f32, threshold: f32) -> bool {
 /// from its previous to current position against every target circle. On the
 /// first hit the target takes damage, the projectile despawns, and hit feedback
 /// is raised. Damage is order-independent across simultaneous hits.
+///
+/// **Unfitted-only now (E007, INV-D17)**: the target query gains `Without<FitLayout>`
+/// so this legacy flat-`Health` path resolves **only** unfitted targets
+/// (dummies/asteroids/E002 bots). Fitted ships (those carrying a [`FitLayout`]) are
+/// handled by [`fitted_damage_system`] (the per-module E007 pipeline) instead, so
+/// no target is processed by both. The `Without<FitLayout>` filter is a **no-op**
+/// for every existing unfitted target, so the E002/E003 behavior is byte-for-byte
+/// identical (the flat `apply_damage` clamp + despawn).
 pub fn collision_detect_system(
     mut commands: Commands,
     mut feedback: ResMut<HitFeedback>,
     projectiles: Query<(Entity, &Position, &PrevPosition, &Damage), With<Projectile>>,
-    mut targets: Query<(&Position, &CollisionRadius, &mut Health), With<Target>>,
+    mut targets: Query<
+        (&Position, &CollisionRadius, &mut Health),
+        (With<Target>, Without<FitLayout>),
+    >,
 ) {
     let physics = RapierPhysics::new();
     for (projectile, pos, prev, dmg) in &projectiles {
@@ -139,6 +153,227 @@ pub fn collision_detect_system(
                 commands.entity(projectile).despawn();
                 break; // a projectile strikes at most one target
             }
+        }
+    }
+}
+
+/// A recorded projectile→fitted-target hit, collected in the query phase so the
+/// exclusive `apply_damage` (which takes `&mut World`) runs after the borrow ends.
+struct FittedHit {
+    /// The projectile to despawn.
+    projectile: Entity,
+    /// The fitted ship struck.
+    target: Entity,
+    /// The typed event built from the shot, in the target's **hull-local cell-space**.
+    event: DamageEvent,
+}
+
+/// Build the hull-local entry ray for a world-space projectile hit on a fitted
+/// target (the local-space transform the E007 pipeline expects, T038).
+///
+/// `apply_damage`/`resolve_entry_point` trace `ev.point → ev.point + ev.dir·REACH`
+/// across the target's **hull-local cell-space** (cells at integer coords, centers
+/// at `coord + 0.5`). This maps the world hit into that space:
+///
+/// 1. **Direction**: rotate the projectile's world travel direction `world_dir`
+///    into the hull frame by `-heading` (the inverse ship rotation), giving the
+///    incoming `dir_local`.
+/// 2. **Entry point**: place it on the far side of the grid **opposite** the
+///    incoming direction, through the grid center, so the local ray sweeps the
+///    whole chassis along `dir_local` and lands on the first occupied cell it
+///    crosses (mirroring the `REACH`-extended sweep `resolve_entry_point` does).
+///    `grid_center = (cols, rows)/2`; the entry sits `span` back along `-dir_local`
+///    where `span` over-covers the grid diagonal.
+///
+/// This is the **simplest correct** transform for the e2e (the brief's documented
+/// option): it does not depend on the world hit's offset within the target circle
+/// (which the coarse unit-cell grid cannot resolve sub-cell anyway), only on the
+/// incoming direction, so a shot fired *at* a fitted ship reliably resolves to a
+/// real module along its flight line. World scale ↔ local cell scale is decoupled:
+/// the local ray is constructed in cell-space directly.
+fn hull_local_entry_ray(world_dir: Vec2, heading: f32, grid_dims: (u16, u16)) -> (Vec2, Vec2) {
+    let dir_local = if world_dir.length_squared() > f32::EPSILON {
+        // Inverse ship rotation: world → hull-local.
+        Vec2::from_angle(-heading)
+            .rotate(world_dir)
+            .normalize_or_zero()
+    } else {
+        Vec2::ZERO
+    };
+    let grid_center = Vec2::new(grid_dims.0 as f32 * 0.5, grid_dims.1 as f32 * 0.5);
+    // Over-cover the grid diagonal so the entry sits fully outside the chassis on
+    // the incoming side; the ray then crosses the centre along `dir_local`.
+    let span = (grid_dims.0.max(grid_dims.1) as f32) + 2.0;
+    let point = grid_center - dir_local * span;
+    (point, dir_local)
+}
+
+/// Map a struck cell to the [`SectionId`] it belongs to on `ship`'s hull (the same
+/// hull lookup `on_section_destroyed` uses, T038), so a destroyed module triggers
+/// its section's destruction chain. `None` for a cell the hull never authored.
+fn section_of_struck_cell(world: &World, ship: Entity, cell: (u16, u16)) -> Option<SectionId> {
+    let fit = world.get::<Fit>(ship)?;
+    let hulls = world.get_resource::<HullCatalog>()?;
+    let hull = hulls.get(fit.hull)?;
+    hull.cells
+        .iter()
+        .find(|gc| gc.coord == cell)
+        .map(|gc| gc.section)
+}
+
+/// Fixed-step per-module damage for **fitted** targets (E007, T038/T039;
+/// FR-001/021, INV-D16/D17) — the exclusive-`&mut World` successor to the legacy
+/// flat-`Health` path for ships carrying a [`FitLayout`].
+///
+/// It runs the **same** swept-ray CCD as [`collision_detect_system`]
+/// ([`RapierPhysics::swept_cast`] — no new geometry, no tunnel, FR-021) but routes
+/// each hit through the E007 [`apply_damage`] pipeline (Shields → Armor → Hull →
+/// Systems, per-module health). It is exclusive because `apply_damage` needs
+/// `&mut World`; the projectile/target sweep is therefore collected **first** (the
+/// query borrow released) and the mutations applied after.
+///
+/// Steps:
+/// 1. **Sweep** every `(Projectile, WeaponSource)` vs every fitted target
+///    (`With<FitLayout>`), skipping self-hits via [`ProjectileOwner`] (E002), and
+///    record the **first** target struck per projectile (lowest `toi`).
+/// 2. For each recorded hit: transform the world hit into the target's hull-local
+///    cell-space ([`hull_local_entry_ray`]), build the [`DamageEvent`]
+///    ([`damage_event_from_hit`]), and apply it ([`apply_damage`]). Set the hit/
+///    destroy flash + the legibility tag ([`HitFeedback::last_kind`], FR-024) and
+///    despawn the projectile.
+/// 3. **Destruction trigger**: if the outcome destroyed a struck module, map its
+///    cell → [`SectionId`] and call [`on_section_destroyed`] (connectivity → sever
+///    → wreck → salvage). MVP coupling: a destroyed module destroys its section
+///    (coarse, documented).
+///
+/// **Graceful degradation (INV-D16)**: a world with no fitted targets (the E002/
+/// E003/determinism worlds) records no hits and is a no-op; `apply_damage` /
+/// `on_section_destroyed` themselves bail (return `NoModule` / no-op) when an E007
+/// resource or catalog is absent, so a world missing them never panics. Server-
+/// authoritative — only the server runs this; the client predicts the same path.
+pub fn fitted_damage_system(world: &mut World) {
+    // --- 1. Collect hits (query borrow released before any &mut World use) -------
+    let physics = RapierPhysics::new();
+    let mut hits: Vec<FittedHit> = Vec::new();
+
+    // Snapshot the fitted targets once (Entity, world pos, radius, heading, grid).
+    let mut target_q = world.query_filtered::<(
+        Entity,
+        &Position,
+        &CollisionRadius,
+        &Heading,
+        &FitLayout,
+        &Fit,
+    ), With<FitLayout>>();
+    // Resolve each fitted target's grid dims from its hull (so the local ray spans
+    // the chassis); a target whose hull is unresolvable is skipped (no panic).
+    let hull_dims: std::collections::BTreeMap<Entity, (u16, u16)> = {
+        let hulls = world.get_resource::<HullCatalog>();
+        target_q
+            .iter(world)
+            .filter_map(|(e, _, _, _, _, fit)| {
+                hulls
+                    .and_then(|h| h.get(fit.hull))
+                    .map(|hull| (e, hull.grid_dims))
+            })
+            .collect()
+    };
+    let targets: Vec<(Entity, Vec2, f32, f32)> = target_q
+        .iter(world)
+        .map(|(e, p, r, h, _, _)| (e, p.0, r.0, h.0))
+        .collect();
+
+    let mut proj_q = world.query_filtered::<(
+        Entity,
+        &Position,
+        &PrevPosition,
+        &Velocity,
+        &Damage,
+        &WeaponSource,
+        Option<&ProjectileOwner>,
+    ), With<Projectile>>();
+    for (projectile, pos, prev, vel, dmg, src, owner) in proj_q.iter(world) {
+        let owner_e = owner.map(|o| o.0);
+        // First target struck along the sweep (lowest toi), skipping self-hits.
+        // Carry the target heading so the local-ray transform has it in the apply
+        // phase without re-querying.
+        let mut best: Option<(Entity, f32, SweptHit)> = None;
+        for &(target, tpos, radius, heading) in &targets {
+            if owner_e == Some(target) {
+                continue; // self-hit prevention (E002 ProjectileOwner)
+            }
+            let Some(hit) = physics.swept_cast(prev.0, pos.0, tpos, radius) else {
+                continue;
+            };
+            let take = match best {
+                None => true,
+                Some((_, _, ref b)) => hit.toi < b.toi,
+            };
+            if take {
+                best = Some((target, heading, hit));
+            }
+        }
+        if let Some((target, heading, hit)) = best {
+            let Some(&dims) = hull_dims.get(&target) else {
+                // Hull unresolvable for this target: skip (no panic, INV-D16).
+                continue;
+            };
+            let (point, dir_local) = hull_local_entry_ray(vel.0, heading, dims);
+            let local_hit = SweptHit {
+                toi: hit.toi,
+                point,
+            };
+            let event = damage_event_from_hit(&local_hit, src, dmg.0, dir_local, owner_e);
+            hits.push(FittedHit {
+                projectile,
+                target,
+                event,
+            });
+        }
+    }
+
+    // --- 2. Apply each hit through the E007 pipeline (exclusive &mut World) -------
+    for FittedHit {
+        projectile,
+        target,
+        event,
+    } in hits
+    {
+        let outcome = apply_damage(world, target, event);
+
+        // Feedback (FR-024): flash + the legibility tag the HUD reads.
+        if let Some(mut feedback) = world.get_resource_mut::<HitFeedback>() {
+            feedback.hit_flash = combat::FLASH_TIME;
+            feedback.last_kind = Some(outcome.result);
+            if outcome.destroyed {
+                feedback.destroy_flash = combat::FLASH_TIME;
+            }
+        }
+
+        // --- 3. Destruction trigger (the chain T040 exercises) -------------------
+        // A destroyed module destroys its section (MVP coupling): map the struck
+        // cell → SectionId and run connectivity → sever → wreck → salvage.
+        if outcome.destroyed {
+            if let Some(struck) = outcome.struck {
+                let cell = world.get::<FitLayout>(target).and_then(|l| {
+                    l.cells
+                        .iter()
+                        .find(|(_, occ)| {
+                            occ.slot == struck.slot && occ.module == Some(struck.module)
+                        })
+                        .map(|(&c, _)| c)
+                });
+                if let Some(cell) = cell {
+                    if let Some(section) = section_of_struck_cell(world, target, cell) {
+                        on_section_destroyed(world, target, section);
+                    }
+                }
+            }
+        }
+
+        // The projectile strikes at most one target, then despawns (E002 parity).
+        if let Ok(e) = world.get_entity_mut(projectile) {
+            e.despawn();
         }
     }
 }

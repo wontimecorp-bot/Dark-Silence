@@ -30,6 +30,7 @@ pub mod tuning;
 pub mod weapon;
 
 pub use clock::FixedDt;
+pub use collision::fitted_damage_system;
 pub use combat::HitFeedback;
 pub use components::{
     AngularVelocity, CollisionRadius, Damage, FlightAssist, Heading, Health, Lifetime, Position,
@@ -44,7 +45,9 @@ pub use intent::ShipIntent;
 pub use motion::{analytic, integrate, simulate, BodyState};
 pub use physics::{Physics, RapierPhysics, SweptHit};
 pub use tuning::Tuning;
+pub use weapon::{damage_event_from_hit, WeaponSource};
 
+use bevy_ecs::schedule::common_conditions::resource_exists;
 use bevy_ecs::schedule::{IntoScheduleConfigs, Schedule};
 
 /// Register the shared fixed-step gameplay systems, in their **canonical order**,
@@ -64,16 +67,49 @@ use bevy_ecs::schedule::{IntoScheduleConfigs, Schedule};
 /// 2. [`flight::ship_motion_system`]
 /// 3. [`weapon::weapon_fire_system`]
 /// 4. [`weapon::projectile_step_system`]
-/// 5. [`collision::collision_detect_system`]
-/// 6. [`collision::ram_collision_system`]
-/// 7. [`combat::destruction_system`]
-/// 8. [`combat::feedback_decay_system`]
+/// 5. [`collision::collision_detect_system`] — unfitted flat-`Health` hits (INV-D17)
+/// 6. [`collision::fitted_damage_system`] — fitted per-module E007 pipeline (E007)
+/// 7. [`collision::ram_collision_system`]
+/// 8. [`damage::shield_regen_system`] — powered shield regen/decay (E007, gated)
+/// 9. [`fitting::recompute_ship_stats_system`] — emergent re-derive (E007, gated)
+/// 10. [`combat::destruction_system`]
+/// 11. [`combat::feedback_decay_system`]
 ///
-/// The caller is responsible for inserting the resources the systems read
-/// ([`FixedDt`], [`Tuning`], [`HitFeedback`]) into the `World` before running
-/// the schedule, and for attaching a [`ShipIntent`] **component** to every
-/// piloted ship (intent is per-entity, not a global resource — the server drives
-/// N independently-controlled ships in one shared step).
+/// **Ordering rationale (E007, FR-021/SC-002, INV-D16)**:
+/// - `fitted_damage_system` runs right after the legacy `collision_detect_system`:
+///   the two are mutually exclusive (unfitted vs fitted targets, INV-D17), so they
+///   form the complete weapon-hit resolution for this tick.
+/// - It mutates each struck ship's [`FitLayout`] (per-module health) and, on a
+///   module kill, runs the destruction chain (`on_section_destroyed`).
+/// - `recompute_ship_stats_system` MUST run **after** it so the `Changed<FitLayout>`
+///   re-derive applies the emergent [`ShipStats`] drop **this** tick (SC-002 live —
+///   a battered ship immediately flies/fires worse).
+/// - `shield_regen_system` sits before the re-derive so a depleted/unpowered shield
+///   regens/decays on the freshly-applied damage state.
+///
+/// **Graceful degradation (INV-D16)**: the two E007 query systems read content
+/// resources ([`ShieldConfig`](damage::ShieldConfig) /
+/// [`HullCatalog`](fitting::HullCatalog) + [`ModuleCatalog`](fitting::ModuleCatalog))
+/// that the E002/E003/determinism worlds do **not** insert. They are therefore each
+/// gated on `resource_exists` so they are simply **skipped** (never panic) in a
+/// world without those resources — the unfitted-only worlds (the determinism bots,
+/// E002/E003 tests) keep the exact prior behavior. `fitted_damage_system` is
+/// exclusive (`&mut World`) and self-degrades (it finds no fitted targets / bails on
+/// a missing resource), so it needs no gate.
+///
+/// The caller is responsible for inserting the resources the **base** systems read
+/// ([`FixedDt`], [`Tuning`], [`HitFeedback`]) into the `World` before running the
+/// schedule, and for attaching a [`ShipIntent`] **component** to every piloted ship
+/// (intent is per-entity, not a global resource — the server drives N
+/// independently-controlled ships in one shared step). For the **fitted** E007 path
+/// to resolve, the caller additionally inserts
+/// [`ResistanceMatrix`](damage::ResistanceMatrix),
+/// [`PenetrationConfig`](damage::PenetrationConfig),
+/// [`ShieldConfig`](damage::ShieldConfig),
+/// [`SalvageConfig`](damage::SalvageConfig),
+/// [`ModuleCatalog`](fitting::ModuleCatalog), and
+/// [`HullCatalog`](fitting::HullCatalog); absent these the fitted path is a
+/// well-defined no-op.
 pub fn add_fixed_step_systems(schedule: &mut Schedule) {
     schedule.add_systems(
         (
@@ -82,7 +118,17 @@ pub fn add_fixed_step_systems(schedule: &mut Schedule) {
             weapon::weapon_fire_system,
             weapon::projectile_step_system,
             collision::collision_detect_system,
+            collision::fitted_damage_system,
             collision::ram_collision_system,
+            // E007 powered shield regen/decay — gated so an unfitted world (no
+            // ShieldConfig) skips it without panicking (graceful degradation).
+            damage::shield_regen_system.run_if(resource_exists::<damage::ShieldConfig>),
+            // E007 emergent re-derive — runs AFTER fitted_damage_system so the
+            // Changed<FitLayout> stat drop applies this tick (SC-002). Gated so a
+            // world without the fit catalogs skips it (graceful degradation).
+            fitting::recompute_ship_stats_system
+                .run_if(resource_exists::<fitting::HullCatalog>)
+                .run_if(resource_exists::<fitting::ModuleCatalog>),
             combat::destruction_system,
             combat::feedback_decay_system,
         )

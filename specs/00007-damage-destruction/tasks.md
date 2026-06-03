@@ -93,23 +93,23 @@
 
 **Goal**: the non-degenerate-matrix guard (every channel beats a layer, every layer resists a channel) and a minimal legible client cue (ricochet/penetrate/shield-absorb). **Independent test**: SC-005.
 
-- [ ] T035 [US5] {FR-023} [COMPLETES FR-023] Non-degenerate matrix guard test in `crates/sim/tests/damage.rs` — over `(Channel × DefenseLayer)` every channel beats a layer and every layer resists a channel; no dominant channel, no bypassed layer (INV-D11) (SC-005) after:T006 ← T005:layer_resist ← T006:default_resistance_matrix
-- [ ] T036 [US5] {FR-024} [COMPLETES FR-024] Surface the `HitKind`/`DamageOutcome` legibility tag (ricochet vs penetration vs shield-absorb + affected module/layer) as a minimal diegetic cue in `crates/client/src/hud.rs` — presentation-only, no authority, no numeric spam (SC-005) after:T017 ← T017:DamageOutcome,HitKind
+- [X] T035 [US5] {FR-023} [COMPLETES FR-023] Non-degenerate matrix guard test in `crates/sim/tests/damage.rs` — over `(Channel × DefenseLayer)` every channel beats a layer and every layer resists a channel; no dominant channel, no bypassed layer (INV-D11) (SC-005) after:T006 ← T005:layer_resist ← T006:default_resistance_matrix
+- [X] T036 [US5] {FR-024} [COMPLETES FR-024] Surface the `HitKind`/`DamageOutcome` legibility tag (ricochet vs penetration vs shield-absorb + affected module/layer) as a minimal diegetic cue in `crates/client/src/hud.rs` — presentation-only, no authority, no numeric spam (SC-005) after:T017 ← T017:DamageOutcome,HitKind
 
 ## Phase 8: Combat Integration (live wire-up)
 
 **Goal**: build a `DamageEvent` from a weapon hit and route a fitted-ship hit through `apply_damage`, replacing the E002 whole-ship `Health` path for fitted ships while keeping unfitted targets on simplified `Health`; register the pipeline + destruction worker in the `sim` fixed step.
 
-- [ ] T037 {FR-001} Implement `damage_event_from_hit(projectile, &SweptHit, &WeaponSource) -> DamageEvent` in `crates/sim/src/weapon.rs` — channel/pen/size from weapon data + geometry from the reused `SweptHit` after:T004,T021 ← T004:DamageEvent → exports: damage_event_from_hit(), WeaponSource
-- [ ] T038 {FR-001,FR-021} [COMPLETES FR-001] Rewire the combat hit path in `crates/sim/src/combat.rs` — **fitted** target → `apply_damage` (replacing the E002 whole-ship `Health` path); **unfitted** target → legacy `Health` clamp verbatim (degenerate, INV-D17); reuse the swept CCD (no tunnel) after:T017,T021,T037 ← T017:apply_damage ← T037:damage_event_from_hit
-- [ ] T039 {FR-021} [COMPLETES FR-021] Register the damage systems in the `sim` fixed step in `crates/sim/src/lib.rs` — `shield_regen_system` + the destruction worker (`on_section_destroyed`, only on destruction events) + the `Changed<FitLayout>` re-derive ordering; all resolution server-authoritative (INV-D16) after:T015,T028,T038 ← T015:shield_regen_system ← T028:on_section_destroyed
-- [ ] T040 Integration test (end-to-end, fitted ship): a fired E002 projectile → swept hit → `damage_event_from_hit` → `apply_damage` → module damage → emergent `ShipStats` drop → section destroyed → sever → wreck → salvage, in a `sim` world (SC-001..SC-004 e2e) after:T020,T028,T032,T038,T039
-- [ ] T041 [P] Integration test (unfitted degenerate path): a projectile hit on a `FitLayout`-less dummy/asteroid resolves via the flat `Health` clamp and despawns at `<=0` — E002/E003 targets + the simplified path stay green (INV-D17) in `crates/sim/tests/damage.rs` after:T038
+- [X] T037 {FR-001} Implement `damage_event_from_hit(projectile, &SweptHit, &WeaponSource) -> DamageEvent` in `crates/sim/src/weapon.rs` — channel/pen/size from weapon data + geometry from the reused `SweptHit` after:T004,T021 ← T004:DamageEvent → exports: damage_event_from_hit(), WeaponSource
+- [X] T038 {FR-001,FR-021} [COMPLETES FR-001] Rewire the combat hit path in `crates/sim/src/combat.rs` — **fitted** target → `apply_damage` (replacing the E002 whole-ship `Health` path); **unfitted** target → legacy `Health` clamp verbatim (degenerate, INV-D17); reuse the swept CCD (no tunnel) after:T017,T021,T037 ← T017:apply_damage ← T037:damage_event_from_hit
+- [X] T039 {FR-021} [COMPLETES FR-021] Register the damage systems in the `sim` fixed step in `crates/sim/src/lib.rs` — `shield_regen_system` + the destruction worker (`on_section_destroyed`, only on destruction events) + the `Changed<FitLayout>` re-derive ordering; all resolution server-authoritative (INV-D16) after:T015,T028,T038 ← T015:shield_regen_system ← T028:on_section_destroyed
+- [X] T040 Integration test (end-to-end, fitted ship): a fired E002 projectile → swept hit → `damage_event_from_hit` → `apply_damage` → module damage → emergent `ShipStats` drop → section destroyed → sever → wreck → salvage, in a `sim` world (SC-001..SC-004 e2e) after:T020,T028,T032,T038,T039
+- [X] T041 [P] Integration test (unfitted degenerate path): a projectile hit on a `FitLayout`-less dummy/asteroid resolves via the flat `Health` clamp and despawns at `<=0` — E002/E003 targets + the simplified path stay green (INV-D17) in `crates/sim/tests/damage.rs` after:T038
 
 ## Phase 9: Polish & Cross-Cutting
 
-- [ ] T042 [P] Run the E001/E002/E006 regression suites — `cargo test -p sim` across `gameplay.rs`, `physics_swap.rs`, and especially `fitting.rs` (the `derive_ship_stats` signature ripple) + the unfitted-target path — and confirm all green after:T040,T041
-- [ ] T043 [P] Full workspace gate: `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`, `cargo audit` after:T040,T041
+- [X] T042 [P] Run the E001/E002/E006 regression suites — `cargo test -p sim` across `gameplay.rs`, `physics_swap.rs`, and especially `fitting.rs` (the `derive_ship_stats` signature ripple) + the unfitted-target path — and confirm all green after:T040,T041
+- [X] T043 [P] Full workspace gate: `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`, `cargo audit` after:T040,T041
 
 ---
 

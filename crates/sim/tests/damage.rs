@@ -1321,3 +1321,415 @@ fn destroyed_ship_persists_as_a_claimed_once_lootable_wreck() {
     );
     assert!(wreck_mut.claimed, "the wreck is flagged claimed");
 }
+
+// --- T035 (FR-023): the matrix is non-degenerate (INV-D11) --------------------
+//
+// A pure, test-guarded property over the FULL `(Channel × DefenseLayer)` content
+// grid (SC-005, INV-D11): every channel beats a layer, every layer resists a
+// channel, no channel is globally dominant, no layer is universally bypassed —
+// and every cell stays bounded (INV-D02 cross-check). The guard is CI, not a
+// runtime branch: it reads only `default_resistance_matrix()` content.
+//
+// Seed mitigation tiers (mirroring `content.rs`): `LOW = 0.10` (the channel gets
+// through), `MID = 0.40` (neutral), `HIGH = 0.70` (the layer strongly resists).
+
+/// Low tier — a channel's strong-vs layer; most of it gets through.
+const NDG_LOW: f32 = 0.10;
+/// Mid tier — the neutral middle of the table.
+const NDG_MID: f32 = 0.40;
+/// High tier — a layer strongly resists the channel (still `< 1.0`, INV-D02).
+const NDG_HIGH: f32 = 0.70;
+
+/// The non-degenerate-matrix guard (FR-023, INV-D11, SC-005): the default
+/// resistance matrix is a *real, readable choice* — effective-HP curves cross.
+///
+/// Asserts, over the full `(Channel::ALL × DefenseLayer::ALL)` grid:
+/// 1. **Every channel beats a layer**: its `min` mitigation across the 4 layers is
+///    `<= NDG_LOW` (it gets through somewhere — no channel is walled out).
+/// 2. **Every layer resists a channel**: its `max` mitigation across the 5 channels
+///    is `>= NDG_HIGH` (it strongly stops something — no useless/bypassed layer).
+/// 3. **No globally dominant channel**: every channel is *meaningfully* resisted by
+///    at least one layer (its `max` mitigation across the layers is `>= NDG_MID`, a
+///    real 40 % bite), so no single channel beats everything. (The bar is `>= MID`
+///    rather than `>= HIGH` because the seed deliberately gives `Radiation` no
+///    `HIGH` resistor — its preferred-target axis is `Systems` like `Em`, and its
+///    best resistance is the neutral `MID`; that is still non-dominant, INV-D11.)
+/// 4. **Bounded** (INV-D02 cross-check): every cell `∈ [0.0, MAX_MITIGATION < 1.0)`.
+#[test]
+fn matrix_is_non_degenerate() {
+    let matrix = default_resistance_matrix();
+    let layers = DefenseLayer::ALL; // [Shields, Armor, HullStructure, Systems] — COUNT == 4
+    assert_eq!(layers.len(), DefenseLayer::COUNT);
+    assert_eq!(layers.len(), 4);
+    assert_eq!(Channel::ALL.len(), 5);
+
+    // (1) Every CHANNEL has a layer it BEATS: its minimum mitigation across the 4
+    // layers is low — it gets through somewhere; no channel is walled out.
+    for channel in Channel::ALL {
+        let min_over_layers = layers
+            .iter()
+            .map(|&layer| layer_resist(&matrix, layer, channel))
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            min_over_layers <= NDG_LOW,
+            "channel {channel:?} is resisted everywhere (min mitigation {min_over_layers} > LOW \
+             {NDG_LOW}) — no layer it beats (INV-D11)"
+        );
+        // Defensive: stays strictly below the neutral middle, i.e. genuinely weak.
+        assert!(
+            min_over_layers < NDG_MID,
+            "channel {channel:?} never drops below MID — no real soft spot (INV-D11)"
+        );
+    }
+
+    // (2) Every LAYER RESISTS a channel: its maximum mitigation across the 5
+    // channels is high — it strongly stops something; no useless/bypassed layer.
+    for &layer in &layers {
+        let max_over_channels = Channel::ALL
+            .iter()
+            .map(|&channel| layer_resist(&matrix, layer, channel))
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            max_over_channels >= NDG_HIGH,
+            "layer {layer:?} resists nothing (max mitigation {max_over_channels} < HIGH \
+             {NDG_HIGH}) — a bypassed/useless layer (INV-D11)"
+        );
+        assert!(
+            max_over_channels > NDG_MID,
+            "layer {layer:?} never rises above MID — no channel it truly resists (INV-D11)"
+        );
+    }
+
+    // (3) No globally DOMINANT channel: every channel is *meaningfully* resisted by
+    // at least one layer (its max across layers is >= MID), so no single channel
+    // beats everything. `>= MID` (not `>= HIGH`) because the seed gives Radiation no
+    // HIGH resistor (Systems-axis like Em); MID resistance is still non-dominant.
+    for channel in Channel::ALL {
+        let max_over_layers = layers
+            .iter()
+            .map(|&layer| layer_resist(&matrix, layer, channel))
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            max_over_layers >= NDG_MID,
+            "channel {channel:?} is dominant (no layer resists it meaningfully: max mitigation \
+             {max_over_layers} < MID {NDG_MID}) — INV-D11"
+        );
+    }
+
+    // (4) Bounded (INV-D02 cross-check): every cell ∈ [0.0, MAX_MITIGATION < 1.0).
+    for &layer in &layers {
+        for channel in Channel::ALL {
+            let m = layer_resist(&matrix, layer, channel);
+            assert!(
+                m.is_finite() && (0.0..1.0).contains(&m),
+                "cell ({layer:?},{channel:?}) = {m} out of [0,1) (INV-D02)"
+            );
+        }
+    }
+    assert!(
+        matrix.is_bounded(),
+        "the seeded matrix violates the INV-D02 bound MAX_MITIGATION < 1.0"
+    );
+}
+
+// =================================================================================
+// Phase 8 — combat integration (live wire-up): T040 (fitted e2e) + T041 (unfitted
+// degenerate path). A fired E002 projectile carrying a `WeaponSource` sweeps a
+// target; a fitted target (`FitLayout`) routes through `apply_damage` → module
+// damage → emergent stat drop → section destroyed → sever → wreck/salvage
+// (SC-001..SC-004 e2e), while an unfitted target keeps the flat `Health` clamp
+// (INV-D17, E002/E003 parity).
+// =================================================================================
+
+use bevy_ecs::schedule::Schedule;
+use sim::components::{
+    CollisionRadius, Damage, Health, Lifetime, PrevPosition, Projectile, ProjectileOwner, Ship,
+    Target, TargetKind,
+};
+use sim::fitting::{recompute_ship_stats_system, ShipStats};
+use sim::weapon::WeaponSource;
+use sim::{FixedDt, HitFeedback, Tuning};
+
+/// Insert every resource the **fitted** E007 path (the schedule + `apply_damage` +
+/// the destruction chain) resolves against, plus the base sim resources.
+fn insert_full_combat_resources(w: &mut World) {
+    let (modules, hulls) = seed_catalogs();
+    w.insert_resource(modules);
+    w.insert_resource(hulls);
+    w.insert_resource(default_resistance_matrix());
+    w.insert_resource(PenetrationConfig::default());
+    w.insert_resource(ShieldConfig::default());
+    w.insert_resource(SalvageConfig::default());
+    w.insert_resource(Tuning::default());
+    w.insert_resource(FixedDt(1.0 / 30.0));
+    w.insert_resource(HitFeedback::default());
+}
+
+/// A fitted fighter at world origin (heading 0): central reactor (2,2) covered by a
+/// thin armor plate (2,3), full defense-layer state + a derived `ShipStats`, body
+/// components, and a `CollisionRadius` large enough that a downward projectile
+/// sweep strikes it. A downward (`-y`) world shot transforms to a downward local
+/// ray that enters the (2,3) cover then the (2,2) reactor behind it.
+fn fitted_fighter_at_origin(w: &mut World) -> Entity {
+    let (modules, hulls) = seed_catalogs();
+    let hull = hulls.get(HULL_FIGHTER).unwrap();
+
+    let mut fit = Fit::new(HULL_FIGHTER);
+    fit.install_raw(SlotId(0), MODULE_REACTOR_BASIC); // reactor (2,2), health_max 30
+    fit.install_raw(SlotId(1), MODULE_THRUSTER_BASIC); // a thruster so ShipStats has thrust
+    fit.install_raw(SlotId(5), MODULE_ARMOR_PLATE); // cover (2,3)
+    let layout = build_layout(hull, &fit, &modules);
+    let stats = derive_ship_stats(hull, &fit, &modules, &layout);
+
+    // A thin steel facet on the entry armor section (SectionId 5) so the shot
+    // clean-penetrates the cover and reaches the reactor behind.
+    let mut armor = SectionArmor::new();
+    armor.sections.insert(
+        SectionId(5),
+        ArmorFacet {
+            thickness: 1.0,
+            material: ArmorMaterial::Steel,
+            normal: Vec2::new(0.0, 1.0),
+        },
+    );
+
+    w.spawn((
+        Ship,
+        fit,
+        layout,
+        stats,
+        armor,
+        HullStructure::full(500.0),
+        Position(Vec2::ZERO),
+        PrevPosition(Vec2::ZERO),
+        Velocity(Vec2::ZERO),
+        Heading(0.0),
+        AngularVelocity(0.0),
+        CollisionRadius(4.0),
+    ))
+    .id()
+}
+
+/// Spawn a projectile positioned + aimed so its `prev → pos` sweep strikes the
+/// fitted target at origin, carrying a high-penetration `WeaponSource` (Kinetic,
+/// `from_damage`) that clean-penetrates the thin cover and destroys the reactor.
+fn spawn_downward_projectile(w: &mut World, owner: Option<Entity>, damage: f32) -> Entity {
+    // Coming straight down through the target circle at origin: prev above, pos at
+    // the centre, velocity downward (so dir_local == (0,-1) at heading 0).
+    let prev = Vec2::new(0.0, 6.0);
+    let pos = Vec2::new(0.0, 0.0);
+    let vel = Vec2::new(0.0, -180.0);
+    let mut e = w.spawn((
+        Projectile,
+        Position(pos),
+        PrevPosition(prev),
+        Velocity(vel),
+        Damage(damage),
+        Lifetime(3.0),
+        WeaponSource::from_damage(damage),
+    ));
+    if let Some(o) = owner {
+        e.insert(ProjectileOwner(o));
+    }
+    e.id()
+}
+
+// --- T040: fitted end-to-end (hit → damage → stat drop → sever → wreck) -----------
+
+/// The full fitted chain in a `sim` `World` driven by the shared fixed step: a
+/// fired projectile sweep-hits a fitted ship → `damage_event_from_hit` →
+/// `apply_damage` → the buried reactor's health drops to 0 → the emergent
+/// `recompute_ship_stats_system` re-derives degraded `ShipStats` (the reactor's
+/// power collapses) → the reactor's section is destroyed → connectivity/sever →
+/// a `Wreck` with salvage exists (SC-001..SC-004 e2e, FR-001/021).
+#[test]
+fn fitted_projectile_hit_drives_the_full_damage_to_wreck_chain() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    let ship = fitted_fighter_at_origin(&mut w);
+
+    // Baseline: the ship is powered (alive reactor) and the reactor cell is full.
+    let reactor_max = w
+        .get_resource::<ModuleCatalog>()
+        .unwrap()
+        .get(MODULE_REACTOR_BASIC)
+        .unwrap()
+        .health_max;
+    assert_eq!(
+        w.get::<FitLayout>(ship)
+            .unwrap()
+            .occupant((2, 2))
+            .unwrap()
+            .health,
+        reactor_max,
+        "the buried reactor starts at full health"
+    );
+
+    // A high-damage Kinetic shot (penetration = damage * PEN_PER_DAMAGE) clean-
+    // penetrates the thin (steel, thickness 1) cover and overkills the reactor.
+    let proj = spawn_downward_projectile(&mut w, None, 1000.0);
+
+    // Drive the shared fixed step ONCE — the same pipeline the server/client run.
+    let mut schedule = Schedule::default();
+    sim::add_fixed_step_systems(&mut schedule);
+    schedule.run(&mut w);
+
+    // --- SC-001: the hit resolved through apply_damage to a real module ----------
+    // The projectile despawned (it struck exactly one target).
+    assert!(
+        w.get_entity(proj).is_err(),
+        "the projectile despawned after striking the fitted target"
+    );
+    // The legibility tag was set (FR-024): a clean penetration on a fitted target.
+    let fb = w.get_resource::<HitFeedback>().unwrap();
+    assert!(fb.hit_flash > 0.0, "a fitted hit raises the hit flash");
+    assert_eq!(
+        fb.last_kind,
+        Some(HitKind::Penetrated),
+        "the clean penetration is tagged for the HUD (FR-024)"
+    );
+
+    // --- SC-003: the reactor's section was destroyed → the ship is a wreck --------
+    // Destroying the reactor's section (it is the deepest/most-central cell on the
+    // fighter, so its loss is the whole-ship-destroyed path) leaves a persistent
+    // DestroyedShip wreck on the (now dead) ship entity.
+    let wreck = w
+        .get::<Wreck>(ship)
+        .expect("the reactor kill destroyed the ship → a persistent Wreck (SC-003)");
+    assert_eq!(wreck.origin, WreckOrigin::DestroyedShip);
+
+    // --- SC-004: the wreck carries salvage (over-kill still yields >= scrap) ------
+    let contents = salvage(wreck);
+    assert!(
+        !contents.is_empty(),
+        "the destroyed ship leaves lootable salvage (SC-004)"
+    );
+
+    // The ship is still a persistent physical body (it IS the wreck).
+    assert!(
+        w.get::<Position>(ship).is_some(),
+        "the wreck persists as a physical body"
+    );
+}
+
+/// A focused slice of the same chain isolating the **emergent stat drop** (SC-002):
+/// a hit that destroys the reactor, followed by the re-derive, collapses the ship's
+/// `power_supply` to the hull capacity alone (the reactor contributes 0). Driven
+/// without the whole-ship destruction so the live degraded `ShipStats` is readable
+/// on a surviving ship.
+#[test]
+fn fitted_damage_drops_emergent_ship_stats_after_rederive() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+
+    // A fighter whose ENTRY module (the (2,3) armor plate) is a non-core section, so
+    // destroying it does NOT whole-ship-destroy the ship — the ship survives and its
+    // re-derived ShipStats are observable. Here the shot kills the COVER itself by
+    // making it the struck module: a thick-but-low-effective setup is fiddly, so we
+    // instead damage the reactor directly via apply_damage and re-derive, asserting
+    // the emergent drop the schedule wires (SC-002).
+    let (modules, hulls) = seed_catalogs();
+    let hull = hulls.get(HULL_FIGHTER).unwrap();
+    let mut fit = Fit::new(HULL_FIGHTER);
+    fit.install_raw(SlotId(0), MODULE_REACTOR_BASIC);
+    fit.install_raw(SlotId(1), MODULE_THRUSTER_BASIC);
+    let layout = build_layout(hull, &fit, &modules);
+    let stats = derive_ship_stats(hull, &fit, &modules, &layout);
+    let ship = w
+        .spawn((Ship, fit, layout, stats, HullStructure::full(500.0)))
+        .id();
+
+    let mut schedule = Schedule::default();
+    schedule.add_systems(recompute_ship_stats_system);
+    // Run once so the freshly-spawned `Changed<Fit>` flag is consumed (a fit-change
+    // rebuilds the layout at full health — that is the install/repair path, not the
+    // damage path). After this, a layout-only mutation is the damage path: stats
+    // re-derive from the *damaged* layout, never a rebuild.
+    schedule.run(&mut w);
+
+    let powered_before = w.get::<ShipStats>(ship).unwrap().power_supply;
+
+    // Destroy the reactor cell directly (the per-module health mutation apply_damage
+    // performs), then run the emergent re-derive — the layout-only change path.
+    {
+        let mut layout = w.get_mut::<FitLayout>(ship).unwrap();
+        let occ = layout
+            .cells
+            .values_mut()
+            .find(|o| o.slot == SlotId(0) && o.module.is_some())
+            .unwrap();
+        occ.health = 0.0;
+    }
+    schedule.run(&mut w);
+
+    let powered_after = w.get::<ShipStats>(ship).unwrap().power_supply;
+    assert!(
+        powered_after < powered_before,
+        "a destroyed reactor collapses the emergent power_supply ({powered_after} < {powered_before}, SC-002)"
+    );
+    assert!(
+        (powered_after - hull.power_capacity).abs() < 1e-4,
+        "the destroyed reactor contributes 0 power_gen ⇒ power_supply = hull capacity alone"
+    );
+}
+
+// --- T041 [P]: unfitted degenerate path (flat Health clamp, INV-D17) --------------
+
+/// A projectile hit on a `FitLayout`-less dummy/asteroid resolves via the **flat
+/// `Health` clamp** in `collision_detect_system` and despawns at `<= 0` — the
+/// E002/E003 simplified path is untouched (INV-D17). The fitted system ignores the
+/// unfitted target; the legacy system still clamps it.
+#[test]
+fn unfitted_target_uses_the_flat_health_clamp_path() {
+    let mut w = World::new();
+    // Only the base sim resources — NO E007 catalogs/configs. This is the
+    // E002/E003/determinism-shaped world: the fitted path + the gated systems must
+    // simply no-op (graceful degradation, INV-D16) and never panic.
+    w.insert_resource(Tuning::default());
+    w.insert_resource(FixedDt(1.0 / 30.0));
+    w.insert_resource(HitFeedback::default());
+
+    // An unfitted dummy target (Target + CollisionRadius + Health, NO FitLayout).
+    let dummy = w
+        .spawn((
+            Target,
+            TargetKind::Dummy,
+            Position(Vec2::ZERO),
+            CollisionRadius(2.0),
+            Health(15.0),
+        ))
+        .id();
+
+    // A projectile sweeping through it (damage 20 > 15 → destroyed at clamp 0). It
+    // carries a WeaponSource (harmless on the unfitted path — never read there).
+    let proj = spawn_downward_projectile(&mut w, None, 20.0);
+
+    // Drive the full shared step: the fitted path finds no FitLayout target and is a
+    // no-op; the legacy collision_detect_system clamps the dummy's Health.
+    let mut schedule = Schedule::default();
+    sim::add_fixed_step_systems(&mut schedule);
+    schedule.run(&mut w);
+
+    // INV-D17: the dummy resolved via the flat Health clamp and was despawned at
+    // <= 0 by the destruction_system (the E002/E003 behavior, verbatim).
+    assert!(
+        w.get_entity(dummy).is_err(),
+        "the unfitted dummy took flat damage to 0 and despawned (INV-D17)"
+    );
+    assert!(
+        w.get_entity(proj).is_err(),
+        "the projectile despawned after the single hit (E002 parity)"
+    );
+    // The hit flash rose via the legacy path (not the fitted path).
+    assert!(
+        w.get_resource::<HitFeedback>().unwrap().destroy_flash > 0.0,
+        "the dummy's destruction raised the destroy flash"
+    );
+    // No wreck/salvage entity exists — the unfitted path never enters the E007
+    // pipeline (no FitLayout, no apply_damage, no sever).
+    assert_eq!(
+        w.query::<&Wreck>().iter(&w).count(),
+        0,
+        "the unfitted degenerate path produces no E007 wreck (INV-D17)"
+    );
+}
