@@ -21,17 +21,21 @@ use super::salvage::salvage_layout;
 use super::sever::{
     connected_region, core_cell, disconnected_regions, sever_chunk, Wreck, WreckOrigin,
 };
-use crate::components::{CollisionRadius, Target};
+use crate::components::{Destructible, Target};
 use crate::fitting::{Cell, Fit, FitLayout, HullCatalog, ModuleCatalog, SectionId};
 
 /// Handle a **carve destruction event** (Phase 2 fine destruction, INV-D08): after
 /// [`apply_damage`](super::apply_damage) has already removed the carved cells from the
-/// ship's [`FitLayout`], run the connectivity flood-fill **once** and resolve the new
+/// target's [`FitLayout`], run the connectivity flood-fill **once** and resolve the new
 /// model of death and severing.
+///
+/// This **dispatches on whether the target is a [`Wreck`]**: a live ship (no `Wreck`)
+/// takes the core-death / sever path below; a wreck (already dead) takes the wreck
+/// branch (sever-further + despawn-when-empty, no re-kill) documented further down.
 ///
 /// `pre_carve_core` is the ship's [`core_cell`] **before** the carve (the caller
 /// captures it just before `apply_damage`, since the carve may have removed it). The
-/// resolution:
+/// **live-ship** resolution:
 ///
 /// 1. **Core destroyed** — `pre_carve_core` is no longer present in the layout (the
 ///    carve cut the core cell away): the whole ship is destroyed ([`destroy_ship`]).
@@ -45,17 +49,55 @@ use crate::fitting::{Cell, Fit, FitLayout, HullCatalog, ModuleCatalog, SectionId
 ///    present core, so any region NOT attached to it severs and the core's piece
 ///    survives — the ship dies only when the core cell is itself gone (cases 1/2).
 ///
+/// **Wreck branch (destructible wreckage)**: a target that already carries a [`Wreck`]
+/// (a severed chunk or a destroyed-ship hulk) is **already dead** — it must NOT be
+/// re-killed. After a further carve into it this re-runs the connectivity flood-fill
+/// and severs any newly-disconnected pieces (reusing [`connected_region`]/
+/// [`disconnected_regions`]/[`sever_chunk`]), and **despawns the entity** once its
+/// [`FitLayout`] has no cells left (fully carved away — the render cell-diff removes its
+/// mesh). It never calls [`destroy_ship`] (already a wreck) and always returns `false`
+/// (no kill flash). This replaces the old early-return-on-`Wreck` guard so wreckage
+/// breaks down further under fire instead of being inert.
+///
 /// Event-driven, never per-frame (INV-D08). Server-authoritative (INV-D16). Total: a
 /// missing fit/hull/layout is a no-op (no panic). Returns `true` iff the ship was
 /// destroyed (so the caller can raise the kill flash).
 pub fn on_cells_carved(world: &mut World, ship: Entity, pre_carve_core: Option<Cell>) -> bool {
-    // Already a wreck → nothing further (idempotent — a later shot on a dead hulk).
-    if world.get::<Wreck>(ship).is_some() {
-        return false;
-    }
+    let is_wreck = world.get::<Wreck>(ship).is_some();
     let Some(layout) = world.get::<FitLayout>(ship).cloned() else {
         return false;
     };
+
+    // --- Wreck branch: already dead → sever-further + despawn-when-empty, no re-kill -
+    if is_wreck {
+        // Fully carved away → despawn (the render cell-diff removes the mesh). Done.
+        if layout.cells.is_empty() {
+            world.entity_mut(ship).despawn();
+            return false;
+        }
+        // Otherwise re-run connectivity from the wreck's (depth-deepest) anchor cell and
+        // sever any region the carve disconnected into its own drifting wreck. There is
+        // no "core death" for a wreck — it is already dead — so the anchor is just the
+        // deepest remaining cell (`core_cell`), and disconnected regions break off.
+        if let Some(anchor) = core_cell(&layout) {
+            let attached = connected_region(&layout, anchor);
+            let regions = disconnected_regions(&layout, &attached);
+            for region in regions {
+                if !region.is_empty() {
+                    sever_chunk(world, ship, &region);
+                }
+            }
+        }
+        // A sever-further could have emptied the wreck (every cell moved into chunks):
+        // despawn it then too, so no empty hulk lingers.
+        let emptied = world
+            .get::<FitLayout>(ship)
+            .is_some_and(|l| l.cells.is_empty());
+        if emptied {
+            world.entity_mut(ship).despawn();
+        }
+        return false;
+    }
 
     // --- 1/2. Core destroyed (carved away) or no cells left → whole-ship death ---
     let core_after = core_cell(&layout);
@@ -287,14 +329,19 @@ pub fn shatter_ship(world: &mut World, ship: Entity) {
 /// A minimal test world without the [`ModuleCatalog`]/[`SalvageConfig`] resources
 /// falls back to empty contents (no panic) — the wreck marker still attaches.
 ///
-/// **Live-combat marker strip (E007 visibility)**: a destroyed ship must STOP being
-/// a live, pristine target. After attaching the [`Wreck`], this removes
-/// [`Target`], [`CollisionRadius`], and [`FitLayout`] from the entity so it is no
-/// longer hit by [`fitted_damage_system`](crate::fitted_damage_system) (no more
-/// repeated "KILL" as later shots land) and `render_state`'s drifting-debris query
-/// (`With<Wreck> Without<Target> Without<Ship> Without<Projectile>`) emits it as a
-/// wreck rather than a pristine ship. The salvage `contents` are computed from the
-/// residual [`FitLayout`] **before** the strip, so loot is unaffected. The body
+/// **Live-`Target` strip + destructible hulk (E007 visibility + destructible wreckage)**:
+/// a destroyed ship must STOP being a *live* combat target — so after attaching the
+/// [`Wreck`], this removes only [`Target`], and `render_state`'s drifting-debris query
+/// (`With<Wreck> Without<Target> Without<Ship> Without<Projectile>`) emits it as a wreck
+/// rather than a pristine ship. The hulk is no longer re-killed because
+/// [`on_cells_carved`] takes the wreck branch for a `Wreck` entity (sever-further /
+/// despawn-when-empty, never `destroy_ship`).
+///
+/// The hulk **keeps** its [`CollisionRadius`](crate::components::CollisionRadius) (the
+/// hull footprint) and is ensured [`Destructible`], so it stays carve-targetable and a
+/// shot into the dead hull erodes it further (it despawns when fully carved away). The
+/// salvage `contents` are computed from the residual [`FitLayout`] **before** any of
+/// this, so loot is unaffected. The body
 /// ([`Position`](crate::components::Position)/[`Velocity`](crate::components::Velocity)/
 /// [`Heading`](crate::components::Heading)/[`AngularVelocity`](crate::components::AngularVelocity))
 /// + [`Wreck`] are kept, so the wreck persists as a drifting physical hulk.
@@ -316,17 +363,29 @@ fn destroy_ship(world: &mut World, ship: Entity) {
         _ => Vec::new(),
     };
 
-    // Attach the destroyed-ship wreck (idempotent — overwrite if present), then strip
-    // the live-combat markers so the dead ship stops being a damageable target and
-    // stops rendering as a pristine ship (it renders as drifting debris instead). The
-    // entity keeps its body + `Wreck`, so it IS the persistent, lootable wreck.
+    // Attach the destroyed-ship wreck (idempotent — overwrite if present), then strip the
+    // live-`Target` marker so the dead ship stops being a *live* combat target (no more
+    // "KILL"). The entity keeps its body + `Wreck`, so it IS the persistent, lootable wreck.
+    //
+    // The residual [`FitLayout`] is **kept** (NOT stripped) so the hulk renders as its
+    // remaining (carved) cells via the SAME hull-mesh path the live ship and the severed
+    // chunks use — a destroyed ship reads as the wreck of its actual shape, not a generic
+    // box. The render centres a hulk on the grid centre (its `Position` is the ship's last
+    // position = the grid centre), so the cells sit exactly where they were.
+    //
+    // **Destructible wreckage**: the hulk also KEEPS its [`CollisionRadius`] (the hull
+    // footprint, no longer stripped) and is ensured [`Destructible`], so it stays
+    // carve-targetable — a shot into the dead hull erodes it further and it despawns when
+    // fully carved away (`fitted_damage_system` → the wreck branch of [`on_cells_carved`],
+    // which never re-kills a `Wreck`). `Destructible` is inserted defensively here (it
+    // carries over from a live ship that had it, but a live ship without it should still
+    // produce a destructible hulk — the wreck is a fresh per-entity choice).
     let mut entity = world.entity_mut(ship);
     entity.insert(Wreck {
         origin: WreckOrigin::DestroyedShip,
         contents,
         claimed: false,
     });
+    entity.insert(Destructible);
     entity.remove::<Target>();
-    entity.remove::<CollisionRadius>();
-    entity.remove::<FitLayout>();
 }

@@ -465,9 +465,12 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
     // --- 1. Read the target's components + the content resources --------------
     // Clone the small reads so the resource/component borrows do not overlap the
     // later mutable writes (World access is sequenced).
-    let Some(fit) = world.get::<Fit>(target).cloned() else {
-        return no_module();
-    };
+    //
+    // The carve is `Fit`-independent: the hull (and thus `grid_dims`) is resolved from
+    // the target's `FitLayout.hull`, NOT from a `Fit`. So **wreckage** (a severed chunk
+    // / destroyed-ship hulk — which carries a residual `FitLayout` but NO `Fit`) carves
+    // through this SAME code path as a live ship; `Fit` stays on live ships but is no
+    // longer required here.
     let Some(layout) = world.get::<FitLayout>(target).cloned() else {
         return no_module();
     };
@@ -485,7 +488,9 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
     let Some(hulls) = world.get_resource::<HullCatalog>() else {
         return no_module();
     };
-    let Some(hull) = hulls.get(fit.hull).cloned() else {
+    // Resolve the hull / `grid_dims` from the layout's `hull` id (not a `Fit`) — the
+    // `Fit`-independent lookup that lets wreckage carve through this same path.
+    let Some(hull) = hulls.get(layout.hull).cloned() else {
         return no_module();
     };
     // The carve reads only the live `FitLayout` (cell health/occupancy) + the armor/

@@ -30,8 +30,10 @@ use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
 use super::salvage::SalvageOutcome;
-use crate::components::{AngularVelocity, Heading, Position, Velocity};
-use crate::fitting::{Cell, FitLayout};
+use crate::components::{
+    AngularVelocity, CollisionRadius, Destructible, Heading, Position, Velocity,
+};
+use crate::fitting::{Cell, Fit, FitLayout, HullCatalog, CELL_WORLD_SIZE};
 use crate::motion::BodyState;
 
 /// Why a [`Wreck`] exists (data-model.md `WreckOrigin`, FR-020).
@@ -224,6 +226,57 @@ fn local_com<'a>(cells: impl IntoIterator<Item = &'a Cell>) -> Option<Vec2> {
     }
 }
 
+/// The collision-circle radius (world units) for a severed chunk, sized to the
+/// **chunk's own cell footprint** so a drifting piece is shootable with a collider that
+/// matches what is rendered (destructible wreckage).
+///
+/// It is the half-extent of the chunk's cell bounding-box **longest** axis in world
+/// units: `max(width_cells, height_cells) · `[`CELL_WORLD_SIZE`]` · 0.5`, mirroring
+/// [`hull_collision_radius`](crate::fitting::hull_collision_radius) but over the chunk's
+/// extent rather than the whole hull. A **one-cell** chunk has a `1×1` bbox → a small but
+/// non-zero radius (`1 · CELL_WORLD_SIZE · 0.5`); a `CHUNK_MIN_CELLS`-cell floor on the
+/// span guarantees even a single-cell sliver still has a finite radius (never `0`, so the
+/// swept-cast can hit it). `0.0` only for the degenerate empty set (never severed).
+fn chunk_collision_radius(cells: &[Cell]) -> f32 {
+    /// The minimum bbox span (in cells) used to floor the chunk radius — a one-cell chunk
+    /// still gets a `1`-cell footprint rather than a zero radius.
+    const CHUNK_MIN_CELLS: u16 = 1;
+    let mut min_col = u16::MAX;
+    let mut max_col = u16::MIN;
+    let mut min_row = u16::MAX;
+    let mut max_row = u16::MIN;
+    for &(col, row) in cells {
+        min_col = min_col.min(col);
+        max_col = max_col.max(col);
+        min_row = min_row.min(row);
+        max_row = max_row.max(row);
+    }
+    if min_col > max_col {
+        return 0.0; // empty set (defensive — the caller never severs an empty region)
+    }
+    // Bounding-box span in cells (+1 because both endpoints are inclusive), floored so a
+    // 1-cell chunk keeps a finite footprint.
+    let width = (max_col - min_col + 1).max(CHUNK_MIN_CELLS);
+    let height = (max_row - min_row + 1).max(CHUNK_MIN_CELLS);
+    width.max(height) as f32 * CELL_WORLD_SIZE * 0.5
+}
+
+/// The carrier hull's `(cols, rows)` grid dimensions for `ship`, resolved through its
+/// [`Fit`] + the [`HullCatalog`] resource — the same lookup
+/// [`on_section_destroyed`](super::destruction::on_section_destroyed) and
+/// [`hull_collision_radius`](crate::fitting::hull_collision_radius) use.
+///
+/// `None` when the ship has no `Fit`, the `HullCatalog` resource is absent, or the
+/// hull id does not resolve (a minimal test world) — the caller then falls back to a
+/// zero offset rather than panicking (INV-D16). The grid centre derived from these
+/// dims is the point the render centres the ship on, so a severed chunk's spawn offset
+/// matches the visible hull.
+fn grid_dims_of(world: &World, ship: Entity) -> Option<(u16, u16)> {
+    let fit = world.get::<Fit>(ship)?;
+    let hulls = world.get_resource::<HullCatalog>()?;
+    hulls.get(fit.hull).map(|h| h.grid_dims)
+}
+
 /// Split the disconnected region `cells` off `ship` into a new drifting physics
 /// body, inheriting the parent's COM momentum (T027, FR-016, INV-D07).
 ///
@@ -231,11 +284,20 @@ fn local_com<'a>(cells: impl IntoIterator<Item = &'a Cell>) -> Option<Vec2> {
 ///
 /// 1. Read the parent's [`Position`]/[`Velocity`]/[`Heading`]/[`AngularVelocity`]
 ///    (any missing component defaults to zero so a minimal test ship works).
-/// 2. The chunk's **local** COM = mean of its cells' centers; the parent's local COM
-///    = mean of **all** the parent layout's current cell centers. The offset
-///    `r_local = chunk_com - parent_com`, rotated into world by the parent `Heading`
-///    (`r = Vec2::from_angle(heading).rotate(r_local)`), gives the chunk's world
-///    position `parent.pos + r`.
+/// 2. The chunk's **local** COM = mean of its cells' centers (in cell-space). The
+///    offset reference is the hull's **grid centre** `(cols·0.5, rows·0.5)` — the SAME
+///    point the render centres the ship's cells on (`build_hull_mesh`'s `center`), and
+///    the point the ship's `Position` sits at — NOT the mean of the remaining cells. So
+///    a chunk appears EXACTLY where its cells were drawn on the live hull, then drifts.
+///    The cell-space offset `r_local = (Δcol, Δrow) = chunk_com − grid_centre` is then
+///    mapped into the ship's LOCAL WORLD frame to match the render convention
+///    (`build_hull_mesh`): forward(`+X`) ← `row`, lateral(`+Y`) ← `col`, scaled by
+///    [`CELL_WORLD_SIZE`] — i.e. `r_local_world = (Δrow, Δcol)·CELL_WORLD_SIZE`. That is
+///    finally rotated into world by the parent `Heading`
+///    (`r = Vec2::from_angle(heading).rotate(r_local_world)`), giving the chunk's world
+///    position `parent.pos + r`. (The old code rotated the raw `(Δcol, Δrow)` cell
+///    vector directly — unscaled and axis-swapped — so the chunk teleported ~3× off and
+///    onto the wrong axis; this is the teleport fix.)
 /// 3. **Inherit COM momentum (INV-D07)**: `chunk_vel = parent.vel + angvel ×ᵣ` where
 ///    the 2D rigid-rotation term at the chunk COM is `angvel * (-r.y, r.x)` — the
 ///    linear velocity plus the rotation-induced velocity at the chunk's COM, so it
@@ -266,25 +328,31 @@ pub fn sever_chunk(world: &mut World, ship: Entity, cells: &HashSet<Cell>) -> Wr
         .map(|a| a.0)
         .unwrap_or(0.0);
 
-    // --- 2. Offset from the parent COM to the chunk COM, rotated into world -----
+    // --- 2. Offset from the hull grid centre to the chunk COM, rotated into world ---
     // Collect the chunk cells in deterministic (sorted) order; reused for the body
     // and the residual layout.
     let mut chunk_cells: Vec<Cell> = cells.iter().copied().collect();
     chunk_cells.sort_unstable();
 
     let chunk_com_local = local_com(&chunk_cells).unwrap_or(Vec2::ZERO);
-    // The parent local COM is the mean of ALL the parent's *current* cell centers
-    // (before this chunk is removed — the chunk is still part of the body's mass at
-    // the instant of severing, so the COM is the whole-ship COM, INV-D07).
     let parent_layout = world.get::<FitLayout>(ship).cloned();
-    let parent_com_local = parent_layout
-        .as_ref()
-        .and_then(|l| local_com(l.cells.keys()))
+    // The offset reference is the hull's GRID CENTRE — the point the render centres the
+    // ship's cells on (`build_hull_mesh`) and the point the ship's `Position` sits at —
+    // so a severed piece appears exactly where its cells were drawn on the live hull,
+    // then drifts. Resolve `grid_dims` from the ship's `Fit` + `HullCatalog` (as
+    // `on_section_destroyed`/`hull_collision_radius` do); fall back to the chunk COM (a
+    // zero offset) only when the hull is unresolvable in a minimal test world.
+    let grid_centre_local = grid_dims_of(world, ship)
+        .map(|(cols, rows)| Vec2::new(cols as f32 * 0.5, rows as f32 * 0.5))
         .unwrap_or(chunk_com_local);
 
-    let r_local = chunk_com_local - parent_com_local;
-    // Rotate the local offset into world by the parent's heading.
-    let r = Vec2::from_angle(heading).rotate(r_local);
+    // Cell-space offset `(Δcol, Δrow)`. Map it into the ship's LOCAL WORLD frame the
+    // SAME way the render does (`build_hull_mesh`): forward(+X) ← row, lateral(+Y) ← col,
+    // scaled by `CELL_WORLD_SIZE`. So `X = Δrow`, `Y = Δcol`, ×CELL_WORLD_SIZE.
+    let r_local = chunk_com_local - grid_centre_local;
+    let r_local_world = Vec2::new(r_local.y, r_local.x) * CELL_WORLD_SIZE;
+    // Rotate the local-world offset into world by the parent's heading.
+    let r = Vec2::from_angle(heading).rotate(r_local_world);
     let chunk_pos = parent_pos + r;
 
     // --- 3. Inherit COM momentum: linear + rigid-rotation term at the chunk COM --
@@ -327,11 +395,21 @@ pub fn sever_chunk(world: &mut World, ship: Entity, cells: &HashSet<Cell>) -> Wr
     // it. If the parent had no layout (a minimal test ship), the chunk still spawns
     // with its body so momentum inheritance is observable. The persistent `Wreck`
     // carries the precomputed lootable `contents`.
+    //
+    // **Destructible wreckage**: the chunk also spawns with a [`CollisionRadius`] sized to
+    // its OWN cell footprint ([`chunk_collision_radius`]) + a [`Destructible`] marker, so
+    // it is shootable — a hit erodes it further (and despawns it when fully carved) via the
+    // `fitted_damage_system` carve query (`With<FitLayout>, With<Destructible>`) and the
+    // wreck branch of [`on_cells_carved`]. The radius matches the chunk's footprint (not
+    // the whole hull), so the collider tracks what is rendered.
+    let chunk_radius = chunk_collision_radius(&chunk_cells);
     let mut entity = world.spawn((
         Position(chunk_pos),
         Velocity(chunk_vel),
         Heading(heading),
         AngularVelocity(angvel),
+        CollisionRadius(chunk_radius),
+        Destructible,
         Wreck {
             origin: WreckOrigin::SeveredChunk,
             contents: contents.clone(),

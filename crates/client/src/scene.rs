@@ -70,6 +70,11 @@ pub struct RenderAssets {
     /// quad (see [`build_hull_mesh`]'s `exposed` hook). Shared across all near ships (the
     /// per-ship variation is the geometry, not the material).
     pub hull_material: Handle<StandardMaterial>,
+    /// The wreck hull plate material — the same metallic hull material but tinted with the
+    /// darkened/desaturated [`WRECK_HULL_COLOR`] ("dead metal"). A severed chunk's / dead
+    /// hulk's hull mesh ([`build_hull_mesh`]) wears it so a broken piece reads as debris
+    /// (not a live ship) while keeping the real cell shape/size/scale.
+    pub wreck_hull_material: Handle<StandardMaterial>,
 }
 
 /// Hull cell size, in sim units — the side length of one hull cell as laid out in the
@@ -89,7 +94,13 @@ pub const CELL_SIZE: f32 = sim::fitting::CELL_WORLD_SIZE;
 /// shared [`RenderAssets::hull_material`]; the merged hull mesh of every near fitted ship
 /// wears it so an undamaged ship reads as a single solid plate with no visible cells.
 /// Module colors are HIDDEN at this surface (revealed only at a breach in Phase 2).
-const HULL_COLOR: Color = Color::srgb(0.30, 0.40, 0.52);
+pub const HULL_COLOR: Color = Color::srgb(0.30, 0.40, 0.52);
+
+/// The "dead metal" wreck tint — a darkened, desaturated [`HULL_COLOR`] (≈60% brightness)
+/// the client wears on a severed chunk's / destroyed hulk's hull mesh so a broken piece
+/// reads as debris rather than a live ship, while keeping the real cell shape/size/scale.
+/// Used by [`RenderAssets::wreck_hull_material`].
+pub const WRECK_HULL_COLOR: Color = Color::srgb(0.18, 0.24, 0.31);
 
 /// Revise-B: the merged hull surface's slab half-thickness in `+Z`, in sim units — the
 /// top face sits at `z = HULL_THICKNESS` so the plate has a touch of relief under the
@@ -250,9 +261,10 @@ fn build_arc_band_mesh(inner_frac: f32, half_angle: f32, segments: u32) -> Mesh 
 /// cell's local position. The local position matches the existing cell-offset convention
 /// (so the nose still points `+X`): the hull silhouettes author **forward = +row** /
 /// **lateral = +col**, but the ship's local nose is `+X`, so `row` maps to the forward
-/// (`+X`) axis and `col` to the lateral (`+Y`) axis:
-///   `cx = ((row + 0.5) − rows·0.5)·CELL_SIZE`  (forward, +X)
-///   `cy = ((col + 0.5) − cols·0.5)·CELL_SIZE`  (lateral, +Y)
+/// (`+X`) axis and `col` to the lateral (`+Y`) axis, measured from the `center` origin
+/// (cell-space; a ship passes the grid centre, so this is the classic grid-centred layout):
+///   `cx = ((row + 0.5) − center.y)·CELL_SIZE`  (forward, +X)
+///   `cy = ((col + 0.5) − center.x)·CELL_SIZE`  (lateral, +Y)
 /// Adjacent cells therefore share an exact edge; since every quad is the same material,
 /// coplanar at `z = HULL_THICKNESS`, and `+Z` (camera-facing) — from the top-down camera
 /// the union reads as one continuous solid plate with NO internal seams or grid lines.
@@ -274,15 +286,25 @@ fn build_arc_band_mesh(inner_frac: f32, half_angle: f32, segments: u32) -> Mesh 
 /// second submesh / vertex-color set so [`RenderAssets::hull_material`] stays the body
 /// plate and only the exposed cell shows its module hue. Documented at the call site too.
 ///
-/// `cells` is the present cell list (`(col, row, kind)`); `grid_dims` is the carrier
-/// hull's `(cols, rows)`; `cell_size` is [`CELL_SIZE`]. An empty `cells` yields an empty
-/// mesh (the caller never voxelizes a non-fitted entity, so this is defensive).
-pub fn build_hull_mesh(cells: &[(u16, u16, u8)], grid_dims: (u16, u16), cell_size: f32) -> Mesh {
+/// `cells` is the present cell list (`(col, row, kind)`); `cell_size` is [`CELL_SIZE`]. An
+/// empty `cells` yields an empty mesh (the caller never voxelizes a non-fitted entity, so
+/// this is defensive).
+///
+/// `center` is the **cell-space** point (in `(col, row)` units) the cells are laid out
+/// around: each cell `c` renders at the swap+scale of `(c − center)`. A whole ship passes
+/// the **grid centre** `(cols·0.5, rows·0.5)` — its `Position` sits at the grid centre, so
+/// the silhouette is centred on the ship (this keeps ship rendering byte-identical to the
+/// old `(rows·0.5, cols·0.5)`-baked-in behaviour). A **severed chunk** passes its own
+/// **cell-COM** (the mean of just its cells) — its `Position` is the chunk COM in world,
+/// so its cells render around that point, sitting exactly where the chunk drifted to.
+/// (The carrier `grid_dims` is no longer needed here — `center` fully determines the
+/// layout — so the caller derives `center` from `grid_dims` (ship) or the cells (chunk).)
+pub fn build_hull_mesh(cells: &[(u16, u16, u8)], cell_size: f32, center: Vec2) -> Mesh {
     // Phase-2 reveal hook: with no breach model yet, no cell is ever exposed, so the
     // whole surface uses the uniform hull material. Phase 2 replaces this with a real
     // breach predicate and per-exposed-cell coloring.
     let exposed = |_col: u16, _row: u16| -> bool { false };
-    build_hull_mesh_with(cells, grid_dims, cell_size, exposed)
+    build_hull_mesh_with(cells, cell_size, center, exposed)
 }
 
 /// [`build_hull_mesh`] with an explicit `exposed(col, row)` predicate — the Phase-2
@@ -291,13 +313,18 @@ pub fn build_hull_mesh(cells: &[(u16, u16, u8)], grid_dims: (u16, u16), cell_siz
 /// can flag exposed module cells without changing this mesh-construction code. (The
 /// `_exposed` flag is threaded but not yet branched on — Phase 2 will emit a distinct
 /// vertex attribute / submesh for exposed cells.)
+///
+/// `center` is the cell-space layout origin (see [`build_hull_mesh`]): each cell renders
+/// at the swap+scale of `(c − center)`. The carrier `grid_dims` is no longer needed here
+/// — `center` fully determines where the cells sit — so the silhouette is laid out
+/// identically for a whole ship (center = grid centre) and a severed chunk (center = its
+/// own cell-COM).
 fn build_hull_mesh_with(
     cells: &[(u16, u16, u8)],
-    grid_dims: (u16, u16),
     cell_size: f32,
+    center: Vec2,
     exposed: impl Fn(u16, u16) -> bool,
 ) -> Mesh {
-    let (cols, rows) = grid_dims;
     let half = HULL_THICKNESS;
 
     // Fast membership test for neighbour lookups (so shared interior edges emit no wall
@@ -336,10 +363,13 @@ fn build_hull_mesh_with(
         // revise-B every cell is body plate (the predicate is always false).
         let _exposed = exposed(col, row);
 
-        // Cell centre in the ship's local frame: row→forward(+X), col→lateral(+Y),
-        // matching `net::cell_local_translation` so the nose stays +X.
-        let cx = ((row as f32 + 0.5) - rows as f32 * 0.5) * cell_size;
-        let cy = ((col as f32 + 0.5) - cols as f32 * 0.5) * cell_size;
+        // Cell centre in the local frame: row→forward(+X), col→lateral(+Y), measured
+        // from `center` (cell-space): `center.y` is the row origin (forward), `center.x`
+        // the col origin (lateral). A ship passes the grid centre `(cols·0.5, rows·0.5)`,
+        // so this is identical to the old `rows·0.5`/`cols·0.5` baked-in centring; a
+        // severed chunk passes its cell-COM so its cells sit around the chunk `Position`.
+        let cx = ((row as f32 + 0.5) - center.y) * cell_size;
+        let cy = ((col as f32 + 0.5) - center.x) * cell_size;
         let h = cell_size * 0.5;
         // Cell footprint extents (gapless — full cell, no fill gap).
         let (x0, x1) = (cx - h, cx + h);
@@ -516,6 +546,18 @@ pub fn setup_scene(
         ..default()
     });
 
+    // Wreck hull plate: the SAME metallic plate as a live ship but tinted "dead metal"
+    // (the darkened/desaturated `WRECK_HULL_COLOR`) so a severed chunk / destroyed hulk
+    // reads as debris while keeping the real cell shape/size/scale (it shares
+    // `build_hull_mesh`). A touch rougher so it reads as scorched/lifeless rather than a
+    // polished live hull.
+    let wreck_hull_material = materials.add(StandardMaterial {
+        base_color: WRECK_HULL_COLOR,
+        metallic: 0.5,
+        perceptual_roughness: 0.75,
+        ..default()
+    });
+
     commands.insert_resource(RenderAssets {
         projectile_mesh,
         projectile_material,
@@ -532,6 +574,7 @@ pub fn setup_scene(
         debris_mesh,
         debris_material,
         hull_material,
+        wreck_hull_material,
     });
 
     // The LOCAL player ship — spawned here deterministically so the `LocalShip`

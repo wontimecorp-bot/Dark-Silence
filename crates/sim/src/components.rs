@@ -149,6 +149,20 @@ impl TargetKind {
 #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CollisionRadius(pub f32);
 
+/// Marker: this entity participates in the fitted **carve** pipeline — it can be shot
+/// and eroded cell-by-cell.
+///
+/// An entity is carve-targetable iff it carries **`FitLayout` + `CollisionRadius` +
+/// `Destructible`** (the three the [`fitted_damage_system`](crate::collision::fitted_damage_system)
+/// query gates on). `Destructible` is the explicit **per-entity toggle**: removing it
+/// from an entity makes that entity **inert** (a hit removes no cells), even though it
+/// still keeps its `FitLayout`/`CollisionRadius` and still renders as its cells. It is
+/// applied to live ships AND wreckage (severed chunks + destroyed-ship hulks) so all
+/// three carve through the SAME code path; later gameplay can choose which pieces stay
+/// destructible by adding/removing this marker.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Destructible;
+
 /// A short-lived per-entity hit-flash timer (seconds), refreshed each time a hit
 /// lands on this entity and decayed toward `0` each fixed step
 /// ([`damage_flash_decay_system`](crate::collision::damage_flash_decay_system)).

@@ -96,11 +96,13 @@ fn fitted_enemies_render_as_distinct_ships() {
     );
 }
 
-/// After a fitted enemy is destroyed, the death-strip removes its `Target`/`FitLayout`
-/// so `render_state` no longer emits it as a pristine `Ship` — it renders as drifting
-/// ship-fragment debris (an `EntityKind::Debris` chunk, FIX 0b) instead, and the enemy
-/// is no longer a live damageable target (so the repeated-"KILL" loop ends). This is
-/// the server-side proof of the visible, clean death (E007, Deliverable 1).
+/// After a fitted enemy is destroyed, the death-strip removes its `Target`/`CollisionRadius`
+/// and tags it `Wreck` so `render_state` no longer emits it as a pristine `Ship` — it
+/// renders as drifting wreckage (an `EntityKind::Debris` entity). The hulk now KEEPS its
+/// residual `FitLayout`, so its Debris entry carries a real cell payload (it renders as the
+/// remaining carved cells, not a generic box); the enemy is no longer a live damageable
+/// target (the `Wreck` tag excludes it from `fitted_damage_system`), so the repeated-"KILL"
+/// loop ends. This is the server-side proof of the visible, clean death (E007, Deliverable 1).
 #[test]
 fn destroyed_fitted_enemy_renders_as_debris_not_a_pristine_ship() {
     use sim::damage::shatter_ship;
@@ -124,8 +126,9 @@ fn destroyed_fitted_enemy_renders_as_debris_not_a_pristine_ship() {
     // Shatter it directly (the live-combat death the hull-depletion trigger drives).
     shatter_ship(server.world_mut(), enemy);
 
-    // Post-death: it is no longer a Target / has no FitLayout (cannot be re-killed),
-    // and it now renders as drifting debris (a Target+Asteroid wreck), not a Ship.
+    // Post-death: it is no longer a Target (cannot be re-killed) but KEEPS its residual
+    // FitLayout, so the hulk renders as its real carved cells (not a box). It now renders
+    // as drifting Debris, not a Ship.
     use sim::components::Target;
     use sim::fitting::FitLayout;
     assert!(
@@ -133,14 +136,14 @@ fn destroyed_fitted_enemy_renders_as_debris_not_a_pristine_ship() {
         "the destroyed enemy is no longer a Target (no repeated KILL)"
     );
     assert!(
-        server.world().get::<FitLayout>(enemy).is_none(),
-        "the destroyed enemy lost its FitLayout (no longer a pristine ship)"
+        server.world().get::<FitLayout>(enemy).is_some(),
+        "the destroyed enemy KEEPS its residual FitLayout so the hulk renders as its real \
+         carved cells (the `Wreck` tag, not FitLayout removal, ends re-carving)"
     );
 
     let after = server.render_state();
-    // The destroyed enemy (its body persists) now reads as ship-fragment debris, and
-    // severed chunks drift around it — all as `EntityKind::Debris` (FIX 0b), NOT grey
-    // `Asteroid` spheres.
+    // The destroyed enemy (its body persists) now reads as wreckage, and severed chunks
+    // drift around it — all as `EntityKind::Debris`, NOT grey `Asteroid` spheres.
     let debris: Vec<_> = after
         .iter()
         .filter(|e| e.kind == EntityKind::Debris)
@@ -149,16 +152,19 @@ fn destroyed_fitted_enemy_renders_as_debris_not_a_pristine_ship() {
         !debris.is_empty(),
         "the destroyed enemy + its severed chunks render as drifting ship-fragment Debris"
     );
-    // Phase 1B: debris is NOT voxelized in 1B (it renders as the single tumbling fragment
-    // box), so a destroyed enemy / its chunks carry no per-cell voxel payload.
+    // The severed-chunk render fix: a Debris entity that carries a residual FitLayout now
+    // emits its REAL cells (so the client draws it as a hull mesh of the exact cells that
+    // broke off, not a generic box). At least one debris piece here (the hulk and/or the
+    // severed chunks) therefore carries a non-empty cell payload with real grid_dims.
     assert!(
         debris
             .iter()
-            .all(|e| e.cells.is_empty() && e.grid_dims == (0, 0)),
-        "destroyed-ship debris carries no voxel cell payload in Phase 1B"
+            .any(|e| !e.cells.is_empty() && e.grid_dims != (0, 0)),
+        "wreckage with a residual FitLayout emits its real severed cells (so it renders as \
+         its actual shape, not a placeholder box)"
     );
     // The size hint (residual cell-count) rides in `flags` and is always ≥ 1 so the
-    // client never scales a fragment to zero.
+    // client never scales a layout-less fragment to zero.
     assert!(
         debris.iter().all(|e| e.flags >= 1),
         "each debris chunk carries a non-zero cell-count size hint in flags"

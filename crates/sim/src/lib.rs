@@ -35,9 +35,9 @@ pub use collision::{
 };
 pub use combat::HitFeedback;
 pub use components::{
-    AngularVelocity, CollisionRadius, Damage, DamageFlash, FlightAssist, Heading, Health, Lifetime,
-    Position, PrevPosition, Projectile, ProjectileOwner, ShieldHitFlash, Ship, Target, TargetKind,
-    Velocity, Weapon,
+    AngularVelocity, CollisionRadius, Damage, DamageFlash, Destructible, FlightAssist, Heading,
+    Health, Lifetime, Position, PrevPosition, Projectile, ProjectileOwner, ShieldHitFlash, Ship,
+    Target, TargetKind, Velocity, Weapon,
 };
 pub use fitting::{
     build_layout, cell_map, derive_ship_stats, hardpoint_arc, load_preset, module_at,

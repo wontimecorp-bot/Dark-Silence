@@ -800,7 +800,7 @@ fn destroyed_weapon_disarms_and_destroyed_reactor_unpowers_shields() {
 // purpose-built **corridor** hull where removing a middle section disconnects an end.
 // =================================================================================
 
-use sim::components::{AngularVelocity, Heading, Position, Velocity};
+use sim::components::{AngularVelocity, Destructible, Heading, Position, Velocity};
 use sim::damage::{
     connected_region, core_cell, on_cells_carved, on_section_destroyed, sever_chunk, Wreck,
     WreckOrigin,
@@ -991,22 +991,25 @@ fn destroying_an_end_section_produces_no_chunk() {
 /// A severed chunk inherits parent **linear + angular** velocity at its COM (it
 /// drifts, momentum conserved, INV-D07): with a nonzero parent `Velocity` and
 /// `AngularVelocity`, an off-center chunk's velocity is
-/// `parent.vel + angvel·perp(r)` where `r` is the world offset from the parent COM
-/// to the chunk COM. And a **core-sever destroys the ship** (destroying the section
-/// containing the core → the whole-ship-destroyed path, INV-D15).
+/// `parent.vel + angvel·perp(r)` where `r` is the world offset from the ship's
+/// `Position` (the hull GRID CENTRE) to the chunk COM — correctly axis-swapped
+/// (forward←row, lateral←col) and ×`CELL_WORLD_SIZE` to match the render. And a
+/// **core-sever destroys the ship** (destroying the section containing the core → the
+/// whole-ship-destroyed path, INV-D15).
 #[test]
 fn severed_chunk_inherits_com_momentum_and_core_sever_destroys_ship() {
     // --- COM momentum inheritance (INV-D07) -----------------------------------
     let parent_pos = Vec2::new(10.0, 5.0);
     let parent_vel = Vec2::new(2.0, -1.0);
-    let heading = 0.0_f32; // zero heading so world offset == local offset (clean check)
+    let heading = 0.0_f32; // zero heading so world offset == local-world offset (clean check)
     let angvel = 0.5_f32;
     let (mut w, ship) = corridor_world(parent_pos, parent_vel, heading, angvel);
 
-    // The parent (whole-ship) local COM is the mean of all 5 cell centers:
-    // cols 0..4 at +0.5 → mean col (0.5+1.5+2.5+3.5+4.5)/5 = 2.5, row 1.5 →
-    // (2.5, 1.5) in local cell-space.
-    let parent_com = Vec2::new(2.5, 1.5);
+    // The offset reference is the hull GRID CENTRE (the point the ship `Position` and the
+    // render centre the cells on), NOT the mean of the remaining cells. The corridor hull
+    // is 5×3, so the grid centre is (5·0.5, 3·0.5) = (2.5, 1.5) in cell-space. (Here it
+    // happens to equal the mean-of-all-cells, but the reference is now the grid centre.)
+    let grid_centre = Vec2::new(2.5, 1.5);
     // Sever the far-end region {(3,1),(4,1)} directly (its local COM is
     // ((3.5+4.5)/2, 1.5) = (4.0, 1.5)).
     let mut region = std::collections::HashSet::new();
@@ -1016,8 +1019,11 @@ fn severed_chunk_inherits_com_momentum_and_core_sever_destroys_ship() {
 
     let chunk = sever_chunk(&mut w, ship, &region);
 
-    // r = (chunk_com - parent_com) rotated by heading(=0) → unchanged.
-    let r = chunk_com - parent_com;
+    // Cell-space offset `(Δcol, Δrow) = chunk_com − grid_centre`, mapped into the ship's
+    // LOCAL WORLD frame the SAME way the render does (forward+X ← row, lateral+Y ← col,
+    // ×CELL_WORLD_SIZE) → `(Δrow, Δcol)·CELL_WORLD_SIZE`, then rotated by heading (=0).
+    let r_local = chunk_com - grid_centre;
+    let r = Vec2::new(r_local.y, r_local.x) * CELL_WORLD_SIZE;
     let expected_vel = parent_vel + angvel * Vec2::new(-r.y, r.x);
     let expected_pos = parent_pos + r;
     assert!(
@@ -1033,7 +1039,10 @@ fn severed_chunk_inherits_com_momentum_and_core_sever_destroys_ship() {
     );
     assert!(
         (chunk.body.pos - expected_pos).length() < 1e-4,
-        "chunk world pos = parent.pos + r"
+        "chunk world pos = parent.pos + r (grid-centre-relative, swapped + scaled): got \
+         {:?}, expected {:?}",
+        chunk.body.pos,
+        expected_pos
     );
     assert_eq!(
         chunk.cells,
@@ -1082,6 +1091,73 @@ fn severed_chunk_inherits_com_momentum_and_core_sever_destroys_ship() {
     assert_eq!(
         severed_chunks, 0,
         "a core-sever yields one whole-ship wreck, not a swarm of chunks"
+    );
+}
+
+/// REGRESSION (severed-chunk teleport): a severed chunk's `Position` must be the WORLD
+/// location its cells occupied on the live hull at the instant of severing — i.e.
+/// `parent.pos + Rot(heading)·worldoffset(chunk_com_cell − grid_centre_cell)` with the
+/// offset **scaled** by `CELL_WORLD_SIZE` AND **axis-swapped** (forward+X ← row,
+/// lateral+Y ← col) to match the render — NOT ~3× off (the missing-scale bug) and NOT on
+/// the swapped axis (the missing-swap bug). The chunk then drifts from exactly there.
+///
+/// Run with a **nonzero heading** (π/2) so the rotation is exercised and the swap is not
+/// masked by an identity rotation. The corridor hull is 5×3; severing the far-end region
+/// {(3,1),(4,1)} (cell-COM (4.0, 1.5)) off the grid centre (2.5, 1.5) gives a cell-space
+/// offset of (Δcol, Δrow) = (1.5, 0.0): purely lateral (a wing), zero forward.
+#[test]
+fn severed_chunk_spawns_at_its_cells_world_location_not_teleported() {
+    let parent_pos = Vec2::new(10.0, 5.0);
+    let heading = std::f32::consts::FRAC_PI_2; // 90° — exercises the rotation + the swap
+    let (mut w, ship) = corridor_world(parent_pos, Vec2::ZERO, heading, 0.0);
+
+    let grid_centre = Vec2::new(2.5, 1.5); // 5×3 hull → grid centre = (cols·0.5, rows·0.5)
+    let chunk_com_cell = Vec2::new(4.0, 1.5); // mean of (3,1),(4,1) cell centres
+    let mut region = std::collections::HashSet::new();
+    region.insert((3u16, 1u16));
+    region.insert((4u16, 1u16));
+
+    let chunk = sever_chunk(&mut w, ship, &region);
+
+    // The CORRECT offset: cell-space (Δcol, Δrow) → local-world (Δrow, Δcol)·CELL_WORLD_SIZE
+    // → rotated by heading. Here (Δcol, Δrow) = (1.5, 0.0), so local-world = (0.0, 0.48),
+    // which at heading π/2 rotates to (-0.48, 0.0).
+    let r_local = chunk_com_cell - grid_centre;
+    let r = Vec2::from_angle(heading).rotate(Vec2::new(r_local.y, r_local.x) * CELL_WORLD_SIZE);
+    let expected_pos = parent_pos + r;
+    assert!(
+        (chunk.body.pos - expected_pos).length() < 1e-4,
+        "the chunk spawns where its cells were (grid-centre-relative, swapped + scaled, \
+         rotated): got {:?}, expected {:?}",
+        chunk.body.pos,
+        expected_pos
+    );
+
+    // GUARD A — the scale is applied: the offset distance is the cell offset × the world
+    // cell size (≈0.48 world units), NOT the raw ~1.5-cell value (the ~3× missing-scale
+    // teleport bug). `CELL_WORLD_SIZE` is 0.32, so the bug would be ~3.1× too far.
+    let offset_len = (chunk.body.pos - parent_pos).length();
+    let expected_len = 1.5 * CELL_WORLD_SIZE; // 0.48
+    assert!(
+        (offset_len - expected_len).abs() < 1e-4,
+        "the offset is scaled by CELL_WORLD_SIZE ({expected_len}), not the raw cell distance \
+         1.5 (got {offset_len}) — the missing-scale teleport"
+    );
+    assert!(
+        offset_len < 1.0,
+        "a 1.5-cell lateral offset is < 1 world unit once scaled (got {offset_len}); the \
+         unscaled bug would put it ~1.5 units off"
+    );
+
+    // GUARD B — the axis is correct (swap applied): a purely-LATERAL cell offset (Δcol with
+    // Δrow = 0) maps to the ship's LATERAL (+Y local) axis, which at heading π/2 points
+    // along world −X. The buggy un-swapped code would treat (Δcol, Δrow) as
+    // (forward, lateral) and put the chunk along the ship's forward (+X local) axis →
+    // world +Y. So the chunk's world offset must be along −X here, not +Y.
+    assert!(
+        r.x < -1e-3 && r.y.abs() < 1e-4,
+        "a lateral (Δcol-only) sever lands on the lateral axis (world −X at heading π/2), \
+         not the swapped forward axis: r = {r:?}"
     );
 }
 
@@ -1559,6 +1635,8 @@ fn fitted_fighter_at_origin(w: &mut World) -> Entity {
         Heading(0.0),
         AngularVelocity(0.0),
         CollisionRadius(4.0),
+        // Carve-targetable: a live ship is `FitLayout` + `CollisionRadius` + `Destructible`.
+        Destructible,
     ))
     .id()
 }
@@ -2038,6 +2116,9 @@ fn spawn_fitted_enemy_target_spin(w: &mut World, pos: Vec2, angvel: f32) -> Enti
         AngularVelocity(angvel),
         // FIX (carve location): the VISIBLE hull footprint, matching `spawn_fitted_enemy`.
         CollisionRadius(hull_collision_radius(hull.grid_dims)),
+        // Carve-targetable: a live ship is `FitLayout` + `CollisionRadius` + `Destructible`
+        // (matching `spawn_fitted_enemy`). The flag is the carve query's explicit gate.
+        Destructible,
         fit,
         layout,
         stats,
@@ -2108,7 +2189,9 @@ fn core_world_pos(w: &World, target: Entity) -> Vec2 {
 /// trigger is retired for fitted ships). The proof: the enemy's `FitLayout` cells are
 /// visibly carved away (the cell count drops as the channel erodes), and when the carve
 /// reaches/severs the **core cell** the enemy becomes a persistent `Wreck` (death-
-/// stripped of `Target`/`FitLayout`/`CollisionRadius`) and a kill flash fires.
+/// stripped of `Target`/`CollisionRadius`, but KEEPING its residual `FitLayout` so the
+/// hulk renders as its real carved cells — the `Wreck` tag excludes it from re-carving)
+/// and a kill flash fires.
 #[test]
 fn fitted_player_fire_carves_to_core_and_destroys_fitted_enemy() {
     let mut w = World::new();
@@ -2192,9 +2275,15 @@ fn fitted_player_fire_carves_to_core_and_destroys_fitted_enemy() {
         destroyed_tick.expect("the enemy must be destroyed by sustained carving fire to its core");
 
     // --- CLEAN death: the dead enemy is NO LONGER a live, pristine target -----------
-    // `destroy_ship` removes `Target`/`CollisionRadius`/`FitLayout`, so the enemy can
-    // no longer be hit by `fitted_damage_system` (no more repeated "KILL") and no
-    // longer renders as a pristine ship — it is the drifting wreck hulk.
+    // `destroy_ship` removes the live `Target` marker and tags the entity `Wreck`, so it
+    // is no longer a live combat target (no repeated "KILL"): the wreck branch of
+    // `on_cells_carved` never re-kills a `Wreck`. The residual `FitLayout` is KEPT so the
+    // hulk renders as its remaining (carved) cells via the same hull-mesh path the live
+    // ship + severed chunks use — it reads as the wreck of its real shape, not a box.
+    //
+    // **Destructible wreckage**: the hulk KEEPS its `CollisionRadius` (the hull footprint)
+    // and is `Destructible`, so a shot into the dead hull erodes it further (it despawns
+    // when fully carved). This is the destructible-wreckage change.
     let wreck = w
         .get::<Wreck>(enemy)
         .expect("the carve-to-core kill leaves a persistent Wreck marker");
@@ -2205,16 +2294,21 @@ fn fitted_player_fire_carves_to_core_and_destroys_fitted_enemy() {
     );
     assert!(
         w.get::<Target>(enemy).is_none(),
-        "the destroyed enemy is no longer a Target (cannot be re-killed → no repeated KILL)"
+        "the destroyed enemy is no longer a live Target"
     );
     assert!(
-        w.get::<FitLayout>(enemy).is_none(),
-        "the destroyed enemy lost its FitLayout (no longer hit by fitted_damage_system, \
-         no longer rendered as a pristine ship)"
+        w.get::<FitLayout>(enemy).is_some(),
+        "the destroyed enemy KEEPS its residual FitLayout so the hulk renders as its real \
+         (carved) cells"
     );
     assert!(
-        w.get::<CollisionRadius>(enemy).is_none(),
-        "the destroyed enemy lost its CollisionRadius (no longer a swept-cast hit target)"
+        w.get::<CollisionRadius>(enemy).is_some(),
+        "the destroyed enemy KEEPS its CollisionRadius (destructible wreckage — the hulk is \
+         still shootable, eroded further by later hits)"
+    );
+    assert!(
+        w.get::<sim::components::Destructible>(enemy).is_some(),
+        "the hulk is Destructible (carve-targetable wreckage)"
     );
     // It is still a persistent physical body (the drifting wreck hulk).
     assert!(
@@ -2642,5 +2736,461 @@ fn forward_aft_hit_carves_the_fore_aft_axis_not_a_wing() {
     assert!(
         tail_row < nose_row,
         "a nose hit and a tail hit carve opposite fore/aft extremes ({tail_row} < {nose_row})"
+    );
+}
+
+// =================================================================================
+// Destructible wreckage + the per-entity `Destructible` toggle: severed pieces and the
+// destroyed-ship hulk are shootable/carve-able now, gated by `Destructible`. The carve
+// is `Fit`-independent (grid resolved from `FitLayout.hull`), so wreckage — which has
+// only a residual `FitLayout` (NO `Fit`) — carves through the SAME `fitted_damage_system`
+// path; the wreck branch of `on_cells_carved` severs-further / despawns-when-empty and
+// never re-kills. Removing `Destructible` per entity makes it inert (the user's toggle).
+// =================================================================================
+
+/// Spawn a **wreck** (a residual fighter hull) at the origin facing +X, drifting, with
+/// its hull-footprint collider — mirroring a destroyed-ship hulk. `destructible` toggles
+/// the `Destructible` marker so a test can prove the per-entity gate. It carries a
+/// residual `FitLayout` (the dense fighter silhouette) + a `Wreck` tag but **NO `Fit`**
+/// (exactly as `destroy_ship`/`sever_chunk` leave it) — so the carve must be
+/// `Fit`-independent to touch it.
+fn spawn_wreck(w: &mut World, destructible: bool) -> Entity {
+    let (modules, hulls) = seed_catalogs();
+    let hull = hulls.get(HULL_FIGHTER).unwrap().clone();
+    let mut fit = Fit::new(HULL_FIGHTER);
+    fit.install_raw(SlotId(0), MODULE_REACTOR_BASIC);
+    let layout = build_layout(&hull, &fit, &modules);
+
+    let mut e = w.spawn((
+        Position(Vec2::ZERO),
+        Velocity(Vec2::ZERO),
+        Heading(0.0),
+        AngularVelocity(0.0),
+        // The hull-footprint collider the hulk keeps (destroy_ship no longer strips it).
+        CollisionRadius(hull_collision_radius(hull.grid_dims)),
+        // The residual hit-map (NO Fit — the carve resolves the hull from layout.hull).
+        layout,
+        Wreck::new(WreckOrigin::DestroyedShip),
+    ));
+    if destructible {
+        e.insert(Destructible);
+    }
+    e.id()
+}
+
+/// Fire a single projectile through the target at the origin along `-X` (entering the
+/// `+X` nose face head-on so it penetrates), offset laterally by `lat` world units so the
+/// carve can be aimed at different columns of the hull. Carries `damage` (+ the matching
+/// `WeaponSource` penetration). Drives ONE `fitted_damage_system` step and returns the set
+/// of cells removed from `target` (empty if the carve removed nothing OR the target
+/// despawned).
+fn carve_wreck_at(
+    w: &mut World,
+    target: Entity,
+    lat: f32,
+    damage: f32,
+) -> std::collections::BTreeSet<(u16, u16)> {
+    // Approach from the +X nose side at lateral offset `lat`, sweeping inward along -X so
+    // it strikes the +X face at that column and bores toward -X.
+    let prev = Vec2::new(6.0, lat);
+    let pos = Vec2::new(-6.0, lat);
+    let vel = Vec2::new(-200.0, 0.0);
+    w.spawn((
+        Projectile,
+        Position(pos),
+        PrevPosition(prev),
+        Velocity(vel),
+        Damage(damage),
+        Lifetime(3.0),
+        WeaponSource::from_damage(damage),
+    ));
+
+    let before: std::collections::BTreeSet<(u16, u16)> = w
+        .get::<FitLayout>(target)
+        .map(|l| l.cells.keys().copied().collect())
+        .unwrap_or_default();
+    sim::fitted_damage_system(w);
+    let after: std::collections::BTreeSet<(u16, u16)> = w
+        .get::<FitLayout>(target)
+        .map(|l| l.cells.keys().copied().collect())
+        .unwrap_or_default();
+    before.difference(&after).copied().collect()
+}
+
+/// A centre-line carve (no lateral offset) — the common case for tests (a)/(c)/(d).
+fn carve_wreck_once(
+    w: &mut World,
+    target: Entity,
+    damage: f32,
+) -> std::collections::BTreeSet<(u16, u16)> {
+    carve_wreck_at(w, target, 0.0, damage)
+}
+
+/// (a) A `Destructible` wreck (a severed chunk / destroyed-ship hulk, with its collider)
+/// IS carved FURTHER by a subsequent hit: cells are removed from its residual
+/// `FitLayout` — the wreckage erodes under fire through the same carve path live ships
+/// use (Fit-independent, gated by `Destructible`).
+#[test]
+fn destructible_wreck_is_carved_further_by_a_hit() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    let wreck = spawn_wreck(&mut w, true);
+
+    let cells_before = w.get::<FitLayout>(wreck).unwrap().cells.len();
+    assert!(
+        cells_before > 0,
+        "the wreck starts with residual hull cells"
+    );
+
+    // A bounded hit so the wreck is eroded but NOT emptied in one shot (covered by (b)).
+    let removed = carve_wreck_once(&mut w, wreck, 40.0);
+    assert!(
+        !removed.is_empty(),
+        "a Destructible wreck is carved further by a hit (cells removed: {removed:?})"
+    );
+    // It is NOT re-killed and NOT (yet) despawned — it still exists as a wreck with fewer
+    // cells (the wreck branch never calls destroy_ship).
+    let layout = w
+        .get::<FitLayout>(wreck)
+        .expect("the partially-carved wreck still exists");
+    assert!(
+        layout.cells.len() < cells_before,
+        "the wreck's live cell count dropped (eroded), {} < {cells_before}",
+        layout.cells.len()
+    );
+    assert!(
+        w.get::<Wreck>(wreck).is_some(),
+        "the wreck is still a Wreck (never re-killed — already dead)"
+    );
+}
+
+/// A **small single-row wreck** (a 5-cell corridor lying along its row, registered in a
+/// `HullCatalog`) at the origin, with its footprint collider + `Destructible` + `Wreck`
+/// tag but NO `Fit`. Small enough that one centre-line carve along the row removes every
+/// cell — so the "carve a wreck until empty → despawn" path is exercised deterministically.
+fn spawn_small_wreck(w: &mut World) -> Entity {
+    // Register the corridor hull so the Fit-independent carve can resolve `layout.hull`.
+    let hull = corridor_hull();
+    let dims = hull.grid_dims;
+    {
+        let mut hulls = w.get_resource_mut::<HullCatalog>().unwrap();
+        hulls.hulls.insert(HULL_CORRIDOR, hull);
+    }
+    // Give the residual cells a small health so the carve does real work removing them.
+    let mut layout = corridor_layout();
+    for occ in layout.cells.values_mut() {
+        occ.health = 5.0;
+    }
+    w.spawn((
+        Position(Vec2::ZERO),
+        Velocity(Vec2::ZERO),
+        Heading(0.0),
+        AngularVelocity(0.0),
+        CollisionRadius(hull_collision_radius(dims)),
+        layout,
+        Destructible,
+        Wreck::new(WreckOrigin::SeveredChunk),
+    ))
+    .id()
+}
+
+/// (b) Carving a wreck until its `FitLayout` is empty **despawns** the entity (fully
+/// carved away — the render cell-diff removes its mesh; no empty hulk lingers). The wreck
+/// branch of `on_cells_carved` despawns the emptied entity; it never calls `destroy_ship`.
+#[test]
+fn carving_a_wreck_until_empty_despawns_it() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    // A small single-row corridor wreck: one centre carve along the row eats it whole.
+    let wreck = spawn_small_wreck(&mut w);
+    assert!(
+        w.get::<FitLayout>(wreck).unwrap().cells.len() == 5,
+        "the small wreck starts with its 5 corridor cells"
+    );
+
+    // Pound it with deep bursts along its row until it despawns. The corridor cells lie
+    // along COLUMNS (cols 0..4) at row 1, and world ±Y maps to cell-space col (heading 0),
+    // so a +Y→-Y bore sweeps the whole row of cells in one channel. Once every cell is gone
+    // the wreck branch despawns the emptied entity. A bounded loop so a never-despawns
+    // regression fails fast instead of hanging.
+    let mut despawned = false;
+    for _ in 0..40 {
+        if w.get_entity(wreck).is_err() {
+            despawned = true;
+            break;
+        }
+        // Fire along the Y axis (the corridor's cell-col axis): enter from +Y, bore to -Y.
+        let prev = Vec2::new(0.0, 6.0);
+        let pos = Vec2::new(0.0, -6.0);
+        let vel = Vec2::new(0.0, -200.0);
+        w.spawn((
+            Projectile,
+            Position(pos),
+            PrevPosition(prev),
+            Velocity(vel),
+            Damage(5000.0),
+            Lifetime(3.0),
+            WeaponSource::from_damage(5000.0),
+        ));
+        sim::fitted_damage_system(&mut w);
+    }
+    assert!(
+        despawned,
+        "carving the wreck until its FitLayout is empty despawns the entity"
+    );
+    assert!(
+        w.get_entity(wreck).is_err(),
+        "the fully-carved wreck no longer exists"
+    );
+}
+
+/// (c) A wreck WITHOUT `Destructible` is **inert** — a hit removes no cells. This proves
+/// the per-entity toggle: the same wreck shape, collider, and incoming shot, but with no
+/// `Destructible` marker, is excluded from the carve query and so never erodes.
+#[test]
+fn wreck_without_destructible_is_inert() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    let wreck = spawn_wreck(&mut w, false); // NO Destructible → the toggle is OFF
+
+    let cells_before = w.get::<FitLayout>(wreck).unwrap().cells.len();
+    assert!(
+        cells_before > 0,
+        "the wreck starts with residual hull cells"
+    );
+
+    // The SAME shot that erodes a Destructible wreck (test (a)) removes NOTHING here.
+    let removed = carve_wreck_once(&mut w, wreck, 5000.0);
+    assert!(
+        removed.is_empty(),
+        "a wreck without `Destructible` is inert — a hit removes no cells (got {removed:?})"
+    );
+    let layout = w
+        .get::<FitLayout>(wreck)
+        .expect("the inert wreck still exists");
+    assert_eq!(
+        layout.cells.len(),
+        cells_before,
+        "the inert wreck's cell count is unchanged (the per-entity toggle is OFF)"
+    );
+}
+
+/// (d) A live ship still dies via **carve-to-core** (the destructible-wreckage change
+/// leaves live-ship death unchanged): a `Destructible`, non-`Wreck` fitted ship struck
+/// such that its core cell is carved away becomes a whole-ship `DestroyedShip` `Wreck`.
+#[test]
+fn live_ship_still_dies_via_carve_to_core() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    // A stationary live enemy (Target + Destructible + collider + Fit + layout + defense).
+    let enemy = spawn_fitted_enemy_target_spin(&mut w, Vec2::ZERO, 0.0);
+    // Drop its shield so the very first heavy burst reaches the hull (death is about the
+    // carve, not the shield pool).
+    if let Some(mut s) = w.get_mut::<Shields>(enemy) {
+        s.current = 0.0;
+    }
+    assert!(
+        w.get::<Wreck>(enemy).is_none(),
+        "the live ship is not a wreck before the kill"
+    );
+    let core = sim::damage::core_cell(w.get::<FitLayout>(enemy).unwrap()).expect("a core cell");
+
+    // Fire a huge burst straight down the centre line (along -X into the +X nose) so the
+    // channel bores to the central core cell. A few shots if needed.
+    let mut destroyed = false;
+    for _ in 0..40 {
+        if w.get::<Wreck>(enemy).is_some() || w.get_entity(enemy).is_err() {
+            destroyed = true;
+            break;
+        }
+        let _ = carve_wreck_once(&mut w, enemy, 5000.0);
+    }
+    assert!(
+        destroyed,
+        "sustained core-aimed carving destroys the live ship"
+    );
+    // Whole-ship death: the core was carved away → a DestroyedShip wreck on the entity.
+    let wreck = w
+        .get::<Wreck>(enemy)
+        .expect("a live ship carved through its core becomes a persistent Wreck");
+    assert_eq!(
+        wreck.origin,
+        WreckOrigin::DestroyedShip,
+        "carving the core away is the whole-ship-destroyed path"
+    );
+    assert!(
+        w.get::<FitLayout>(enemy)
+            .map(|l| !l.cells.contains_key(&core))
+            .unwrap_or(true),
+        "the core cell was carved away (or the hulk fully carved/despawned)"
+    );
+}
+
+// =================================================================================
+// Carve-center mismatch regression: an OFF-CENTRE wreck piece (a severed wing whose
+// cells sit far from the parent grid centre) must carve where its cells ACTUALLY are.
+//
+// The carve maps the world impact into cell-space via `collision::hull_local_entry_ray`.
+// It used a FIXED grid centre (`grid_dims·0.5`) for every entity. But a severed chunk's
+// `Position` is its **cell-COM** and the client renders its cells around that COM
+// (`hull_mesh_center` for `Debris`: `mean(col+0.5, row+0.5)`). So for an off-centre piece
+// the carve ray entered the (empty) grid centre → `NoModule`/MISS, nothing removed — the
+// "HIT MISS" bug. The fix threads a per-target cell-space `center` (cell-COM for a `Wreck`)
+// into the entry mapping so the carve enters where the cells render. The `Wreck` tests
+// above did not expose this because their residual cells straddled the grid centre.
+// =================================================================================
+
+/// The off-centre hull id used by the carve-center regression test.
+const HULL_OFFCENTER: HullId = HullId(11);
+
+/// A **filled** 9×5 silhouette (every cell of cols `0..8` × rows `0..4`, 45 cells), each
+/// its own [`SectionId`]. The full authored silhouette matters for the carve's tunnel
+/// guard: with a residual wing buried inside this silhouette, the carve reads a head-on
+/// (angle-0) entry rather than a glancing wing-tip surface (so a clean penetration carves,
+/// not a ricochet). The wide grid centre `(4.5, 2.5)` is far from the wing the wreck keeps.
+fn offcenter_hull() -> Hull {
+    let mut cells: Vec<GridCell> = Vec::new();
+    let mut section = 0u32;
+    for col in 0u16..9 {
+        for row in 0u16..5 {
+            cells.push(GridCell::new((col, row), SectionId(section)));
+            section += 1;
+        }
+    }
+    Hull {
+        id: HULL_OFFCENTER,
+        name: "Offcenter".to_string(),
+        grid_dims: (9, 5),
+        cells,
+        power_capacity: 100.0,
+        cpu_capacity: 100.0,
+        mass_capacity: 100.0,
+        hull_base_mass: 1.0,
+        slots: Vec::new(),
+    }
+}
+
+/// Spawn a `Wreck` whose residual [`FitLayout`] is ONLY the off-centre **wing** — three
+/// cells in the far `+col` column `{(7,1),(7,2),(7,3)}` of the 9×5 grid (cell-COM
+/// `(7.5, 2.5)`, vs the grid centre `(4.5, 2.5)`: off-centre by 3 cells on the col axis).
+/// Its `Position` is the wing's cell-COM world point — exactly how `sever_chunk` places a
+/// severed chunk (and how the client renders it). Carries the footprint collider +
+/// `Destructible` + `Wreck`, NO `Fit` (residual-hull wreckage). The authored hull is the
+/// full 9×5 silhouette so the buried-entry tunnel guard reads a head-on penetration.
+fn spawn_offcenter_wing_wreck(w: &mut World) -> Entity {
+    {
+        let mut hulls = w.get_resource_mut::<HullCatalog>().unwrap();
+        hulls.hulls.insert(HULL_OFFCENTER, offcenter_hull());
+    }
+    let wing: [(u16, u16); 3] = [(7, 1), (7, 2), (7, 3)];
+    let mut cells = CellMap::new();
+    for (col, row) in wing {
+        // depth = min(col, cols-1-col, row, rows-1-row) on the 9×5 grid.
+        let depth = col.min(8 - col).min(row).min(4 - row);
+        cells.insert(
+            (col, row),
+            CellOccupant {
+                slot: SlotId(u32::MAX),
+                module: None,
+                health: 5.0, // small structural HP so a carve removes cells
+                depth,
+                structural: true,
+            },
+        );
+    }
+    let layout = FitLayout {
+        hull: HULL_OFFCENTER,
+        cells,
+    };
+    // The chunk's cell-COM in WORLD space (heading 0): the cell-space COM minus the grid
+    // centre, scaled to world — the offset `sever_chunk` bakes into the chunk `Position`
+    // (mirrors how the wing's cells render around this `Position`). The render axis swap
+    // maps forward←row, lateral←col, so world X ← row offset and world Y ← col offset. Only
+    // the relative offset matters for the carve (`hit.point - tpos`); placing it at a
+    // non-trivial point proves the mapping is not accidentally centred.
+    let com_local = Vec2::new(7.5, 2.5); // mean(col+0.5,row+0.5) over the wing
+    let grid_centre = Vec2::new(9.0 * 0.5, 5.0 * 0.5);
+    let pos = Vec2::new(
+        (com_local.y - grid_centre.y) * CELL_WORLD_SIZE, // world X ← row offset
+        (com_local.x - grid_centre.x) * CELL_WORLD_SIZE, // world Y ← col offset (the off-centre axis)
+    );
+    w.spawn((
+        Position(pos),
+        Velocity(Vec2::ZERO),
+        Heading(0.0),
+        AngularVelocity(0.0),
+        CollisionRadius(hull_collision_radius((9, 5))),
+        layout,
+        Destructible,
+        Wreck::new(WreckOrigin::SeveredChunk),
+    ))
+    .id()
+}
+
+/// REGRESSION (carve-center mismatch): firing at a genuinely **off-centre** severed wing
+/// carves cells out of it — the case the earlier `Wreck` tests missed. A forward (`-X`)
+/// shot sweeps the wreck's collider (centred on its cell-COM `Position`); the carve must
+/// enter the wing's actual column (cell-COM col `7.5`), NOT the grid centre col `4.5`.
+///
+/// PRE-FIX this FAILED: `hull_local_entry_ray` mapped the impact onto the grid centre
+/// (`4.5`) for every entity, so the ray entered the empty centre of the 9×5 grid where the
+/// wing-only residual has no cells → `carve_path` empty → `HitKind::NoModule`, zero cells
+/// removed (the "HIT MISS"). POST-FIX the per-target `center` is the wing's cell-COM, so
+/// the ray enters col `7` where the cells are and carves them.
+#[test]
+fn offcenter_wreck_piece_is_carved_where_its_cells_are() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    let wreck = spawn_offcenter_wing_wreck(&mut w);
+
+    let before: std::collections::BTreeSet<(u16, u16)> = w
+        .get::<FitLayout>(wreck)
+        .unwrap()
+        .cells
+        .keys()
+        .copied()
+        .collect();
+    assert_eq!(
+        before.len(),
+        3,
+        "the off-centre wing wreck starts with its 3 residual cells (cols all 7)"
+    );
+
+    // Fire a forward (-X) shot through the wreck's collider (centred on its cell-COM
+    // `Position`). The entry col is FIXED at the cell-space `center.x`; with the fix that
+    // is the wing's COM col (7.5 → col 7), so the bore (-row) sweeps the wing cells. The
+    // grid-centre col (4.5) would enter the empty centre column (no cells) → NoModule.
+    let tpos = w.get::<Position>(wreck).unwrap().0;
+    w.spawn((
+        Projectile,
+        Position(Vec2::new(tpos.x - 6.0, tpos.y)),
+        PrevPosition(Vec2::new(tpos.x + 6.0, tpos.y)),
+        Velocity(Vec2::new(-200.0, 0.0)),
+        Damage(5000.0),
+        Lifetime(3.0),
+        WeaponSource::from_damage(5000.0),
+    ));
+
+    sim::fitted_damage_system(&mut w);
+
+    // The wreck either lost cells (partial carve) or was fully carved away (despawn). Either
+    // way, cells WERE removed — the carve hit the wing instead of reporting MISS.
+    let after: std::collections::BTreeSet<(u16, u16)> = w
+        .get::<FitLayout>(wreck)
+        .map(|l| l.cells.keys().copied().collect())
+        .unwrap_or_default();
+    let removed: std::collections::BTreeSet<(u16, u16)> =
+        before.difference(&after).copied().collect();
+    assert!(
+        !removed.is_empty(),
+        "an off-centre wing wreck IS carved where its cells are (removed: {removed:?}); \
+         pre-fix the ray entered the grid centre (empty) → NoModule/MISS, removing nothing"
+    );
+
+    // The carve registered a real HIT, not the `NoModule` MISS the bug produced.
+    let last_kind = w.get_resource::<HitFeedback>().unwrap().last_kind;
+    assert!(
+        last_kind.is_some() && last_kind != Some(HitKind::NoModule),
+        "the off-centre wreck hit registers as a carve (HitKind != NoModule), got {last_kind:?}"
     );
 }

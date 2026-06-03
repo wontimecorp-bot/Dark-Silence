@@ -39,8 +39,9 @@ use protocol::{
     LoopbackTransport, Message, NetTransport, QAngle, QVec2, Snapshot,
 };
 use sim::components::{
-    AngularVelocity, CollisionRadius, DamageFlash, FlightAssist, Heading, Health, LastShieldHit,
-    Position, Projectile, ShieldHitFlash, Ship, Target, TargetKind, Velocity, Weapon,
+    AngularVelocity, CollisionRadius, DamageFlash, Destructible, FlightAssist, Heading, Health,
+    LastShieldHit, Position, Projectile, ShieldHitFlash, Ship, Target, TargetKind, Velocity,
+    Weapon,
 };
 use sim::damage::{
     default_resistance_matrix, seed_defense_layers, PenetrationConfig, SalvageConfig, ShieldConfig,
@@ -1042,9 +1043,11 @@ impl ServerApp {
     /// [`ServerApp::full_records`] but skips quantization: `flags` carries the
     /// target sub-kind ([`TargetKind::as_u8`]; `0` for ship/projectile) and
     /// `heading` is the ship `Heading` (projectile heading is derived from velocity
-    /// direction, target heading is `0.0`). Severed chunks (a `Wreck` body with no
-    /// Ship/Target/Projectile marker) are emitted as `Target`+`Asteroid` so the
-    /// client draws drifting grey debris — render-only, no protocol change, no
+    /// direction, target heading is `0.0`). Severed chunks + destroyed-ship hulks (a
+    /// `Wreck` body with no Ship/Target/Projectile marker) are emitted as
+    /// [`EntityKind::Debris`] and, when they carry a residual `FitLayout`, with their
+    /// **real severed cells** (`cells_of`, the same payload a fitted ship emits) so the
+    /// client renders the actual broken shape — render-only, no protocol change, no
     /// `full_records`/snapshot/determinism impact.
     ///
     /// Additive and client-only: no test depends on it, and it mutates no world
@@ -1289,12 +1292,19 @@ impl ServerApp {
         // Projectile — so the three queries above miss it and it would be invisible.
         // `Without<Target>` keeps the **destroyed enemy** (which keeps its `Target`
         // marker and is emitted above as a persistent hulk) out of this set, so it is
-        // not double-emitted. FIX 0b: each chunk now renders as `EntityKind::Debris`
-        // (a tinted, tumbling ship-fragment box client-side) instead of reusing the
-        // grey `Asteroid` sphere; its residual `FitLayout.cells.len()` rides in `flags`
-        // (clamped to `u8`) as a size hint the client scales the fragment by. Render-
-        // only + client-only: NO `full_records`/snapshot/determinism impact (the wire
-        // path never emits `Debris`).
+        // not double-emitted. (The destroyed-ship hulk keeps its `Target` marker until
+        // `destroy_ship` strips it; once stripped it falls into this query and, since it
+        // KEEPS its residual `FitLayout`, renders as its remaining carved cells too.)
+        //
+        // FIX (severed-chunk render): a chunk/hulk that carries a residual `FitLayout`
+        // now emits its **real cells** (`cells_of`, reused from the fitted-ship path) so
+        // the client draws it as a hull mesh of the exact cells that broke off — same
+        // shape/size/scale as on the ship — NOT a generic placeholder box. It stays
+        // `EntityKind::Debris` so the client knows it is wreckage (and tints it as dead
+        // metal). A degenerate `Wreck` with no `FitLayout` keeps the old box fallback
+        // (empty `cells`), and its residual cell-count still rides in `flags` as the
+        // size hint that box scales by. Render-only + client-only: NO
+        // `full_records`/snapshot/determinism impact (the wire path never emits `Debris`).
         let mut chunks = self
             .world
             .query_filtered::<(Entity, &Position, &Velocity, &Heading, Option<&FitLayout>), (
@@ -1303,16 +1313,28 @@ impl ServerApp {
                 Without<Target>,
                 Without<Projectile>,
             )>();
-        let chunk_rows: Vec<(Entity, Vec2, Vec2, f32, u8)> = chunks
+        let chunk_rows: Vec<(Entity, Vec2, Vec2, f32, u8, Vec<RenderCell>, (u16, u16))> = chunks
             .iter(&self.world)
             .map(|(e, p, v, h, layout)| {
+                // The chunk's real severed cells (same payload a fitted ship emits) so the
+                // client renders its actual shape; empty for a degenerate layout-less wreck.
+                let (cells, grid_dims) = cells_of(layout, &catalog_hulls, &catalog_modules);
                 // Residual cell-count as the size hint (≥ 1 so a fragment is never
-                // zero-sized), clamped into the `u8` flags field.
-                let cells = layout.map(|l| l.cells.len()).unwrap_or(1).max(1);
-                (e, p.0, v.0, h.0, cells.min(u8::MAX as usize) as u8)
+                // zero-sized), clamped into the `u8` flags field — the box fallback's scale
+                // for a layout-less wreck.
+                let size_hint = layout.map(|l| l.cells.len()).unwrap_or(1).max(1);
+                (
+                    e,
+                    p.0,
+                    v.0,
+                    h.0,
+                    size_hint.min(u8::MAX as usize) as u8,
+                    cells,
+                    grid_dims,
+                )
             })
             .collect();
-        for (entity, pos, vel, heading, size_hint) in chunk_rows {
+        for (entity, pos, vel, heading, size_hint, cells, grid_dims) in chunk_rows {
             out.push(RenderEntity {
                 id: self.entity_ids.id_for(entity),
                 kind: EntityKind::Debris,
@@ -1325,10 +1347,9 @@ impl ServerApp {
                 flash: 0.0,
                 shield_flash: 0.0,
                 hit_dir: Vec2::ZERO,
-                // Phase 1B renders debris as the single tumbling fragment box (no
-                // voxelization in 1B — severed chunks voxelize in Phase 2), so no cells.
-                cells: Vec::new(),
-                grid_dims: (0, 0),
+                // The chunk's real severed cells (empty → the client's box fallback).
+                cells,
+                grid_dims,
             });
         }
 
@@ -1610,6 +1631,10 @@ impl ServerApp {
                 // so the swept-cast impact point lands on the visible edge and the carve
                 // (which maps the real impact into cell-space) erodes where the bullet hit.
                 CollisionRadius(hull_collision_radius(hull.grid_dims)),
+                // Carve-targetable: a live ship is `FitLayout` + `CollisionRadius` +
+                // `Destructible`. The flag carries over to the hulk + severed chunks so the
+                // wreckage stays destructible too (a per-entity toggle for later gameplay).
+                Destructible,
                 // The fitted set: fit + hit-map + derived stats + the three defense
                 // layers. NO `Ship` (flight/weapon never pilot it), NO `Health` (the
                 // legacy destruction_system never despawns it — it persists as a wreck).

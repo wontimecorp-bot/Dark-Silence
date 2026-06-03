@@ -53,7 +53,7 @@ use protocol::{
     NetTransport, CLIENT_TOKEN_BYTES,
 };
 use server::{RenderEntity, ServerApp, PROTOCOL_VERSION};
-use sim::components::{CollisionRadius, TargetKind, Velocity};
+use sim::components::{CollisionRadius, Destructible, TargetKind, Velocity};
 use sim::damage::seed_defense_layers;
 use sim::fitting::{
     build_layout, derive_ship_stats, hull_collision_radius, seed_catalogs, Fit, SlotId,
@@ -340,6 +340,10 @@ fn attach_starter_fit(server: &mut ServerApp, local_id: EntityId) {
             section_armor,
             hull_structure,
             CollisionRadius(hull_collision_radius(hull.grid_dims)),
+            // Carve-targetable: a live ship is `FitLayout` + `CollisionRadius` +
+            // `Destructible`. The flag carries over to the hulk + severed chunks so the
+            // player's wreckage stays destructible too (a per-entity toggle for later).
+            Destructible,
         ));
     }
 }
@@ -580,12 +584,15 @@ fn spawn_render_entity(
         EntityKind::Debris => (assets.debris_mesh.clone(), assets.debris_material.clone()),
     };
 
-    // FIX 0b: a debris fragment gets a deterministic, id-derived base rotation (so
-    // fragments don't all align) and a scale from the per-chunk size hint in `flags`
-    // (residual cell-count). `interpolate_transforms` then drives its drift + spin from
-    // the inherited COM momentum + heading. Non-debris entities keep the existing
-    // heading-only orientation + unit scale (byte-identical to before).
-    let transform = if e.kind == EntityKind::Debris {
+    // A LAYOUT-LESS debris fragment (no cell payload) gets a deterministic, id-derived
+    // base rotation (so fragments don't all align) and a scale from the per-chunk size
+    // hint in `flags` (residual cell-count) — the generic box fallback. A debris chunk
+    // that DOES carry real cells (a severed piece / dead hulk) is rendered as its actual
+    // hull mesh by `sync_ship_hull`, so it takes the SAME heading-only, unit-scale
+    // transform a ship does (the cells are already correctly shaped/scaled around the
+    // chunk `Position` = cell-COM world) — no tumble/scale distortion. Non-debris entities
+    // keep the existing heading-only orientation + unit scale (byte-identical to before).
+    let transform = if e.kind == EntityKind::Debris && e.cells.is_empty() {
         let (extra_rot, scale) = debris_transform(e.id, e.flags);
         Transform {
             translation: Vec3::new(e.pos.x, e.pos.y, 0.0),
@@ -630,11 +637,21 @@ fn spawn_render_entity(
 /// VISUAL (own box mesh vs. hull-surface child) changes.
 ///
 /// A non-fitted entity (empty `cells`) is a no-op — it keeps its single mesh (asteroids,
-/// projectiles, debris, an unfitted ship are never given a hull surface).
+/// projectiles, a layout-less wreck, an unfitted ship are never given a hull surface).
+///
+/// **Wreckage path (severed chunk / dead hulk).** A [`EntityKind::Debris`] entity that
+/// carries cells is wreckage: it flows through this SAME path so it renders as its REAL
+/// severed cells (correct shape/size/scale, reusing [`build_hull_mesh`]) instead of a
+/// generic box. Two things differ from a live ship: (1) the merged surface wears the
+/// darkened "dead metal" [`RenderAssets::wreck_hull_material`] so it reads as debris, and
+/// (2) the cells are centred on the wreck's **cell-COM** (via [`hull_mesh_center`]) — the
+/// chunk's `Position` is that COM in world — not the grid centre, so the cells sit exactly
+/// where the piece broke off and drifted to. Its LOD-far fallback is the tinted debris box.
 ///
 /// LOD switch is clean both ways: near → drop the parent's own `Mesh3d`/`MeshMaterial3d`
 /// (so it stops drawing the box) and spawn the hull-surface child; far → despawn the child,
-/// FREE its `Mesh` handle from [`Assets<Mesh>`] (no leak), and restore the box mesh.
+/// FREE its `Mesh` handle from [`Assets<Mesh>`] (no leak), and restore the box mesh
+/// (ship box for a ship, tinted debris box for a wreck).
 ///
 /// **Rebuild-on-cell-set-change hook (Phase-2 erosion seam):** while near, the present cell
 /// set's cheap hash ([`cells_hash`]) is compared to the one the current mesh was built from
@@ -654,10 +671,25 @@ fn sync_ship_hull(
     e: &RenderEntity,
     lod_origin: Vec2,
 ) {
-    // Only fitted ships carry a cell payload; everything else keeps its single mesh.
+    // Only a fitted ship OR a severed chunk / dead hulk carries a cell payload; everything
+    // else (projectiles, plain targets, a layout-less wreck) keeps its single mesh.
     if e.cells.is_empty() {
         return;
     }
+
+    // A `Debris` entity with cells is WRECKAGE (a severed chunk or a destroyed-ship hulk):
+    // render its real cells with the darkened "dead metal" wreck tint and centre the cells
+    // on their own cell-COM (the chunk's `Position` is that COM in world). A live ship
+    // renders with the live hull material, centred on the GRID CENTRE (its `Position` sits
+    // there) — byte-identical to before. The LOD-far box fallback also differs: a wreck
+    // falls back to the tumbling debris box, a ship to its coarse ship box.
+    let is_wreck = e.kind == EntityKind::Debris;
+    let hull_mat = if is_wreck {
+        assets.wreck_hull_material.clone()
+    } else {
+        assets.hull_material.clone()
+    };
+    let center = hull_mesh_center(e);
 
     let near = e.pos.distance(lod_origin) <= SHIP_VOXEL_LOD_DIST;
 
@@ -700,16 +732,18 @@ fn sync_ship_hull(
             }
 
             // Merge the present cells into ONE seamless hull surface + add it to the mesh
-            // store. Modules stay hidden: `build_hull_mesh` uses the single uniform hull
-            // material (Phase 2 will pass an `exposed` predicate to reveal breach cells).
+            // store, centred on `center` (grid centre for a ship, cell-COM for a wreck) so
+            // the cells sit around the parent `Position`. Modules stay hidden:
+            // `build_hull_mesh` uses one uniform material (Phase 2 will pass an `exposed`
+            // predicate to reveal breach cells). A wreck wears the dead-metal tint.
             let cell_tuples: Vec<(u16, u16, u8)> =
                 e.cells.iter().map(|c| (c.col, c.row, c.kind)).collect();
-            let mesh = meshes.add(build_hull_mesh(&cell_tuples, e.grid_dims, CELL_SIZE));
+            let mesh = meshes.add(build_hull_mesh(&cell_tuples, CELL_SIZE, center));
 
             let child = commands
                 .spawn((
                     Mesh3d(mesh.clone()),
-                    MeshMaterial3d(assets.hull_material.clone()),
+                    MeshMaterial3d(hull_mat.clone()),
                     Transform::IDENTITY,
                 ))
                 .id();
@@ -731,10 +765,19 @@ fn sync_ship_hull(
             }
         }
         if let Ok(mut ec) = commands.get_entity(parent) {
-            ec.insert((
-                Mesh3d(assets.ship_mesh.clone()),
-                MeshMaterial3d(assets.ship_material.clone()),
-            ));
+            // Restore the coarse far-LOD mesh: a wreck → the tinted debris box, a ship →
+            // the coarse ship box. (The demo keeps combatants near, so this path is rare.)
+            if is_wreck {
+                ec.insert((
+                    Mesh3d(assets.debris_mesh.clone()),
+                    MeshMaterial3d(assets.debris_material.clone()),
+                ));
+            } else {
+                ec.insert((
+                    Mesh3d(assets.ship_mesh.clone()),
+                    MeshMaterial3d(assets.ship_material.clone()),
+                ));
+            }
         }
         current.set_voxelized(false);
     }
@@ -744,6 +787,36 @@ fn sync_ship_hull(
         if let Ok(mut ec) = commands.get_entity(parent) {
             ec.insert(state);
         }
+    }
+}
+
+/// The cell-space layout origin for [`build_hull_mesh`] — the point the entity's cells are
+/// drawn around so the silhouette sits on the parent `Position`.
+///
+/// - A **ship / fitted target** (`EntityKind::Ship`) sits at its hull GRID CENTRE
+///   `(cols·0.5, rows·0.5)` — its `Position` is the grid centre — so passing the grid
+///   centre reproduces the classic grid-centred ship layout exactly (byte-identical).
+/// - A **severed chunk / dead hulk** (`EntityKind::Debris` with cells) sits at its
+///   **cell-COM** — the sim set its `Position` to the world COM of just these cells at the
+///   instant of severing ([`sim::damage::sever_chunk`]). So passing the mean of its received
+///   cells' centres (`mean(col+0.5, row+0.5)`, matching the sim's `local_com`) lays the
+///   cells out around that `Position`, i.e. exactly where they were on the hull, now
+///   drifting. (A dead hulk keeps the grid centre via this same mean only if it still owns
+///   the whole grid; in practice its `Position` is the ship's last grid-centre position and
+///   its residual cells are the full remaining silhouette, so the mean ≈ grid centre and it
+///   reads correctly either way.)
+fn hull_mesh_center(e: &RenderEntity) -> Vec2 {
+    if e.kind == EntityKind::Debris {
+        // Mean cell centre of just this wreck's cells — matches the sim's `local_com` so the
+        // cells render around the chunk `Position` (= their world COM).
+        let n = e.cells.len().max(1) as f32;
+        let sum = e.cells.iter().fold(Vec2::ZERO, |acc, c| {
+            acc + Vec2::new(c.col as f32 + 0.5, c.row as f32 + 0.5)
+        });
+        sum / n
+    } else {
+        // Ship: the hull grid centre (its `Position` sits here) — classic layout.
+        Vec2::new(e.grid_dims.0 as f32 * 0.5, e.grid_dims.1 as f32 * 0.5)
     }
 }
 

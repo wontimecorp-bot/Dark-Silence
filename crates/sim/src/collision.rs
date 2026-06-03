@@ -9,11 +9,11 @@
 use crate::clock::FixedDt;
 use crate::combat::{self, HitFeedback};
 use crate::components::{
-    CollisionRadius, Damage, DamageFlash, Heading, Health, LastShieldHit, Position, PrevPosition,
-    Projectile, ProjectileOwner, ShieldHitFlash, Ship, Target, TargetKind, Velocity,
+    CollisionRadius, Damage, DamageFlash, Destructible, Heading, Health, LastShieldHit, Position,
+    PrevPosition, Projectile, ProjectileOwner, ShieldHitFlash, Ship, Target, TargetKind, Velocity,
 };
-use crate::damage::{apply_damage, core_cell, on_cells_carved, DamageEvent, HitKind};
-use crate::fitting::{Fit, FitLayout, HullCatalog, CELL_WORLD_SIZE};
+use crate::damage::{apply_damage, core_cell, on_cells_carved, DamageEvent, HitKind, Wreck};
+use crate::fitting::{FitLayout, HullCatalog, CELL_WORLD_SIZE};
 use crate::physics::{Physics, RapierPhysics, SweptHit};
 use crate::tuning::Tuning;
 use crate::weapon::{damage_event_from_hit, WeaponSource};
@@ -194,10 +194,12 @@ struct FittedHit {
 ///    (the contact point's offset from the ship centre, world units); `offset_local =
 ///    Rot(−heading) · offset_world` (un-rotate into the hull frame, so `offset_local.x`
 ///    is ship-local **forward** and `offset_local.y` is ship-local **lateral**);
-///    `entry_cell_pos = offset_local / CELL_WORLD_SIZE + grid_dims · 0.5` mapped onto the
+///    `entry_cell_pos = offset_local / CELL_WORLD_SIZE + center` mapped onto the
 ///    cell-space axes to **match the render** ([`build_hull_mesh`] maps local **X
 ///    (forward) ← row**, local **Y (lateral) ← col**): therefore **col ← lateral**
-///    (`offset_local.y`) and **row ← forward** (`offset_local.x`).
+///    (`offset_local.y`) and **row ← forward** (`offset_local.x`). `center` is the
+///    per-target cell-space anchor (the caller mirrors the client's `hull_mesh_center`:
+///    cell-COM for a `Wreck`, grid centre for a live ship).
 ///
 /// The carve ray STARTS at this impact cell (on the hull edge the shot met) and goes
 /// inward along `dir_cell`, so the channel BEGINS where the bullet hit. The existing
@@ -213,7 +215,7 @@ fn hull_local_entry_ray(
     world_impact: Vec2,
     world_centre: Vec2,
     heading: f32,
-    grid_dims: (u16, u16),
+    center: Vec2,
 ) -> (Vec2, Vec2) {
     let inv_rot = Vec2::from_angle(-heading);
     // Inverse ship rotation: world travel direction → hull-local `(forward, lateral)`
@@ -225,16 +227,25 @@ fn hull_local_entry_ray(
     };
     // Impact offset from the ship centre, un-rotated into the hull frame (so
     // `offset_local.x` = forward, `offset_local.y` = lateral), scaled from world units to
-    // cells, and centred on the grid → the cell-space position the bullet visually struck.
+    // cells, and centred on the target's cell-space `center` → the cell-space position the
+    // bullet visually struck.
+    //
+    // `center` is the per-target cell-space point that the entity's `Position`/render is
+    // anchored on, computed by the caller to MATCH the client's `hull_mesh_center`
+    // (`crates/client/src/net.rs`): the **cell-COM** (`mean(col+0.5, row+0.5)`) for a
+    // `Wreck` (its `Position` is its cell-COM and its cells render around it), and the
+    // **grid centre** (`grid_dims·0.5`) for a live ship (its `Position` sits at the grid
+    // centre). Threading it here — rather than always using the grid centre — makes the
+    // carve enter where the cells actually are for an off-centre wreck piece (otherwise the
+    // ray entered empty space → `NoModule`/MISS, nothing carved).
     let offset_world = world_impact - world_centre;
     let offset_local = inv_rot.rotate(offset_world);
-    let grid_centre = Vec2::new(grid_dims.0 as f32 * 0.5, grid_dims.1 as f32 * 0.5);
     // Cell/trace space is (x = col, y = row); the render maps forward → row, lateral →
     // col (`build_hull_mesh`: local X/nose ← row, local Y/wing ← col). Match it so a
     // lateral wing hit lands on the col axis (the wing), not the row (fore/aft) axis.
     let entry_cell_pos = Vec2::new(
-        offset_local.y / CELL_WORLD_SIZE + grid_centre.x, // x = col  <- lateral
-        offset_local.x / CELL_WORLD_SIZE + grid_centre.y, // y = row  <- forward
+        offset_local.y / CELL_WORLD_SIZE + center.x, // x = col  <- lateral
+        offset_local.x / CELL_WORLD_SIZE + center.y, // y = row  <- forward
     );
     // The carve direction in cell space: x = col <- lateral = dir_local.y; y = row <-
     // forward = dir_local.x — the same swap, so carve_path AND the armor-angle (entry-cell
@@ -255,9 +266,10 @@ fn hull_local_entry_ray(
 /// released) and the mutations applied after.
 ///
 /// Steps:
-/// 1. **Sweep** every `(Projectile, WeaponSource)` vs every fitted target
-///    (`With<FitLayout>`), skipping self-hits via [`ProjectileOwner`] (E002), and
-///    record the **first** target struck per projectile (lowest `toi`).
+/// 1. **Sweep** every `(Projectile, WeaponSource)` vs every carve-target
+///    (`With<FitLayout>, With<Destructible>` — live ships AND destructible wreckage),
+///    skipping self-hits via [`ProjectileOwner`] (E002), and record the **first** target
+///    struck per projectile (lowest `toi`).
 /// 2. For each recorded hit: capture the target's pre-carve [`core_cell`], transform
 ///    the world hit into the target's hull-local cell-space ([`hull_local_entry_ray`]),
 ///    build the [`DamageEvent`] ([`damage_event_from_hit`]), and apply it
@@ -265,14 +277,17 @@ fn hull_local_entry_ray(
 ///    `FitLayout`). Set the hit flash + the legibility tag
 ///    ([`HitFeedback::last_kind`], FR-024) and despawn the projectile.
 /// 3. **Carve destruction event (Phase 2)**: if the carve removed any cell
-///    (`outcome.destroyed`), call [`on_cells_carved`] with the pre-carve core — it
-///    runs the connectivity flood-fill **once** (INV-D08) and (a) severs each region
-///    the carve disconnected from the core into a drifting [`WreckChunk`] while the
-///    ship lives, and (b) destroys the whole ship ([`destroy_ship`](crate::damage::on_cells_carved))
-///    when the **core cell** was carved away or left coreless. A whole-ship death
-///    raises the kill flash. This is the Phase 2 death model: a ship dies when its
-///    core is destroyed/severed — the old `HullStructure`-depletion `shatter_ship`
-///    trigger is retired (carving-to-core is now the death).
+///    (`outcome.destroyed`), call [`on_cells_carved`] with the pre-carve core. For a
+///    **live ship** it runs the connectivity flood-fill **once** (INV-D08) and (a) severs
+///    each region the carve disconnected from the core into a drifting [`WreckChunk`]
+///    while the ship lives, and (b) destroys the whole ship
+///    ([`destroy_ship`](crate::damage::on_cells_carved)) when the **core cell** was carved
+///    away or left coreless. A whole-ship death raises the kill flash. For a **wreck**
+///    (already dead) it instead severs further-disconnected pieces and **despawns** the
+///    entity once its cells are fully carved away — never a re-kill (see
+///    [`on_cells_carved`]). This is the Phase 2 death model: a ship dies when its core is
+///    destroyed/severed — the old `HullStructure`-depletion `shatter_ship` trigger is
+///    retired (carving-to-core is now the death).
 ///
 /// **Graceful degradation (INV-D16)**: a world with no fitted targets (the E002/
 /// E003/determinism worlds) records no hits and is a no-op; `apply_damage` /
@@ -284,29 +299,66 @@ pub fn fitted_damage_system(world: &mut World) {
     let physics = RapierPhysics::new();
     let mut hits: Vec<FittedHit> = Vec::new();
 
-    // Snapshot the fitted targets once (Entity, world pos, radius, heading, grid).
-    let mut target_q = world.query_filtered::<(
-        Entity,
-        &Position,
-        &CollisionRadius,
-        &Heading,
-        &FitLayout,
-        &Fit,
-    ), With<FitLayout>>();
-    // Resolve each fitted target's grid dims (the cell-space the carve maps the real
-    // impact into — see `hull_local_entry_ray`). A target whose hull is unresolvable is
-    // skipped in the apply loop (no panic, INV-D16).
+    // Snapshot the carve-targets once (Entity, world pos, radius, heading, grid).
+    // **Destructibility is the explicit per-entity gate** (`With<Destructible>`): a target
+    // is carve-eligible iff it carries `FitLayout` + `CollisionRadius` + `Destructible`.
+    // This deliberately drops the old `&Fit` requirement and the `Without<Wreck>` gate —
+    // live ships AND wreckage (severed chunks / destroyed-ship hulks, which keep a residual
+    // `FitLayout` + a collider + `Destructible`) carve through the SAME path. Wreckage is
+    // not re-killed: the wreck-aware `on_cells_carved` branch handles a `Wreck` target
+    // separately (sever-further / despawn-when-empty, no `destroy_ship`). Removing
+    // `Destructible` per entity makes that entity inert (the user's toggle).
+    let mut target_q = world
+        .query_filtered::<(Entity, &Position, &CollisionRadius, &Heading, &FitLayout, Option<&Wreck>), (
+            With<FitLayout>,
+            With<Destructible>,
+        )>();
+    // Resolve each target's grid dims from its **`FitLayout.hull`** (→ `HullCatalog`),
+    // not a `Fit` — the `Fit`-independent lookup that lets wreckage (no `Fit`) carve too.
+    // The grid is the cell-space the carve maps the real impact into (see
+    // `hull_local_entry_ray`). A target whose hull is unresolvable is skipped in the apply
+    // loop (no panic, INV-D16).
     let hull_dims: std::collections::BTreeMap<Entity, (u16, u16)> = {
         let hulls = world.get_resource::<HullCatalog>();
         target_q
             .iter(world)
-            .filter_map(|(e, _, _, _, _, fit)| {
+            .filter_map(|(e, _, _, _, layout, _)| {
                 hulls
-                    .and_then(|h| h.get(fit.hull))
+                    .and_then(|h| h.get(layout.hull))
                     .map(|hull| (e, hull.grid_dims))
             })
             .collect()
     };
+    // Per-target cell-space **center** for the carve entry ray — computed to MATCH the
+    // client's `hull_mesh_center` (`crates/client/src/net.rs`) so the carve enters where
+    // the cells actually render:
+    //   * `Wreck` target → the **cell-COM**: `mean(col+0.5, row+0.5)` over its CURRENT
+    //     `FitLayout.cells` (= the sim's `local_com`). A severed chunk's `Position` is its
+    //     cell-COM, and its cells render around it — so an off-centre piece carves where it
+    //     is, not at the (empty) grid centre (which produced `NoModule`/MISS before).
+    //   * live ship (no `Wreck`) → the **grid centre** `(cols·0.5, rows·0.5)` — its
+    //     `Position` sits at the grid centre (byte-identical to the previous behaviour).
+    // Deterministic: the `BTreeMap` cells iterate in sorted `Cell` order, the query order is
+    // stable, and the result is keyed by `Entity` in a `BTreeMap`. A target whose hull is
+    // unresolvable has no entry and is skipped in the apply loop alongside `hull_dims`.
+    let centers: std::collections::BTreeMap<Entity, Vec2> = target_q
+        .iter(world)
+        .filter_map(|(e, _, _, _, layout, wreck)| {
+            let center = if wreck.is_some() {
+                // Cell-COM over the chunk's current cells (matches client Debris layout).
+                let n = layout.cells.len().max(1) as f32;
+                let sum = layout.cells.keys().fold(Vec2::ZERO, |acc, &(col, row)| {
+                    acc + Vec2::new(col as f32 + 0.5, row as f32 + 0.5)
+                });
+                sum / n
+            } else {
+                // Live ship: the hull grid centre.
+                let (cols, rows) = *hull_dims.get(&e)?;
+                Vec2::new(cols as f32 * 0.5, rows as f32 * 0.5)
+            };
+            Some((e, center))
+        })
+        .collect();
     let targets: Vec<(Entity, Vec2, f32, f32)> = target_q
         .iter(world)
         .map(|(e, p, r, h, _, _)| (e, p.0, r.0, h.0))
@@ -344,8 +396,12 @@ pub fn fitted_damage_system(world: &mut World) {
             }
         }
         if let Some((target, heading, tpos, hit)) = best {
-            let Some(&dims) = hull_dims.get(&target) else {
+            if !hull_dims.contains_key(&target) {
                 // Hull unresolvable for this target: skip (no panic, INV-D16).
+                continue;
+            }
+            let Some(&center) = centers.get(&target) else {
+                // No carve center (unresolvable live-ship hull): skip (no panic, INV-D16).
                 continue;
             };
             // FIX 0a: the world impact direction from the ship centre to the swept hit
@@ -363,8 +419,12 @@ pub fn fitted_damage_system(world: &mut World) {
             };
             // FIX (carve location): build the carve entry ray from the REAL world impact
             // (`hit.point` relative to the target centre `tpos`), not through the core —
-            // so the channel begins at the cell the bullet visually struck.
-            let (point, dir_cell) = hull_local_entry_ray(vel.0, hit.point, tpos, heading, dims);
+            // so the channel begins at the cell the bullet visually struck. `center` is the
+            // per-target cell-space anchor mirroring the client's `hull_mesh_center`
+            // (cell-COM for a `Wreck`, grid centre for a live ship) so an off-centre wreck
+            // piece carves where its cells actually are (no more HIT/MISS).
+            let (point, dir_cell) =
+                hull_local_entry_ray(vel.0, hit.point, tpos, heading, center);
             let local_hit = SweptHit {
                 toi: hit.toi,
                 point,
@@ -426,11 +486,13 @@ pub fn fitted_damage_system(world: &mut World) {
 
         // --- 3. Carve destruction event (Phase 2): sever + core-death --------------
         // The carve removed cells from the live FitLayout. Run the connectivity
-        // flood-fill ONCE (INV-D08): sever each region the carve disconnected from the
-        // core into a drifting chunk while the ship lives, and destroy the whole ship
-        // when the CORE cell was carved away/severed (the Phase 2 death model). A
-        // whole-ship death raises the kill flash. Skipped if the target despawned this
-        // hit or is already a wreck (on_cells_carved is itself idempotent/total).
+        // flood-fill ONCE (INV-D08): on a LIVE ship, sever each region the carve
+        // disconnected from the core into a drifting chunk while the ship lives, and
+        // destroy the whole ship when the CORE cell was carved away/severed (the Phase 2
+        // death model — raises the kill flash). On a WRECK (already dead) it severs
+        // further-disconnected pieces and despawns the emptied entity instead — no
+        // re-kill. `on_cells_carved` dispatches on the `Wreck` tag and is total. Skipped
+        // if the target despawned this hit.
         if outcome.destroyed && world.get_entity(target).is_ok() {
             let ship_destroyed = on_cells_carved(world, target, pre_carve_core);
             if ship_destroyed {
