@@ -1937,14 +1937,47 @@ fn fitted_player_fire_destroys_fitted_enemy_via_hull_depletion() {
         wreck_on_enemy || any_wreck,
         "destruction leaves a persistent Wreck (or severed chunks)"
     );
-    // The shatter sheds the fighter's disconnected sections as drifting debris.
+
+    // --- CLEAN death: the dead enemy is NO LONGER a live, pristine target -----------
+    // The death-strip removes `Target`/`CollisionRadius`/`FitLayout`, so the enemy can
+    // no longer be hit by `fitted_damage_system` (no more repeated "KILL") and no
+    // longer renders as a pristine ship — it is the drifting wreck hulk.
+    assert!(
+        w.get::<Wreck>(enemy).is_some(),
+        "the destroyed enemy carries the persistent Wreck marker"
+    );
+    assert!(
+        w.get::<Target>(enemy).is_none(),
+        "the destroyed enemy is no longer a Target (cannot be re-killed → no repeated KILL)"
+    );
+    assert!(
+        w.get::<FitLayout>(enemy).is_none(),
+        "the destroyed enemy lost its FitLayout (no longer hit by fitted_damage_system, \
+         no longer rendered as a pristine ship)"
+    );
+    assert!(
+        w.get::<CollisionRadius>(enemy).is_none(),
+        "the destroyed enemy lost its CollisionRadius (no longer a swept-cast hit target)"
+    );
+    // It is still a persistent physical body (the drifting wreck hulk).
+    assert!(
+        w.get::<Position>(enemy).is_some() && w.get::<Velocity>(enemy).is_some(),
+        "the wreck persists as a drifting physical body"
+    );
+
+    // --- VISIBLE death: the shatter shed drifting debris chunks (severed) -----------
     let chunk_count = w
         .query_filtered::<&Wreck, ()>()
         .iter(&w)
         .filter(|wr| wr.origin == WreckOrigin::SeveredChunk)
         .count();
-    // The `WreckChunk` value type is part of the sever surface the demo relies on;
-    // reference it so the import is load-bearing (a chunk's drift kinematics).
+    assert!(
+        chunk_count > 0,
+        "the death sheds drifting WreckChunk debris (non-core sections severed before \
+         the core's whole-ship wreck) — got {chunk_count} severed chunks"
+    );
+    // Each severed chunk is a drifting `WreckChunk`-shaped body; reference the type so
+    // the import is load-bearing (the chunk's drift kinematics the demo relies on).
     let _ = std::mem::size_of::<WreckChunk>();
 
     // --- Record + sanity-check the kill-time (the brief's 5–12 s tuning window) ------
