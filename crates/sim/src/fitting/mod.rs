@@ -55,14 +55,14 @@ pub use hull::{
     CELL_WORLD_SIZE,
 };
 pub use layout::{
-    build_layout, cell_map, cell_mass, center_or_anchor, hardpoint_arc, layout_center,
-    layout_inertia, layout_mass, module_at, resolve_hit, Cell, CellMap, CellOccupant, FitLayout,
-    HitResolution,
+    build_layout, build_layout_with, cell_map, cell_mass, cell_mass_with, center_or_anchor,
+    hardpoint_arc, layout_center, layout_inertia, layout_inertia_with, layout_mass, layout_mass_with,
+    module_at, resolve_hit, Cell, CellMap, CellOccupant, FitLayout, HitResolution,
 };
 pub use module::{
     Axis, HardpointType, Module, ModuleId, ModuleKind, ModuleSpecifics, SlotSize, Violation,
 };
-pub use stats::{derive_ship_stats, ShipStats, WeaponProfile};
+pub use stats::{derive_ship_stats, derive_ship_stats_with, ShipStats, WeaponProfile};
 pub use validate::{
     budget_usage, check_slot_fit, validate_fit, AxisUsage, BudgetUsage, FitValidation,
 };
@@ -104,11 +104,16 @@ use bevy_ecs::prelude::*;
 pub fn recompute_ship_stats_system(
     hulls: Res<HullCatalog>,
     modules: Res<ModuleCatalog>,
+    // Phase M6: read the live tuning so a re-derive (incl. the dev panel's "Apply / Re-derive"
+    // which `set_changed`s every `Fit`) rebuilds layouts + stats at the live structural-cell
+    // HP/mass. Absent (a minimal world) → the const defaults.
+    sim: Option<Res<crate::tuning::SimTuning>>,
     mut q: Query<
         (Ref<Fit>, &mut ShipStats, &mut FitLayout),
         Or<(Changed<Fit>, Changed<FitLayout>)>,
     >,
 ) {
+    let sim = sim.map(|s| *s).unwrap_or_default();
     for (fit, mut stats, mut layout) in &mut q {
         let Some(hull) = hulls.get(fit.hull) else {
             // Unknown hull: cannot derive; leave the prior stats/layout untouched.
@@ -117,8 +122,22 @@ pub fn recompute_ship_stats_system(
         // A fit re-configure rebuilds the layout fresh (full health = repaired);
         // a layout-only change (damage) preserves the damaged health.
         if fit.is_changed() {
-            *layout = build_layout(hull, &fit, &modules);
+            *layout = build_layout_with(hull, &fit, &modules, sim.struct_cell_hp);
         }
-        *stats = derive_ship_stats(hull, &fit, &modules, &layout);
+        *stats = derive_ship_stats_with(hull, &fit, &modules, &layout, sim.struct_cell_mass);
+    }
+}
+
+/// Force EVERY fitted ship to re-derive next tick (Phase M6 — the dev panel's "Apply / Re-derive"
+/// button): marks each [`Fit`] changed so [`recompute_ship_stats_system`] rebuilds its
+/// [`FitLayout`] + [`ShipStats`] at the **live** [`SimTuning`](crate::SimTuning) + catalog values
+/// (editing a module's mass/thrust or `struct_cell_*` doesn't touch a ship's cached stats until
+/// it re-derives). **Caveat:** a `Changed<Fit>` rebuilds the layout FRESH (full health) — it
+/// previews new balance but **repairs** the ship, wiping live battle damage. Solo / dev only.
+pub fn force_rederive_all(world: &mut World) {
+    let mut q = world.query::<&mut Fit>();
+    // `set_changed` trips `Changed<Fit>` even though the value is untouched.
+    for mut fit in q.iter_mut(world) {
+        fit.set_changed();
     }
 }

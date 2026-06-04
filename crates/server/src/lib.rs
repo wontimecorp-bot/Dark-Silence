@@ -52,7 +52,7 @@ use sim::fitting::{
     HullCatalog, ModuleCatalog, SlotId, HULL_FIGHTER, MODULE_ARMOR_PLATE, MODULE_AUTOCANNON,
     MODULE_REACTOR_BASIC, MODULE_THRUSTER_BASIC,
 };
-use sim::{FixedDt, HitFeedback, ShipIntent, Tuning};
+use sim::{FixedDt, HitFeedback, ShipIntent, SimTuning, Tuning};
 
 pub use session::{
     decode_inbound, ClientState, DropReason, InputDisposition, RateDecision, RejectionCategory,
@@ -448,6 +448,10 @@ impl ServerApp {
 
         let mut world = World::new();
         world.insert_resource(Tuning::default());
+        // Phase M6: the promoted carve/struct/projectile/wreck/ram feel-consts as a live-tunable
+        // resource (the dev panel edits it; default == the old consts, so behaviour is unchanged
+        // until edited). Authoritative (server) world.
+        world.insert_resource(SimTuning::default());
         world.insert_resource(FixedDt(rates.fixed_dt()));
         // Intent is per-entity now (a `ShipIntent` component on each ship), not a
         // global resource — so each client ship is piloted by its own input.

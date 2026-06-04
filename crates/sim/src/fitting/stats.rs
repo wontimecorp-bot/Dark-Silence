@@ -29,10 +29,10 @@
 use bevy_ecs::component::Component;
 use serde::{Deserialize, Serialize};
 
-use super::content::ModuleCatalog;
+use super::content::{ModuleCatalog, STRUCT_CELL_MASS};
 use super::fit::Fit;
 use super::hull::Hull;
-use super::layout::{layout_mass, CellOccupant, FitLayout};
+use super::layout::{layout_mass_with, CellOccupant, FitLayout};
 use super::module::{Module, ModuleKind, ModuleSpecifics};
 use crate::damage::StatScalingConfig;
 use crate::tuning::Tuning;
@@ -228,6 +228,20 @@ pub fn derive_ship_stats(
     catalog: &ModuleCatalog,
     layout: &FitLayout,
 ) -> ShipStats {
+    derive_ship_stats_with(hull, fit, catalog, layout, STRUCT_CELL_MASS)
+}
+
+/// [`derive_ship_stats`] with an explicit structural-cell mass (Phase M6 live tuning): the flight
+/// `total_mass` = [`layout_mass_with`] at `struct_cell_mass` instead of the compile-time
+/// [`STRUCT_CELL_MASS`]. The dev panel's re-derive passes the live `SimTuning.struct_cell_mass`.
+#[allow(clippy::too_many_arguments)]
+pub fn derive_ship_stats_with(
+    hull: &Hull,
+    fit: &Fit,
+    catalog: &ModuleCatalog,
+    layout: &FitLayout,
+    struct_cell_mass: f32,
+) -> ShipStats {
     // Flight-feel constants the modules do not supply come from the demoted
     // `Tuning` baseline (HINT-002): the seed baseline fit reproduces these.
     let base = Tuning::default();
@@ -322,7 +336,7 @@ pub fn derive_ship_stats(
     // continuous as it erodes into a wreck. (The authored `hull.hull_base_mass` is no longer part
     // of the flight mass — it remains only the fitting-screen mass-**budget** axis.) Floored `> 0`
     // (INV-F14) — a no-cell layout never zeroes the flight denominator.
-    let total_mass = layout_mass(layout, catalog).max(f32::MIN_POSITIVE);
+    let total_mass = layout_mass_with(layout, catalog, struct_cell_mass).max(f32::MIN_POSITIVE);
 
     ShipStats {
         thrust_force,

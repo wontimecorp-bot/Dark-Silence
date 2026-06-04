@@ -167,39 +167,65 @@ fn cell_center(coord: Cell) -> Vec2 {
 /// [`FitLayout`]'s cells ([`layout_mass`]) it gives the body's mass for flight acceleration,
 /// projectile knockback, wreck drift, and inertia alike — so mass is continuous as a ship erodes
 /// into a wreck and reflects what the body is actually made of (a reactor cell outweighs plating).
+///
+/// Uses the compile-time [`STRUCT_CELL_MASS`]; for the live-tunable path (the dev panel's
+/// `SimTuning.struct_cell_mass`) call [`cell_mass_with`].
 pub fn cell_mass(occupant: &CellOccupant, modules: &ModuleCatalog) -> f32 {
+    cell_mass_with(occupant, modules, STRUCT_CELL_MASS)
+}
+
+/// [`cell_mass`] with an explicit structural-cell mass (Phase M6 live tuning): a module cell
+/// weighs its module's mass; a structural / empty / dangling cell weighs `struct_cell_mass`.
+pub fn cell_mass_with(occupant: &CellOccupant, modules: &ModuleCatalog, struct_cell_mass: f32) -> f32 {
     occupant
         .module
         .and_then(|m| modules.get(m))
         .map(|m| m.mass)
-        .unwrap_or(STRUCT_CELL_MASS)
+        .unwrap_or(struct_cell_mass)
 }
 
 /// A body's total inertial **mass** = Σ [`cell_mass`] over its current cells (Phase M5). The one
 /// mass `derive_ship_stats` gives flight AND `fitted_damage_system` gives the projectile-impulse +
 /// wreck drift, so a live ship and the wreck it becomes share the same mass basis (no jump on
-/// death). Deterministic (a fold over the `BTreeMap`-sorted cells); an empty layout → `0`.
+/// death). Deterministic; empty layout → `0`. Live-tunable variant: [`layout_mass_with`].
 pub fn layout_mass(layout: &FitLayout, modules: &ModuleCatalog) -> f32 {
-    layout.cells.values().map(|o| cell_mass(o, modules)).sum()
+    layout_mass_with(layout, modules, STRUCT_CELL_MASS)
+}
+
+/// [`layout_mass`] with an explicit structural-cell mass (Phase M6 live tuning).
+pub fn layout_mass_with(layout: &FitLayout, modules: &ModuleCatalog, struct_cell_mass: f32) -> f32 {
+    layout
+        .cells
+        .values()
+        .map(|o| cell_mass_with(o, modules, struct_cell_mass))
+        .sum()
 }
 
 /// A body's **moment of inertia** about its mass-weighted centre of mass, in world units²·mass
 /// (Phase M5): `Σ cell_mass·|cell_center − COM|² · CELL_WORLD_SIZE²`, using the REAL per-cell mass
 /// so an off-centre hit spins a reactor/armor-heavy body less than light plating. Floored
-/// `> 0` (a single-cell or massless body still divides safely). Deterministic.
+/// `> 0` (a single-cell or massless body still divides safely). Deterministic. Live-tunable
+/// variant: [`layout_inertia_with`].
 pub fn layout_inertia(layout: &FitLayout, modules: &ModuleCatalog) -> f32 {
-    let total = layout_mass(layout, modules);
+    layout_inertia_with(layout, modules, STRUCT_CELL_MASS)
+}
+
+/// [`layout_inertia`] with an explicit structural-cell mass (Phase M6 live tuning).
+pub fn layout_inertia_with(layout: &FitLayout, modules: &ModuleCatalog, struct_cell_mass: f32) -> f32 {
+    let total = layout_mass_with(layout, modules, struct_cell_mass);
     if total <= f32::MIN_POSITIVE {
         return f32::MIN_POSITIVE;
     }
     // Mass-weighted centre of mass in cell-space.
     let com = layout.cells.iter().fold(Vec2::ZERO, |acc, (&coord, occ)| {
-        acc + cell_center(coord) * cell_mass(occ, modules)
+        acc + cell_center(coord) * cell_mass_with(occ, modules, struct_cell_mass)
     }) / total;
     let i_cellspace: f32 = layout
         .cells
         .iter()
-        .map(|(&coord, occ)| cell_mass(occ, modules) * (cell_center(coord) - com).length_squared())
+        .map(|(&coord, occ)| {
+            cell_mass_with(occ, modules, struct_cell_mass) * (cell_center(coord) - com).length_squared()
+        })
         .sum();
     (i_cellspace * CELL_WORLD_SIZE * CELL_WORLD_SIZE).max(f32::MIN_POSITIVE)
 }
@@ -252,8 +278,19 @@ fn cell_depth(hull: &Hull, coord: Cell) -> u16 {
 /// reads structural cells. The dense grid therefore changes **no** combat outcome this
 /// phase — it only populates the per-cell health store for Phase 2 carving.
 pub fn build_layout(hull: &Hull, fit: &Fit, catalog: &ModuleCatalog) -> FitLayout {
-    use super::content::STRUCT_CELL_HP;
+    build_layout_with(hull, fit, catalog, super::content::STRUCT_CELL_HP)
+}
 
+/// [`build_layout`] with an explicit structural-cell HP (Phase M6 live tuning): structural filler
+/// cells are seeded with `struct_cell_hp` instead of the compile-time [`STRUCT_CELL_HP`]
+/// (`crate::fitting::content::STRUCT_CELL_HP`), so the dev panel can retune hull erosion + a
+/// re-derive rebuilds layouts at the new value.
+pub fn build_layout_with(
+    hull: &Hull,
+    fit: &Fit,
+    catalog: &ModuleCatalog,
+    struct_cell_hp: f32,
+) -> FitLayout {
     let mut cells: CellMap = BTreeMap::new();
 
     for grid_cell in &hull.cells {
@@ -262,7 +299,7 @@ pub fn build_layout(hull: &Hull, fit: &Fit, catalog: &ModuleCatalog) -> FitLayou
         let (slot_id, module_id, health) = if grid_cell.structural {
             // A structural filler cell: no slot identity, seeded with the tunable
             // structural HP so the dense body is carvable in Phase 2.
-            (SlotId(u32::MAX), None, STRUCT_CELL_HP)
+            (SlotId(u32::MAX), None, struct_cell_hp)
         } else {
             // A module cell: the slot sitting on it drives occupancy. Found positionally
             // so the map stays correct under any authoring.

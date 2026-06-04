@@ -17,7 +17,7 @@ use crate::damage::{Channel, DamageEvent};
 use crate::fitting::ShipStats;
 use crate::intent::ShipIntent;
 use crate::physics::SweptHit;
-use crate::tuning::Tuning;
+use crate::tuning::{SimTuning, Tuning};
 use bevy_ecs::prelude::*;
 use glam::Vec2;
 use serde::{Deserialize, Serialize};
@@ -26,9 +26,9 @@ use serde::{Deserialize, Serialize};
 /// fallback when the shot's source is the [`Weapon`] component, which has no
 /// per-shot damage field. Fitted ships use their [`ShipStats`] weapon profile's
 /// `damage`.
-const PROJECTILE_DAMAGE: f32 = 10.0;
+pub(crate) const PROJECTILE_DAMAGE: f32 = 10.0;
 /// Projectile time-to-live in seconds.
-const PROJECTILE_LIFETIME: f32 = 3.0;
+pub(crate) const PROJECTILE_LIFETIME: f32 = 3.0;
 /// Phase M4/M5 — **fallback projectile inertial mass** for the UNFITTED gun (and any projectile
 /// spawned without a [`ProjectileMass`](crate::components::ProjectileMass)). A fitted weapon now
 /// carries its own per-weapon slug mass (`WeaponProfile::projectile_mass`); this is the global
@@ -46,12 +46,12 @@ pub const PROJECTILE_MASS: f32 = 0.03;
 /// (steel, thickness ~1) plate but stopped by a thick one. A later content pass
 /// sources per-weapon penetration from [`ModuleSpecifics::Weapon`](crate::fitting::ModuleSpecifics)
 /// directly (NEW-CONFIG).
-const PEN_PER_DAMAGE: f32 = 3.0;
+pub(crate) const PEN_PER_DAMAGE: f32 = 3.0;
 /// MVP penetrator size for the overmatch test (NEW-CONFIG seam). A constant small
 /// slug for the seed gun, below the overmatch ratio against any meaningful plate,
 /// so the angle/penetration gate (not overmatch) decides the outcome. Later
 /// content sources this per-weapon (NEW-CONFIG).
-const PEN_SIZE: f32 = 1.0;
+pub(crate) const PEN_SIZE: f32 = 1.0;
 
 /// The damage-typing carrier the E007 pipeline reads off a fired projectile
 /// (contracts/damage-api.md §5 `WeaponSource`, T037).
@@ -86,12 +86,20 @@ pub struct WeaponSource {
 impl WeaponSource {
     /// The MVP fixed-forward gun typing derived from a shot's per-projectile
     /// [`Damage`] (NEW-CONFIG seam): [`Channel::Kinetic`], penetration scaled from
-    /// the damage, a constant slug size. The single delivery this epic.
+    /// the damage, a constant slug size. The single delivery this epic. Uses the
+    /// compile-time [`PEN_PER_DAMAGE`]/[`PEN_SIZE`]; the live-tunable path
+    /// (`weapon_fire_system` reading `SimTuning`) calls [`from_damage_with`].
     pub fn from_damage(damage: f32) -> Self {
+        Self::from_damage_with(damage, PEN_PER_DAMAGE, PEN_SIZE)
+    }
+
+    /// [`from_damage`] with explicit penetration scaling + slug size (Phase M6 live tuning):
+    /// `penetration = damage · pen_per_damage`, `pen_size = pen_size`.
+    pub fn from_damage_with(damage: f32, pen_per_damage: f32, pen_size: f32) -> Self {
         Self {
             channel: Channel::Kinetic,
-            penetration: damage.max(0.0) * PEN_PER_DAMAGE,
-            pen_size: PEN_SIZE,
+            penetration: damage.max(0.0) * pen_per_damage,
+            pen_size,
         }
     }
 }
@@ -162,6 +170,9 @@ pub fn cooldown_after_fire(fire_rate: f32) -> f32 {
 pub fn weapon_fire_system(
     dt: Res<FixedDt>,
     tuning: Res<Tuning>,
+    // Phase M6: live-tunable projectile/pen consts. `Option` so a minimal world (no `SimTuning`,
+    // e.g. the headless sim tests) degrades to the const defaults rather than panicking.
+    sim: Option<Res<SimTuning>>,
     mut commands: Commands,
     // Fitted ships: ShipStats gates firing + supplies the profile; the optional
     // Weapon component (present when a weapon module is installed) holds cooldown.
@@ -192,6 +203,7 @@ pub fn weapon_fire_system(
     >,
 ) {
     let dt = dt.0;
+    let sim = sim.map(|s| *s).unwrap_or_default();
 
     // Fitted path: fit-derived can_fire + WeaponProfile (FR-016).
     for (owner, intent, pos, heading, mut ship_vel, stats, weapon) in &mut fitted {
@@ -216,12 +228,12 @@ pub fn weapon_fire_system(
                 Damage(profile.damage),
                 // Phase M5: the per-weapon slug mass, carried to the hit for the impulse.
                 ProjectileMass(profile.projectile_mass),
-                Lifetime(PROJECTILE_LIFETIME),
+                Lifetime(sim.projectile_lifetime),
                 ProjectileOwner(owner),
-                // E007 damage typing (T037): the fixed-forward gun is Kinetic with
-                // penetration derived from the shot damage. Harmless on a shot that
-                // only ever hits an unfitted target (the legacy path ignores it).
-                WeaponSource::from_damage(profile.damage),
+                // E007 damage typing (T037): the fixed-forward gun is Kinetic with penetration
+                // derived from the shot damage (M6: live `pen_per_damage`/`pen_size`). Harmless on
+                // a shot that only ever hits an unfitted target (the legacy path ignores it).
+                WeaponSource::from_damage_with(profile.damage, sim.pen_per_damage, sim.pen_size),
             ));
             // Phase M4/M5 recoil: conserve momentum against the MUZZLE component only (the inherited
             // part was already the ship's momentum), using the per-weapon slug mass.
@@ -245,19 +257,19 @@ pub fn weapon_fire_system(
                 Position(pos.0),
                 PrevPosition(pos.0),
                 Velocity(vel),
-                Damage(PROJECTILE_DAMAGE),
-                // Phase M5: the unfitted gun has no profile, so use the global fallback slug mass.
-                ProjectileMass(PROJECTILE_MASS),
-                Lifetime(PROJECTILE_LIFETIME),
+                Damage(sim.projectile_damage),
+                // Phase M5/M6: the unfitted gun has no profile → the live fallback slug mass.
+                ProjectileMass(sim.projectile_mass),
+                Lifetime(sim.projectile_lifetime),
                 ProjectileOwner(owner),
                 // E007 damage typing (T037): harmless on the unfitted E002/E003
                 // path (those targets resolve via the flat `Health` clamp, which
                 // never reads `WeaponSource`); present so a fitted target a legacy
                 // shot happens to hit still routes through the new pipeline.
-                WeaponSource::from_damage(PROJECTILE_DAMAGE),
+                WeaponSource::from_damage_with(sim.projectile_damage, sim.pen_per_damage, sim.pen_size),
             ));
-            // Phase M4 recoil — unfitted ships use the global Tuning mass.
-            ship_vel.0 -= PROJECTILE_MASS * muzzle / tuning.mass.max(f32::MIN_POSITIVE);
+            // Phase M4/M6 recoil — unfitted ships use the global Tuning mass + live slug mass.
+            ship_vel.0 -= sim.projectile_mass * muzzle / tuning.mass.max(f32::MIN_POSITIVE);
             weapon.cooldown = cooldown_after_fire(weapon.fire_rate);
         }
     }

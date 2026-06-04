@@ -24,7 +24,7 @@ use super::sever::{
 };
 use crate::clock::FixedDt;
 use crate::components::{
-    Destructible, MeshAnchor, Ship, Target, WreckLifetime, WRECK_LIFETIME_SECS,
+    Destructible, MeshAnchor, Ship, Target, WreckLifetime,
 };
 use crate::fitting::{Cell, Fit, FitLayout, HullCatalog, ModuleCatalog, SectionId};
 use glam::Vec2;
@@ -397,6 +397,12 @@ fn destroy_ship(world: &mut World, ship: Entity) {
     // which never re-kills a `Wreck`). `Destructible` is inserted defensively here (it
     // carries over from a live ship that had it, but a live ship without it should still
     // produce a destructible hulk — the wreck is a fresh per-entity choice).
+    // Phase M6: the drift lifetime is live-tunable (dev panel); absent resource → const default.
+    let wreck_lifetime = world
+        .get_resource::<crate::tuning::SimTuning>()
+        .copied()
+        .unwrap_or_default()
+        .wreck_lifetime_secs;
     let mut entity = world.entity_mut(ship);
     entity.insert(Wreck {
         origin: WreckOrigin::DestroyedShip,
@@ -414,7 +420,7 @@ fn destroy_ship(world: &mut World, ship: Entity) {
     // via `wreck_motion_system` like any other wreck body. Give it a drift lifetime so the hulk
     // eventually despawns instead of floating forever.
     entity.remove::<Ship>();
-    entity.insert(WreckLifetime(WRECK_LIFETIME_SECS));
+    entity.insert(WreckLifetime(wreck_lifetime));
 }
 
 /// Fixed-step **despawn-when-old** for drifting wreckage (Phase M4): decay each `Wreck`'s

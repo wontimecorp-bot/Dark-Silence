@@ -250,19 +250,19 @@ pub const REACH: f32 = 64.0;
 /// top of the per-cell damage cost). Tunnelling deeper costs penetration, so a finite
 /// shot carves a finite-depth channel and a low-pen shot stops shallow even when its
 /// damage budget is large. `> 0`.
-const CARVE_PEN_COST: f32 = 8.0;
+pub(crate) const CARVE_PEN_COST: f32 = 8.0;
 
 /// Multiplicative damage falloff applied to the surviving `damage` budget after a
 /// cell is punched through (the shot loses energy crossing each cell). `∈ (0, 1)`: a
 /// value near `1` carves a long channel from one strong shot, near `0` chips ~one
 /// cell. With the per-cell `health` subtraction this gives a tunable, decaying
 /// channel depth.
-const CARVE_FALLOFF: f32 = 0.75;
+pub(crate) const CARVE_FALLOFF: f32 = 0.75;
 
 /// The per-cell `health` floor used as the carve *work cost* for an empty module-slot
 /// cell (`health == 0`, no installed device): such a cell still costs a little to
 /// punch through so the channel does not carve infinitely free through hollow slots.
-const CARVE_MIN_CELL_COST: f32 = 1.0;
+pub(crate) const CARVE_MIN_CELL_COST: f32 = 1.0;
 
 /// The fallback armor facet for an **unplated** entry section (no [`ArmorFacet`] in
 /// [`SectionArmor`]): a thin steel plate normal to the incoming shot. So a hit on a
@@ -450,7 +450,7 @@ fn cell_in_front(cells: &BTreeSet<Cell>, entry_cell: Cell, dir_n: Vec2) -> bool 
 /// deflecting genuine grazes; live-ship authored cells are part of the solid silhouette
 /// (always ≥3), so the gate never trips for them. Tunable: raise it to also let 2-wide strips
 /// carve.
-const RICOCHET_MIN_NEIGHBORS: u8 = 3;
+pub(crate) const RICOCHET_MIN_NEIGHBORS: u8 = 3;
 
 /// Half-width of the **smoothing kernel** for [`local_surface_normal`]. `2` → a 5×5 window.
 /// A wider window than the immediate 3×3 averages the outward direction over more of the local
@@ -460,7 +460,7 @@ const RICOCHET_MIN_NEIGHBORS: u8 = 3;
 /// occupancy field = the normal of a smoothed marching-squares contour, computed cheaply
 /// without building the polyline. Tunable: larger = rounder/smoother (the client contour's
 /// smoothing should be tuned to match this).
-const SMOOTH_NORMAL_RADIUS: i32 = 2;
+pub(crate) const SMOOTH_NORMAL_RADIUS: i32 = 2;
 
 /// The **smoothed local outward surface normal** at `cell` within the **geometry cell set**,
 /// plus the COUNT of `cell`'s immediate (8-)neighbours that are present. The normal points
@@ -476,12 +476,12 @@ const SMOOTH_NORMAL_RADIUS: i32 = 2;
 /// a detached piece faces the way its ACTUAL shape faces, not the original ship's (Fix #9; a
 /// 1-cell chunk has no present neighbours → normal `0` + count `0` → head-on, always carves).
 /// Pure + deterministic (a fixed-order `BTreeSet` membership scan; no transcendentals).
-fn local_surface_normal(cells: &BTreeSet<Cell>, cell: Cell) -> (Vec2, u8) {
+fn local_surface_normal(cells: &BTreeSet<Cell>, cell: Cell, radius: i32) -> (Vec2, u8) {
     let (c, r) = (cell.0 as i32, cell.1 as i32);
     let mut normal = Vec2::ZERO;
     let mut present_count: u8 = 0; // immediate 8-neighbours only — the thin-shard gate input
-    for dc in -SMOOTH_NORMAL_RADIUS..=SMOOTH_NORMAL_RADIUS {
-        for dr in -SMOOTH_NORMAL_RADIUS..=SMOOTH_NORMAL_RADIUS {
+    for dc in -radius..=radius {
+        for dr in -radius..=radius {
             if dc == 0 && dr == 0 {
                 continue;
             }
@@ -640,6 +640,12 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
         .get_resource::<PenetrationConfig>()
         .copied()
         .unwrap_or_default();
+    // Phase M6: the promoted carve / ricochet feel-consts, live-tunable via the dev panel.
+    // Absent (a minimal/determinism world) → the const defaults (byte-identical to pre-M6).
+    let sim = world
+        .get_resource::<crate::tuning::SimTuning>()
+        .copied()
+        .unwrap_or_default();
 
     let channel = ev.channel;
 
@@ -732,13 +738,14 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
     // — a flank cell's true normal faces sideways while the radial points along the long axis,
     // so square-on flank hits spuriously ricocheted (Fix #8). The local normal is exact for
     // any shape and any carve state.
-    let (surface_normal, present_neighbors) = local_surface_normal(&geom_cells, entry_cell);
+    let (surface_normal, present_neighbors) =
+        local_surface_normal(&geom_cells, entry_cell, sim.smooth_normal_radius);
     let cos_impact = if surface_normal.length_squared() <= f32::EPSILON {
         1.0 // no outward direction → treat as head-on
     } else {
         (-dir_n).dot(surface_normal.normalize())
     };
-    let angle = if buried || present_neighbors < RICOCHET_MIN_NEIGHBORS || cos_impact < 0.0 {
+    let angle = if buried || present_neighbors < sim.ricochet_min_neighbors || cos_impact < 0.0 {
         // Down a bored tunnel (material in front — Fix #5's guard), a thin shard (too few
         // neighbours for a reliable surface normal → no spurious ricochet, Fix #10), or a
         // BACK-FACING entry whose local surface points away from the shooter (a concave/inside
@@ -845,12 +852,12 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
             // (a hollow/already-dead cell still costs a small CARVE_MIN_CELL_COST so the
             // channel is not infinitely free), apply the falloff, and continue carving
             // the next cell deeper with the reduced budget.
-            let cost = remaining.max(CARVE_MIN_CELL_COST);
+            let cost = remaining.max(sim.carve_min_cell_cost);
             applied += remaining;
             layout.cells.remove(cell);
             destroyed_cells.push(*cell);
-            damage_budget = (damage_budget - cost).max(0.0) * CARVE_FALLOFF;
-            pen_budget -= CARVE_PEN_COST;
+            damage_budget = (damage_budget - cost).max(0.0) * sim.carve_falloff;
+            pen_budget -= sim.carve_pen_cost;
         } else {
             // The shot lodges in this cell: chip its health (clamped >= 0) and stop.
             applied += damage_budget;

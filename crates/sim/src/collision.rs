@@ -18,7 +18,7 @@ use crate::damage::{
     apply_damage, core_cell, first_cell_hit, on_cells_carved, DamageEvent, HitKind, Wreck, REACH,
 };
 use crate::fitting::{
-    center_or_anchor, layout_inertia, layout_mass, FitLayout, HullCatalog, ModuleCatalog,
+    center_or_anchor, layout_inertia_with, layout_mass_with, FitLayout, HullCatalog, ModuleCatalog,
     CELL_WORLD_SIZE,
 };
 use crate::motion::{apply_angular_impulse, apply_linear_impulse};
@@ -30,9 +30,9 @@ use glam::Vec2;
 
 /// Ship inertial mass for ram impulses (asteroids are heavier, so the ship
 /// bounces more).
-const SHIP_MASS: f32 = 2.0;
+pub(crate) const SHIP_MASS: f32 = 2.0;
 /// Asteroid inertial mass for ram impulses.
-const ASTEROID_MASS: f32 = 8.0;
+pub(crate) const ASTEROID_MASS: f32 = 8.0;
 
 /// Earliest time-of-impact `t ∈ [0, 1]` at which the point sweeping `p0`→`p1`
 /// first touches the circle `(center, radius)`, or `None` if it never does
@@ -515,11 +515,17 @@ pub fn fitted_damage_system(world: &mut World) {
         // computed up-front so the `FitLayout`/`ModuleCatalog` borrows drop before the velocity
         // writes. A catalog-less minimal test world (no `ModuleCatalog`) skips the impulse; a target
         // with no `Velocity`/`AngularVelocity` is skipped per-write. Deterministic (sorted-cell fold).
+        // M6: the structural-cell mass is live-tunable (dev panel); copy it out first (no borrow).
+        let struct_cell_mass = world
+            .get_resource::<crate::tuning::SimTuning>()
+            .copied()
+            .unwrap_or_default()
+            .struct_cell_mass;
         let mass_inertia = world.get_resource::<ModuleCatalog>().and_then(|modules| {
             world.get::<FitLayout>(target).map(|layout| {
                 (
-                    layout_mass(layout, modules),
-                    layout_inertia(layout, modules),
+                    layout_mass_with(layout, modules, struct_cell_mass),
+                    layout_inertia_with(layout, modules, struct_cell_mass),
                 )
             })
         });
@@ -645,12 +651,15 @@ pub fn shield_hit_flash_decay_system(
 /// handled by `combat::destruction_system`).
 pub fn ram_collision_system(
     tuning: Res<Tuning>,
+    // Phase M6: `Option` so a minimal world (no `SimTuning`) degrades to the const ram masses.
+    sim: Option<Res<crate::tuning::SimTuning>>,
     mut ship_q: Query<(&Position, &mut Velocity, &mut Health, &CollisionRadius), With<Ship>>,
     mut asteroids: Query<
         (&Position, &mut Velocity, &CollisionRadius, &TargetKind),
         (With<Target>, Without<Ship>),
     >,
 ) {
+    let sim = sim.map(|s| *s).unwrap_or_default();
     let Some((ship_pos, mut ship_vel, mut ship_health, ship_radius)) = ship_q.iter_mut().next()
     else {
         return;
@@ -671,10 +680,10 @@ pub fn ram_collision_system(
             let (new_ship, new_ast) = elastic_velocities(
                 ship_pos,
                 ship_vel.0,
-                SHIP_MASS,
+                sim.ship_ram_mass,
                 apos.0,
                 avel.0,
-                ASTEROID_MASS,
+                sim.asteroid_ram_mass,
             );
             ship_vel.0 = new_ship;
             avel.0 = new_ast;

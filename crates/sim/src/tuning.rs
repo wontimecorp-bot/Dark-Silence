@@ -17,6 +17,14 @@
 
 use bevy_ecs::prelude::Resource;
 
+use crate::collision::{ASTEROID_MASS, SHIP_MASS};
+use crate::components::WRECK_LIFETIME_SECS;
+use crate::damage::layers::{
+    CARVE_FALLOFF, CARVE_MIN_CELL_COST, CARVE_PEN_COST, RICOCHET_MIN_NEIGHBORS, SMOOTH_NORMAL_RADIUS,
+};
+use crate::fitting::content::{STRUCT_CELL_HP, STRUCT_CELL_MASS};
+use crate::weapon::{PEN_PER_DAMAGE, PEN_SIZE, PROJECTILE_DAMAGE, PROJECTILE_LIFETIME, PROJECTILE_MASS};
+
 /// Global gameplay tuning. One instance is inserted by the client at startup
 /// and read by the `sim` systems. All magnitudes are positive (INV-10);
 /// `turn_power_share` is a `0..=1` fraction.
@@ -97,6 +105,77 @@ impl Tuning {
     }
 }
 
+/// **Promoted gameplay feel-consts** (Phase M6) — the carve / structural / projectile / wreck /
+/// ram magnitudes that used to be compile-time `const`s, gathered into one runtime [`Resource`]
+/// so the dev tuning panel can adjust them live. Inserted into the (authoritative, server) world;
+/// the sim reads it via `get_resource::<SimTuning>().copied().unwrap_or_default()`, so a world that
+/// never inserts it (e.g. the headless determinism harness) behaves byte-identically to the old
+/// consts.
+///
+/// **`Default` reproduces every promoted const EXACTLY** — the `simtuning_default_matches_consts`
+/// drift-guard test asserts each field equals its source const, so the consts (still defined at
+/// their read-sites + threaded into the pure helpers) and this resource can never silently
+/// diverge. Editing a field is **solo / server-authoritative only** (a networked client has no
+/// authority over server tuning, and divergent tuning would break reconciliation).
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+pub struct SimTuning {
+    /// Structural (filler-plating) cell hit points — hull erosion rate (`STRUCT_CELL_HP`).
+    pub struct_cell_hp: f32,
+    /// Structural cell mass — ship inertia + wreck mass per plating cell (`STRUCT_CELL_MASS`).
+    pub struct_cell_mass: f32,
+    /// Carve damage multiplier after punching through a cell (`CARVE_FALLOFF`).
+    pub carve_falloff: f32,
+    /// Penetration cost to tunnel through one carved cell (`CARVE_PEN_COST`).
+    pub carve_pen_cost: f32,
+    /// Floor work-cost for a hollow/empty cell so the channel is never free (`CARVE_MIN_CELL_COST`).
+    pub carve_min_cell_cost: f32,
+    /// Minimum present neighbours for a hit to be ricochet-eligible (`RICOCHET_MIN_NEIGHBORS`).
+    pub ricochet_min_neighbors: u8,
+    /// Smoothed-surface-normal kernel half-width (`SMOOTH_NORMAL_RADIUS`).
+    pub smooth_normal_radius: i32,
+    /// Fallback projectile slug mass for the unfitted gun (`PROJECTILE_MASS`).
+    pub projectile_mass: f32,
+    /// Fallback projectile damage for the unfitted gun (`PROJECTILE_DAMAGE`).
+    pub projectile_damage: f32,
+    /// Projectile time-to-live, seconds (`PROJECTILE_LIFETIME`).
+    pub projectile_lifetime: f32,
+    /// Penetration value per point of damage (`PEN_PER_DAMAGE`).
+    pub pen_per_damage: f32,
+    /// Penetrator size for the overmatch test (`PEN_SIZE`).
+    pub pen_size: f32,
+    /// Drift lifetime of a wreck before despawn, seconds (`WRECK_LIFETIME_SECS`).
+    pub wreck_lifetime_secs: f32,
+    /// Ship inertial mass for ram impulses (`SHIP_MASS`).
+    pub ship_ram_mass: f32,
+    /// Asteroid inertial mass for ram impulses (`ASTEROID_MASS`).
+    pub asteroid_ram_mass: f32,
+}
+
+impl Default for SimTuning {
+    fn default() -> Self {
+        // The promoted consts ARE the default — single source of truth, so the resource can never
+        // drift from the consts (and the consts stay "live" non-test code, no dead-code warning).
+        // The consts remain defined at their read-sites + threaded into the pure carve/mass helpers.
+        Self {
+            struct_cell_hp: STRUCT_CELL_HP,
+            struct_cell_mass: STRUCT_CELL_MASS,
+            carve_falloff: CARVE_FALLOFF,
+            carve_pen_cost: CARVE_PEN_COST,
+            carve_min_cell_cost: CARVE_MIN_CELL_COST,
+            ricochet_min_neighbors: RICOCHET_MIN_NEIGHBORS,
+            smooth_normal_radius: SMOOTH_NORMAL_RADIUS,
+            projectile_mass: PROJECTILE_MASS,
+            projectile_damage: PROJECTILE_DAMAGE,
+            projectile_lifetime: PROJECTILE_LIFETIME,
+            pen_per_damage: PEN_PER_DAMAGE,
+            pen_size: PEN_SIZE,
+            wreck_lifetime_secs: WRECK_LIFETIME_SECS,
+            ship_ram_mass: SHIP_MASS,
+            asteroid_ram_mass: ASTEROID_MASS,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +183,17 @@ mod tests {
     #[test]
     fn default_tuning_satisfies_inv10() {
         assert!(Tuning::default().is_valid());
+    }
+
+    /// `SimTuning::default()` is well-formed (positive magnitudes; the gate counters in range).
+    #[test]
+    fn simtuning_default_is_sane() {
+        let t = SimTuning::default();
+        assert!(t.struct_cell_hp > 0.0 && t.struct_cell_mass > 0.0);
+        assert!(t.carve_falloff > 0.0 && t.carve_pen_cost > 0.0 && t.carve_min_cell_cost >= 0.0);
+        assert!(t.projectile_mass > 0.0 && t.projectile_damage > 0.0 && t.projectile_lifetime > 0.0);
+        assert!(t.pen_per_damage > 0.0 && t.pen_size > 0.0 && t.wreck_lifetime_secs > 0.0);
+        assert!(t.ship_ram_mass > 0.0 && t.asteroid_ram_mass > 0.0);
     }
 
     #[test]

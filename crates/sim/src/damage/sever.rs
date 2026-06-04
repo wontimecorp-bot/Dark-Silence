@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use super::salvage::SalvageOutcome;
 use crate::components::{
     AngularVelocity, CollisionRadius, Destructible, Heading, MeshAnchor, Position, Velocity,
-    WreckLifetime, WRECK_LIFETIME_SECS,
+    WreckLifetime,
 };
 use crate::fitting::{Cell, Fit, FitLayout, HullCatalog, CELL_WORLD_SIZE};
 use crate::motion::BodyState;
@@ -413,6 +413,12 @@ pub fn sever_chunk(world: &mut World, ship: Entity, cells: &HashSet<Cell>) -> Wr
     // wreck branch of [`on_cells_carved`]. The radius matches the chunk's footprint (not
     // the whole hull), so the collider tracks what is rendered.
     let chunk_radius = chunk_collision_radius(&chunk_cells);
+    // Phase M6: the drift lifetime is live-tunable (dev panel); absent resource → const default.
+    let wreck_lifetime = world
+        .get_resource::<crate::tuning::SimTuning>()
+        .copied()
+        .unwrap_or_default()
+        .wreck_lifetime_secs;
     let mut entity = world.spawn((
         Position(chunk_pos),
         Velocity(chunk_vel),
@@ -431,7 +437,7 @@ pub fn sever_chunk(world: &mut World, ship: Entity, cells: &HashSet<Cell>) -> Wr
         },
         // Phase M4: a drift lifetime so the chunk despawns after coasting a while (frictionless
         // space never slows it), rather than floating forever.
-        WreckLifetime(WRECK_LIFETIME_SECS),
+        WreckLifetime(wreck_lifetime),
     ));
     if let Some(hull) = hull_id {
         entity.insert(FitLayout {

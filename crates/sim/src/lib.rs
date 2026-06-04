@@ -47,7 +47,7 @@ pub use fitting::{
 pub use intent::ShipIntent;
 pub use motion::{analytic, integrate, simulate, BodyState};
 pub use physics::{Physics, RapierPhysics, SweptHit};
-pub use tuning::Tuning;
+pub use tuning::{SimTuning, Tuning};
 pub use weapon::{damage_event_from_hit, WeaponSource};
 
 use bevy_ecs::schedule::common_conditions::resource_exists;
