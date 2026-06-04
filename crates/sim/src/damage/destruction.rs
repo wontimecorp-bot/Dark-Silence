@@ -21,8 +21,9 @@ use super::salvage::salvage_layout;
 use super::sever::{
     connected_region, core_cell, disconnected_regions, sever_chunk, Wreck, WreckOrigin,
 };
-use crate::components::{Destructible, Target};
+use crate::components::{Destructible, MeshAnchor, Target};
 use crate::fitting::{Cell, Fit, FitLayout, HullCatalog, ModuleCatalog, SectionId};
+use glam::Vec2;
 
 /// Handle a **carve destruction event** (Phase 2 fine destruction, INV-D08): after
 /// [`apply_damage`](super::apply_damage) has already removed the carved cells from the
@@ -363,6 +364,18 @@ fn destroy_ship(world: &mut World, ship: Entity) {
         _ => Vec::new(),
     };
 
+    // FROZEN render/carve anchor (Fix #6): the hulk keeps the ship's grid-centre `Position`,
+    // so its fixed reference is the GRID CENTRE — carving the dead hull no longer re-centres
+    // (shifts) it, and this matches the documented hulk render intent (its cells sit where
+    // they were on the live ship). Resolved from the residual layout's hull; absent (a minimal
+    // test world with no `HullCatalog`) → no anchor (the live cell-COM fallback, unchanged).
+    let grid_centre = residual_layout.as_ref().and_then(|l| {
+        world
+            .get_resource::<HullCatalog>()
+            .and_then(|h| h.get(l.hull))
+            .map(|hull| Vec2::new(hull.grid_dims.0 as f32 * 0.5, hull.grid_dims.1 as f32 * 0.5))
+    });
+
     // Attach the destroyed-ship wreck (idempotent — overwrite if present), then strip the
     // live-`Target` marker so the dead ship stops being a *live* combat target (no more
     // "KILL"). The entity keeps its body + `Wreck`, so it IS the persistent, lootable wreck.
@@ -387,5 +400,8 @@ fn destroy_ship(world: &mut World, ship: Entity) {
         claimed: false,
     });
     entity.insert(Destructible);
+    if let Some(c) = grid_centre {
+        entity.insert(MeshAnchor(c));
+    }
     entity.remove::<Target>();
 }

@@ -137,6 +137,23 @@ pub fn layout_center(layout: &FitLayout, grid_dims: (u16, u16), is_wreck: bool) 
     }
 }
 
+/// Resolve the cell-space centre the carve + armor angle anchor on: the **frozen**
+/// [`MeshAnchor`](crate::components::MeshAnchor) when the entity has one (a wreck captured
+/// its reference at creation), else the live [`layout_center`] fallback (cell-COM for a
+/// wreck, grid centre for a ship). Single-sources the choice for both
+/// [`fitted_damage_system`](crate::collision::fitted_damage_system) (the entry point) and
+/// [`apply_damage`](crate::damage::apply_damage) (the armor angle) so they never diverge,
+/// and freezes a wreck's reference so carving a cell does not shift the piece (it no longer
+/// chases the moving COM).
+pub fn center_or_anchor(
+    anchor: Option<Vec2>,
+    layout: &FitLayout,
+    grid_dims: (u16, u16),
+    is_wreck: bool,
+) -> Vec2 {
+    anchor.unwrap_or_else(|| layout_center(layout, grid_dims, is_wreck))
+}
+
 /// The local-space center of a unit cell `(col, row)` — its mid-point on the grid
 /// (`coord + 0.5`). The hit-line `p0`→`p1` and the cell circles in [`resolve_hit`]
 /// share this local cell-space.

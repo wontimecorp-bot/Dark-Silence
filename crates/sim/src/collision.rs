@@ -9,13 +9,14 @@
 use crate::clock::FixedDt;
 use crate::combat::{self, HitFeedback};
 use crate::components::{
-    CollisionRadius, Damage, DamageFlash, Destructible, Heading, Health, LastShieldHit, Position,
-    PrevPosition, Projectile, ProjectileOwner, ShieldHitFlash, Ship, Target, TargetKind, Velocity,
+    CollisionRadius, Damage, DamageFlash, Destructible, Heading, Health, LastShieldHit, MeshAnchor,
+    Position, PrevPosition, Projectile, ProjectileOwner, ShieldHitFlash, Ship, Target, TargetKind,
+    Velocity,
 };
 use crate::damage::{
     apply_damage, core_cell, first_cell_hit, on_cells_carved, DamageEvent, HitKind, Wreck, REACH,
 };
-use crate::fitting::{layout_center, FitLayout, HullCatalog, CELL_WORLD_SIZE};
+use crate::fitting::{center_or_anchor, FitLayout, HullCatalog, CELL_WORLD_SIZE};
 use crate::physics::{Physics, RapierPhysics, SweptHit};
 use crate::tuning::Tuning;
 use crate::weapon::{damage_event_from_hit, WeaponSource};
@@ -317,6 +318,7 @@ pub fn fitted_damage_system(world: &mut World) {
         &Heading,
         &FitLayout,
         Option<&Wreck>,
+        Option<&MeshAnchor>,
     ), (With<FitLayout>, With<Destructible>)>();
     // Resolve each target's grid dims from its **`FitLayout.hull`** (→ `HullCatalog`),
     // not a `Fit` — the `Fit`-independent lookup that lets wreckage (no `Fit`) carve too.
@@ -327,7 +329,7 @@ pub fn fitted_damage_system(world: &mut World) {
         let hulls = world.get_resource::<HullCatalog>();
         target_q
             .iter(world)
-            .filter_map(|(e, _, _, _, layout, _)| {
+            .filter_map(|(e, _, _, _, layout, _, _)| {
                 hulls
                     .and_then(|h| h.get(layout.hull))
                     .map(|hull| (e, hull.grid_dims))
@@ -337,10 +339,11 @@ pub fn fitted_damage_system(world: &mut World) {
     // Per-target cell-space **center** for the carve entry ray — computed to MATCH the
     // client's `hull_mesh_center` (`crates/client/src/net.rs`) so the carve enters where
     // the cells actually render:
-    //   * `Wreck` target → the **cell-COM**: `mean(col+0.5, row+0.5)` over its CURRENT
-    //     `FitLayout.cells` (= the sim's `local_com`). A severed chunk's `Position` is its
-    //     cell-COM, and its cells render around it — so an off-centre piece carves where it
-    //     is, not at the (empty) grid centre (which produced `NoModule`/MISS before).
+    //   * `Wreck` target → its **frozen [`MeshAnchor`]** (the cell-COM captured AT SEVER /
+    //     the hulk's grid centre), so carving a cell does not move where the piece anchors
+    //     (Fix #6). A severed chunk's `Position` is that anchor's world point, and its cells
+    //     render around it. (Absent anchor — a hand-built test wreck — falls back to the live
+    //     cell-COM, unchanged.)
     //   * live ship (no `Wreck`) → the **grid centre** `(cols·0.5, rows·0.5)` — its
     //     `Position` sits at the grid centre (byte-identical to the previous behaviour).
     // Deterministic: the `BTreeMap` cells iterate in sorted `Cell` order, the query order is
@@ -348,17 +351,19 @@ pub fn fitted_damage_system(world: &mut World) {
     // unresolvable has no entry and is skipped in the apply loop alongside `hull_dims`.
     let centers: std::collections::BTreeMap<Entity, Vec2> = target_q
         .iter(world)
-        .filter_map(|(e, _, _, _, layout, wreck)| {
+        .filter_map(|(e, _, _, _, layout, wreck, anchor)| {
             let is_wreck = wreck.is_some();
             // A live ship needs its resolved grid dims (skip the target if unresolvable,
-            // matching `hull_dims`); a `Wreck` uses its cell-COM and ignores the dims.
-            // Single-sourced with `apply_damage`'s armor-angle reference via `layout_center`.
+            // matching `hull_dims`); a `Wreck` uses its frozen anchor / cell-COM and ignores
+            // the dims. Single-sourced with `apply_damage`'s armor-angle reference via
+            // `center_or_anchor`.
             let grid_dims = if is_wreck {
                 (0, 0)
             } else {
                 *hull_dims.get(&e)?
             };
-            Some((e, layout_center(layout, grid_dims, is_wreck)))
+            let anchor = anchor.map(|a| a.0);
+            Some((e, center_or_anchor(anchor, layout, grid_dims, is_wreck)))
         })
         .collect();
     // Snapshot each target's selection inputs, INCLUDING a clone of its `FitLayout` so the
@@ -368,7 +373,7 @@ pub fn fitted_damage_system(world: &mut World) {
     // collected hit data.
     let targets: Vec<(Entity, Vec2, f32, f32, FitLayout)> = target_q
         .iter(world)
-        .map(|(e, p, r, h, layout, _)| (e, p.0, r.0, h.0, layout.clone()))
+        .map(|(e, p, r, h, layout, _, _)| (e, p.0, r.0, h.0, layout.clone()))
         .collect();
 
     let mut proj_q = world.query_filtered::<(

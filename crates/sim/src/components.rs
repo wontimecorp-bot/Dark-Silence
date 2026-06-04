@@ -163,6 +163,24 @@ pub struct CollisionRadius(pub f32);
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Destructible;
 
+/// The **frozen** cell-space reference point a wreck's cells render and carve around —
+/// captured ONCE when the entity becomes wreckage and never recomputed.
+///
+/// It is the cell-space point whose world location is the entity's [`Position`]: a severed
+/// chunk's COM at the instant of severing ([`sever_chunk`](crate::damage::sever_chunk)), or
+/// a destroyed-ship hulk's grid centre ([`destroy_ship`](crate::damage::destroy_ship), whose
+/// `Position` stays at the ship's grid centre). Both the client render
+/// ([`hull_mesh_center`]) and the sim carve/armor-angle centre resolve to this anchor when
+/// present (else the live cell-COM / grid-centre fallback).
+///
+/// **Why frozen:** without it, a wreck's reference was the LIVE cell-COM recomputed from the
+/// current cells every update, so removing a cell shifted the COM and the whole piece visibly
+/// jumped ("re-centres on its COM"). Freezing the anchor keeps every remaining cell exactly
+/// where it is — only the carved cell disappears. Live ships need no anchor (their grid-centre
+/// reference never drifts). Render-only / carve-only; not on any wire/snapshot path.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MeshAnchor(pub Vec2);
+
 /// A short-lived per-entity hit-flash timer (seconds), refreshed each time a hit
 /// lands on this entity and decayed toward `0` each fixed step
 /// ([`damage_flash_decay_system`](crate::collision::damage_flash_decay_system)).

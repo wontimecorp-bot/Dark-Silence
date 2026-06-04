@@ -28,7 +28,7 @@
 //! `SectionHealth`/`ArmorFacet` are `Copy`; `SectionArmor`/`DamageContext` hold a
 //! map (`Clone`, not `Copy`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
@@ -43,8 +43,8 @@ use super::resist::{layer_resist, DefenseLayer, ResistanceMatrix};
 use super::sever::Wreck;
 use super::shields::shield_absorb;
 use crate::fitting::{
-    layout_center, resolve_hit, Cell, CellOccupant, Fit, FitLayout, HitResolution, Hull,
-    HullCatalog, ModuleCatalog, ModuleRef, SectionId,
+    resolve_hit, Cell, CellOccupant, Fit, FitLayout, HitResolution, Hull, HullCatalog,
+    ModuleCatalog, ModuleRef, SectionId,
 };
 use crate::physics::{Physics, RapierPhysics};
 
@@ -412,34 +412,65 @@ fn carve_path(layout: &FitLayout, p0: Vec2, p1: Vec2) -> Vec<(Cell, CellOccupant
         .collect()
 }
 
-/// Whether the AUTHORED hull has any cell **in front of** `entry_cell` along the actual shot
-/// line (toward the shooter, `-dir_n`) — i.e. the shot bored through authored hull to reach
-/// the entry (a **tunnel** → head-on), as opposed to the entry being the first authored cell
+/// Whether the **geometry cell set** has any cell **in front of** `entry_cell` along the
+/// actual shot line (toward the shooter, `-dir_n`) — i.e. the shot bored through that material
+/// to reach the entry (a **tunnel** → head-on), as opposed to the entry being the first cell
 /// the shot meets (a **fresh outer surface** → its obliquity, and a genuine glancing
 /// ricochet, applies).
 ///
-/// Replaces the old single dominant-axis `front` cell, which rounded `-dir_n` to ONE
-/// orthogonal step and so misfired for an off-axis (diagonal) bore on a SHAPED hull — the
-/// orthogonal neighbour could land OFF the silhouette even though the shot drilled a real
-/// tunnel, mis-reading a buried cell as a fresh surface and **stalling the drill on a
-/// permanent ricochet** (Fix #5). This walks the authored cells along the REAL ray instead:
-/// a cell `c` is "in front" iff it lies toward the shooter (`d·(−dir_n) > 0`) AND on the
-/// shot line (perpendicular offset `< CARVE_CELL_RADIUS`, the same inscribe the carve uses).
-/// Length-independent, direction-accurate, and works for any ray on any shaped hull. Pure +
-/// deterministic (a `hull.cells.iter().any(..)` over a `Vec`).
-fn authored_cell_in_front(hull: &Hull, entry_cell: Cell, dir_n: Vec2) -> bool {
+/// `cells` is the **reference shape**: the authored hull for a live ship (a bored channel's
+/// carved cells are still authored → buried → head-on, no re-ricochet stall, Fix #5), OR a
+/// `Wreck`'s CURRENT cells for a detached chunk (its REAL shape, not the original ship it came
+/// from — Fix #9). Replaces the old single dominant-axis `front` cell, which misfired for an
+/// off-axis bore on a shaped hull (Fix #5). Walks the set along the REAL ray: a cell `c` is "in
+/// front" iff it lies toward the shooter (`d·(−dir_n) > 0`) AND on the shot line (perpendicular
+/// offset `< CARVE_CELL_RADIUS`). Length-independent, direction-accurate, any shape. Pure +
+/// deterministic (a `BTreeSet` scan).
+fn cell_in_front(cells: &BTreeSet<Cell>, entry_cell: Cell, dir_n: Vec2) -> bool {
     let entry_center = Vec2::new(entry_cell.0 as f32 + 0.5, entry_cell.1 as f32 + 0.5);
     let back = -dir_n; // unit vector toward the shooter (dir_n is normalized)
-    hull.cells.iter().any(|gc| {
-        if gc.coord == entry_cell {
+    cells.iter().any(|&coord| {
+        if coord == entry_cell {
             return false;
         }
-        let d = Vec2::new(gc.coord.0 as f32 + 0.5, gc.coord.1 as f32 + 0.5) - entry_center;
+        let d = Vec2::new(coord.0 as f32 + 0.5, coord.1 as f32 + 0.5) - entry_center;
         let along = d.dot(back);
         // Toward the shooter (`along > 0`) AND on the shot line (perpendicular within the
-        // per-cell carve inscribe) → authored material the shot bored through to get here.
+        // per-cell carve inscribe) → material the shot bored through to get here.
         along > 0.0 && (d - back * along).length() < CARVE_CELL_RADIUS
     })
+}
+
+/// The **local outward surface normal** at `cell` within the **geometry cell set** — the
+/// geometry-accurate direction the cell's plate faces, used for the armor obliquity on a fresh
+/// (non-buried) surface hit. Sums the unit vectors toward each of the 8 neighbour offsets that
+/// are NOT in the set (empty space): material pushes the normal AWAY from itself, so it points
+/// into the void = outward. `Vec2::ZERO` for a fully-interior cell (every neighbour present) →
+/// the caller treats that as head-on.
+///
+/// `cells` is the authored hull for a live ship, or a `Wreck`'s CURRENT cells for a chunk — so
+/// a detached piece faces the way its ACTUAL shape faces, not the original ship's (Fix #9; a
+/// 1-cell chunk has no present neighbours → normal `0` → head-on, always carves). Replaces the
+/// old grid-centre radial (Fix #8). Pure + deterministic (a fixed 8-neighbour `BTreeSet`
+/// membership scan).
+fn local_surface_normal(cells: &BTreeSet<Cell>, cell: Cell) -> Vec2 {
+    let (c, r) = (cell.0 as i32, cell.1 as i32);
+    let mut normal = Vec2::ZERO;
+    for dc in -1..=1 {
+        for dr in -1..=1 {
+            if dc == 0 && dr == 0 {
+                continue;
+            }
+            let nc = c + dc;
+            let nr = r + dr;
+            // An out-of-bounds neighbour is empty (void) too — it still pulls the normal out.
+            let present = nc >= 0 && nr >= 0 && cells.contains(&(nc as u16, nr as u16));
+            if !present {
+                normal += Vec2::new(dc as f32, dr as f32).normalize_or_zero();
+            }
+        }
+    }
+    normal
 }
 
 /// The legible "what happened" tag the HUD reads (FR-024, SC-005) — never numeric
@@ -550,10 +581,9 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
         .get::<SectionArmor>(target)
         .cloned()
         .unwrap_or_default();
-    // Whether this target is severed wreckage — selects the armor-angle reference centre
-    // below (a `Wreck`'s real centre is its cell-COM, not the original hull grid centre),
-    // the SAME choice `fitted_damage_system` makes for the entry point (single-sourced via
-    // `layout_center`). Read with the other per-target components, before the resource borrow.
+    // Severed wreckage uses its OWN CURRENT shape for the armor geometry (Fix #9), not the
+    // original ship it came from; a live ship uses the authored hull (Fix #5/#8). Read with the
+    // other per-target components, before the resource borrow.
     let is_wreck = world.get::<Wreck>(target).is_some();
 
     let Some(hulls) = world.get_resource::<HullCatalog>() else {
@@ -629,56 +659,55 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
         .and_then(|section| section_armor.facet(section).copied())
         .unwrap_or_else(|| default_facet(&ev));
 
-    // Impact angle = the shot's obliquity against the **original outer hull surface**
-    // at the entry cell — with a tunnel guard so a bored channel does not re-ricochet.
+    // Impact angle = the shot's obliquity against the entry cell's outer surface — measured
+    // from the cell's **local surface normal** ([`local_surface_normal`]: the direction its
+    // plate actually faces, from which neighbours are solid vs void), with a tunnel guard so a
+    // bored channel does not re-ricochet. A shot meeting that surface square-on
+    // (`cos_impact ≈ 1`) penetrates; a glancing edge hit (`cos_impact ≈ 0`) ricochets.
     //
-    // The entry cell's radial (`entry_cell_center − center`, where `center` is the
-    // target's OWN centre — cell-COM for a `Wreck` chunk, grid centre for a live ship)
-    // is its outward surface normal: a +x-rim cell faces +x, a wing-tip faces outward,
-    // etc. A shot
-    // meeting that surface square-on (`cos_impact ≈ 1`) penetrates; a glancing edge hit
-    // (`cos_impact ≈ 0`) ricochets. BUT as a channel is carved inward, the first
-    // surviving cell recedes toward the core, whose radial is perpendicular to a
-    // side-on approach — which would wrongly flip a long-bored head-on burst into a
-    // permanent `Ricochet`. The physical truth: a shot travelling down an
-    // already-bored tunnel meets the cell at its end **head-on along the tunnel axis**
-    // (no plate obliquity).
-    //
-    // Tunnel guard (erosion-aware, using the AUTHORED `hull`): if the **original**
-    // silhouette had a cell *in front of* the entry cell along the approach (i.e. the
-    // entry cell was buried in the intact hull and only exposed by carving), the shot
-    // is down a tunnel → head-on (`angle 0`). Only when the entry cell is on the
-    // original outer surface (no authored cell in front) does its radial obliquity
-    // apply — so fresh glancing hits ricochet, but a bored channel never re-ricochets.
+    // Tunnel guard (erosion-aware, using the AUTHORED `hull`, [`authored_cell_in_front`]): if
+    // the **original** silhouette had a cell *in front of* the entry cell along the actual
+    // shot line (i.e. the shot bored through authored material to reach it), the shot is down a
+    // tunnel → head-on (`angle 0`) — the first surviving cell recedes toward the core as a
+    // channel is carved, and a shot down an already-bored tunnel meets it head-on along the
+    // tunnel axis (no plate obliquity). Only when the entry cell is the first authored cell the
+    // shot meets (a fresh outer surface) does its local-normal obliquity apply — so fresh
+    // glancing hits ricochet, but a bored channel never re-ricochets. (The local normal also
+    // replaced the old grid-centre radial, which mislabeled square-on flank hits on the
+    // elongated hull as glancing — Fix #8.)
     let dir_n = if ev.dir.length_squared() > f32::EPSILON {
         ev.dir.normalize()
     } else {
         Vec2::X
     };
-    // Tunnel vs fresh surface, tested **direction-accurately along the real ray**: the entry
-    // is buried (a bored tunnel → head-on) iff the AUTHORED hull had any cell in front of it
-    // toward the shooter on the shot line ([`authored_cell_in_front`]). The previous
-    // single-dominant-axis check misfired for off-axis bores on a shaped hull — the
-    // orthogonal neighbour fell outside the silhouette mid-tunnel → a permanent ricochet
-    // stall (Fix #5).
-    let buried = authored_cell_in_front(&hull, entry_cell, dir_n);
+    // The reference shape for the armor geometry: a `Wreck` uses its OWN CURRENT cells (its
+    // real, detached shape — Fix #9, so a chunk faces the way it ACTUALLY faces, not the
+    // original ship it came from); a live ship uses the authored hull (Fix #5/#8). For a live
+    // ship this set IS the authored hull cells, so the result is byte-identical to before.
+    let geom_cells: BTreeSet<Cell> = if is_wreck {
+        layout.cells.keys().copied().collect()
+    } else {
+        hull.cells.iter().map(|gc| gc.coord).collect()
+    };
+    // Tunnel vs fresh surface, tested **direction-accurately along the real ray**: the entry is
+    // buried (a bored tunnel → head-on) iff `geom_cells` had any cell in front of it toward the
+    // shooter on the shot line ([`cell_in_front`]). The previous single-dominant-axis check
+    // misfired for off-axis bores on a shaped hull (Fix #5).
+    let buried = cell_in_front(&geom_cells, entry_cell, dir_n);
 
-    // The angle's surface-normal reference is the target's OWN centre — the cell-COM for a
-    // `Wreck` chunk (an off-centre subset of the original hull), the grid centre for a live
-    // ship. Using the original hull grid centre for a chunk pointed every cell's radial the
-    // same way (away from the far-off centre) → almost any shot read as glancing → spurious
-    // permanent `Ricochet`. `layout_center` single-sources this with the entry-point centre
-    // in `fitted_damage_system`, so the angle is measured where the cells actually are.
-    let center = layout_center(&layout, hull.grid_dims, is_wreck);
-    let entry_cell_center = Vec2::new(entry_cell.0 as f32 + 0.5, entry_cell.1 as f32 + 0.5);
-    let radial = entry_cell_center - center;
-    let angle = if buried || radial.length_squared() <= f32::EPSILON {
-        // Down a bored tunnel (entry was buried in the intact hull), or a centred
-        // surface cell with no outward direction → head-on, never a ricochet.
+    // The obliquity uses the entry cell's LOCAL surface normal (the direction its plate
+    // actually faces, from which of its neighbours are solid vs void), NOT a far-away centre
+    // radial. The old `entry_cell − grid_centre` proxy was wrong for an elongated/winged hull
+    // — a flank cell's true normal faces sideways while the radial points along the long axis,
+    // so square-on flank hits spuriously ricocheted (Fix #8). The local normal is exact for
+    // any shape and any carve state.
+    let surface_normal = local_surface_normal(&geom_cells, entry_cell);
+    let angle = if buried || surface_normal.length_squared() <= f32::EPSILON {
+        // Down a bored tunnel (material in front — Fix #5's guard), or a fully-interior cell
+        // with no outward direction → head-on, never a ricochet.
         0.0
     } else {
-        let surface_normal = radial.normalize();
-        let cos_impact = (-dir_n).dot(surface_normal).clamp(0.0, 1.0);
+        let cos_impact = (-dir_n).dot(surface_normal.normalize()).clamp(0.0, 1.0);
         cos_impact.acos()
     };
 

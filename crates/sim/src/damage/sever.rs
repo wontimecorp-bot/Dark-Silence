@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use super::salvage::SalvageOutcome;
 use crate::components::{
-    AngularVelocity, CollisionRadius, Destructible, Heading, Position, Velocity,
+    AngularVelocity, CollisionRadius, Destructible, Heading, MeshAnchor, Position, Velocity,
 };
 use crate::fitting::{Cell, Fit, FitLayout, HullCatalog, CELL_WORLD_SIZE};
 use crate::motion::BodyState;
@@ -336,14 +336,23 @@ pub fn sever_chunk(world: &mut World, ship: Entity, cells: &HashSet<Cell>) -> Wr
 
     let chunk_com_local = local_com(&chunk_cells).unwrap_or(Vec2::ZERO);
     let parent_layout = world.get::<FitLayout>(ship).cloned();
-    // The offset reference is the hull's GRID CENTRE — the point the render centres the
-    // ship's cells on (`build_hull_mesh`) and the point the ship's `Position` sits at —
-    // so a severed piece appears exactly where its cells were drawn on the live hull,
-    // then drifts. Resolve `grid_dims` from the ship's `Fit` + `HullCatalog` (as
-    // `on_section_destroyed`/`hull_collision_radius` do); fall back to the chunk COM (a
-    // zero offset) only when the hull is unresolvable in a minimal test world.
-    let grid_centre_local = grid_dims_of(world, ship)
-        .map(|(cols, rows)| Vec2::new(cols as f32 * 0.5, rows as f32 * 0.5))
+    // The offset reference is the parent's RENDER/CARVE anchor — the cell-space point whose
+    // world location IS the parent's `Position` (the point the render centres its cells on).
+    // For a LIVE ship that is the hull GRID CENTRE (resolved from its `Fit` + `HullCatalog`).
+    // For a `Wreck` (which has NO `Fit`) it is the parent's frozen [`MeshAnchor`] (Fix #6/#7) —
+    // WITHOUT this, severing a piece off a wreck (splitting it) fell back to the chunk COM (a
+    // ZERO offset), so the sub-chunk spawned ON TOP of the parent and the halves overlapped
+    // ("fell together"). With the parent anchor, `r_local = chunk_com − parent_anchor` is the
+    // real cell-space offset of the sub-region within the parent → it spawns where its cells
+    // were → the halves SEPARATE. Falls back to the chunk COM only in a minimal test world
+    // with neither a `MeshAnchor` nor a resolvable hull.
+    let grid_centre_local = world
+        .get::<MeshAnchor>(ship)
+        .map(|a| a.0)
+        .or_else(|| {
+            grid_dims_of(world, ship)
+                .map(|(cols, rows)| Vec2::new(cols as f32 * 0.5, rows as f32 * 0.5))
+        })
         .unwrap_or(chunk_com_local);
 
     // Cell-space offset `(Δcol, Δrow)`. Map it into the ship's LOCAL WORLD frame the
@@ -410,6 +419,10 @@ pub fn sever_chunk(world: &mut World, ship: Entity, cells: &HashSet<Cell>) -> Wr
         AngularVelocity(angvel),
         CollisionRadius(chunk_radius),
         Destructible,
+        // FROZEN render/carve anchor (Fix #6): the chunk's cell-COM AT SEVER — the cell-space
+        // point whose world location is `chunk_pos`. Render + carve resolve to this fixed
+        // reference, so carving a cell off the chunk later does not re-centre (shift) it.
+        MeshAnchor(chunk_com_local),
         Wreck {
             origin: WreckOrigin::SeveredChunk,
             contents: contents.clone(),

@@ -582,25 +582,27 @@ fn clean_penetration_carves_a_channel_to_the_module_behind() {
     );
 
     // A RICOCHET carves nothing: a shot grazing the hull's outer surface near-tangent
-    // (obliquity > ricochet_angle) bounces. Geometry: a straight-DOWN shot through the
-    // exposed left **wing tip** (0,5) — the only cell on column 0, a genuine outer
-    // surface cell whose outward normal is `-x`, perpendicular to the downward ray
-    // (obliquity ≈ 90°) → Ricochet, with a small non-overmatching penetrator.
+    // (obliquity > ricochet_angle) bounces. Geometry: a LATERAL (−col) shot across the
+    // **nose tip** `(4,10)` — the only cell on row 10, whose local surface normal points
+    // purely **forward** (+row, away from the row-9 cells below it), so a sideways shot is
+    // exactly perpendicular (obliquity ≈ 90°) → Ricochet, with a small non-overmatching
+    // penetrator. (The previous wing-tip straight-down graze is, under the accurate local
+    // normal, only a borderline ~67.5° corner clip — this lateral nose graze is unambiguous.)
     let (mut w3, ship3) = fitted_world(None, thin_entry_facet);
     let graze = DamageEvent {
         channel: Channel::Em,
         magnitude: 100.0,
         penetration: 50.0,
         pen_size: 0.0,
-        point: Vec2::new(0.5, 12.0), // above the left wing tip column 0
-        dir: Vec2::new(0.0, -1.0),   // straight down → grazes the -x-facing wing tip
+        point: Vec2::new(12.0, 10.5), // far +col side, on the nose-tip row
+        dir: Vec2::new(-1.0, 0.0),    // sideways across the forward-facing nose tip
         source: None,
     };
     let out3 = apply_damage(&mut w3, ship3, graze);
     assert_eq!(
         out3.result,
         HitKind::Ricochet,
-        "a near-tangent grazing clip of the wing tip ricochets (carves nothing)"
+        "a near-tangent lateral graze of the forward-facing nose tip ricochets (carves nothing)"
     );
     assert!(
         out3.destroyed_cells.is_empty(),
@@ -4095,5 +4097,417 @@ fn live_ship_bore_does_not_permanently_ricochet_mid_body() {
     assert!(
         layout.cells.contains_key(&(5, 5)),
         "the core (5,5) is untouched — this reproduces a MID-BODY stall on a live ship"
+    );
+}
+
+// =================================================================================
+// Fix #6 — a wreck's render/carve reference is a FROZEN `MeshAnchor` captured at sever/death,
+// not the live cell-COM recomputed every update. Without it, removing a cell shifted the COM
+// and the whole piece visibly jumped ("re-centres on its COM"). The anchor freezes the
+// reference so carving a cell only removes that cell — the rest stay put. Both the sim carve
+// (`center_or_anchor`) and the client render (`hull_mesh_center`) resolve to it.
+// =================================================================================
+
+/// `sever_chunk` freezes a `MeshAnchor` at the chunk's cell-COM (the cell-space point whose
+/// world location is the chunk `Position`) — so carving the chunk later does not re-centre it.
+#[test]
+fn sever_chunk_freezes_a_meshanchor_at_the_chunk_com() {
+    // Sever the corridor's far end {(3,1),(4,1)} via the REAL `on_section_destroyed` path.
+    let (mut w, ship) = corridor_world(Vec2::new(20.0, -7.0), Vec2::ZERO, 0.0, 0.0);
+    on_section_destroyed(&mut w, ship, SectionId(2));
+
+    let chunk = {
+        let mut q = w.query_filtered::<(Entity, &Wreck), With<FitLayout>>();
+        let severed: Vec<Entity> = q
+            .iter(&w)
+            .filter(|(_, wr)| wr.origin == WreckOrigin::SeveredChunk)
+            .map(|(e, _)| e)
+            .collect();
+        assert_eq!(severed.len(), 1, "exactly one severed flank chunk");
+        severed[0]
+    };
+
+    let anchor = w
+        .get::<sim::components::MeshAnchor>(chunk)
+        .expect("a severed chunk carries a FROZEN MeshAnchor");
+    // cell-COM of {(3,1),(4,1)} = mean((3.5,1.5),(4.5,1.5)) = (4.0, 1.5).
+    assert_eq!(
+        anchor.0,
+        Vec2::new(4.0, 1.5),
+        "the anchor is the chunk's cell-COM at sever (its Position's cell-space point)"
+    );
+}
+
+/// `destroy_ship` freezes a `MeshAnchor` at the hull's GRID CENTRE — the hulk keeps the ship's
+/// grid-centre `Position`, so anchoring there freezes the dead hull's reference (and matches
+/// the documented hulk render intent), so carving the dead hull does not re-centre it.
+#[test]
+fn destroy_ship_freezes_a_meshanchor_at_the_grid_centre() {
+    let (mut w, ship) = corridor_world(Vec2::ZERO, Vec2::ZERO, 0.0, 0.0);
+    // Destroying the CORE section (cell (1,1) = SectionId(1)) is whole-ship death → destroy_ship.
+    on_section_destroyed(&mut w, ship, SectionId(1));
+    assert_eq!(
+        w.get::<Wreck>(ship).unwrap().origin,
+        WreckOrigin::DestroyedShip,
+        "destroying the core section is whole-ship death"
+    );
+
+    let anchor = w
+        .get::<sim::components::MeshAnchor>(ship)
+        .expect("the hulk carries a FROZEN grid-centre MeshAnchor");
+    // Grid centre of the 5×3 corridor = (cols·0.5, rows·0.5) = (2.5, 1.5).
+    assert_eq!(
+        anchor.0,
+        Vec2::new(2.5, 1.5),
+        "the hulk anchor is the grid centre"
+    );
+}
+
+/// THE fix: carving a cell off a wreck does NOT drift its frozen anchor — the reference the
+/// carve + render use stays fixed even though the live cell-COM moves. Without the freeze the
+/// reference would follow the moving COM and the whole piece would visibly shift.
+#[test]
+fn carving_a_wreck_does_not_drift_its_frozen_anchor() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    // Off-centre wing wreck {(7,1),(7,2),(7,3)} on a 9×5 grid (cell-COM (7.5, 2.5)).
+    let wreck = spawn_offcenter_wing_wreck(&mut w);
+    let anchor0 = Vec2::new(7.5, 2.5); // the frozen reference `sever_chunk` would set
+    w.entity_mut(wreck)
+        .insert(sim::components::MeshAnchor(anchor0));
+
+    // Simulate the carve removing an END cell (as `apply_damage` does) — this shifts the live
+    // cell-COM in row from 2.5 → 2.0, the move that used to jump the piece.
+    w.get_mut::<FitLayout>(wreck).unwrap().cells.remove(&(7, 3));
+    let layout = w.get::<FitLayout>(wreck).unwrap();
+
+    // (1) The anchor is FROZEN — carving never mutates it.
+    let anchor = w.get::<sim::components::MeshAnchor>(wreck).unwrap().0;
+    assert_eq!(
+        anchor, anchor0,
+        "carving must NOT change the frozen MeshAnchor"
+    );
+
+    // (2) The live cell-COM genuinely DRIFTED — so a non-frozen reference WOULD shift the piece.
+    let live_com = sim::fitting::layout_center(layout, (0, 0), true);
+    assert_eq!(
+        live_com,
+        Vec2::new(7.5, 2.0),
+        "the recomputed COM moved off the anchor"
+    );
+    assert_ne!(anchor, live_com);
+
+    // (3) The carve/render resolve to the FROZEN anchor, not the drifted COM.
+    assert_eq!(
+        sim::fitting::center_or_anchor(Some(anchor), layout, (9, 5), true),
+        anchor,
+        "with a MeshAnchor present the centre stays the anchor (the piece does not re-centre)"
+    );
+}
+
+/// End-to-end: a wreck carrying a `MeshAnchor` still carves through `fitted_damage_system`
+/// (the anchor-routed `centers` path works — a cell is removed), i.e. the freeze doesn't break
+/// the carve. The anchor equals the fresh wing's cell-COM, so the shot lands exactly as the
+/// anchor-less off-centre carve test, then the cells erode.
+#[test]
+fn wreck_with_meshanchor_still_carves_when_shot() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    let wreck = spawn_offcenter_wing_wreck(&mut w);
+    w.entity_mut(wreck)
+        .insert(sim::components::MeshAnchor(Vec2::new(7.5, 2.5)));
+
+    let before: std::collections::BTreeSet<(u16, u16)> = w
+        .get::<FitLayout>(wreck)
+        .unwrap()
+        .cells
+        .keys()
+        .copied()
+        .collect();
+    let tpos = w.get::<Position>(wreck).unwrap().0;
+    w.spawn((
+        Projectile,
+        Position(Vec2::new(tpos.x - 6.0, tpos.y)),
+        PrevPosition(Vec2::new(tpos.x + 6.0, tpos.y)),
+        Velocity(Vec2::new(-200.0, 0.0)),
+        Damage(5000.0),
+        Lifetime(3.0),
+        WeaponSource::from_damage(5000.0),
+    ));
+    sim::fitted_damage_system(&mut w);
+
+    let after: std::collections::BTreeSet<(u16, u16)> = w
+        .get::<FitLayout>(wreck)
+        .map(|l| l.cells.keys().copied().collect())
+        .unwrap_or_default();
+    assert!(
+        after.len() < before.len(),
+        "an anchor-carrying wreck is still carved when shot (cells removed: {:?})",
+        before.difference(&after).collect::<Vec<_>>()
+    );
+}
+
+// =================================================================================
+// Fix #7 — splitting a WRECK must SEPARATE the halves (they used to overlap/"combine").
+// `sever_chunk` placed a new chunk relative to the parent's grid centre, resolved via the
+// parent's `Fit` — but a wreck has NO `Fit`, so the offset fell back to ZERO and the
+// sub-chunk spawned on top of the parent. The fix uses the parent's frozen `MeshAnchor` as
+// the offset reference for a wreck.
+// =================================================================================
+
+/// Splitting a `Wreck` spawns the new piece OFFSET from the parent (where its cells were),
+/// not on top of it. Pre-fix `sever_chunk` fell back to a zero offset for the `Fit`-less
+/// wreck → `Position == parent_pos` → the halves overlapped.
+#[test]
+fn splitting_a_wreck_offsets_the_new_piece_so_the_halves_do_not_overlap() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    // An off-centre wing wreck {(7,1),(7,2),(7,3)} (cell-COM (7.5, 2.5)). A real wreck carries
+    // a frozen anchor at that COM (Fix #6) — add it (the helper predates Fix #6).
+    let parent = spawn_offcenter_wing_wreck(&mut w);
+    let anchor = Vec2::new(7.5, 2.5);
+    w.entity_mut(parent)
+        .insert(sim::components::MeshAnchor(anchor));
+    let parent_pos = w.get::<Position>(parent).unwrap().0;
+
+    // Split off the far end {(7,3)} (cell-COM (7.5, 3.5)) — the disconnected half a centre
+    // carve would produce. It must land OFFSET by `swap_scale((7.5,3.5) − anchor)`.
+    let mut region = std::collections::HashSet::new();
+    region.insert((7u16, 3u16));
+    sever_chunk(&mut w, parent, &region);
+
+    let sub = {
+        let mut q = w.query_filtered::<Entity, With<Wreck>>();
+        let others: Vec<Entity> = q.iter(&w).filter(|&e| e != parent).collect();
+        assert_eq!(others.len(), 1, "exactly one sub-chunk was severed off");
+        others[0]
+    };
+    let sub_pos = w.get::<Position>(sub).unwrap().0;
+
+    // Expected: r_local = (7.5,3.5) − (7.5,2.5) = (Δcol 0, Δrow 1); world = swap(Δrow,Δcol)·CELL
+    // = (1·CELL, 0) → offset (CELL_WORLD_SIZE, 0).
+    let expected = parent_pos + Vec2::new(CELL_WORLD_SIZE, 0.0);
+    assert!(
+        (sub_pos - expected).length() < 1e-4,
+        "the split piece spawns where its cells were ({expected:?}), got {sub_pos:?}"
+    );
+    assert!(
+        (sub_pos - parent_pos).length() > 1e-3,
+        "the split piece is NOT on top of the parent ({parent_pos:?}); pre-fix it overlapped \
+         (sever_chunk fell back to a zero offset for the Fit-less wreck), got {sub_pos:?}"
+    );
+}
+
+// =================================================================================
+// Fix #8 — the armor obliquity uses the cell's LOCAL surface normal (from which neighbours
+// are solid vs void), not a far-away grid-centre radial that mislabeled square-on flank hits
+// on the elongated hull as glancing → "way too many ricochets". Ricochet stays a real
+// mechanic: a genuine graze still bounces.
+// =================================================================================
+
+/// A SQUARE-ON shot at an off-axis flank cell now CARVES instead of spuriously ricocheting.
+/// The fighter's nose-flank cell (3,8) faces `-col` (left); a shot from the left meets it
+/// head-on. PRE-FIX the grid-centre radial (3.5,8.5)−(4.5,5.5)=(−1,3) read it as ~71.6° >
+/// ricochet_angle → spurious Ricochet; the local surface normal (≈ −col) reads ~22° → carve.
+/// A genuine LATERAL graze of the forward-facing nose tip (4,10) still ricochets (mechanic
+/// preserved).
+#[test]
+fn square_on_flank_hit_carves_while_a_genuine_graze_still_ricochets() {
+    let (mut w, ship) = fitted_world(None, thin_entry_facet);
+
+    // (a) Square-on at the left-facing flank cell (3,8): enter from the left (cell +col).
+    let square_on = DamageEvent {
+        channel: Channel::Kinetic,
+        magnitude: 1000.0,
+        penetration: 5000.0,
+        pen_size: 1.0, // < overmatch threshold → the angle decides
+        point: Vec2::new(1.0, 8.5),
+        dir: Vec2::new(1.0, 0.0),
+        source: None,
+    };
+    let out = apply_damage(&mut w, ship, square_on);
+    assert!(
+        matches!(out.result, HitKind::Penetrated | HitKind::OverPenetrated),
+        "a square-on hit on the nose flank CARVES (local normal), not a spurious Ricochet; \
+         got {:?} (pre-fix the grid-centre radial ricocheted it)",
+        out.result
+    );
+    assert!(
+        out.destroyed_cells.contains(&(3, 8)),
+        "the flank cell (3,8) is carved; got {:?}",
+        out.destroyed_cells
+    );
+
+    // (b) Genuine graze: a LATERAL shot across the forward-facing nose tip (4,10) → ~90° → still
+    // ricochets. Proves the fix did NOT disable ricochet for glancing hits.
+    let (mut w2, ship2) = fitted_world(None, thin_entry_facet);
+    let graze = DamageEvent {
+        channel: Channel::Kinetic,
+        magnitude: 1000.0,
+        penetration: 5000.0,
+        pen_size: 1.0,
+        point: Vec2::new(12.0, 10.5),
+        dir: Vec2::new(-1.0, 0.0),
+        source: None,
+    };
+    let out2 = apply_damage(&mut w2, ship2, graze);
+    assert_eq!(
+        out2.result,
+        HitKind::Ricochet,
+        "a genuine lateral graze of the nose tip still RICOCHETS (mechanic preserved); got {:?}",
+        out2.result
+    );
+}
+
+// =================================================================================
+// Fix #9 — a `Wreck` chunk's armor geometry uses its OWN CURRENT cells, not the original ship
+// it was severed from. Before, both the tunnel guard and the local normal read the authored
+// full hull, so a detached chunk deflected by the INVISIBLE original-ship shape — the same
+// piece carved from one side and ricocheted from another. Now a head-on hit on the chunk's
+// VISIBLE face carves; only a genuine graze of its actual edge bounces.
+// =================================================================================
+
+/// A horizontal 5-cell bar `{(0,2)..(4,2)}` on a 6×5 grid — a deliberately elongated authored
+/// shape whose END cell `(4,2)` faces `+col` (its only authored neighbour is the bar to its
+/// left). A `Wreck` carved down to a SUBSET of this bar then deflects by the bar's geometry
+/// under the old code, but by its OWN shape under Fix #9.
+const HULL_BAR5: HullId = HullId(14);
+fn bar5_hull() -> Hull {
+    let coords = [(0u16, 2u16), (1, 2), (2, 2), (3, 2), (4, 2)];
+    let cells: Vec<GridCell> = coords
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| GridCell::new(c, SectionId(i as u32)))
+        .collect();
+    Hull {
+        id: HULL_BAR5,
+        name: "Bar5".to_string(),
+        grid_dims: (6, 5),
+        cells,
+        power_capacity: 100.0,
+        cpu_capacity: 100.0,
+        mass_capacity: 100.0,
+        hull_base_mass: 1.0,
+        slots: Vec::new(),
+    }
+}
+
+/// Spawn a `Wreck` whose residual cells are `cells` (a subset of the BAR5 hull), with the bar
+/// registered so `apply_damage` resolves `layout.hull`. Each cell carries small structural HP.
+fn spawn_bar_wreck(w: &mut World, cells: &[(u16, u16)]) -> Entity {
+    {
+        let mut hulls = w.get_resource_mut::<HullCatalog>().unwrap();
+        hulls.hulls.insert(HULL_BAR5, bar5_hull());
+    }
+    let mut cm = CellMap::new();
+    for &c in cells {
+        cm.insert(
+            c,
+            CellOccupant {
+                slot: SlotId(u32::MAX),
+                module: None,
+                health: 5.0,
+                depth: 0,
+                structural: true,
+            },
+        );
+    }
+    w.spawn((
+        Position(Vec2::ZERO),
+        Velocity(Vec2::ZERO),
+        Heading(0.0),
+        AngularVelocity(0.0),
+        CollisionRadius(hull_collision_radius((6, 5))),
+        FitLayout {
+            hull: HULL_BAR5,
+            cells: cm,
+        },
+        Destructible,
+        Wreck::new(WreckOrigin::SeveredChunk),
+    ))
+    .id()
+}
+
+/// REGRESSION (Fix #9): a 1-cell scrap piece carves by its OWN shape, not the original hull's.
+/// In the authored BAR5 the end cell `(4,2)` faces `+col`, so a perpendicular (downward) shot
+/// reads ~90° → Ricochet. As a detached 1-cell chunk it has no neighbours → normal `0` →
+/// head-on → carve. PRE-FIX (authored geometry) the perpendicular shot ricocheted.
+#[test]
+fn scrap_carves_by_its_own_shape_not_the_original_hull() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    let wreck = spawn_bar_wreck(&mut w, &[(4, 2)]);
+
+    // A perpendicular (cell −row, "downward") shot at the 1-cell chunk (4,2).
+    let ev = DamageEvent {
+        channel: Channel::Kinetic,
+        magnitude: 1000.0,
+        penetration: 5000.0,
+        pen_size: 1.0,
+        point: Vec2::new(4.5, 8.0),
+        dir: Vec2::new(0.0, -1.0),
+        source: None,
+    };
+    let out = apply_damage(&mut w, wreck, ev);
+    assert!(
+        matches!(out.result, HitKind::Penetrated | HitKind::OverPenetrated),
+        "a perpendicular hit on the 1-cell scrap CARVES (its own shape → head-on), not a \
+         ricochet off the original bar's geometry; got {:?}",
+        out.result
+    );
+    assert!(
+        out.destroyed_cells.contains(&(4, 2)),
+        "the scrap cell (4,2) is carved; got {:?}",
+        out.destroyed_cells
+    );
+}
+
+/// COMPANION (Fix #9 keeps the mechanic): on a multi-cell chunk, a head-on hit on its broad
+/// face carves, while a genuine graze of its actual END edge still ricochets — both judged by
+/// the CHUNK's own shape.
+#[test]
+fn scrap_head_on_carves_but_its_own_edge_graze_still_ricochets() {
+    // (a) Head-on on the broad face: a downward shot at the MIDDLE cell (2,2) of the full bar →
+    // its own-shape normal is 0 (left/right present, up/down cancel) → head-on → carve.
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    let bar = spawn_bar_wreck(&mut w, &[(0, 2), (1, 2), (2, 2), (3, 2), (4, 2)]);
+    let head_on = DamageEvent {
+        channel: Channel::Kinetic,
+        magnitude: 1000.0,
+        penetration: 5000.0,
+        pen_size: 1.0,
+        point: Vec2::new(2.5, 8.0),
+        dir: Vec2::new(0.0, -1.0),
+        source: None,
+    };
+    let o1 = apply_damage(&mut w, bar, head_on);
+    assert!(
+        matches!(o1.result, HitKind::Penetrated | HitKind::OverPenetrated),
+        "a head-on hit on the chunk's broad face carves; got {:?}",
+        o1.result
+    );
+
+    // (b) Genuine edge-graze: a downward shot at the END cell (4,2) — by the chunk's OWN shape
+    // its only neighbour is to the left so it faces `+col`, ⊥ to the downward ray → ~90° →
+    // still ricochets (the mechanic is preserved for a real edge graze).
+    let mut w2 = World::new();
+    insert_full_combat_resources(&mut w2);
+    let bar2 = spawn_bar_wreck(&mut w2, &[(0, 2), (1, 2), (2, 2), (3, 2), (4, 2)]);
+    let graze = DamageEvent {
+        channel: Channel::Kinetic,
+        magnitude: 1000.0,
+        penetration: 5000.0,
+        pen_size: 1.0,
+        point: Vec2::new(4.5, 8.0),
+        dir: Vec2::new(0.0, -1.0),
+        source: None,
+    };
+    let o2 = apply_damage(&mut w2, bar2, graze);
+    assert_eq!(
+        o2.result,
+        HitKind::Ricochet,
+        "a genuine graze of the chunk's own END edge still RICOCHETS; got {:?}",
+        o2.result
     );
 }

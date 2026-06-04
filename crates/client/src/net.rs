@@ -806,9 +806,17 @@ fn sync_ship_hull(
 ///   its residual cells are the full remaining silhouette, so the mean ≈ grid centre and it
 ///   reads correctly either way.)
 fn hull_mesh_center(e: &RenderEntity) -> Vec2 {
+    // Fix #6: a wreck carries a FROZEN cell-space anchor (captured at sever / death). Lay its
+    // cells out around THAT fixed point so carving a cell does NOT recompute the centre and
+    // visibly shift the whole piece. Absent (a live ship, or a degenerate layout-less wreck)
+    // → the classic reference below.
+    if let Some(anchor) = e.mesh_anchor {
+        return anchor;
+    }
     if e.kind == EntityKind::Debris {
         // Mean cell centre of just this wreck's cells — matches the sim's `local_com` so the
-        // cells render around the chunk `Position` (= their world COM).
+        // cells render around the chunk `Position` (= their world COM). (Fallback only; real
+        // wreckage carries a frozen `mesh_anchor` above so it does not drift as it erodes.)
         let n = e.cells.len().max(1) as f32;
         let sum = e.cells.iter().fold(Vec2::ZERO, |acc, c| {
             acc + Vec2::new(c.col as f32 + 0.5, c.row as f32 + 0.5)

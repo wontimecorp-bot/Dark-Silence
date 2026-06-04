@@ -40,8 +40,8 @@ use protocol::{
 };
 use sim::components::{
     AngularVelocity, CollisionRadius, DamageFlash, Destructible, FlightAssist, Heading, Health,
-    LastShieldHit, Position, Projectile, ShieldHitFlash, Ship, Target, TargetKind, Velocity,
-    Weapon,
+    LastShieldHit, MeshAnchor, Position, Projectile, ShieldHitFlash, Ship, Target, TargetKind,
+    Velocity, Weapon,
 };
 use sim::damage::{
     default_resistance_matrix, seed_defense_layers, PenetrationConfig, SalvageConfig, ShieldConfig,
@@ -268,6 +268,13 @@ pub struct RenderEntity {
     /// to the grid-centre in the ship's local frame. `(0, 0)` for a non-fitted entity (its
     /// [`cells`](RenderEntity::cells) is empty, so the value is unused).
     pub grid_dims: (u16, u16),
+    /// Fix #6 (**client-only / in-process**): a wreck's **frozen** cell-space render anchor
+    /// ([`MeshAnchor`](sim::components::MeshAnchor)), if it carries one. The client lays the
+    /// `cells` out around THIS fixed point instead of recomputing the live cell-COM, so
+    /// carving a cell off a scrap piece / hulk does not re-centre (visibly shift) it. `None`
+    /// for a live ship (the client uses the grid centre) or a layout-less wreck. Never on the
+    /// snapshot wire (no protocol/determinism impact).
+    pub mesh_anchor: Option<Vec2>,
 }
 
 /// The [`RenderEntity::shield_frac`] of an optional [`Shields`]: `current / max`
@@ -1142,6 +1149,8 @@ impl ServerApp {
                 hit_dir,
                 cells,
                 grid_dims,
+                // A live ship uses the grid centre (no frozen anchor).
+                mesh_anchor: None,
             });
         }
 
@@ -1168,6 +1177,7 @@ impl ServerApp {
                 // A projectile is never fitted — no voxel cell payload.
                 cells: Vec::new(),
                 grid_dims: (0, 0),
+                mesh_anchor: None,
             });
         }
 
@@ -1283,6 +1293,8 @@ impl ServerApp {
                 hit_dir,
                 cells,
                 grid_dims,
+                // A live fitted enemy (or plain target) uses the grid centre — no anchor.
+                mesh_anchor: None,
             });
         }
 
@@ -1305,17 +1317,31 @@ impl ServerApp {
         // (empty `cells`), and its residual cell-count still rides in `flags` as the
         // size hint that box scales by. Render-only + client-only: NO
         // `full_records`/snapshot/determinism impact (the wire path never emits `Debris`).
-        let mut chunks = self
-            .world
-            .query_filtered::<(Entity, &Position, &Velocity, &Heading, Option<&FitLayout>), (
-                With<Wreck>,
-                Without<Ship>,
-                Without<Target>,
-                Without<Projectile>,
-            )>();
-        let chunk_rows: Vec<(Entity, Vec2, Vec2, f32, u8, Vec<RenderCell>, (u16, u16))> = chunks
+        let mut chunks = self.world.query_filtered::<(
+            Entity,
+            &Position,
+            &Velocity,
+            &Heading,
+            Option<&FitLayout>,
+            Option<&MeshAnchor>,
+        ), (
+            With<Wreck>,
+            Without<Ship>,
+            Without<Target>,
+            Without<Projectile>,
+        )>();
+        let chunk_rows: Vec<(
+            Entity,
+            Vec2,
+            Vec2,
+            f32,
+            u8,
+            Vec<RenderCell>,
+            (u16, u16),
+            Option<Vec2>,
+        )> = chunks
             .iter(&self.world)
-            .map(|(e, p, v, h, layout)| {
+            .map(|(e, p, v, h, layout, anchor)| {
                 // The chunk's real severed cells (same payload a fitted ship emits) so the
                 // client renders its actual shape; empty for a degenerate layout-less wreck.
                 let (cells, grid_dims) = cells_of(layout, &catalog_hulls, &catalog_modules);
@@ -1331,10 +1357,13 @@ impl ServerApp {
                     size_hint.min(u8::MAX as usize) as u8,
                     cells,
                     grid_dims,
+                    // The FROZEN render anchor (Fix #6) so the client lays the cells around a
+                    // fixed point — carving a cell does not shift the piece.
+                    anchor.map(|a| a.0),
                 )
             })
             .collect();
-        for (entity, pos, vel, heading, size_hint, cells, grid_dims) in chunk_rows {
+        for (entity, pos, vel, heading, size_hint, cells, grid_dims, mesh_anchor) in chunk_rows {
             out.push(RenderEntity {
                 id: self.entity_ids.id_for(entity),
                 kind: EntityKind::Debris,
@@ -1350,6 +1379,7 @@ impl ServerApp {
                 // The chunk's real severed cells (empty → the client's box fallback).
                 cells,
                 grid_dims,
+                mesh_anchor,
             });
         }
 
