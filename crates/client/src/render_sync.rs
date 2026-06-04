@@ -107,6 +107,11 @@ pub struct ShipHull {
     /// Whether this ship is currently drawn as the merged hull mesh (`true`, near) or the
     /// single coarse box (`false`, far / not yet built).
     pub voxelized: bool,
+    /// Which hull mesh style the current child was built in: `true` = the smoothed contour
+    /// (Fix #11 M2), `false` = the blocky per-cell voxel mesh. Compared against the live
+    /// `HullRenderMode` so flipping the runtime toggle forces a one-shot rebuild in the new
+    /// style (the cell set is unchanged, so `cells_hash` alone wouldn't trigger it).
+    pub built_contour: bool,
 }
 
 /// Previous + current sim snapshots for one entity. `interpolate_transforms`

@@ -69,6 +69,19 @@ pub fn toggle_assist(keys: Res<ButtonInput<KeyCode>>, mut q: Query<&mut FlightAs
     }
 }
 
+/// Flip the hull render style (Fix #11 M2) on a fresh `V` press: voxel cell-boxes ↔ the smoothed
+/// rounded contour. Purely cosmetic (the sim's ricochet/carve is unchanged), so it can be A/B'd
+/// freely; the next render tick rebuilds each near ship's hull mesh in the new style. Default is
+/// voxel ([`HullRenderMode::default`]).
+pub fn toggle_hull_render(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut mode: ResMut<crate::net::HullRenderMode>,
+) {
+    if keys.just_pressed(KeyCode::KeyV) {
+        mode.contour = !mode.contour;
+    }
+}
+
 /// The monotonic per-client input sequence and the redundant-tail history
 /// (TR-007/027). `next_seq` counts every input the client has ever produced; the
 /// `tail` keeps the most recent quantized intents, **newest-first**, capped at

@@ -65,7 +65,7 @@ use crate::input::{build_client_input, InputSequencer};
 use crate::render_sync::{
     interpolate_transforms, RemoteEntity, RenderInterp, ShieldBubble, ShieldChild, ShipHull,
 };
-use crate::scene::{build_hull_mesh, RenderAssets, CELL_SIZE};
+use crate::scene::{build_hull_mesh, build_hull_mesh_contour, RenderAssets, CELL_SIZE};
 
 /// The loopback solo-play host: the embedded authoritative [`ServerApp`] plus the
 /// client end of its [`LoopbackTransport`] and the established connection. A
@@ -157,6 +157,17 @@ fn shield_radius_for(grid_dims: (u16, u16)) -> f32 {
 /// the demo the handful of ships are always near, so the voxel path runs; the box path
 /// exists + switches cleanly when a ship crosses the threshold. Tunable for feel.
 pub const SHIP_VOXEL_LOD_DIST: f32 = 60.0;
+
+/// Runtime hull-render style toggle (Fix #11 M2), flipped in-game by
+/// [`crate::input::toggle_hull_render`] (the `V` key). `false` (default) = the blocky per-cell
+/// voxel mesh ([`build_hull_mesh`]); `true` = the smoothed rounded contour
+/// ([`build_hull_mesh_contour`]). Purely cosmetic — the sim's ricochet/carve is unaffected — so
+/// it can be flipped freely to A/B the look. [`sync_ship_hull`] rebuilds a ship's hull mesh when
+/// this differs from the style it was last built in ([`ShipHull::built_contour`]).
+#[derive(Resource, Default, Clone, Copy)]
+pub struct HullRenderMode {
+    pub contour: bool,
+}
 
 /// The windowed solo-client plugin (T045). Adds the embedded-server lifecycle and
 /// the render-from-server-world path, making the client runnable solo
@@ -427,8 +438,10 @@ fn capture_render_state(
     shield_child_q: Query<&ShieldChild>,
     mut bubble_q: Query<(&mut Visibility, &mut Transform)>,
     mut ship_hull_q: Query<&mut ShipHull>,
+    hull_mode: Res<HullRenderMode>,
 ) {
     let local_id = state.local_id;
+    let contour = hull_mode.contour;
     let entities = host.server.render_state();
 
     // Phase 1B LOD origin: the local player ship's world position (the follow-camera
@@ -469,6 +482,7 @@ fn capture_render_state(
                 bevy_entity,
                 e,
                 lod_origin,
+                contour,
             );
             // Show + fade (or lazily spawn) this entity's LOCALIZED shield-impact flash
             // from the hit-driven `shield_flash`, placed at the impact (`hit_dir`).
@@ -502,6 +516,7 @@ fn capture_render_state(
                 spawned,
                 e,
                 lod_origin,
+                contour,
             );
             // Seed (if its shield is being hit) its localized impact flash immediately
             // so the first rendered frame already shows it at the impact point.
@@ -662,6 +677,7 @@ fn spawn_render_entity(
 /// breach-edge walls) and the old `Mesh` handle is freed. That rebuild is also where Phase 2
 /// will pass a real `exposed` predicate into [`build_hull_mesh`] so a breach-exposed module
 /// cell can be tinted (today modules are hidden under the uniform hull color).
+#[allow(clippy::too_many_arguments)]
 fn sync_ship_hull(
     commands: &mut Commands,
     assets: &RenderAssets,
@@ -670,6 +686,7 @@ fn sync_ship_hull(
     parent: Entity,
     e: &RenderEntity,
     lod_origin: Vec2,
+    contour: bool,
 ) {
     // Only a fitted ship OR a severed chunk / dead hulk carries a cell payload; everything
     // else (projectiles, plain targets, a layout-less wreck) keeps its single mesh.
@@ -718,8 +735,11 @@ fn sync_ship_hull(
             current.set_voxelized(true);
         }
 
-        // Build on first sight, or REBUILD when the cell set changed (Phase-2 erosion).
-        let needs_build = current.child().is_none() || current.cells_hash() != hash;
+        // Build on first sight, REBUILD when the cell set changed (Phase-2 erosion), OR when
+        // the render-style toggle flipped (voxel ↔ contour — same cells, new look).
+        let needs_build = current.child().is_none()
+            || current.cells_hash() != hash
+            || current.built_contour() != contour;
         if needs_build {
             // Free the previous mesh + child (rebuild path) so meshes/entities don't leak.
             if let Some(old) = current.take_mesh() {
@@ -738,7 +758,15 @@ fn sync_ship_hull(
             // predicate to reveal breach cells). A wreck wears the dead-metal tint.
             let cell_tuples: Vec<(u16, u16, u8)> =
                 e.cells.iter().map(|c| (c.col, c.row, c.kind)).collect();
-            let mesh = meshes.add(build_hull_mesh(&cell_tuples, CELL_SIZE, center));
+            // The runtime toggle picks the look: smoothed rounded contour (Fix #11 M2) vs the
+            // blocky per-cell voxel mesh. Both share the same `center`-relative local frame, so
+            // the child sits identically under the parent transform either way.
+            let raw_mesh = if contour {
+                build_hull_mesh_contour(&cell_tuples, CELL_SIZE, center)
+            } else {
+                build_hull_mesh(&cell_tuples, CELL_SIZE, center)
+            };
+            let mesh = meshes.add(raw_mesh);
 
             let child = commands
                 .spawn((
@@ -753,6 +781,7 @@ fn sync_ship_hull(
             current.set_child(Some(child));
             current.set_mesh(Some(mesh));
             current.set_cells_hash(hash);
+            current.set_built_contour(contour);
         }
     } else if current.voxelized() {
         // Near→far switch: despawn the hull child, free its mesh, restore the coarse box.
@@ -904,6 +933,18 @@ impl HullView<'_> {
         match self {
             HullView::Existing(c) => c.cells_hash = v,
             HullView::New(c) => c.cells_hash = v,
+        }
+    }
+    fn built_contour(&self) -> bool {
+        match self {
+            HullView::Existing(c) => c.built_contour,
+            HullView::New(c) => c.built_contour,
+        }
+    }
+    fn set_built_contour(&mut self, v: bool) {
+        match self {
+            HullView::Existing(c) => c.built_contour = v,
+            HullView::New(c) => c.built_contour = v,
         }
     }
 }

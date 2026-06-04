@@ -76,13 +76,24 @@ pub fn run() -> AppExit {
         .insert_resource(FixedDt((1.0 / TICK_HZ) as f32))
         .insert_resource(Tuning::default())
         .insert_resource(HitFeedback::default())
+        // Hull render style toggle (Fix #11 M2): default voxel; `V` flips to the
+        // smoothed rounded contour at runtime. Purely cosmetic — the sim's
+        // ricochet/carve is unaffected — so it can be A/B'd freely mid-playtest.
+        .init_resource::<net::HullRenderMode>()
         .add_systems(
             Startup,
             (scene::setup_scene, camera::setup_camera, hud::setup_hud),
         )
         // Input runs before the fixed step so intents apply the same frame; the
         // net plugin reads the local ship's `ShipIntent` in FixedUpdate.
-        .add_systems(PreUpdate, (input::read_input, input::toggle_assist))
+        .add_systems(
+            PreUpdate,
+            (
+                input::read_input,
+                input::toggle_assist,
+                input::toggle_hull_render,
+            ),
+        )
         // The interactive fitting screen (E006 US5): the plugin registers the
         // `FittingScreenState` app-state + the screen's build/teardown + the
         // place/remove/budget/preview/preset systems. A key (Tab) toggles between

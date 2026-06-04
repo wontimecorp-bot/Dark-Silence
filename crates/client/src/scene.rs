@@ -454,6 +454,232 @@ fn build_hull_mesh_with(
     .with_inserted_indices(Indices::U32(indices))
 }
 
+// ============================================================================
+// Fix #11 M2 — smoothed marching-squares hull CONTOUR mesh (the "rounded look").
+// An alternative to the blocky per-cell [`build_hull_mesh`], selectable at runtime via the
+// `HullRenderMode` toggle (default OFF = the voxel mesh). It traces the cell set's boundary
+// into grid-corner loop(s), rounds them with Chaikin corner-cutting, and fills the OUTER loop
+// by ear-clipping — so a chunk reads as a rounded plate. First cut: flat top face only (the
+// top-down camera sees it); interior holes are left filled and side walls are TODO (cosmetic).
+// ============================================================================
+
+/// Chaikin corner-cutting passes for the contour — more = rounder (and slightly smaller, since
+/// each pass pulls corners inward). `2` is a moderate "rounded-voxel" look. Tunable for feel.
+const CONTOUR_CHAIKIN_ITERS: u32 = 2;
+
+/// 2× the signed area of a closed polygon (shoelace). Positive = CCW, negative = CW.
+fn signed_area2(pts: &[Vec2]) -> f32 {
+    let n = pts.len();
+    let mut a = 0.0;
+    for i in 0..n {
+        let p = pts[i];
+        let q = pts[(i + 1) % n];
+        a += p.x * q.y - q.x * p.y;
+    }
+    a
+}
+
+/// Trace the boundary of a cell set into ordered grid-corner loops, CCW around the material in
+/// `(col=x, row=y)` cell space (outer loops are CCW / positive area; holes are CW). Each present
+/// cell contributes one CCW directed edge per side whose neighbour is ABSENT; the edges link
+/// head-to-tail into closed loops. A boundary that pinches itself at a corner (rare for a
+/// 4-connected chunk) may drop an edge there — acceptable for the cosmetic contour.
+fn cell_boundary_loops(present: &std::collections::HashSet<(u16, u16)>) -> Vec<Vec<(i32, i32)>> {
+    let is_present = |c: i32, r: i32| c >= 0 && r >= 0 && present.contains(&(c as u16, r as u16));
+    // start corner -> end corner, one directed boundary edge per start.
+    let mut next: std::collections::HashMap<(i32, i32), (i32, i32)> =
+        std::collections::HashMap::new();
+    for &(cu, ru) in present {
+        let (c, r) = (cu as i32, ru as i32);
+        // CCW around the cell (interior on the left): bottom, right, top, left edges.
+        if !is_present(c, r - 1) {
+            next.insert((c, r), (c + 1, r)); // bottom (-row side)
+        }
+        if !is_present(c + 1, r) {
+            next.insert((c + 1, r), (c + 1, r + 1)); // right (+col side)
+        }
+        if !is_present(c, r + 1) {
+            next.insert((c + 1, r + 1), (c, r + 1)); // top (+row side)
+        }
+        if !is_present(c - 1, r) {
+            next.insert((c, r + 1), (c, r)); // left (-col side)
+        }
+    }
+    // Link the directed edges into closed loops (deterministic start order).
+    let mut starts: Vec<(i32, i32)> = next.keys().copied().collect();
+    starts.sort_unstable();
+    let mut used: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+    let mut loops = Vec::new();
+    for &start in &starts {
+        if used.contains(&start) {
+            continue;
+        }
+        let mut pts = Vec::new();
+        let mut cur = start;
+        while used.insert(cur) {
+            pts.push(cur);
+            match next.get(&cur) {
+                Some(&nx) => cur = nx,
+                None => break,
+            }
+            if cur == start {
+                break;
+            }
+        }
+        if pts.len() >= 3 {
+            loops.push(pts);
+        }
+    }
+    loops
+}
+
+/// One or more Chaikin corner-cutting passes on a CLOSED loop → rounded. Each pass replaces
+/// every edge `a→b` with the points `0.75a+0.25b` and `0.25a+0.75b`, so corners get cut and
+/// the loop smooths (and shrinks slightly toward its interior).
+fn chaikin_closed(pts: &[Vec2], iterations: u32) -> Vec<Vec2> {
+    let mut cur = pts.to_vec();
+    for _ in 0..iterations {
+        let n = cur.len();
+        if n < 3 {
+            break;
+        }
+        let mut out = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let a = cur[i];
+            let b = cur[(i + 1) % n];
+            out.push(a * 0.75 + b * 0.25);
+            out.push(a * 0.25 + b * 0.75);
+        }
+        cur = out;
+    }
+    cur
+}
+
+/// Whether `p` is inside the CCW triangle `a,b,c`, **boundary included** (a point on an
+/// edge counts as inside). Ear-clipping needs the inclusive test so a reflex vertex lying
+/// exactly on a candidate ear's edge (the concave-notch case) still blocks the ear — a
+/// strict test would let the ear poke across the notch and fill area outside the polygon.
+fn point_in_tri(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> bool {
+    (b - a).perp_dot(p - a) >= 0.0
+        && (c - b).perp_dot(p - b) >= 0.0
+        && (a - c).perp_dot(p - c) >= 0.0
+}
+
+/// Ear-clipping triangulation of a simple **CCW** polygon → index triples into `poly`. Handles
+/// convex and concave simple polygons (no holes). Bails gracefully on a degenerate/self-
+/// intersecting input (returns whatever ears it found).
+fn ear_clip(poly: &[Vec2]) -> Vec<u32> {
+    let n = poly.len();
+    let mut tris = Vec::new();
+    if n < 3 {
+        return tris;
+    }
+    let mut idx: Vec<usize> = (0..n).collect();
+    let mut guard = 0usize;
+    let max_iter = 4 * n;
+    while idx.len() > 3 && guard < max_iter {
+        guard += 1;
+        let m = idx.len();
+        let mut clipped = false;
+        for i in 0..m {
+            let i0 = idx[(i + m - 1) % m];
+            let i1 = idx[i];
+            let i2 = idx[(i + 1) % m];
+            let (a, b, c) = (poly[i0], poly[i1], poly[i2]);
+            // Convex (CCW) vertex?
+            if (b - a).perp_dot(c - a) <= 0.0 {
+                continue;
+            }
+            // A convex tip is a valid ear iff no REFLEX vertex of the remaining polygon
+            // lies in the candidate triangle (boundary included — see `point_in_tri`).
+            // Only reflex vertices can invalidate an ear; testing convex ones (which may
+            // sit harmlessly on an edge) would spuriously block valid ears.
+            let blocked = idx.iter().enumerate().any(|(k, &j)| {
+                if j == i0 || j == i1 || j == i2 {
+                    return false;
+                }
+                let jp = poly[idx[(k + m - 1) % m]];
+                let jn = poly[idx[(k + 1) % m]];
+                let reflex = (poly[j] - jp).perp_dot(jn - jp) <= 0.0;
+                reflex && point_in_tri(poly[j], a, b, c)
+            });
+            if blocked {
+                continue;
+            }
+            tris.extend_from_slice(&[i0 as u32, i1 as u32, i2 as u32]);
+            idx.remove(i);
+            clipped = true;
+            break;
+        }
+        if !clipped {
+            break; // degenerate — bail with what we have
+        }
+    }
+    if idx.len() == 3 {
+        tris.extend_from_slice(&[idx[0] as u32, idx[1] as u32, idx[2] as u32]);
+    }
+    tris
+}
+
+/// Build the **smoothed contour** hull mesh for a cell set — the rounded-look alternative to
+/// [`build_hull_mesh`] (Fix #11 M2). Same `(cells, cell_size, center)` contract and the same
+/// local frame (`x = forward ← row`, `y = lateral ← col`, scaled by `cell_size`, measured from
+/// `center`), so it drops in at the same parent transform. Traces the boundary, Chaikin-smooths
+/// it, and fills the outer loop (flat top face at `z = HULL_THICKNESS`, normal `+Z`).
+pub fn build_hull_mesh_contour(cells: &[(u16, u16, u8)], cell_size: f32, center: Vec2) -> Mesh {
+    let present: std::collections::HashSet<(u16, u16)> =
+        cells.iter().map(|&(c, r, _)| (c, r)).collect();
+    let loops = cell_boundary_loops(&present);
+
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    for raw in &loops {
+        // Grid corner (col,row) → local 2D, the SAME mapping `build_hull_mesh` uses for cell
+        // centres: x (forward) ← row, y (lateral) ← col. (The col↔row swap flips winding, so an
+        // OUTER loop — CCW in (col,row) — is CW / negative-area here; a hole is CCW / positive.)
+        let mut pts: Vec<Vec2> = raw
+            .iter()
+            .map(|&(cc, rr)| {
+                Vec2::new(
+                    (rr as f32 - center.y) * cell_size,
+                    (cc as f32 - center.x) * cell_size,
+                )
+            })
+            .collect();
+        let area2 = signed_area2(&pts);
+        if area2 >= -1.0e-6 {
+            continue; // a hole (positive) or degenerate loop — skip (left filled-over for now)
+        }
+        pts.reverse(); // CW outer → CCW so the filled top face winds toward the +Z camera
+        let smooth = chaikin_closed(&pts, CONTOUR_CHAIKIN_ITERS);
+        if smooth.len() < 3 {
+            continue;
+        }
+        let tris = ear_clip(&smooth);
+        let base = positions.len() as u32;
+        for p in &smooth {
+            positions.push([p.x, p.y, HULL_THICKNESS]);
+            normals.push([0.0, 0.0, 1.0]);
+            uvs.push([0.0, 0.0]);
+        }
+        for t in tris {
+            indices.push(base + t);
+        }
+    }
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
 /// Spawn lighting, the gunsight pip, and the LOCAL player ship; register the
 /// shared runtime render assets (projectile + remote ship/target looks).
 pub fn setup_scene(
@@ -618,4 +844,110 @@ pub fn setup_scene(
         })),
         Transform::from_xyz(5.0, 0.0, 0.0),
     ));
+}
+
+#[cfg(test)]
+mod contour_tests {
+    use super::*;
+
+    #[test]
+    fn signed_area_sign_and_magnitude() {
+        let ccw = [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(0.0, 1.0),
+        ];
+        assert!((signed_area2(&ccw) - 2.0).abs() < 1e-5); // 2×(unit square area 1) = 2, CCW>0
+        let mut cw = ccw;
+        cw.reverse();
+        assert!((signed_area2(&cw) + 2.0).abs() < 1e-5); // CW → negative
+    }
+
+    #[test]
+    fn boundary_loop_of_a_2x2_block_is_the_outer_perimeter() {
+        let present: std::collections::HashSet<(u16, u16)> =
+            [(0, 0), (1, 0), (0, 1), (1, 1)].into_iter().collect();
+        let loops = cell_boundary_loops(&present);
+        assert_eq!(loops.len(), 1, "a solid 2×2 has exactly one boundary loop");
+        // 8 grid-corner steps around a 2×2 perimeter (one per unit cell-edge).
+        assert_eq!(loops[0].len(), 8);
+        // CCW in (col,row): positive shoelace (area 2×2=4 → 2×area=8).
+        let pts: Vec<Vec2> = loops[0]
+            .iter()
+            .map(|&(c, r)| Vec2::new(c as f32, r as f32))
+            .collect();
+        assert!(signed_area2(&pts) > 0.0);
+    }
+
+    #[test]
+    fn ear_clip_square_makes_two_triangles_with_full_area() {
+        let sq = [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(0.0, 1.0),
+        ];
+        let tris = ear_clip(&sq);
+        assert_eq!(tris.len(), 6, "a quad → 2 triangles");
+        // The two triangles' areas sum to the square's area (1.0).
+        let mut total = 0.0;
+        for t in tris.chunks(3) {
+            let (a, b, c) = (sq[t[0] as usize], sq[t[1] as usize], sq[t[2] as usize]);
+            total += (b - a).perp_dot(c - a).abs() * 0.5;
+        }
+        assert!((total - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn ear_clip_handles_a_concave_l_polygon() {
+        // CCW L-shape (reflex vertex at (1,1)).
+        let l = [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(2.0, 0.0),
+            Vec2::new(2.0, 1.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(1.0, 2.0),
+            Vec2::new(0.0, 2.0),
+        ];
+        let tris = ear_clip(&l);
+        assert_eq!(tris.len(), (l.len() - 2) * 3, "n-gon → n-2 triangles");
+        let mut total = 0.0;
+        for t in tris.chunks(3) {
+            let (a, b, c) = (l[t[0] as usize], l[t[1] as usize], l[t[2] as usize]);
+            total += (b - a).perp_dot(c - a).abs() * 0.5;
+        }
+        assert!((total - 3.0).abs() < 1e-5, "L area = 3 (got {total})");
+    }
+
+    #[test]
+    fn chaikin_rounds_and_stays_inside_bounds() {
+        let sq = [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(4.0, 0.0),
+            Vec2::new(4.0, 4.0),
+            Vec2::new(0.0, 4.0),
+        ];
+        let out = chaikin_closed(&sq, 2);
+        assert_eq!(out.len(), sq.len() * 4); // doubles each of 2 passes
+        for p in &out {
+            assert!(p.x >= -1e-4 && p.x <= 4.0 + 1e-4 && p.y >= -1e-4 && p.y <= 4.0 + 1e-4);
+        }
+    }
+
+    #[test]
+    fn contour_mesh_of_a_block_is_nonempty_and_upward_facing() {
+        let cells: Vec<(u16, u16, u8)> = (0..3)
+            .flat_map(|c| (0..3).map(move |r| (c, r, 0u8)))
+            .collect();
+        let mesh = build_hull_mesh_contour(&cells, 0.32, Vec2::new(1.5, 1.5));
+        let pos = mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap();
+        assert!(pos.len() >= 3, "a solid block contour has a filled face");
+        // All top-face normals point +Z (toward the top-down camera).
+        if let Some(bevy::mesh::VertexAttributeValues::Float32x3(ns)) =
+            mesh.attribute(Mesh::ATTRIBUTE_NORMAL)
+        {
+            assert!(ns.iter().all(|n| n[2] > 0.5));
+        }
+    }
 }
