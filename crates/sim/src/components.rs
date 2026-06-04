@@ -181,6 +181,21 @@ pub struct Destructible;
 #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MeshAnchor(pub Vec2);
 
+/// Default lifetime (seconds) a freshly-created wreck (severed chunk or destroyed hulk) drifts
+/// before it is despawned (Phase M4). In frictionless space, inherited momentum never decays, so
+/// debris would otherwise drift forever / litter the arena and waste sim+snapshot work. Tunable.
+pub const WRECK_LIFETIME_SECS: f32 = 30.0;
+
+/// Remaining drift time (seconds) for a `Wreck` body, set at creation to [`WRECK_LIFETIME_SECS`]
+/// and decayed each fixed step by `dt` ([`crate::damage::destruction::wreck_lifetime_system`]);
+/// when it reaches `0` the wreck despawns. This is the "despawn-when-old" bound that keeps drifting
+/// debris from accumulating without imposing unphysical drag (space stays frictionless — the piece
+/// coasts at full speed until its time is up). Complements the despawn-when-`FitLayout.cells`-empty
+/// path (a fully carved wreck vanishes immediately regardless of remaining lifetime). Deterministic
+/// (ticks by the fixed `dt`).
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WreckLifetime(pub f32);
+
 /// A short-lived per-entity hit-flash timer (seconds), refreshed each time a hit
 /// lands on this entity and decayed toward `0` each fixed step
 /// ([`damage_flash_decay_system`](crate::collision::damage_flash_decay_system)).

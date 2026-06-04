@@ -17,6 +17,7 @@ use crate::damage::{Channel, DamageEvent};
 use crate::fitting::ShipStats;
 use crate::intent::ShipIntent;
 use crate::physics::SweptHit;
+use crate::tuning::Tuning;
 use bevy_ecs::prelude::*;
 use glam::Vec2;
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,13 @@ use serde::{Deserialize, Serialize};
 const PROJECTILE_DAMAGE: f32 = 10.0;
 /// Projectile time-to-live in seconds.
 const PROJECTILE_LIFETIME: f32 = 3.0;
+/// Phase M4 — **projectile inertial mass** for momentum. A projectile's momentum is
+/// `p = PROJECTILE_MASS · velocity`: at fire time the shooter recoils by the muzzle component of
+/// it (Newton's third law), and at hit time [`crate::collision::fitted_damage_system`] deposits
+/// the full momentum as an impulse on the struck body. Small relative to ship mass so a shot
+/// nudges rather than flings; **tunable for feel** (start subtle). Sim-side → part of the
+/// determinism contract (identical on server + predicted client).
+pub const PROJECTILE_MASS: f32 = 0.03;
 
 // --- E007 damage-typing seam (T037) ---------------------------------------------
 
@@ -153,30 +161,40 @@ pub fn cooldown_after_fire(fire_rate: f32) -> f32 {
 /// has its cooldown ticked harmlessly.
 pub fn weapon_fire_system(
     dt: Res<FixedDt>,
+    tuning: Res<Tuning>,
     mut commands: Commands,
     // Fitted ships: ShipStats gates firing + supplies the profile; the optional
     // Weapon component (present when a weapon module is installed) holds cooldown.
+    // `&mut Velocity` (Phase M4): the shooter recoils + its motion is inherited by the shot.
     mut fitted: Query<
         (
             Entity,
             &ShipIntent,
             &Position,
             &Heading,
+            &mut Velocity,
             &ShipStats,
             Option<&mut Weapon>,
         ),
         With<Ship>,
     >,
-    // Unfitted ships: the E002 Weapon-component behavior, unchanged.
+    // Unfitted ships: the E002 Weapon-component behavior, + Phase M4 recoil/inheritance.
     mut unfitted: Query<
-        (Entity, &ShipIntent, &Position, &Heading, &mut Weapon),
+        (
+            Entity,
+            &ShipIntent,
+            &Position,
+            &Heading,
+            &mut Velocity,
+            &mut Weapon,
+        ),
         (With<Ship>, Without<ShipStats>),
     >,
 ) {
     let dt = dt.0;
 
     // Fitted path: fit-derived can_fire + WeaponProfile (FR-016).
-    for (owner, intent, pos, heading, stats, weapon) in &mut fitted {
+    for (owner, intent, pos, heading, mut ship_vel, stats, weapon) in &mut fitted {
         // No weapon module ⇒ cannot fire; if a Weapon component lingers, still
         // tick its cooldown so it stays a valid (idle) state machine.
         let (Some(profile), Some(mut weapon)) = (stats.weapon, weapon) else {
@@ -186,7 +204,10 @@ pub fn weapon_fire_system(
             weapon.cooldown -= dt;
         }
         if stats.can_fire && intent.fire && can_fire(weapon.cooldown) {
-            let vel = Vec2::from_angle(heading.0) * profile.muzzle_speed;
+            // Phase M4: the muzzle velocity (the gun's contribution) plus the shooter's own
+            // velocity, so a moving ship's shots carry its motion (a true Newtonian gun).
+            let muzzle = Vec2::from_angle(heading.0) * profile.muzzle_speed;
+            let vel = muzzle + ship_vel.0;
             commands.spawn((
                 Projectile,
                 Position(pos.0),
@@ -200,17 +221,21 @@ pub fn weapon_fire_system(
                 // only ever hits an unfitted target (the legacy path ignores it).
                 WeaponSource::from_damage(profile.damage),
             ));
+            // Phase M4 recoil: conserve momentum against the MUZZLE component only (the inherited
+            // part was already the ship's momentum). Δv = −(PROJECTILE_MASS·muzzle)/ship_mass.
+            ship_vel.0 -= PROJECTILE_MASS * muzzle / stats.total_mass.max(f32::MIN_POSITIVE);
             weapon.cooldown = cooldown_after_fire(profile.fire_rate);
         }
     }
 
-    // Unfitted path: the original Weapon-component behavior (E001/E002/E003).
-    for (owner, intent, pos, heading, mut weapon) in &mut unfitted {
+    // Unfitted path: the original Weapon-component behavior (E001/E002/E003) + M4 recoil.
+    for (owner, intent, pos, heading, mut ship_vel, mut weapon) in &mut unfitted {
         if weapon.cooldown > 0.0 {
             weapon.cooldown -= dt;
         }
         if intent.fire && can_fire(weapon.cooldown) {
-            let vel = Vec2::from_angle(heading.0) * weapon.muzzle_speed;
+            let muzzle = Vec2::from_angle(heading.0) * weapon.muzzle_speed;
+            let vel = muzzle + ship_vel.0;
             commands.spawn((
                 Projectile,
                 Position(pos.0),
@@ -225,6 +250,8 @@ pub fn weapon_fire_system(
                 // shot happens to hit still routes through the new pipeline.
                 WeaponSource::from_damage(PROJECTILE_DAMAGE),
             ));
+            // Phase M4 recoil — unfitted ships use the global Tuning mass.
+            ship_vel.0 -= PROJECTILE_MASS * muzzle / tuning.mass.max(f32::MIN_POSITIVE);
             weapon.cooldown = cooldown_after_fire(weapon.fire_rate);
         }
     }

@@ -67,7 +67,9 @@ use bevy_ecs::schedule::{IntoScheduleConfigs, Schedule};
 /// client-only render-capture system (which is not gameplay):
 ///
 /// 1. [`ai::seek_system`]
-/// 2. [`flight::ship_motion_system`]
+/// 2. [`flight::ship_motion_system`] (+ Phase M4 [`flight::wreck_motion_system`] integrating
+///    `Wreck` bodies' inherited drift/spin, then [`damage::destruction::wreck_lifetime_system`]
+///    despawning old wreckage)
 /// 3. [`weapon::weapon_fire_system`]
 /// 4. [`weapon::projectile_step_system`]
 /// 5. [`collision::collision_detect_system`] — unfitted flat-`Health` hits (INV-D17)
@@ -120,6 +122,12 @@ pub fn add_fixed_step_systems(schedule: &mut Schedule) {
         (
             ai::seek_system,
             flight::ship_motion_system,
+            // Phase M4: wreckage drifts/tumbles on its inherited velocity+spin (no thrust/drag),
+            // moved before collision so a drifting wreck is hit at its current-tick position; and
+            // a per-wreck lifetime despawns old debris (frictionless space never slows it). Both
+            // are no-ops in a world with no `Wreck` entities.
+            flight::wreck_motion_system,
+            damage::destruction::wreck_lifetime_system,
             weapon::weapon_fire_system,
             weapon::projectile_step_system,
             collision::collision_detect_system,

@@ -4576,3 +4576,314 @@ fn solid_hulk_scrap_still_ricochets_on_a_graze() {
         out.result
     );
 }
+
+// =================================================================================
+// Phase M4 (Phase A) — wreckage DRIFT + TUMBLE on inherited velocity/spin, and the
+// despawn-when-old lifetime. `sever_chunk`/`destroy_ship` already set the inherited
+// momentum; the new `wreck_motion_system` integrates it (it never moved before because the
+// only integrator was `With<Ship>`-gated), and `wreck_lifetime_system` despawns old debris.
+// =================================================================================
+
+use sim::components::{WreckLifetime, WRECK_LIFETIME_SECS};
+
+/// A `Wreck` body coasts on its inherited velocity + spin each fixed step (frictionless — no
+/// thrust, no drag), driven by the new `wreck_motion_system`. Pre-M4 it sat frozen (the only
+/// integrator, `ship_motion_system`, is `With<Ship>`-gated and a wreck is not a `Ship`).
+#[test]
+fn a_wreck_drifts_and_tumbles_on_its_inherited_motion() {
+    let mut w = World::new();
+    w.insert_resource(Tuning::default());
+    w.insert_resource(FixedDt(1.0 / 30.0));
+    w.insert_resource(HitFeedback::default());
+    let dt = 1.0 / 30.0_f32;
+
+    let v = Vec2::new(2.0, -1.0);
+    let omega = 0.5_f32;
+    let start = Vec2::new(3.0, 4.0);
+    let start_h = 0.25_f32;
+    // No `WreckLifetime` so it persists for the whole test (despawn-when-old is tested below).
+    let wreck = w
+        .spawn((
+            Position(start),
+            Velocity(v),
+            Heading(start_h),
+            AngularVelocity(omega),
+            Wreck::new(WreckOrigin::SeveredChunk),
+        ))
+        .id();
+
+    let mut schedule = Schedule::default();
+    sim::add_fixed_step_systems(&mut schedule);
+    let n = 10;
+    for _ in 0..n {
+        schedule.run(&mut w);
+    }
+
+    let pos = w.get::<Position>(wreck).unwrap().0;
+    let head = w.get::<Heading>(wreck).unwrap().0;
+    let expected_pos = start + v * (dt * n as f32);
+    let expected_h = (start_h + omega * dt * n as f32).rem_euclid(std::f32::consts::TAU);
+    assert!(
+        (pos - expected_pos).length() < 1e-3,
+        "the wreck drifts by vel·t (got {pos:?}, expected {expected_pos:?}) — pre-M4 it stayed put"
+    );
+    assert!(
+        (head - expected_h).abs() < 1e-3,
+        "the wreck tumbles by ω·t (got {head}, expected {expected_h})"
+    );
+    // Frictionless: velocity + spin are conserved (no drag on a wreck).
+    assert!(
+        (w.get::<Velocity>(wreck).unwrap().0 - v).length() < 1e-6,
+        "no drag — linear velocity is conserved"
+    );
+    assert!(
+        (w.get::<AngularVelocity>(wreck).unwrap().0 - omega).abs() < 1e-6,
+        "no angular drag — spin is conserved"
+    );
+}
+
+/// Two independently-seeded wreck bodies advance bit-identically across two runs of the shared
+/// schedule (determinism preserved by the new motion system).
+#[test]
+fn wreck_drift_is_bit_identical_across_two_runs() {
+    fn run() -> (Vec2, f32, Vec2, f32) {
+        let mut w = World::new();
+        w.insert_resource(Tuning::default());
+        w.insert_resource(FixedDt(1.0 / 30.0));
+        w.insert_resource(HitFeedback::default());
+        let a = w
+            .spawn((
+                Position(Vec2::new(1.0, 2.0)),
+                Velocity(Vec2::new(0.7, -0.3)),
+                Heading(0.1),
+                AngularVelocity(-0.4),
+                Wreck::new(WreckOrigin::SeveredChunk),
+            ))
+            .id();
+        let b = w
+            .spawn((
+                Position(Vec2::new(-5.0, 9.0)),
+                Velocity(Vec2::new(-1.1, 0.6)),
+                Heading(2.0),
+                AngularVelocity(0.9),
+                Wreck::new(WreckOrigin::DestroyedShip),
+            ))
+            .id();
+        let mut schedule = Schedule::default();
+        sim::add_fixed_step_systems(&mut schedule);
+        for _ in 0..25 {
+            schedule.run(&mut w);
+        }
+        (
+            w.get::<Position>(a).unwrap().0,
+            w.get::<Heading>(a).unwrap().0,
+            w.get::<Position>(b).unwrap().0,
+            w.get::<Heading>(b).unwrap().0,
+        )
+    }
+    assert_eq!(
+        run(),
+        run(),
+        "wreck drift is deterministic across identical runs"
+    );
+}
+
+/// `destroy_ship` (via the whole-ship-destroyed path) strips the `Ship` marker — so a corpse is
+/// no longer driven by piloted flight (drag/stale intent) or `weapon_fire_system` — and stamps a
+/// `WreckLifetime`, while keeping its physical body (Position/Velocity/Heading) and `Wreck`.
+#[test]
+fn destroy_ship_strips_the_ship_marker_and_sets_a_drift_lifetime() {
+    let (mut w, ship, _) = salvage_world(50.0);
+    // A live ship carries the `Ship` marker (the helper omits it; add it so the strip is real).
+    w.entity_mut(ship).insert(Ship);
+    assert!(
+        w.get::<Ship>(ship).is_some(),
+        "precondition: it is a live Ship"
+    );
+
+    // Destroying SectionId(0) collapses the core → the whole-ship-destroyed path → `destroy_ship`.
+    on_section_destroyed(&mut w, ship, SectionId(0));
+
+    assert!(
+        w.get::<Wreck>(ship).is_some(),
+        "the ship becomes a persistent wreck"
+    );
+    assert!(
+        w.get::<Ship>(ship).is_none(),
+        "the hulk is no longer a piloted Ship (Phase M4 strips the marker)"
+    );
+    let life = w
+        .get::<WreckLifetime>(ship)
+        .expect("the hulk gets a drift lifetime so it eventually despawns");
+    assert!(
+        (life.0 - WRECK_LIFETIME_SECS).abs() < 1e-6,
+        "the lifetime starts at WRECK_LIFETIME_SECS (got {})",
+        life.0
+    );
+    assert!(
+        w.get::<Position>(ship).is_some() && w.get::<Velocity>(ship).is_some(),
+        "the hulk is still a physical body that drifts"
+    );
+}
+
+/// `wreck_lifetime_system` decays a wreck's `WreckLifetime` by the fixed `dt` and despawns it at
+/// `<= 0` — so drifting debris doesn't accumulate forever in frictionless space.
+#[test]
+fn an_old_wreck_despawns_after_its_lifetime() {
+    let mut w = World::new();
+    w.insert_resource(Tuning::default());
+    w.insert_resource(FixedDt(1.0 / 30.0));
+    w.insert_resource(HitFeedback::default());
+    let dt = 1.0 / 30.0_f32;
+
+    // A short lifetime so the test runs in a few ticks (drifting the whole time).
+    let life = 3.0 * dt;
+    let wreck = w
+        .spawn((
+            Position(Vec2::new(0.0, 0.0)),
+            Velocity(Vec2::new(5.0, 0.0)),
+            Heading(0.0),
+            AngularVelocity(0.0),
+            Wreck::new(WreckOrigin::SeveredChunk),
+            WreckLifetime(life),
+        ))
+        .id();
+
+    let mut schedule = Schedule::default();
+    sim::add_fixed_step_systems(&mut schedule);
+    // Two steps: still alive (lifetime not yet exhausted).
+    schedule.run(&mut w);
+    schedule.run(&mut w);
+    assert!(
+        w.get_entity(wreck).is_ok(),
+        "the wreck is still drifting before its lifetime ends"
+    );
+    // After enough steps to exhaust the lifetime, it is despawned.
+    for _ in 0..3 {
+        schedule.run(&mut w);
+    }
+    assert!(
+        w.get_entity(wreck).is_err(),
+        "the wreck despawns once its drift lifetime is exhausted"
+    );
+}
+
+// =================================================================================
+// Phase M4 (Phase B) — a projectile hit transfers its MOMENTUM to the struck body:
+// a linear shove along the shot, plus an off-centre TUMBLE. The impulse is applied in
+// `fitted_damage_system` BEFORE the carve, so a piece the carve severs carries the kick.
+// (The impulse MATH is unit-tested in `motion.rs`; these prove the wiring.)
+// =================================================================================
+
+/// A head-on (centred) hit shoves the target along the shot direction (linear momentum
+/// transfer), with negligible spin (the contact arm is ∥ the impulse through the centre).
+#[test]
+fn a_centred_hit_shoves_the_target_along_the_shot() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    let ship = fitted_fighter_at_origin(&mut w);
+    // Drain the shield so the hit reaches the hull (the impulse applies on any hit, but this
+    // keeps the scenario unambiguous).
+    if let Some(mut s) = w.get_mut::<Shields>(ship) {
+        s.current = 0.0;
+    }
+    assert_eq!(
+        w.get::<Velocity>(ship).unwrap().0,
+        Vec2::ZERO,
+        "at rest before the hit"
+    );
+
+    // The centred nose-axis shot (world −X through y=0): impulse = PROJECTILE_MASS·(−180,0).
+    spawn_downward_projectile(&mut w, None, 12.0);
+    sim::fitted_damage_system(&mut w);
+
+    let v = w.get::<Velocity>(ship).unwrap().0;
+    let omega = w.get::<AngularVelocity>(ship).unwrap().0;
+    assert!(
+        v.x < -1e-4,
+        "the target is shoved along the shot (−X); got {v:?} (was zero)"
+    );
+    assert!(
+        v.y.abs() < 1e-3,
+        "a centred shot imparts no lateral velocity; got {v:?}"
+    );
+    assert!(
+        omega.abs() < 1e-3,
+        "a head-on (arm ∥ impulse) hit imparts negligible spin; got {omega}"
+    );
+}
+
+/// An OFF-CENTRE hit imparts spin (tumble): the contact arm is not parallel to the impulse, so
+/// `Δω = (arm × J)/I ≠ 0`. Fires straight along −X but offset in +y so it strikes a wing cell
+/// off the centreline.
+#[test]
+fn an_off_centre_hit_tumbles_the_target() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    let ship = fitted_fighter_at_origin(&mut w);
+    if let Some(mut s) = w.get_mut::<Shields>(ship) {
+        s.current = 0.0;
+    }
+    assert_eq!(
+        w.get::<AngularVelocity>(ship).unwrap().0,
+        0.0,
+        "no spin before the hit"
+    );
+
+    // A −X shot offset to +y = 0.5 world (≈ col 6 on the 9-wide hull): still crosses hull cells
+    // (so it's a real hit) but the impact sits off the centreline → a nonzero arm × impulse.
+    let y = 0.5_f32;
+    w.spawn((
+        Projectile,
+        Position(Vec2::new(0.0, y)),
+        PrevPosition(Vec2::new(6.0, y)),
+        Velocity(Vec2::new(-180.0, 0.0)),
+        Damage(12.0),
+        Lifetime(3.0),
+        WeaponSource::from_damage(12.0),
+    ));
+    sim::fitted_damage_system(&mut w);
+
+    let v = w.get::<Velocity>(ship).unwrap().0;
+    let omega = w.get::<AngularVelocity>(ship).unwrap().0;
+    assert!(v.x < -1e-4, "still shoved along the shot (−X); got {v:?}");
+    assert!(
+        omega.abs() > 1e-3,
+        "an off-centre hit spins the target (tumble); got ω = {omega}"
+    );
+}
+
+/// A `Wreck` is shoved + spun by a hit too (it routes through the SAME impulse path; its mass is
+/// derived from its cell count, so a light chunk gets flung harder than a heavy ship).
+#[test]
+fn a_hit_shoves_and_spins_a_wreck() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    // A real severed-chunk-shaped wreck with a collider + Destructible + a frozen anchor.
+    let wreck = spawn_offcenter_wing_wreck(&mut w);
+    w.entity_mut(wreck)
+        .insert(sim::components::MeshAnchor(Vec2::new(7.5, 2.5)));
+    let wpos = w.get::<Position>(wreck).unwrap().0;
+    let v0 = w.get::<Velocity>(wreck).unwrap().0;
+
+    // Fire a shot that crosses the chunk's cells (aim at its world position, sweeping through it).
+    w.spawn((
+        Projectile,
+        Position(wpos),
+        PrevPosition(wpos + Vec2::new(6.0, 0.0)),
+        Velocity(Vec2::new(-180.0, 0.0)),
+        Damage(8.0),
+        Lifetime(3.0),
+        WeaponSource::from_damage(8.0),
+    ));
+    sim::fitted_damage_system(&mut w);
+
+    // The chunk may have been carved/severed; if it still exists, it carries the kick.
+    if let Ok(e) = w.get_entity(wreck) {
+        let v = e.get::<Velocity>().unwrap().0;
+        assert!(
+            (v - v0).length() > 1e-3,
+            "the wreck's velocity changed from the hit's momentum (was {v0:?}, now {v:?})"
+        );
+    }
+}

@@ -443,3 +443,58 @@ fn hard_turn_diverts_thrust_and_bleeds_speed() {
         "hard turning should bleed speed via the shared power budget (was {cruise}, now {turning})"
     );
 }
+
+// --- Phase M4 (Phase C): recoil + projectile velocity inheritance ----------------
+
+/// Firing recoils the shooter opposite the muzzle, conserving momentum: the ship's change in
+/// momentum equals minus the momentum the gun gave the slug (`PROJECTILE_MASS · muzzle`).
+#[test]
+fn firing_recoils_the_shooter_conserving_momentum() {
+    let mut w = make_world();
+    let ship = spawn_ship(&mut w, Vec2::ZERO, 0.0, Vec2::ZERO); // nose +x, at rest
+    let mass = w.get_resource::<Tuning>().unwrap().mass;
+    let mut sched = make_schedule();
+
+    set_intent(&mut w, ship, |i| i.fire = true);
+    sched.run(&mut w); // one tick: cooldown starts at 0 → exactly one shot fires
+
+    let v = w.get::<Velocity>(ship).unwrap().0;
+    let muzzle = Vec2::new(200.0, 0.0); // heading 0 × muzzle_speed 200
+    let expected = -sim::weapon::PROJECTILE_MASS * muzzle / mass;
+    assert!(
+        (v - expected).length() < 1e-4,
+        "the shooter recoils opposite the muzzle (got {v:?}, expected {expected:?})"
+    );
+    assert!(v.x < 0.0, "a +x shot recoils the shooter backward (−x)");
+    // Momentum conservation: ship Δp (= mass·Δv) = −(projectile muzzle momentum).
+    let ship_dp = mass * v;
+    assert!(
+        (ship_dp + sim::weapon::PROJECTILE_MASS * muzzle).length() < 1e-4,
+        "ship Δp = −(PROJECTILE_MASS·muzzle); got Δp = {ship_dp:?}"
+    );
+}
+
+/// A moving ship's projectiles carry its velocity (a true Newtonian gun): the shot's velocity is
+/// the muzzle velocity PLUS the shooter's velocity at fire time.
+#[test]
+fn a_moving_ships_shot_inherits_its_velocity() {
+    let mut w = make_world();
+    let drift = Vec2::new(0.0, 10.0);
+    let ship = spawn_ship(&mut w, Vec2::ZERO, 0.0, drift); // nose +x, drifting +y
+    let mut sched = make_schedule();
+
+    set_intent(&mut w, ship, |i| i.fire = true);
+    sched.run(&mut w);
+
+    let pv = {
+        let mut q = w.query_filtered::<&Velocity, With<Projectile>>();
+        let vs: Vec<Vec2> = q.iter(&w).map(|v| v.0).collect();
+        assert_eq!(vs.len(), 1, "exactly one projectile fired");
+        vs[0]
+    };
+    let expected = Vec2::new(200.0, 0.0) + drift; // muzzle (+x·200) + the shooter's drift (+y·10)
+    assert!(
+        (pv - expected).length() < 1e-3,
+        "the projectile inherits the shooter's velocity (got {pv:?}, expected {expected:?})"
+    );
+}

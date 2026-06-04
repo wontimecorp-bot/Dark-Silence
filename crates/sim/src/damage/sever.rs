@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use super::salvage::SalvageOutcome;
 use crate::components::{
     AngularVelocity, CollisionRadius, Destructible, Heading, MeshAnchor, Position, Velocity,
+    WreckLifetime, WRECK_LIFETIME_SECS,
 };
 use crate::fitting::{Cell, Fit, FitLayout, HullCatalog, CELL_WORLD_SIZE};
 use crate::motion::BodyState;
@@ -428,6 +429,9 @@ pub fn sever_chunk(world: &mut World, ship: Entity, cells: &HashSet<Cell>) -> Wr
             contents: contents.clone(),
             claimed: false,
         },
+        // Phase M4: a drift lifetime so the chunk despawns after coasting a while (frictionless
+        // space never slows it), rather than floating forever.
+        WreckLifetime(WRECK_LIFETIME_SECS),
     ));
     if let Some(hull) = hull_id {
         entity.insert(FitLayout {

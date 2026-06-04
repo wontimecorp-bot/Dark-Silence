@@ -94,6 +94,26 @@ pub fn analytic(start: BodyState, accel: Vec2, t: f32) -> BodyState {
     BodyState { pos, vel }
 }
 
+/// Apply a **linear impulse** `j` (momentum, sim-units·mass/s) to a body of inertial `mass` →
+/// the new velocity `v + j/mass` (Phase M4). An impulse is an instantaneous change in momentum
+/// (`Δp = j`, `Δv = j/mass`), unlike a force applied over `dt`; this is the shared primitive for
+/// projectile knockback + firing recoil. Pure; the caller writes the result back. `mass` is
+/// floored away from `0` so a degenerate body never divides by zero.
+#[inline]
+pub fn apply_linear_impulse(vel: Vec2, j: Vec2, mass: f32) -> Vec2 {
+    vel + j / mass.max(f32::MIN_POSITIVE)
+}
+
+/// Apply an **off-centre impulse** `j` at arm `r` (the contact point relative to the body's
+/// centre of mass) to a body of moment of inertia `inertia` → the new angular velocity
+/// `ω + (r × j)/inertia` (Phase M4). The 2D cross product `r × j = r.perp_dot(j)` is the torque
+/// impulse, so a hit off the COM spins the body (tumble). Pure; `inertia` is floored away from
+/// `0`. (Pair with [`apply_linear_impulse`] for the same `j` to get the full rigid-body response.)
+#[inline]
+pub fn apply_angular_impulse(omega: f32, r: Vec2, j: Vec2, inertia: f32) -> f32 {
+    omega + r.perp_dot(j) / inertia.max(f32::MIN_POSITIVE)
+}
+
 /// Convenience: integrate `steps` ticks of `dt` under constant `accel`.
 ///
 /// This is the explicit Tier 0 loop; in production the server drives
@@ -186,6 +206,29 @@ mod tests {
         let s = analytic(start, Vec2::ZERO, 10.0);
         assert_close(s.pos, Vec2::new(20.0, 30.0), 1e-5);
         assert_eq!(s.vel, start.vel, "coasting must not change velocity");
+    }
+
+    #[test]
+    fn linear_impulse_changes_velocity_by_j_over_mass() {
+        // Δv = j/m, added to the existing velocity.
+        let v = apply_linear_impulse(Vec2::new(1.0, 0.0), Vec2::new(6.0, -4.0), 2.0);
+        assert_close(v, Vec2::new(1.0 + 3.0, -2.0), 1e-6);
+        // A zero/degenerate mass is floored (no NaN/inf), so the result stays finite.
+        assert!(apply_linear_impulse(Vec2::ZERO, Vec2::new(1.0, 0.0), 0.0).is_finite());
+    }
+
+    #[test]
+    fn angular_impulse_spins_by_cross_over_inertia() {
+        // An off-centre impulse (arm ⟂ impulse) imparts spin = (r × j)/I.
+        // arm (1,0), j (0,3): r×j = 1·3 − 0·0 = 3; I = 1.5 → Δω = 2.0.
+        let w = apply_angular_impulse(0.5, Vec2::new(1.0, 0.0), Vec2::new(0.0, 3.0), 1.5);
+        assert!((w - (0.5 + 2.0)).abs() < 1e-6, "ω += (r×j)/I; got {w}");
+        // A CENTERED hit (arm ∥ impulse) imparts NO spin.
+        let none = apply_angular_impulse(0.0, Vec2::new(2.0, 0.0), Vec2::new(-5.0, 0.0), 1.0);
+        assert!(
+            none.abs() < 1e-6,
+            "a head-on (arm ∥ j) hit does not spin; got {none}"
+        );
     }
 
     /// Sanity: a deliberately wrong (forward Euler) integrator must NOT match the

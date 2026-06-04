@@ -9,6 +9,7 @@
 
 use crate::clock::FixedDt;
 use crate::components::{AngularVelocity, FlightAssist, Heading, Position, Ship, Velocity};
+use crate::damage::Wreck;
 use crate::fitting::ShipStats;
 use crate::intent::ShipIntent;
 use crate::motion::{integrate, BodyState};
@@ -244,6 +245,30 @@ fn step_ship_motion(
     let stepped = integrate(BodyState::new(pos.0, vel.0), accel, dt);
     pos.0 = stepped.pos;
     vel.0 = stepped.vel;
+}
+
+/// Fixed-step **drift + tumble for `Wreck` bodies** (Phase M4): severed chunks and
+/// destroyed-ship hulks coast on the velocity + spin they inherited at sever/death.
+///
+/// The piloted [`ship_motion_system`] is `With<Ship>`-gated (and `destroy_ship` strips the
+/// `Ship` marker), so wreckage never moved before — it is driven HERE instead, as pure
+/// Newtonian integration with **no thrust and no drag** (space is frictionless; a wreck's only
+/// lifetime bound is [`WreckLifetime`](crate::components::WreckLifetime), not friction). Reuses
+/// the shared [`integrate`] with zero acceleration so the linear path stays bit-identical in
+/// style to a coasting ship; `Heading` advances by `ω·dt`, kept bounded with `rem_euclid(TAU)`
+/// exactly like [`step_ship_motion`]. `MeshAnchor`/render is unaffected — world `Position`
+/// drives the rendered mesh via interpolation. A world with no wrecks is a no-op.
+pub fn wreck_motion_system(
+    dt: Res<FixedDt>,
+    mut q: Query<(&mut Position, &Velocity, &mut Heading, &AngularVelocity), With<Wreck>>,
+) {
+    let dt = dt.0;
+    for (mut pos, vel, mut heading, omega) in &mut q {
+        // accel = 0 → `integrate` reduces to `pos += vel·dt`, vel unchanged (frictionless coast).
+        let stepped = integrate(BodyState::new(pos.0, vel.0), Vec2::ZERO, dt);
+        pos.0 = stepped.pos;
+        heading.0 = (heading.0 + omega.0 * dt).rem_euclid(std::f32::consts::TAU);
+    }
 }
 
 #[cfg(test)]

@@ -13,6 +13,7 @@
 use std::collections::BTreeSet;
 
 use bevy_ecs::entity::Entity;
+use bevy_ecs::prelude::{Commands, Query, Res};
 use bevy_ecs::world::World;
 
 use super::content::SalvageConfig;
@@ -21,7 +22,10 @@ use super::salvage::salvage_layout;
 use super::sever::{
     connected_region, core_cell, disconnected_regions, sever_chunk, Wreck, WreckOrigin,
 };
-use crate::components::{Destructible, MeshAnchor, Target};
+use crate::clock::FixedDt;
+use crate::components::{
+    Destructible, MeshAnchor, Ship, Target, WreckLifetime, WRECK_LIFETIME_SECS,
+};
 use crate::fitting::{Cell, Fit, FitLayout, HullCatalog, ModuleCatalog, SectionId};
 use glam::Vec2;
 
@@ -404,4 +408,32 @@ fn destroy_ship(world: &mut World, ship: Entity) {
         entity.insert(MeshAnchor(c));
     }
     entity.remove::<Target>();
+    // Phase M4: the hulk is no longer a piloted ship. Strip `Ship` so it stops being driven by
+    // `ship_motion_system` (which would apply piloted flight-assist DRAG + stale `ShipIntent`
+    // thrust to a corpse) and by `weapon_fire_system`; it now coasts on its final velocity/spin
+    // via `wreck_motion_system` like any other wreck body. Give it a drift lifetime so the hulk
+    // eventually despawns instead of floating forever.
+    entity.remove::<Ship>();
+    entity.insert(WreckLifetime(WRECK_LIFETIME_SECS));
+}
+
+/// Fixed-step **despawn-when-old** for drifting wreckage (Phase M4): decay each `Wreck`'s
+/// [`WreckLifetime`] by the fixed `dt` and despawn it once it reaches `0`. Frictionless space
+/// never slows a wreck, so without this a severed piece / hulk would drift forever; this bounds
+/// debris by AGE (not unphysical drag), keeping the live entity count + snapshot work bounded.
+/// Complements the despawn-when-`FitLayout.cells`-empty path in [`on_cells_carved`] (a fully
+/// carved wreck vanishes immediately, regardless of remaining lifetime). Deterministic — ticks by
+/// the fixed `dt`; despawns are order-independent.
+pub fn wreck_lifetime_system(
+    mut commands: Commands,
+    dt: Res<FixedDt>,
+    mut q: Query<(Entity, &mut WreckLifetime)>,
+) {
+    let dt = dt.0;
+    for (entity, mut life) in &mut q {
+        life.0 -= dt;
+        if life.0 <= 0.0 {
+            commands.entity(entity).despawn();
+        }
+    }
 }
