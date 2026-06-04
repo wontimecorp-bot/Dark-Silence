@@ -452,25 +452,36 @@ fn cell_in_front(cells: &BTreeSet<Cell>, entry_cell: Cell, dir_n: Vec2) -> bool 
 /// carve.
 const RICOCHET_MIN_NEIGHBORS: u8 = 3;
 
-/// The **local outward surface normal** at `cell` within the **geometry cell set**, plus the
-/// COUNT of `cell`'s present neighbours (out of 8). The normal is the geometry-accurate
-/// direction the cell's plate faces, used for the armor obliquity on a fresh (non-buried)
-/// surface hit. Sums the unit vectors toward each of the 8 neighbour offsets that are NOT in
-/// the set (empty space): material pushes the normal AWAY from itself, so it points into the
-/// void = outward. `Vec2::ZERO` for a fully-interior cell (every neighbour present) → the
-/// caller treats that as head-on. The neighbour count gates ricochet eligibility
-/// ([`RICOCHET_MIN_NEIGHBORS`]) — a thin shard (few neighbours) has an unreliable normal.
+/// Half-width of the **smoothing kernel** for [`local_surface_normal`]. `2` → a 5×5 window.
+/// A wider window than the immediate 3×3 averages the outward direction over more of the local
+/// surface, so the normal varies SMOOTHLY between adjacent cells (consistent ricochet — no
+/// "same angle, neighbouring cell flips") and ROUNDS convex corners (the gradient blends the
+/// two faces, more so with a bigger radius — Fix #11 M1). This is the gradient of a smoothed
+/// occupancy field = the normal of a smoothed marching-squares contour, computed cheaply
+/// without building the polyline. Tunable: larger = rounder/smoother (the client contour's
+/// smoothing should be tuned to match this).
+const SMOOTH_NORMAL_RADIUS: i32 = 2;
+
+/// The **smoothed local outward surface normal** at `cell` within the **geometry cell set**,
+/// plus the COUNT of `cell`'s immediate (8-)neighbours that are present. The normal points
+/// toward the local void (= outward): each ABSENT cell within the [`SMOOTH_NORMAL_RADIUS`]
+/// window contributes `offset / |offset|²` (an inverse-distance-weighted unit vector toward
+/// it), so nearer void dominates and the result is a smooth gradient that rounds corners and
+/// agrees between adjacent cells. `Vec2::ZERO` for a fully-surrounded cell → the caller treats
+/// that as head-on. The immediate-8 `present_count` gates ricochet eligibility
+/// ([`RICOCHET_MIN_NEIGHBORS`]) — a thin shard (few neighbours) always carves regardless of the
+/// (then-unreliable) normal.
 ///
 /// `cells` is the authored hull for a live ship, or a `Wreck`'s CURRENT cells for a chunk — so
 /// a detached piece faces the way its ACTUAL shape faces, not the original ship's (Fix #9; a
 /// 1-cell chunk has no present neighbours → normal `0` + count `0` → head-on, always carves).
-/// Pure + deterministic (a fixed 8-neighbour `BTreeSet` membership scan).
+/// Pure + deterministic (a fixed-order `BTreeSet` membership scan; no transcendentals).
 fn local_surface_normal(cells: &BTreeSet<Cell>, cell: Cell) -> (Vec2, u8) {
     let (c, r) = (cell.0 as i32, cell.1 as i32);
     let mut normal = Vec2::ZERO;
-    let mut present_count: u8 = 0;
-    for dc in -1..=1 {
-        for dr in -1..=1 {
+    let mut present_count: u8 = 0; // immediate 8-neighbours only — the thin-shard gate input
+    for dc in -SMOOTH_NORMAL_RADIUS..=SMOOTH_NORMAL_RADIUS {
+        for dr in -SMOOTH_NORMAL_RADIUS..=SMOOTH_NORMAL_RADIUS {
             if dc == 0 && dr == 0 {
                 continue;
             }
@@ -479,9 +490,14 @@ fn local_surface_normal(cells: &BTreeSet<Cell>, cell: Cell) -> (Vec2, u8) {
             // An out-of-bounds neighbour is empty (void) too — it still pulls the normal out.
             let present = nc >= 0 && nr >= 0 && cells.contains(&(nc as u16, nr as u16));
             if present {
-                present_count += 1;
+                if dc.abs() <= 1 && dr.abs() <= 1 {
+                    present_count += 1;
+                }
             } else {
-                normal += Vec2::new(dc as f32, dr as f32).normalize_or_zero();
+                // Inverse-distance-weighted direction toward the void cell:
+                // `(dc,dr)/|(dc,dr)|² = unit_dir / distance` → nearer void weighs more (smooth).
+                let d2 = (dc * dc + dr * dr) as f32;
+                normal += Vec2::new(dc as f32, dr as f32) / d2;
             }
         }
     }
@@ -717,17 +733,21 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
     // so square-on flank hits spuriously ricocheted (Fix #8). The local normal is exact for
     // any shape and any carve state.
     let (surface_normal, present_neighbors) = local_surface_normal(&geom_cells, entry_cell);
-    let angle = if buried
-        || present_neighbors < RICOCHET_MIN_NEIGHBORS
-        || surface_normal.length_squared() <= f32::EPSILON
-    {
+    let cos_impact = if surface_normal.length_squared() <= f32::EPSILON {
+        1.0 // no outward direction → treat as head-on
+    } else {
+        (-dir_n).dot(surface_normal.normalize())
+    };
+    let angle = if buried || present_neighbors < RICOCHET_MIN_NEIGHBORS || cos_impact < 0.0 {
         // Down a bored tunnel (material in front — Fix #5's guard), a thin shard (too few
         // neighbours for a reliable surface normal → no spurious ricochet, Fix #10), or a
-        // fully-interior cell with no outward direction → head-on, never a ricochet.
+        // BACK-FACING entry whose local surface points away from the shooter (a concave/inside
+        // corner — Fix #11 M1: previously `clamp(0,1)` forced this to 90° → a spurious ricochet;
+        // the entry should be a front face, so treat it as head-on) → never a ricochet.
         0.0
     } else {
-        let cos_impact = (-dir_n).dot(surface_normal.normalize()).clamp(0.0, 1.0);
-        cos_impact.acos()
+        // `cos_impact ∈ [0,1]`: 1 = square-on (carve), 0 = grazing-parallel (→ 90°, ricochet).
+        cos_impact.min(1.0).acos()
     };
 
     // Mitigate at the Armor layer before the penetration tier applies.
