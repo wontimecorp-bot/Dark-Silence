@@ -4887,3 +4887,42 @@ fn a_hit_shoves_and_spins_a_wreck() {
         );
     }
 }
+
+// =================================================================================
+// Phase M5 — per-weapon projectile mass: a heavier slug imparts more knockback.
+// =================================================================================
+
+/// A heavier `ProjectileMass` shoves the struck target proportionally harder — the per-weapon
+/// slug mass (not a single global constant) sets the momentum a shot transfers.
+#[test]
+fn a_heavier_slug_imparts_more_knockback() {
+    // The same centred nose shot at a fresh fighter, carrying different slug masses.
+    fn shove(slug_mass: f32) -> f32 {
+        let mut w = World::new();
+        insert_full_combat_resources(&mut w);
+        let ship = fitted_fighter_at_origin(&mut w);
+        if let Some(mut s) = w.get_mut::<Shields>(ship) {
+            s.current = 0.0;
+        }
+        w.spawn((
+            Projectile,
+            Position(Vec2::ZERO),
+            PrevPosition(Vec2::new(6.0, 0.0)),
+            Velocity(Vec2::new(-180.0, 0.0)),
+            Damage(12.0),
+            sim::components::ProjectileMass(slug_mass),
+            Lifetime(3.0),
+            WeaponSource::from_damage(12.0),
+        ));
+        sim::fitted_damage_system(&mut w);
+        w.get::<Velocity>(ship).map(|v| v.0.length()).unwrap_or(0.0)
+    }
+
+    let light = shove(0.03);
+    let heavy = shove(0.30); // a 10× heavier slug
+    assert!(light > 0.0, "even the light slug shoves the target");
+    assert!(
+        heavy > light * 5.0,
+        "a 10× heavier slug shoves much harder (light {light}, heavy {heavy})"
+    );
+}

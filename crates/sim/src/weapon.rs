@@ -10,8 +10,8 @@
 
 use crate::clock::FixedDt;
 use crate::components::{
-    Damage, Heading, Lifetime, Position, PrevPosition, Projectile, ProjectileOwner, Ship, Velocity,
-    Weapon,
+    Damage, Heading, Lifetime, Position, PrevPosition, Projectile, ProjectileMass, ProjectileOwner,
+    Ship, Velocity, Weapon,
 };
 use crate::damage::{Channel, DamageEvent};
 use crate::fitting::ShipStats;
@@ -29,12 +29,12 @@ use serde::{Deserialize, Serialize};
 const PROJECTILE_DAMAGE: f32 = 10.0;
 /// Projectile time-to-live in seconds.
 const PROJECTILE_LIFETIME: f32 = 3.0;
-/// Phase M4 — **projectile inertial mass** for momentum. A projectile's momentum is
-/// `p = PROJECTILE_MASS · velocity`: at fire time the shooter recoils by the muzzle component of
-/// it (Newton's third law), and at hit time [`crate::collision::fitted_damage_system`] deposits
-/// the full momentum as an impulse on the struck body. Small relative to ship mass so a shot
-/// nudges rather than flings; **tunable for feel** (start subtle). Sim-side → part of the
-/// determinism contract (identical on server + predicted client).
+/// Phase M4/M5 — **fallback projectile inertial mass** for the UNFITTED gun (and any projectile
+/// spawned without a [`ProjectileMass`](crate::components::ProjectileMass)). A fitted weapon now
+/// carries its own per-weapon slug mass (`WeaponProfile::projectile_mass`); this is the global
+/// default the legacy E002 `Weapon` path uses for recoil + knockback (`p = mass · velocity`).
+/// Small relative to ship mass so a shot nudges rather than flings; **tunable**. Sim-side → part
+/// of the determinism contract.
 pub const PROJECTILE_MASS: f32 = 0.03;
 
 // --- E007 damage-typing seam (T037) ---------------------------------------------
@@ -214,6 +214,8 @@ pub fn weapon_fire_system(
                 PrevPosition(pos.0),
                 Velocity(vel),
                 Damage(profile.damage),
+                // Phase M5: the per-weapon slug mass, carried to the hit for the impulse.
+                ProjectileMass(profile.projectile_mass),
                 Lifetime(PROJECTILE_LIFETIME),
                 ProjectileOwner(owner),
                 // E007 damage typing (T037): the fixed-forward gun is Kinetic with
@@ -221,9 +223,11 @@ pub fn weapon_fire_system(
                 // only ever hits an unfitted target (the legacy path ignores it).
                 WeaponSource::from_damage(profile.damage),
             ));
-            // Phase M4 recoil: conserve momentum against the MUZZLE component only (the inherited
-            // part was already the ship's momentum). Δv = −(PROJECTILE_MASS·muzzle)/ship_mass.
-            ship_vel.0 -= PROJECTILE_MASS * muzzle / stats.total_mass.max(f32::MIN_POSITIVE);
+            // Phase M4/M5 recoil: conserve momentum against the MUZZLE component only (the inherited
+            // part was already the ship's momentum), using the per-weapon slug mass.
+            // Δv = −(projectile_mass·muzzle)/ship_mass.
+            ship_vel.0 -=
+                profile.projectile_mass * muzzle / stats.total_mass.max(f32::MIN_POSITIVE);
             weapon.cooldown = cooldown_after_fire(profile.fire_rate);
         }
     }
@@ -242,6 +246,8 @@ pub fn weapon_fire_system(
                 PrevPosition(pos.0),
                 Velocity(vel),
                 Damage(PROJECTILE_DAMAGE),
+                // Phase M5: the unfitted gun has no profile, so use the global fallback slug mass.
+                ProjectileMass(PROJECTILE_MASS),
                 Lifetime(PROJECTILE_LIFETIME),
                 ProjectileOwner(owner),
                 // E007 damage typing (T037): harmless on the unfitted E002/E003

@@ -45,6 +45,7 @@ pub use content::{
     baseline_fit, baseline_hull, seed_catalogs, HullCatalog, ModuleCatalog, HULL_BASELINE,
     HULL_CORVETTE, HULL_FIGHTER, MODULE_ARMOR_PLATE, MODULE_AUTOCANNON, MODULE_BASELINE_THRUSTER,
     MODULE_REACTOR_BASIC, MODULE_SHIELD_BASIC, MODULE_THRUSTER_BASIC, MODULE_UTILITY_BASIC,
+    STRUCT_CELL_MASS,
 };
 pub use fit::{
     load_preset, preview_stats, save_preset, Fit, FitPreset, FitRejection, ModuleRef, PresetId,
@@ -54,8 +55,9 @@ pub use hull::{
     CELL_WORLD_SIZE,
 };
 pub use layout::{
-    build_layout, cell_map, center_or_anchor, hardpoint_arc, layout_center, module_at, resolve_hit,
-    Cell, CellMap, CellOccupant, FitLayout, HitResolution,
+    build_layout, cell_map, cell_mass, center_or_anchor, hardpoint_arc, layout_center,
+    layout_inertia, layout_mass, module_at, resolve_hit, Cell, CellMap, CellOccupant, FitLayout,
+    HitResolution,
 };
 pub use module::{
     Axis, HardpointType, Module, ModuleId, ModuleKind, ModuleSpecifics, SlotSize, Violation,

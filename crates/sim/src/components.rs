@@ -92,6 +92,13 @@ pub struct Projectile;
 #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Damage(pub f32);
 
+/// The inertial **mass of a fired projectile** (Phase M5) — the per-weapon slug mass it carries
+/// to the hit, where [`crate::collision::fitted_damage_system`] deposits its momentum
+/// (`projectile_mass · velocity`) as an impulse on the struck body. Set at fire from the weapon's
+/// profile (a heavier gun → bigger knockback + recoil); the unfitted path uses a global fallback.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProjectileMass(pub f32);
+
 /// Remaining lifetime in seconds; the projectile despawns at zero (INV-06).
 #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Lifetime(pub f32);

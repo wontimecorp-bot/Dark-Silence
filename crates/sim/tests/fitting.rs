@@ -658,14 +658,37 @@ mod stats_phase4 {
             muzzle_speed,
             fire_rate,
             damage,
+            projectile_mass,
         } = cannon.specifics
         {
             assert_eq!(profile.muzzle_speed, muzzle_speed);
             assert_eq!(profile.fire_rate, fire_rate);
             assert_eq!(profile.damage, damage);
+            // Phase M5: the profile carries the weapon's per-shot slug mass through unchanged,
+            // pinned to the seed value (recoil/knockback unchanged until a heavier gun is authored).
+            assert_eq!(profile.projectile_mass, projectile_mass);
+            assert_eq!(projectile_mass, 0.03, "seed autocannon slug mass is pinned");
         } else {
             panic!("autocannon should be a Weapon module");
         }
+    }
+
+    /// Phase M5: a ship's flight `total_mass` IS its per-cell `layout_mass` — so flight, the
+    /// projectile-impulse, and the wreck it becomes all share ONE mass basis (no jump on death),
+    /// and the mass reflects the body's real composition (a reactor cell outweighs plating).
+    #[test]
+    fn flight_mass_is_the_per_cell_mass_sum() {
+        let (modules, hulls) = seed_catalogs();
+        let hull = hulls.get(HULL_FIGHTER).unwrap();
+        let mut fit = Fit::new(HULL_FIGHTER);
+        fit.install_raw(SlotId(3), MODULE_AUTOCANNON);
+        let layout = build_layout(hull, &fit, &modules);
+        let stats = derive_ship_stats(hull, &fit, &modules, &layout);
+        assert!(
+            (stats.total_mass - sim::fitting::layout_mass(&layout, &modules)).abs() < 1e-6,
+            "flight total_mass == layout_mass (one basis for flight + impulse + wreck)"
+        );
+        assert!(stats.total_mass > 0.0 && stats.total_mass.is_finite());
     }
 
     #[test]

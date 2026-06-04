@@ -96,6 +96,21 @@ pub const HULL_CORVETTE: HullId = HullId(2);
 /// placeholder 10.0 so the carve is legible against the autocannon's per-shot budget.
 pub const STRUCT_CELL_HP: f32 = 4.0;
 
+/// Inertial **mass of one structural (filler-plating) cell** (Phase M5) — the per-cell mass the
+/// unified bottom-up mass model gives every non-module cell. A body's total mass is the sum of its
+/// cells' masses ([`layout_mass`](super::layout::layout_mass)): structural cells each weigh this,
+/// module cells weigh their installed module's `mass`. This single source feeds flight
+/// acceleration, projectile knockback, wreck drift, and moment of inertia, so a ship's mass is
+/// continuous as it erodes into a wreck and reflects what it is actually made of.
+///
+/// **Uniform per-cell calibration:** one value for every hull (a structural cell weighs the same
+/// everywhere), so a ship's chassis mass is proportional to its size in cells rather than a
+/// hand-authored per-hull lump — the fighter (44 structural cells) lands ≈ its old 8.0 chassis,
+/// the corvette (89) ≈ 17.8 (lighter/more agile than its old hand-picked 30.0). **Tunable for
+/// feel**; sim-side (determinism contract). (The fitting-screen mass **budget** axis still uses the
+/// authored `hull_base_mass` — a separate fit-validation constraint, not physical mass.)
+pub const STRUCT_CELL_MASS: f32 = 0.2;
+
 /// Seed module id: `reactor_basic` — supplies power; cost axis = mass.
 pub const MODULE_REACTOR_BASIC: ModuleId = ModuleId(1);
 /// Seed module id: `thruster_basic` — thrust/torque; cost = power_draw + mass.
@@ -204,6 +219,9 @@ fn seed_modules() -> ModuleCatalog {
                 muzzle_speed: 200.0,
                 fire_rate: 5.0,
                 damage: 12.0,
+                // Phase M5: per-weapon slug mass — the seed autocannon keeps the prior global
+                // value so recoil/knockback are unchanged until a heavier gun is authored.
+                projectile_mass: 0.03,
             },
         },
         // shield_basic — shield hp/regen (tank); dominant cost axis = power_draw
@@ -254,8 +272,11 @@ fn seed_modules() -> ModuleCatalog {
             specifics: ModuleSpecifics::Utility,
         },
         // baseline_thruster — the flight-feel reference (HINT-002): supplies the
-        // full `Tuning::default()` thrust/torque/strafe (30/12/18) in one module,
-        // mass 0.6 so `hull_base_mass(0.4) + 0.6 = 1.0 = Tuning::default().mass`.
+        // full `Tuning::default()` thrust/torque/strafe (30/12/18) in one module.
+        // Phase M5: flight `total_mass` is now the SUM of the body's cells, and the
+        // baseline hull is a single module cell with no structural filler, so this
+        // module's mass IS the baseline fit's total mass — set to `1.0` so
+        // `total_mass == Tuning::default().mass` (the flight-feel-preservation guard).
         // Outside the player-facing ladder; used only by `baseline_fit`.
         Module {
             id: MODULE_BASELINE_THRUSTER,
@@ -263,7 +284,7 @@ fn seed_modules() -> ModuleCatalog {
             power_gen: 0.0,
             power_draw: 0.0,
             cpu_draw: 0.0,
-            mass: 0.6,
+            mass: 1.0,
             heat: 0.0,
             health_max: 20.0,
             hardpoint_type: HardpointType::Thruster,

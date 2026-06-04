@@ -131,6 +131,12 @@ pub enum ModuleSpecifics {
         fire_rate: f32,
         /// Damage per shot (`> 0`).
         damage: f32,
+        /// Phase M5 — the fired projectile's inertial **mass** (`> 0`), the per-weapon slug mass
+        /// that sets both the shot's knockback on a target and the shooter's recoil
+        /// (`momentum = projectile_mass · muzzle_velocity`). Small relative to ship mass; a heavier
+        /// gun (e.g. a railgun) hits + recoils harder. Distinct from the weapon module's own
+        /// install `mass` (the cost axis). Tunable for feel.
+        projectile_mass: f32,
     },
     /// Shield: defense data consumed by E007 (not flight).
     Shield {

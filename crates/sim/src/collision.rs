@@ -11,13 +11,16 @@ use crate::combat::{self, HitFeedback};
 use crate::components::AngularVelocity;
 use crate::components::{
     CollisionRadius, Damage, DamageFlash, Destructible, Heading, Health, LastShieldHit, MeshAnchor,
-    Position, PrevPosition, Projectile, ProjectileOwner, ShieldHitFlash, Ship, Target, TargetKind,
-    Velocity,
+    Position, PrevPosition, Projectile, ProjectileMass, ProjectileOwner, ShieldHitFlash, Ship,
+    Target, TargetKind, Velocity,
 };
 use crate::damage::{
     apply_damage, core_cell, first_cell_hit, on_cells_carved, DamageEvent, HitKind, Wreck, REACH,
 };
-use crate::fitting::{center_or_anchor, FitLayout, HullCatalog, ShipStats, CELL_WORLD_SIZE};
+use crate::fitting::{
+    center_or_anchor, layout_inertia, layout_mass, FitLayout, HullCatalog, ModuleCatalog,
+    CELL_WORLD_SIZE,
+};
 use crate::motion::{apply_angular_impulse, apply_linear_impulse};
 use crate::physics::{Physics, RapierPhysics, SweptHit};
 use crate::tuning::Tuning;
@@ -27,16 +30,9 @@ use glam::Vec2;
 
 /// Ship inertial mass for ram impulses (asteroids are heavier, so the ship
 /// bounces more).
-const SHIP_MASS: f32 = 1.0;
+const SHIP_MASS: f32 = 2.0;
 /// Asteroid inertial mass for ram impulses.
-const ASTEROID_MASS: f32 = 6.0;
-
-/// Phase M4 — **per-cell mass** used to derive a wreck's inertial mass (`cells · MASS_PER_CELL`)
-/// and every body's geometric moment of inertia (`Σ MASS_PER_CELL·|cell−COM|²`). Calibrated so a
-/// reference fighter's cell-derived mass is in the same ballpark as its `ShipStats.total_mass`,
-/// keeping the linear (mass) and angular (inertia) responses consistent. **Tunable**; sim-side
-/// (determinism contract).
-const MASS_PER_CELL: f32 = 0.2;
+const ASTEROID_MASS: f32 = 8.0;
 
 /// Earliest time-of-impact `t ∈ [0, 1]` at which the point sweeping `p0`→`p1`
 /// first touches the circle `(center, radius)`, or `None` if it never does
@@ -399,9 +395,13 @@ pub fn fitted_damage_system(world: &mut World) {
         &Damage,
         &WeaponSource,
         Option<&ProjectileOwner>,
+        Option<&ProjectileMass>,
     ), With<Projectile>>();
-    for (projectile, pos, prev, vel, dmg, src, owner) in proj_q.iter(world) {
+    for (projectile, pos, prev, vel, dmg, src, owner, pmass) in proj_q.iter(world) {
         let owner_e = owner.map(|o| o.0);
+        // Phase M5: the per-weapon slug mass the shot carries (falls back to the global
+        // `PROJECTILE_MASS` for a projectile spawned without one — e.g. a minimal-world test shot).
+        let proj_mass = pmass.map(|m| m.0).unwrap_or(PROJECTILE_MASS);
         // **Cell-precise hit selection** (the targeting-bug fix): a projectile hits a target
         // ONLY if its swept segment actually crosses one of that target's present CELLS —
         // not merely the loose `CollisionRadius` circle. The circle (sized to the whole
@@ -480,9 +480,9 @@ pub fn fitted_damage_system(world: &mut World) {
                 target,
                 event,
                 shield_dir,
-                // Phase M4: momentum the shot carries = mass·velocity (world), and the contact
-                // arm from the target centre → off-centre hits spin the body when applied.
-                impulse: PROJECTILE_MASS * vel.0,
+                // Phase M4/M5: momentum the shot carries = its per-weapon mass·velocity (world),
+                // and the contact arm from the target centre → off-centre hits spin the body.
+                impulse: proj_mass * vel.0,
                 arm: world_impact - tpos,
             });
         }
@@ -503,35 +503,28 @@ pub fn fitted_damage_system(world: &mut World) {
         // to detect "core destroyed".
         let pre_carve_core = world.get::<FitLayout>(target).and_then(core_cell);
 
-        // --- Phase M4: transfer the shot's momentum to the struck body ----------------
-        // Apply the projectile's impulse (`impulse = mass·velocity`) to the target BEFORE the
-        // carve, so a piece the carve severs off carries the kick (`sever_chunk` reads the
-        // post-kick parent velocity). Linear `Δv = J/M`; off-centre `Δω = (arm × J)/I` → tumble.
-        // Mass `M` = the live ship's `total_mass`, or a wreck's `cells · MASS_PER_CELL`; inertia
-        // `I` is the geometric `Σ MASS_PER_CELL·|cell − COM|²` over the CURRENT (pre-carve) cells,
-        // in world units. A target with no `Velocity`/`AngularVelocity` (a non-physical test
-        // target) is simply skipped (`get_mut` → `None`). Deterministic (f32, sorted-cell fold).
-        if let Some(layout) = world.get::<FitLayout>(target).cloned() {
-            let cell_count = layout.cells.len().max(1) as f32;
-            let mass = world
-                .get::<ShipStats>(target)
-                .map(|s| s.total_mass)
-                .unwrap_or(cell_count * MASS_PER_CELL)
-                .max(f32::MIN_POSITIVE);
-            let com = layout.cells.keys().fold(Vec2::ZERO, |a, &(c, r)| {
-                a + Vec2::new(c as f32 + 0.5, r as f32 + 0.5)
-            }) / cell_count;
-            let inertia = (layout
-                .cells
-                .keys()
-                .map(|&(c, r)| {
-                    let d = Vec2::new(c as f32 + 0.5, r as f32 + 0.5) - com;
-                    MASS_PER_CELL * d.length_squared()
-                })
-                .sum::<f32>()
-                * CELL_WORLD_SIZE
-                * CELL_WORLD_SIZE)
-                .max(f32::MIN_POSITIVE);
+        // --- Phase M4/M5: transfer the shot's momentum to the struck body --------------
+        // Apply the projectile's impulse (`impulse = projectile_mass·velocity`) to the target
+        // BEFORE the carve, so a piece the carve severs off carries the kick (`sever_chunk` reads
+        // the post-kick parent velocity). Linear `Δv = J/M`; off-centre `Δω = (arm × J)/I` → tumble.
+        // M5: mass `M` ([`layout_mass`]) and inertia `I` ([`layout_inertia`]) are the body's REAL
+        // per-cell masses (module cells = their module mass, structural = `STRUCT_CELL_MASS`) over
+        // the CURRENT (pre-carve) cells — the SAME mass basis `derive_ship_stats` gives flight, so
+        // a live ship and the wreck it becomes share one mass (no jump on death), and a heavy
+        // reactor/armor body resists knockback + tumble more than light plating. Mass + inertia are
+        // computed up-front so the `FitLayout`/`ModuleCatalog` borrows drop before the velocity
+        // writes. A catalog-less minimal test world (no `ModuleCatalog`) skips the impulse; a target
+        // with no `Velocity`/`AngularVelocity` is skipped per-write. Deterministic (sorted-cell fold).
+        let mass_inertia = world.get_resource::<ModuleCatalog>().and_then(|modules| {
+            world.get::<FitLayout>(target).map(|layout| {
+                (
+                    layout_mass(layout, modules),
+                    layout_inertia(layout, modules),
+                )
+            })
+        });
+        if let Some((mass, inertia)) = mass_inertia {
+            let mass = mass.max(f32::MIN_POSITIVE);
             if let Some(mut vel) = world.get_mut::<Velocity>(target) {
                 vel.0 = apply_linear_impulse(vel.0, impulse, mass);
             }

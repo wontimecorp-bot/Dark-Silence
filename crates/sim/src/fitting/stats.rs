@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use super::content::ModuleCatalog;
 use super::fit::Fit;
 use super::hull::Hull;
-use super::layout::{CellOccupant, FitLayout};
+use super::layout::{layout_mass, CellOccupant, FitLayout};
 use super::module::{Module, ModuleKind, ModuleSpecifics};
 use crate::damage::StatScalingConfig;
 use crate::tuning::Tuning;
@@ -67,6 +67,10 @@ pub struct WeaponProfile {
     pub fire_rate: f32,
     /// Damage per shot (`> 0`).
     pub damage: f32,
+    /// Phase M5 — the fired projectile's inertial **mass** (`> 0`): sets the shot's knockback on a
+    /// target + the shooter's recoil (`momentum = projectile_mass · muzzle_velocity`). NOT
+    /// health-scaled (a slug's mass is a physical property, not a working-condition output).
+    pub projectile_mass: f32,
 }
 
 /// The fit-derived effective stats for a ship — the per-entity flight + weapon
@@ -234,7 +238,6 @@ pub fn derive_ship_stats(
     let mut thrust_force = 0.0_f32;
     let mut turn_torque = 0.0_f32;
     let mut strafe_force = 0.0_f32;
-    let mut total_module_mass = 0.0_f32;
     let mut power_gen = 0.0_f32;
     let mut power_draw = 0.0_f32;
     let mut cpu_draw = 0.0_f32;
@@ -266,8 +269,8 @@ pub fn derive_ship_stats(
             .unwrap_or(0.0);
 
         // Universal budget costs apply on every kind and are NOT scaled by health
-        // (a damaged module still has mass / draws power+cpu, INV-D13).
-        total_module_mass += module.mass;
+        // (a damaged module still draws power+cpu, INV-D13). Mass is no longer summed
+        // here — Phase M5 derives `total_mass` bottom-up from the layout's cells below.
         power_draw += module.power_draw;
         cpu_draw += module.cpu_draw;
 
@@ -295,11 +298,14 @@ pub fn derive_ship_stats(
                 muzzle_speed,
                 fire_rate,
                 damage,
+                projectile_mass,
             } if module.kind == ModuleKind::Weapon && weapon.is_none() && hf > 0.0 => {
                 weapon = Some(WeaponProfile {
                     muzzle_speed,
                     fire_rate,
                     damage: damage * hf,
+                    // The slug's mass is a physical property — NOT health-scaled.
+                    projectile_mass,
                 });
             }
             _ => {}
@@ -310,9 +316,13 @@ pub fn derive_ship_stats(
     let thrust_force = thrust_force.max(THRUST_FLOOR);
     let turn_torque = turn_torque.max(TORQUE_FLOOR);
     let strafe_force = strafe_force.max(STRAFE_FLOOR);
-    // `hull_base_mass > 0` by construction, so total mass is always `> 0`
-    // (INV-F14); the extra `max` is defensive belt-and-suspenders.
-    let total_mass = (hull.hull_base_mass + total_module_mass).max(f32::MIN_POSITIVE);
+    // Phase M5 — **mass is the sum of the body's cells** ([`layout_mass`]): each module cell
+    // weighs its module's mass, each structural cell `STRUCT_CELL_MASS`. This is the SAME mass
+    // basis the projectile-impulse + wreck drift use (`fitted_damage_system`), so a ship's mass is
+    // continuous as it erodes into a wreck. (The authored `hull.hull_base_mass` is no longer part
+    // of the flight mass — it remains only the fitting-screen mass-**budget** axis.) Floored `> 0`
+    // (INV-F14) — a no-cell layout never zeroes the flight denominator.
+    let total_mass = layout_mass(layout, catalog).max(f32::MIN_POSITIVE);
 
     ShipStats {
         thrust_force,

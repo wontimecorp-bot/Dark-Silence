@@ -35,9 +35,9 @@ use bevy_ecs::component::Component;
 use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
-use super::content::ModuleCatalog;
+use super::content::{ModuleCatalog, STRUCT_CELL_MASS};
 use super::fit::{Fit, ModuleRef};
-use super::hull::{FiringArc, Hull, HullId, SlotId};
+use super::hull::{FiringArc, Hull, HullId, SlotId, CELL_WORLD_SIZE};
 use crate::physics::{Physics, RapierPhysics};
 
 /// A grid cell coordinate `(col, row)` on the hull — the shared fitting / hit-map
@@ -159,6 +159,49 @@ pub fn center_or_anchor(
 /// share this local cell-space.
 fn cell_center(coord: Cell) -> Vec2 {
     Vec2::new(coord.0 as f32 + 0.5, coord.1 as f32 + 0.5)
+}
+
+/// The inertial **mass of one cell** (Phase M5) — the single source of truth for a body's mass.
+/// A **module cell** (an installed, catalog-resolvable module) weighs that module's authored
+/// `mass`; a **structural / empty / dangling** cell weighs [`STRUCT_CELL_MASS`]. Summed over a
+/// [`FitLayout`]'s cells ([`layout_mass`]) it gives the body's mass for flight acceleration,
+/// projectile knockback, wreck drift, and inertia alike — so mass is continuous as a ship erodes
+/// into a wreck and reflects what the body is actually made of (a reactor cell outweighs plating).
+pub fn cell_mass(occupant: &CellOccupant, modules: &ModuleCatalog) -> f32 {
+    occupant
+        .module
+        .and_then(|m| modules.get(m))
+        .map(|m| m.mass)
+        .unwrap_or(STRUCT_CELL_MASS)
+}
+
+/// A body's total inertial **mass** = Σ [`cell_mass`] over its current cells (Phase M5). The one
+/// mass `derive_ship_stats` gives flight AND `fitted_damage_system` gives the projectile-impulse +
+/// wreck drift, so a live ship and the wreck it becomes share the same mass basis (no jump on
+/// death). Deterministic (a fold over the `BTreeMap`-sorted cells); an empty layout → `0`.
+pub fn layout_mass(layout: &FitLayout, modules: &ModuleCatalog) -> f32 {
+    layout.cells.values().map(|o| cell_mass(o, modules)).sum()
+}
+
+/// A body's **moment of inertia** about its mass-weighted centre of mass, in world units²·mass
+/// (Phase M5): `Σ cell_mass·|cell_center − COM|² · CELL_WORLD_SIZE²`, using the REAL per-cell mass
+/// so an off-centre hit spins a reactor/armor-heavy body less than light plating. Floored
+/// `> 0` (a single-cell or massless body still divides safely). Deterministic.
+pub fn layout_inertia(layout: &FitLayout, modules: &ModuleCatalog) -> f32 {
+    let total = layout_mass(layout, modules);
+    if total <= f32::MIN_POSITIVE {
+        return f32::MIN_POSITIVE;
+    }
+    // Mass-weighted centre of mass in cell-space.
+    let com = layout.cells.iter().fold(Vec2::ZERO, |acc, (&coord, occ)| {
+        acc + cell_center(coord) * cell_mass(occ, modules)
+    }) / total;
+    let i_cellspace: f32 = layout
+        .cells
+        .iter()
+        .map(|(&coord, occ)| cell_mass(occ, modules) * (cell_center(coord) - com).length_squared())
+        .sum();
+    (i_cellspace * CELL_WORLD_SIZE * CELL_WORLD_SIZE).max(f32::MIN_POSITIVE)
 }
 
 /// The occlusion depth of a cell (INV-F10): how far **inward** it sits, measured as
@@ -546,5 +589,72 @@ mod tests {
         assert!((0.0..=1.0).contains(&hit.toi));
         // An autocannon id exists in the catalog (referenced for the import).
         assert!(modules.get(MODULE_AUTOCANNON).is_some());
+    }
+
+    // --- Phase M5: per-cell mass helpers ----------------------------------------
+
+    #[test]
+    fn cell_mass_is_module_mass_or_the_structural_constant() {
+        use crate::fitting::content::STRUCT_CELL_MASS;
+        let (modules, _) = seed_catalogs();
+        let reactor_mass = modules.get(MODULE_REACTOR_BASIC).unwrap().mass;
+        // A module cell weighs its installed module's mass.
+        let module_cell = CellOccupant {
+            slot: SlotId(0),
+            module: Some(MODULE_REACTOR_BASIC),
+            health: 1.0,
+            depth: 0,
+            structural: false,
+        };
+        assert_eq!(cell_mass(&module_cell, &modules), reactor_mass);
+        // A structural / empty cell weighs the structural constant.
+        let struct_cell = CellOccupant {
+            slot: SlotId(u32::MAX),
+            module: None,
+            health: 0.0,
+            depth: 0,
+            structural: true,
+        };
+        assert_eq!(cell_mass(&struct_cell, &modules), STRUCT_CELL_MASS);
+    }
+
+    #[test]
+    fn layout_mass_sums_real_cell_masses() {
+        use crate::fitting::content::STRUCT_CELL_MASS;
+        let (modules, hulls) = seed_catalogs();
+        let hull = hulls.get(HULL_FIGHTER).unwrap();
+        let mut fit = Fit::new(HULL_FIGHTER);
+        fit.install_raw(SlotId(0), MODULE_REACTOR_BASIC);
+        let layout = build_layout(hull, &fit, &modules);
+
+        // The total equals the explicit per-cell sum.
+        let expected: f32 = layout.cells.values().map(|o| cell_mass(o, &modules)).sum();
+        assert!((layout_mass(&layout, &modules) - expected).abs() < 1e-6);
+        // A fitted (heavy) reactor cell makes the body outweigh all-structural plating.
+        let all_structural = layout.cells.len() as f32 * STRUCT_CELL_MASS;
+        assert!(
+            layout_mass(&layout, &modules) > all_structural,
+            "a fitted reactor cell outweighs plain plating"
+        );
+    }
+
+    #[test]
+    fn layout_inertia_is_positive_and_tracks_footprint() {
+        let (modules, hulls) = seed_catalogs();
+        let hull = hulls.get(HULL_FIGHTER).unwrap();
+        let fit = Fit::new(HULL_FIGHTER);
+        let layout = build_layout(hull, &fit, &modules);
+        let full = layout_inertia(&layout, &modules);
+        assert!(full > 0.0 && full.is_finite());
+
+        // A single-cell body has (near-)zero inertia — all its mass sits at its own COM —
+        // so it is strictly less than the whole footprint's inertia.
+        let first = *layout.cells.keys().next().unwrap();
+        let mut one = layout.clone();
+        one.cells.retain(|&c, _| c == first);
+        assert!(
+            layout_inertia(&one, &modules) < full,
+            "a single cell has less rotational inertia than the full body"
+        );
     }
 }
