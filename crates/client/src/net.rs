@@ -65,7 +65,9 @@ use crate::input::{build_client_input, InputSequencer};
 use crate::render_sync::{
     interpolate_transforms, RemoteEntity, RenderInterp, ShieldBubble, ShieldChild, ShipHull,
 };
-use crate::scene::{build_hull_mesh, build_hull_mesh_contour, RenderAssets, CELL_SIZE};
+use crate::scene::{
+    build_hull_mesh, build_hull_mesh_contour, build_module_overlay_mesh, RenderAssets, CELL_SIZE,
+};
 
 /// The loopback solo-play host: the embedded authoritative [`ServerApp`] plus the
 /// client end of its [`LoopbackTransport`] and the established connection. A
@@ -167,6 +169,18 @@ pub const SHIP_VOXEL_LOD_DIST: f32 = 60.0;
 #[derive(Resource, Default, Clone, Copy)]
 pub struct HullRenderMode {
     pub contour: bool,
+}
+
+/// Runtime **module-color** toggle (Fix #11 M3), flipped in-game by
+/// [`crate::input::toggle_module_color`] (the `C` key). `false` (default) = the uniform hull
+/// look; `true` = cells are tinted by module type ([`crate::scene::module_palette`]). In the
+/// VOXEL look this is per-cell vertex coloring (paired with a white-base hull material so the
+/// hues show); in the CONTOUR look it adds a thin module-marker overlay child over the smooth
+/// hull. Purely cosmetic. [`sync_ship_hull`] rebuilds a ship's hull when this differs from the
+/// state it was last built in ([`ShipHull::built_module_color`]).
+#[derive(Resource, Default, Clone, Copy)]
+pub struct ModuleColorMode {
+    pub on: bool,
 }
 
 /// The windowed solo-client plugin (T045). Adds the embedded-server lifecycle and
@@ -439,9 +453,11 @@ fn capture_render_state(
     mut bubble_q: Query<(&mut Visibility, &mut Transform)>,
     mut ship_hull_q: Query<&mut ShipHull>,
     hull_mode: Res<HullRenderMode>,
+    module_mode: Res<ModuleColorMode>,
 ) {
     let local_id = state.local_id;
     let contour = hull_mode.contour;
+    let module_color = module_mode.on;
     let entities = host.server.render_state();
 
     // Phase 1B LOD origin: the local player ship's world position (the follow-camera
@@ -483,6 +499,7 @@ fn capture_render_state(
                 e,
                 lod_origin,
                 contour,
+                module_color,
             );
             // Show + fade (or lazily spawn) this entity's LOCALIZED shield-impact flash
             // from the hit-driven `shield_flash`, placed at the impact (`hit_dir`).
@@ -517,6 +534,7 @@ fn capture_render_state(
                 e,
                 lod_origin,
                 contour,
+                module_color,
             );
             // Seed (if its shield is being hit) its localized impact flash immediately
             // so the first rendered frame already shows it at the impact point.
@@ -687,6 +705,7 @@ fn sync_ship_hull(
     e: &RenderEntity,
     lod_origin: Vec2,
     contour: bool,
+    module_color: bool,
 ) {
     // Only a fitted ship OR a severed chunk / dead hulk carries a cell payload; everything
     // else (projectiles, plain targets, a layout-less wreck) keeps its single mesh.
@@ -701,10 +720,16 @@ fn sync_ship_hull(
     // there) — byte-identical to before. The LOD-far box fallback also differs: a wreck
     // falls back to the tumbling debris box, a ship to its coarse ship box.
     let is_wreck = e.kind == EntityKind::Debris;
-    let hull_mat = if is_wreck {
-        assets.wreck_hull_material.clone()
-    } else {
-        assets.hull_material.clone()
+    // Module coloring in the VOXEL look paints each cell's quads with its module hue as a vertex
+    // color, which only shows under a WHITE-base material (StandardMaterial multiplies vertex ×
+    // base_color). The CONTOUR look keeps the normal tinted hull material and shows modules via a
+    // separate overlay child instead, so it always uses the plain material.
+    let voxel_colored = module_color && !contour;
+    let hull_mat = match (is_wreck, voxel_colored) {
+        (true, true) => assets.wreck_hull_material_white.clone(),
+        (true, false) => assets.wreck_hull_material.clone(),
+        (false, true) => assets.hull_material_white.clone(),
+        (false, false) => assets.hull_material.clone(),
     };
     let center = hull_mesh_center(e);
 
@@ -735,11 +760,13 @@ fn sync_ship_hull(
             current.set_voxelized(true);
         }
 
-        // Build on first sight, REBUILD when the cell set changed (Phase-2 erosion), OR when
-        // the render-style toggle flipped (voxel ↔ contour — same cells, new look).
+        // Build on first sight, REBUILD when the cell set changed (Phase-2 erosion), when the
+        // render-style toggle flipped (voxel ↔ contour), OR when the module-color toggle flipped
+        // (same cells, new look) — all "same parent, new mesh" cases.
         let needs_build = current.child().is_none()
             || current.cells_hash() != hash
-            || current.built_contour() != contour;
+            || current.built_contour() != contour
+            || current.built_module_color() != module_color;
         if needs_build {
             // Free the previous mesh + child (rebuild path) so meshes/entities don't leak.
             if let Some(old) = current.take_mesh() {
@@ -750,21 +777,30 @@ fn sync_ship_hull(
                     ec.despawn();
                 }
             }
+            // The contour module-marker overlay is rebuilt with the hull (its inputs — cells,
+            // style, color — are exactly the rebuild triggers), so always tear the old one down.
+            if let Some(old) = current.take_module_overlay_mesh() {
+                meshes.remove(&old);
+            }
+            if let Some(old_child) = current.take_module_overlay_child() {
+                if let Ok(mut ec) = commands.get_entity(old_child) {
+                    ec.despawn();
+                }
+            }
 
-            // Merge the present cells into ONE seamless hull surface + add it to the mesh
-            // store, centred on `center` (grid centre for a ship, cell-COM for a wreck) so
-            // the cells sit around the parent `Position`. Modules stay hidden:
-            // `build_hull_mesh` uses one uniform material (Phase 2 will pass an `exposed`
-            // predicate to reveal breach cells). A wreck wears the dead-metal tint.
+            // Merge the present cells into ONE seamless hull surface + add it to the mesh store,
+            // centred on `center` (grid centre for a ship, cell-COM for a wreck) so the cells sit
+            // around the parent `Position`.
             let cell_tuples: Vec<(u16, u16, u8)> =
                 e.cells.iter().map(|c| (c.col, c.row, c.kind)).collect();
-            // The runtime toggle picks the look: smoothed rounded contour (Fix #11 M2) vs the
+            // The runtime toggles pick the look: smoothed rounded contour (Fix #11 M2) vs the
             // blocky per-cell voxel mesh. Both share the same `center`-relative local frame, so
-            // the child sits identically under the parent transform either way.
+            // the child sits identically under the parent transform either way. In the voxel look,
+            // `module_color` paints per-cell vertex colors (shown by the white-base material above).
             let raw_mesh = if contour {
                 build_hull_mesh_contour(&cell_tuples, CELL_SIZE, center)
             } else {
-                build_hull_mesh(&cell_tuples, CELL_SIZE, center)
+                build_hull_mesh(&cell_tuples, CELL_SIZE, center, module_color)
             };
             let mesh = meshes.add(raw_mesh);
 
@@ -782,13 +818,44 @@ fn sync_ship_hull(
             current.set_mesh(Some(mesh));
             current.set_cells_hash(hash);
             current.set_built_contour(contour);
+            current.set_built_module_color(module_color);
+
+            // Module-color OVERLAY (the "second layer", contour look only): thin colored markers
+            // on module cells over the smooth hull. `None` when the chunk has no module cells.
+            if contour && module_color {
+                if let Some(overlay_raw) =
+                    build_module_overlay_mesh(&cell_tuples, CELL_SIZE, center)
+                {
+                    let overlay_mesh = meshes.add(overlay_raw);
+                    let overlay_child = commands
+                        .spawn((
+                            Mesh3d(overlay_mesh.clone()),
+                            MeshMaterial3d(assets.module_overlay_material.clone()),
+                            Transform::IDENTITY,
+                        ))
+                        .id();
+                    if let Ok(mut ec) = commands.get_entity(parent) {
+                        ec.add_child(overlay_child);
+                    }
+                    current.set_module_overlay_child(Some(overlay_child));
+                    current.set_module_overlay_mesh(Some(overlay_mesh));
+                }
+            }
         }
     } else if current.voxelized() {
-        // Near→far switch: despawn the hull child, free its mesh, restore the coarse box.
+        // Near→far switch: despawn the hull child + overlay, free their meshes, restore the box.
         if let Some(old) = current.take_mesh() {
             meshes.remove(&old);
         }
         if let Some(old_child) = current.take_child() {
+            if let Ok(mut ec) = commands.get_entity(old_child) {
+                ec.despawn();
+            }
+        }
+        if let Some(old) = current.take_module_overlay_mesh() {
+            meshes.remove(&old);
+        }
+        if let Some(old_child) = current.take_module_overlay_child() {
             if let Ok(mut ec) = commands.get_entity(old_child) {
                 ec.despawn();
             }
@@ -945,6 +1012,42 @@ impl HullView<'_> {
         match self {
             HullView::Existing(c) => c.built_contour = v,
             HullView::New(c) => c.built_contour = v,
+        }
+    }
+    fn built_module_color(&self) -> bool {
+        match self {
+            HullView::Existing(c) => c.built_module_color,
+            HullView::New(c) => c.built_module_color,
+        }
+    }
+    fn set_built_module_color(&mut self, v: bool) {
+        match self {
+            HullView::Existing(c) => c.built_module_color = v,
+            HullView::New(c) => c.built_module_color = v,
+        }
+    }
+    fn set_module_overlay_child(&mut self, v: Option<Entity>) {
+        match self {
+            HullView::Existing(c) => c.module_overlay_child = v,
+            HullView::New(c) => c.module_overlay_child = v,
+        }
+    }
+    fn take_module_overlay_child(&mut self) -> Option<Entity> {
+        match self {
+            HullView::Existing(c) => c.module_overlay_child.take(),
+            HullView::New(c) => c.module_overlay_child.take(),
+        }
+    }
+    fn set_module_overlay_mesh(&mut self, v: Option<Handle<Mesh>>) {
+        match self {
+            HullView::Existing(c) => c.module_overlay_mesh = v,
+            HullView::New(c) => c.module_overlay_mesh = v,
+        }
+    }
+    fn take_module_overlay_mesh(&mut self) -> Option<Handle<Mesh>> {
+        match self {
+            HullView::Existing(c) => c.module_overlay_mesh.take(),
+            HullView::New(c) => c.module_overlay_mesh.take(),
         }
     }
 }

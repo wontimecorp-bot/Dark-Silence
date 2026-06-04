@@ -22,6 +22,7 @@ protocol = { path = "../protocol" }
 # renet transport can be swapped in later behind the same `NetTransport` seam.
 server = { path = "../server" }
 glam = { workspace = true }
+earcutr = "0.5.0"
 
 [features]
 # Dev-only convenience (AD-005): faster iterative linking. Never enabled in a

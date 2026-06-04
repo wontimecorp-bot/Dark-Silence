@@ -80,6 +80,9 @@ pub fn run() -> AppExit {
         // smoothed rounded contour at runtime. Purely cosmetic — the sim's
         // ricochet/carve is unaffected — so it can be A/B'd freely mid-playtest.
         .init_resource::<net::HullRenderMode>()
+        // Module-color toggle (Fix #11 M3): default off; `C` tints cells by module
+        // type (voxel = per-cell vertex colors, contour = a marker overlay). Cosmetic.
+        .init_resource::<net::ModuleColorMode>()
         .add_systems(
             Startup,
             (scene::setup_scene, camera::setup_camera, hud::setup_hud),
@@ -92,6 +95,7 @@ pub fn run() -> AppExit {
                 input::read_input,
                 input::toggle_assist,
                 input::toggle_hull_render,
+                input::toggle_module_color,
             ),
         )
         // The interactive fitting screen (E006 US5): the plugin registers the

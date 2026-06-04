@@ -112,6 +112,19 @@ pub struct ShipHull {
     /// `HullRenderMode` so flipping the runtime toggle forces a one-shot rebuild in the new
     /// style (the cell set is unchanged, so `cells_hash` alone wouldn't trigger it).
     pub built_contour: bool,
+    /// Whether the current child was built with module coloring ON (Fix #11 M3). Compared
+    /// against the live `ModuleColorMode` so flipping the `C` toggle forces a rebuild (in voxel
+    /// mode the vertex colors change; in contour mode the module-marker overlay child appears /
+    /// disappears).
+    pub built_module_color: bool,
+    /// The contour module-color OVERLAY child entity (Fix #11 M3) — the thin colored markers on
+    /// module cells drawn OVER the smooth contour hull. `None` unless in contour mode with module
+    /// coloring on and the hull has at least one module cell. Despawned + freed alongside the hull
+    /// child (rebuild / LOD-far).
+    pub module_overlay_child: Option<Entity>,
+    /// The overlay mesh's handle, kept so it is removed from [`Assets<Mesh>`] on rebuild / despawn
+    /// (no per-session mesh leak), mirroring [`ShipHull::mesh`].
+    pub module_overlay_mesh: Option<Handle<Mesh>>,
 }
 
 /// Previous + current sim snapshots for one entity. `interpolate_transforms`

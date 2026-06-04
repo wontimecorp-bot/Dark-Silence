@@ -82,6 +82,19 @@ pub fn toggle_hull_render(
     }
 }
 
+/// Flip per-cell module coloring (Fix #11 M3) on a fresh `C` press: cells are tinted by module
+/// type ([`crate::scene::module_palette`]) instead of the uniform hull color. Purely cosmetic
+/// (the sim is unaffected), so it can be A/B'd freely; the next render tick rebuilds each near
+/// ship's hull in the new look. Default is OFF ([`crate::net::ModuleColorMode::default`]).
+pub fn toggle_module_color(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut mode: ResMut<crate::net::ModuleColorMode>,
+) {
+    if keys.just_pressed(KeyCode::KeyC) {
+        mode.on = !mode.on;
+    }
+}
+
 /// The monotonic per-client input sequence and the redundant-tail history
 /// (TR-007/027). `next_seq` counts every input the client has ever produced; the
 /// `tail` keeps the most recent quantized intents, **newest-first**, capped at

@@ -75,6 +75,18 @@ pub struct RenderAssets {
     /// hulk's hull mesh ([`build_hull_mesh`]) wears it so a broken piece reads as debris
     /// (not a live ship) while keeping the real cell shape/size/scale.
     pub wreck_hull_material: Handle<StandardMaterial>,
+    /// WHITE-base counterparts of the two hull materials (Fix #11 M3), used ONLY in the voxel
+    /// look while module coloring is ON: the per-cell module hue is a vertex color, and
+    /// StandardMaterial computes `vertex × base_color`, so the base must be white for the hues to
+    /// show as-is. Structural cells carry [`HULL_COLOR`] as their vertex color so plating still
+    /// reads normally. (A colored wreck's structural cells therefore lose the dead-metal tint
+    /// while coloring is on — an accepted inspection-mode trade-off.)
+    pub hull_material_white: Handle<StandardMaterial>,
+    pub wreck_hull_material_white: Handle<StandardMaterial>,
+    /// Material for the contour module-marker OVERLAY ([`build_module_overlay_mesh`]) — white
+    /// base so the markers' per-vertex [`module_palette`] colors show as-is, sitting just above
+    /// the smooth hull. (Fix #11 M3.)
+    pub module_overlay_material: Handle<StandardMaterial>,
 }
 
 /// Hull cell size, in sim units — the side length of one hull cell as laid out in the
@@ -101,6 +113,32 @@ pub const HULL_COLOR: Color = Color::srgb(0.30, 0.40, 0.52);
 /// reads as debris rather than a live ship, while keeping the real cell shape/size/scale.
 /// Used by [`RenderAssets::wreck_hull_material`].
 pub const WRECK_HULL_COLOR: Color = Color::srgb(0.18, 0.24, 0.31);
+
+/// Per-cell **module color palette** (Fix #11 M3), keyed by the `kind` byte each render cell
+/// carries — `0` = structural / empty plating, `1..=6` = the `ModuleKind`s in the server's
+/// `render_cell_kind` order: 1 Reactor, 2 Thruster, 3 Weapon, 4 Shield, 5 Armor, 6 Utility.
+/// Used as a per-vertex color in the voxel hull mesh and on the contour module-overlay markers
+/// when the module-color toggle ([`crate::net::ModuleColorMode`]) is ON; structural cells reuse
+/// [`HULL_COLOR`] so plating reads normally. Distinct, readable hues so module types are
+/// tellable at a glance.
+pub fn module_palette(kind: u8) -> Color {
+    match kind {
+        1 => Color::srgb(0.96, 0.78, 0.18), // Reactor — amber (power)
+        2 => Color::srgb(0.96, 0.46, 0.14), // Thruster — orange (propulsion)
+        3 => Color::srgb(0.90, 0.20, 0.20), // Weapon — red
+        4 => Color::srgb(0.24, 0.66, 0.96), // Shield — cyan
+        5 => Color::srgb(0.72, 0.74, 0.78), // Armor — bright steel
+        6 => Color::srgb(0.52, 0.86, 0.42), // Utility — green
+        _ => HULL_COLOR,                    // 0 / unknown — structural plating
+    }
+}
+
+/// A [`Color`] as a linear-RGBA vertex-color array — the `Mesh::ATTRIBUTE_COLOR` convention
+/// (StandardMaterial multiplies it into `base_color`, so a white-base material shows it as-is).
+fn color_rgba(c: Color) -> [f32; 4] {
+    let l = c.to_linear();
+    [l.red, l.green, l.blue, l.alpha]
+}
 
 /// Revise-B: the merged hull surface's slab half-thickness in `+Z`, in sim units — the
 /// top face sits at `z = HULL_THICKNESS` so the plate has a touch of relief under the
@@ -299,20 +337,31 @@ fn build_arc_band_mesh(inner_frac: f32, half_angle: f32, segments: u32) -> Mesh 
 /// so its cells render around that point, sitting exactly where the chunk drifted to.
 /// (The carrier `grid_dims` is no longer needed here — `center` fully determines the
 /// layout — so the caller derives `center` from `grid_dims` (ship) or the cells (chunk).)
-pub fn build_hull_mesh(cells: &[(u16, u16, u8)], cell_size: f32, center: Vec2) -> Mesh {
+pub fn build_hull_mesh(
+    cells: &[(u16, u16, u8)],
+    cell_size: f32,
+    center: Vec2,
+    module_color: bool,
+) -> Mesh {
     // Phase-2 reveal hook: with no breach model yet, no cell is ever exposed, so the
     // whole surface uses the uniform hull material. Phase 2 replaces this with a real
     // breach predicate and per-exposed-cell coloring.
     let exposed = |_col: u16, _row: u16| -> bool { false };
-    build_hull_mesh_with(cells, cell_size, center, exposed)
+    build_hull_mesh_with(cells, cell_size, center, exposed, module_color)
 }
 
 /// [`build_hull_mesh`] with an explicit `exposed(col, row)` predicate — the Phase-2
-/// reveal seam. Today `exposed` is always `false` (modules hidden), so the merged
-/// surface is one uniform-material solid plate; the parameter exists so a breach phase
-/// can flag exposed module cells without changing this mesh-construction code. (The
-/// `_exposed` flag is threaded but not yet branched on — Phase 2 will emit a distinct
-/// vertex attribute / submesh for exposed cells.)
+/// reveal seam. Today `exposed` is always `false` (breach reveal unused), so the merged
+/// surface's geometry is one solid plate; the parameter exists so a breach phase can flag
+/// exposed module cells without changing this mesh-construction code. (The `_exposed` flag
+/// is threaded but not yet branched on.)
+///
+/// `module_color` (Fix #11 M3): when `true`, each cell's quads carry its [`module_palette`]
+/// color as a per-vertex `Mesh::ATTRIBUTE_COLOR` so module cells are tellable apart at a glance
+/// (the caller pairs this with a WHITE-base material so the colors show as-is); when `false`
+/// the per-vertex color is white `[1,1,1,1]` so the material's own [`HULL_COLOR`]/wreck tint
+/// shows through. `ATTRIBUTE_COLOR` is ALWAYS inserted either way, so flipping the toggle never
+/// changes the material's `VERTEX_COLORS` pipeline specialization (no per-toggle shader recompile).
 ///
 /// `center` is the cell-space layout origin (see [`build_hull_mesh`]): each cell renders
 /// at the swap+scale of `(c − center)`. The carrier `grid_dims` is no longer needed here
@@ -324,6 +373,7 @@ fn build_hull_mesh_with(
     cell_size: f32,
     center: Vec2,
     exposed: impl Fn(u16, u16) -> bool,
+    module_color: bool,
 ) -> Mesh {
     let half = HULL_THICKNESS;
 
@@ -335,21 +385,25 @@ fn build_hull_mesh_with(
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut uvs: Vec<[f32; 2]> = Vec::new();
+    let mut colors: Vec<[f32; 4]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
 
-    // Emit one CCW-from-`+Z` quad (two triangles) given its four corner positions, a
-    // shared normal, and simple UVs. Corners are ordered v0→v1→v2→v3 counter-clockwise
-    // as seen from the side the normal points to.
+    // Emit one CCW-from-`+Z` quad (two triangles) given its four corner positions, a shared
+    // normal, simple UVs, and a per-vertex color (module hue or white). Corners are ordered
+    // v0→v1→v2→v3 counter-clockwise as seen from the side the normal points to.
     let push_quad = |positions: &mut Vec<[f32; 3]>,
                      normals: &mut Vec<[f32; 3]>,
                      uvs: &mut Vec<[f32; 2]>,
+                     colors: &mut Vec<[f32; 4]>,
                      indices: &mut Vec<u32>,
                      corners: [[f32; 3]; 4],
-                     normal: [f32; 3]| {
+                     normal: [f32; 3],
+                     color: [f32; 4]| {
         let base = positions.len() as u32;
         positions.extend_from_slice(&corners);
         for _ in 0..4 {
             normals.push(normal);
+            colors.push(color);
         }
         uvs.push([0.0, 0.0]);
         uvs.push([1.0, 0.0]);
@@ -358,10 +412,16 @@ fn build_hull_mesh_with(
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     };
 
-    for &(col, row, _kind) in cells {
-        // Phase-2 hook (no-op today): a future breach phase tints `exposed` cells; for
-        // revise-B every cell is body plate (the predicate is always false).
+    for &(col, row, kind) in cells {
+        // Phase-2 hook (no-op today): a future breach phase tints `exposed` cells.
         let _exposed = exposed(col, row);
+        // Module color (M3): the cell's palette hue when the toggle is on, else white so the
+        // material's own hull/wreck color shows. Structural cells map to `HULL_COLOR`.
+        let cell_color = if module_color {
+            color_rgba(module_palette(kind))
+        } else {
+            [1.0, 1.0, 1.0, 1.0]
+        };
 
         // Cell centre in the local frame: row→forward(+X), col→lateral(+Y), measured
         // from `center` (cell-space): `center.y` is the row origin (forward), `center.x`
@@ -376,11 +436,12 @@ fn build_hull_mesh_with(
         let (y0, y1) = (cy - h, cy + h);
 
         // Top face at z = +HULL_THICKNESS, normal +Z, wound CCW seen from +Z (the
-        // top-down camera). Coplanar + same material across all cells → seamless.
+        // top-down camera). Coplanar across all cells → seamless.
         push_quad(
             &mut positions,
             &mut normals,
             &mut uvs,
+            &mut colors,
             &mut indices,
             [
                 [x0, y0, half],
@@ -389,10 +450,11 @@ fn build_hull_mesh_with(
                 [x0, y1, half],
             ],
             [0.0, 0.0, 1.0],
+            cell_color,
         );
 
         // Boundary side walls: only on edges with no present neighbour (silhouette edge,
-        // or a Phase-2 carved-hole edge). Interior shared edges are covered → no wall, so
+        // or a carved-hole edge). Interior shared edges are covered → no wall, so
         // the surface stays gapless. Each wall drops from z=+half to z=0.
         // -X edge (toward a smaller row / aft). Neighbour is (col, row-1).
         let has_neg_x = row > 0 && present.contains(&(col, row - 1));
@@ -401,9 +463,11 @@ fn build_hull_mesh_with(
                 &mut positions,
                 &mut normals,
                 &mut uvs,
+                &mut colors,
                 &mut indices,
                 [[x0, y0, 0.0], [x0, y1, 0.0], [x0, y1, half], [x0, y0, half]],
                 [-1.0, 0.0, 0.0],
+                cell_color,
             );
         }
         // +X edge (toward a larger row / nose). Neighbour is (col, row+1).
@@ -413,9 +477,11 @@ fn build_hull_mesh_with(
                 &mut positions,
                 &mut normals,
                 &mut uvs,
+                &mut colors,
                 &mut indices,
                 [[x1, y1, 0.0], [x1, y0, 0.0], [x1, y0, half], [x1, y1, half]],
                 [1.0, 0.0, 0.0],
+                cell_color,
             );
         }
         // -Y edge (toward a smaller col). Neighbour is (col-1, row).
@@ -425,9 +491,11 @@ fn build_hull_mesh_with(
                 &mut positions,
                 &mut normals,
                 &mut uvs,
+                &mut colors,
                 &mut indices,
                 [[x1, y0, 0.0], [x0, y0, 0.0], [x0, y0, half], [x1, y0, half]],
                 [0.0, -1.0, 0.0],
+                cell_color,
             );
         }
         // +Y edge (toward a larger col). Neighbour is (col+1, row).
@@ -437,9 +505,11 @@ fn build_hull_mesh_with(
                 &mut positions,
                 &mut normals,
                 &mut uvs,
+                &mut colors,
                 &mut indices,
                 [[x0, y1, 0.0], [x1, y1, 0.0], [x1, y1, half], [x0, y1, half]],
                 [0.0, 1.0, 0.0],
+                cell_color,
             );
         }
     }
@@ -451,16 +521,20 @@ fn build_hull_mesh_with(
     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
     .with_inserted_indices(Indices::U32(indices))
 }
 
 // ============================================================================
-// Fix #11 M2 — smoothed marching-squares hull CONTOUR mesh (the "rounded look").
+// Fix #11 M2/M3 — smoothed marching-squares hull CONTOUR mesh (the "rounded look").
 // An alternative to the blocky per-cell [`build_hull_mesh`], selectable at runtime via the
 // `HullRenderMode` toggle (default OFF = the voxel mesh). It traces the cell set's boundary
-// into grid-corner loop(s), rounds them with Chaikin corner-cutting, and fills the OUTER loop
-// by ear-clipping — so a chunk reads as a rounded plate. First cut: flat top face only (the
-// top-down camera sees it); interior holes are left filled and side walls are TODO (cosmetic).
+// into grid-corner loop(s), rounds them with Chaikin corner-cutting, and fills the silhouette
+// by ear-clipping — so a chunk reads as a rounded plate. M3 lifts the first-cut limitations:
+// carved-through INTERIOR HOLES are now cut out of the top face (triangulated with holes via
+// `earcutr`) and SIDE WALLS are dropped along every ring (the outer silhouette AND each hole),
+// so a hole reads as a real walled cavity — matching what [`build_hull_mesh`] already does
+// per cell.
 // ============================================================================
 
 /// Chaikin corner-cutting passes for the contour — more = rounder (and slightly smaller, since
@@ -555,87 +629,108 @@ fn chaikin_closed(pts: &[Vec2], iterations: u32) -> Vec<Vec2> {
     cur
 }
 
-/// Whether `p` is inside the CCW triangle `a,b,c`, **boundary included** (a point on an
-/// edge counts as inside). Ear-clipping needs the inclusive test so a reflex vertex lying
-/// exactly on a candidate ear's edge (the concave-notch case) still blocks the ear — a
-/// strict test would let the ear poke across the notch and fill area outside the polygon.
-fn point_in_tri(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> bool {
-    (b - a).perp_dot(p - a) >= 0.0
-        && (c - b).perp_dot(p - b) >= 0.0
-        && (a - c).perp_dot(p - c) >= 0.0
+/// Triangulate a **CCW outer ring with CW hole rings** (holes cut out) via `earcutr` → index
+/// triples into the COMBINED vertex list `[outer, holes[0], holes[1], …]` — the SAME order the
+/// caller pushes positions, so `base + index` maps directly. Output triangles are forced CCW
+/// (we set the top face's normals to `+Z`, and a CW triangle would be back-face-culled by the
+/// top-down camera). Returns empty on an earcut failure (graceful).
+fn ear_clip_with_holes(outer: &[Vec2], holes: &[Vec<Vec2>]) -> Vec<u32> {
+    if outer.len() < 3 {
+        return Vec::new();
+    }
+    // Flat `[x, y, x, y, …]` coords: outer first, then each hole in order. earcut keys holes off
+    // `hole_indices` (the VERTEX index where each hole starts), not winding.
+    let total: usize = outer.len() + holes.iter().map(|h| h.len()).sum::<usize>();
+    let mut coords: Vec<f32> = Vec::with_capacity(total * 2);
+    for p in outer {
+        coords.push(p.x);
+        coords.push(p.y);
+    }
+    let mut hole_indices: Vec<usize> = Vec::with_capacity(holes.len());
+    let mut idx = outer.len();
+    for h in holes {
+        hole_indices.push(idx);
+        for p in h {
+            coords.push(p.x);
+            coords.push(p.y);
+        }
+        idx += h.len();
+    }
+    let Ok(tris) = earcutr::earcut(&coords, &hole_indices, 2) else {
+        return Vec::new();
+    };
+    let pt = |i: usize| Vec2::new(coords[i * 2], coords[i * 2 + 1]);
+    let mut out = Vec::with_capacity(tris.len());
+    for t in tris.chunks(3) {
+        if t.len() < 3 {
+            continue;
+        }
+        let (a, b, c) = (pt(t[0]), pt(t[1]), pt(t[2]));
+        // Force CCW (front toward +Z): flip a CW triangle by swapping its last two indices.
+        if (b - a).perp_dot(c - a) >= 0.0 {
+            out.extend_from_slice(&[t[0] as u32, t[1] as u32, t[2] as u32]);
+        } else {
+            out.extend_from_slice(&[t[0] as u32, t[2] as u32, t[1] as u32]);
+        }
+    }
+    out
 }
 
-/// Ear-clipping triangulation of a simple **CCW** polygon → index triples into `poly`. Handles
-/// convex and concave simple polygons (no holes). Bails gracefully on a degenerate/self-
-/// intersecting input (returns whatever ears it found).
-fn ear_clip(poly: &[Vec2]) -> Vec<u32> {
+/// Mean of a ring's vertices — used to test which outer loop a hole belongs to.
+fn ring_centroid(ring: &[Vec2]) -> Vec2 {
+    if ring.is_empty() {
+        return Vec2::ZERO;
+    }
+    let mut c = Vec2::ZERO;
+    for p in ring {
+        c += *p;
+    }
+    c / ring.len() as f32
+}
+
+/// Even-odd ray-cast point-in-polygon. Assigns a hole loop to the outer loop that contains it
+/// when a cell set has multiple disconnected bodies (rare — connectivity normally severs them
+/// into separate entities, but transiently a render entity can hold several components).
+fn point_in_polygon(p: Vec2, poly: &[Vec2]) -> bool {
     let n = poly.len();
-    let mut tris = Vec::new();
     if n < 3 {
-        return tris;
+        return false;
     }
-    let mut idx: Vec<usize> = (0..n).collect();
-    let mut guard = 0usize;
-    let max_iter = 4 * n;
-    while idx.len() > 3 && guard < max_iter {
-        guard += 1;
-        let m = idx.len();
-        let mut clipped = false;
-        for i in 0..m {
-            let i0 = idx[(i + m - 1) % m];
-            let i1 = idx[i];
-            let i2 = idx[(i + 1) % m];
-            let (a, b, c) = (poly[i0], poly[i1], poly[i2]);
-            // Convex (CCW) vertex?
-            if (b - a).perp_dot(c - a) <= 0.0 {
-                continue;
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (pi, pj) = (poly[i], poly[j]);
+        if (pi.y > p.y) != (pj.y > p.y) {
+            let x = pi.x + (p.y - pi.y) / (pj.y - pi.y) * (pj.x - pi.x);
+            if p.x < x {
+                inside = !inside;
             }
-            // A convex tip is a valid ear iff no REFLEX vertex of the remaining polygon
-            // lies in the candidate triangle (boundary included — see `point_in_tri`).
-            // Only reflex vertices can invalidate an ear; testing convex ones (which may
-            // sit harmlessly on an edge) would spuriously block valid ears.
-            let blocked = idx.iter().enumerate().any(|(k, &j)| {
-                if j == i0 || j == i1 || j == i2 {
-                    return false;
-                }
-                let jp = poly[idx[(k + m - 1) % m]];
-                let jn = poly[idx[(k + 1) % m]];
-                let reflex = (poly[j] - jp).perp_dot(jn - jp) <= 0.0;
-                reflex && point_in_tri(poly[j], a, b, c)
-            });
-            if blocked {
-                continue;
-            }
-            tris.extend_from_slice(&[i0 as u32, i1 as u32, i2 as u32]);
-            idx.remove(i);
-            clipped = true;
-            break;
         }
-        if !clipped {
-            break; // degenerate — bail with what we have
-        }
+        j = i;
     }
-    if idx.len() == 3 {
-        tris.extend_from_slice(&[idx[0] as u32, idx[1] as u32, idx[2] as u32]);
-    }
-    tris
+    inside
 }
 
 /// Build the **smoothed contour** hull mesh for a cell set — the rounded-look alternative to
-/// [`build_hull_mesh`] (Fix #11 M2). Same `(cells, cell_size, center)` contract and the same
+/// [`build_hull_mesh`] (Fix #11 M2/M3). Same `(cells, cell_size, center)` contract and the same
 /// local frame (`x = forward ← row`, `y = lateral ← col`, scaled by `cell_size`, measured from
-/// `center`), so it drops in at the same parent transform. Traces the boundary, Chaikin-smooths
-/// it, and fills the outer loop (flat top face at `z = HULL_THICKNESS`, normal `+Z`).
+/// `center`), so it drops in at the same parent transform.
+///
+/// Traces the cell-set boundary into loops, classifies each by winding (after the col↔row swap
+/// an OUTER loop is CW / negative area, a HOLE is CCW / positive), Chaikin-smooths each ring,
+/// triangulates the outer-minus-holes top face at `z = HULL_THICKNESS` (`+Z`), and drops a SIDE
+/// WALL (`z = 0 … HULL_THICKNESS`) along every ring so the silhouette has a lip and carved holes
+/// read as real walled cavities. Wall normals fall out of one emission order: for corners
+/// `[a_bot, b_bot, b_top, a_top]` the front face normal is `(dy, −dx)` — OUTWARD for the CCW
+/// outer ring and INTO-the-cavity for the CW hole rings, so a single pattern serves both.
 pub fn build_hull_mesh_contour(cells: &[(u16, u16, u8)], cell_size: f32, center: Vec2) -> Mesh {
     let present: std::collections::HashSet<(u16, u16)> =
         cells.iter().map(|&(c, r, _)| (c, r)).collect();
     let loops = cell_boundary_loops(&present);
 
-    let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut normals: Vec<[f32; 3]> = Vec::new();
-    let mut uvs: Vec<[f32; 2]> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
-
+    // Local-space rings, oriented canonically for earcut + walls: outer CCW, holes CW.
+    let mut outers: Vec<Vec<Vec2>> = Vec::new();
+    let mut holes: Vec<Vec<Vec2>> = Vec::new();
     for raw in &loops {
         // Grid corner (col,row) → local 2D, the SAME mapping `build_hull_mesh` uses for cell
         // centres: x (forward) ← row, y (lateral) ← col. (The col↔row swap flips winding, so an
@@ -650,23 +745,109 @@ pub fn build_hull_mesh_contour(cells: &[(u16, u16, u8)], cell_size: f32, center:
             })
             .collect();
         let area2 = signed_area2(&pts);
-        if area2 >= -1.0e-6 {
-            continue; // a hole (positive) or degenerate loop — skip (left filled-over for now)
+        if area2 < -1.0e-6 {
+            pts.reverse(); // CW outer → CCW (top face toward +Z; outward wall normal)
+            outers.push(pts);
+        } else if area2 > 1.0e-6 {
+            pts.reverse(); // CCW hole → CW (canonical for earcut; into-cavity wall normal)
+            holes.push(pts);
         }
-        pts.reverse(); // CW outer → CCW so the filled top face winds toward the +Z camera
-        let smooth = chaikin_closed(&pts, CONTOUR_CHAIKIN_ITERS);
-        if smooth.len() < 3 {
+        // else: a degenerate (≈0 area) loop — skip.
+    }
+
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    // Emit one CCW-from-its-normal quad (two triangles); same convention as `build_hull_mesh`.
+    let push_quad = |positions: &mut Vec<[f32; 3]>,
+                     normals: &mut Vec<[f32; 3]>,
+                     uvs: &mut Vec<[f32; 2]>,
+                     indices: &mut Vec<u32>,
+                     corners: [[f32; 3]; 4],
+                     normal: [f32; 3]| {
+        let base = positions.len() as u32;
+        positions.extend_from_slice(&corners);
+        for _ in 0..4 {
+            normals.push(normal);
+        }
+        uvs.push([0.0, 0.0]);
+        uvs.push([1.0, 0.0]);
+        uvs.push([1.0, 1.0]);
+        uvs.push([0.0, 1.0]);
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+
+    let single_outer = outers.len() == 1;
+    for outer in &outers {
+        // Holes inside this outer loop (single-body fast path = all of them).
+        let my_holes: Vec<Vec<Vec2>> = if single_outer {
+            holes.clone()
+        } else {
+            holes
+                .iter()
+                .filter(|h| point_in_polygon(ring_centroid(h), outer))
+                .cloned()
+                .collect()
+        };
+
+        let outer_s = chaikin_closed(outer, CONTOUR_CHAIKIN_ITERS);
+        if outer_s.len() < 3 {
             continue;
         }
-        let tris = ear_clip(&smooth);
+        let holes_s: Vec<Vec<Vec2>> = my_holes
+            .iter()
+            .map(|h| chaikin_closed(h, CONTOUR_CHAIKIN_ITERS))
+            .filter(|h| h.len() >= 3)
+            .collect();
+
+        // TOP FACE: outer-minus-holes, flat at z = HULL_THICKNESS, normal +Z. Positions pushed
+        // in the combined order `[outer, holes…]` that `ear_clip_with_holes` indexes into.
         let base = positions.len() as u32;
-        for p in &smooth {
+        for p in &outer_s {
             positions.push([p.x, p.y, HULL_THICKNESS]);
             normals.push([0.0, 0.0, 1.0]);
             uvs.push([0.0, 0.0]);
         }
-        for t in tris {
+        for h in &holes_s {
+            for p in h {
+                positions.push([p.x, p.y, HULL_THICKNESS]);
+                normals.push([0.0, 0.0, 1.0]);
+                uvs.push([0.0, 0.0]);
+            }
+        }
+        for t in ear_clip_with_holes(&outer_s, &holes_s) {
             indices.push(base + t);
+        }
+
+        // SIDE WALLS along every ring (outer silhouette + each hole). The (dy, −dx) normal is
+        // outward for the CCW outer and into-the-cavity for the CW holes (see fn doc).
+        for ring in std::iter::once(&outer_s).chain(holes_s.iter()) {
+            let n = ring.len();
+            for i in 0..n {
+                let a = ring[i];
+                let b = ring[(i + 1) % n];
+                let d = b - a;
+                let len = d.length();
+                if len <= 1.0e-6 {
+                    continue;
+                }
+                let nrm = Vec2::new(d.y, -d.x) / len;
+                push_quad(
+                    &mut positions,
+                    &mut normals,
+                    &mut uvs,
+                    &mut indices,
+                    [
+                        [a.x, a.y, 0.0],
+                        [b.x, b.y, 0.0],
+                        [b.x, b.y, HULL_THICKNESS],
+                        [a.x, a.y, HULL_THICKNESS],
+                    ],
+                    [nrm.x, nrm.y, 0.0],
+                );
+            }
         }
     }
 
@@ -678,6 +859,74 @@ pub fn build_hull_mesh_contour(cells: &[(u16, u16, u8)], cell_size: f32, center:
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
     .with_inserted_indices(Indices::U32(indices))
+}
+
+/// How far above the hull top face (`z = HULL_THICKNESS`) the contour module markers float, so
+/// they never z-fight the rounded surface beneath them.
+const MODULE_OVERLAY_LIFT: f32 = 0.01;
+/// Module marker quad size as a fraction of a cell (centred) — markers read as insets on the
+/// smooth hull, not a gapless recolor.
+const MODULE_OVERLAY_FRAC: f32 = 0.6;
+
+/// Build the **module-color overlay** mesh (Fix #11 M3) for the contour ("rounded") look: one
+/// small flat colored quad per MODULE cell (`kind != 0`), centred on the cell at
+/// `z = HULL_THICKNESS + MODULE_OVERLAY_LIFT`, normal +Z, carrying the [`module_palette`] hue as
+/// `ATTRIBUTE_COLOR`. Rendered as a SECOND child over the smooth uniform hull so modules read
+/// crisp without fighting the rounded fill (the "multiple layers" approach). Returns `None` when
+/// the cell set has no module cells (the caller then skips / tears down the overlay child). Uses
+/// the same `(cells, cell_size, center)` local frame as the hull builders.
+pub fn build_module_overlay_mesh(
+    cells: &[(u16, u16, u8)],
+    cell_size: f32,
+    center: Vec2,
+) -> Option<Mesh> {
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    let mut colors: Vec<[f32; 4]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    let z = HULL_THICKNESS + MODULE_OVERLAY_LIFT;
+    let h = cell_size * 0.5 * MODULE_OVERLAY_FRAC;
+
+    for &(col, row, kind) in cells {
+        if kind == 0 {
+            continue; // structural / empty plating — no marker
+        }
+        let cx = ((row as f32 + 0.5) - center.y) * cell_size;
+        let cy = ((col as f32 + 0.5) - center.x) * cell_size;
+        let color = color_rgba(module_palette(kind));
+        let base = positions.len() as u32;
+        positions.extend_from_slice(&[
+            [cx - h, cy - h, z],
+            [cx + h, cy - h, z],
+            [cx + h, cy + h, z],
+            [cx - h, cy + h, z],
+        ]);
+        for _ in 0..4 {
+            normals.push([0.0, 0.0, 1.0]);
+            colors.push(color);
+        }
+        uvs.push([0.0, 0.0]);
+        uvs.push([1.0, 0.0]);
+        uvs.push([1.0, 1.0]);
+        uvs.push([0.0, 1.0]);
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    if indices.is_empty() {
+        return None; // no module cells → no overlay
+    }
+    Some(
+        Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+        .with_inserted_indices(Indices::U32(indices)),
+    )
 }
 
 /// Spawn lighting, the gunsight pip, and the LOCAL player ship; register the
@@ -784,6 +1033,31 @@ pub fn setup_scene(
         ..default()
     });
 
+    // WHITE-base hull plates (Fix #11 M3): identical metal/roughness to the tinted plates above,
+    // but a white base so per-cell module vertex colors show as-is (StandardMaterial computes
+    // `vertex × base_color`). Used ONLY by the voxel look while module coloring is ON.
+    let hull_material_white = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        metallic: 0.6,
+        perceptual_roughness: 0.55,
+        ..default()
+    });
+    let wreck_hull_material_white = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        metallic: 0.5,
+        perceptual_roughness: 0.75,
+        ..default()
+    });
+
+    // Contour module-marker overlay material (Fix #11 M3): white base so the markers' per-vertex
+    // `module_palette` colors show as-is; lit like the hull (it floats just above the top face).
+    let module_overlay_material = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        metallic: 0.2,
+        perceptual_roughness: 0.5,
+        ..default()
+    });
+
     commands.insert_resource(RenderAssets {
         projectile_mesh,
         projectile_material,
@@ -801,6 +1075,9 @@ pub fn setup_scene(
         debris_material,
         hull_material,
         wreck_hull_material,
+        hull_material_white,
+        wreck_hull_material_white,
+        module_overlay_material,
     });
 
     // The LOCAL player ship — spawned here deterministically so the `LocalShip`
@@ -881,43 +1158,63 @@ mod contour_tests {
     }
 
     #[test]
-    fn ear_clip_square_makes_two_triangles_with_full_area() {
-        let sq = [
+    fn ear_clip_with_holes_fills_a_simple_square() {
+        // CCW unit square, no holes → 2 triangles, area 1, all forced CCW (positive).
+        let sq = vec![
             Vec2::new(0.0, 0.0),
             Vec2::new(1.0, 0.0),
             Vec2::new(1.0, 1.0),
             Vec2::new(0.0, 1.0),
         ];
-        let tris = ear_clip(&sq);
+        let tris = ear_clip_with_holes(&sq, &[]);
         assert_eq!(tris.len(), 6, "a quad → 2 triangles");
-        // The two triangles' areas sum to the square's area (1.0).
         let mut total = 0.0;
         for t in tris.chunks(3) {
             let (a, b, c) = (sq[t[0] as usize], sq[t[1] as usize], sq[t[2] as usize]);
-            total += (b - a).perp_dot(c - a).abs() * 0.5;
+            let signed = (b - a).perp_dot(c - a) * 0.5;
+            assert!(signed > 0.0, "triangles are forced CCW (front toward +Z)");
+            total += signed;
         }
         assert!((total - 1.0).abs() < 1e-5);
     }
 
     #[test]
-    fn ear_clip_handles_a_concave_l_polygon() {
-        // CCW L-shape (reflex vertex at (1,1)).
-        let l = [
+    fn ear_clip_with_holes_cuts_a_central_hole() {
+        // CCW 4×4 outer with a CW 2×2 hole → filled area = 16 − 4 = 12.
+        let outer = vec![
             Vec2::new(0.0, 0.0),
-            Vec2::new(2.0, 0.0),
-            Vec2::new(2.0, 1.0),
-            Vec2::new(1.0, 1.0),
-            Vec2::new(1.0, 2.0),
-            Vec2::new(0.0, 2.0),
+            Vec2::new(4.0, 0.0),
+            Vec2::new(4.0, 4.0),
+            Vec2::new(0.0, 4.0),
         ];
-        let tris = ear_clip(&l);
-        assert_eq!(tris.len(), (l.len() - 2) * 3, "n-gon → n-2 triangles");
+        let hole = vec![
+            Vec2::new(1.0, 1.0),
+            Vec2::new(1.0, 3.0),
+            Vec2::new(3.0, 3.0),
+            Vec2::new(3.0, 1.0),
+        ];
+        assert!(
+            signed_area2(&hole) < 0.0,
+            "hole ring is CW (canonical for earcut)"
+        );
+        let tris = ear_clip_with_holes(&outer, std::slice::from_ref(&hole));
+        assert!(!tris.is_empty(), "the hole-cut polygon triangulates");
+        // Combined vertex list = outer then hole — the order the fn indexes into.
+        let mut verts = outer.clone();
+        verts.extend(hole.iter().copied());
         let mut total = 0.0;
         for t in tris.chunks(3) {
-            let (a, b, c) = (l[t[0] as usize], l[t[1] as usize], l[t[2] as usize]);
+            let (a, b, c) = (
+                verts[t[0] as usize],
+                verts[t[1] as usize],
+                verts[t[2] as usize],
+            );
             total += (b - a).perp_dot(c - a).abs() * 0.5;
         }
-        assert!((total - 3.0).abs() < 1e-5, "L area = 3 (got {total})");
+        assert!(
+            (total - 12.0).abs() < 1e-4,
+            "outer 16 − hole 4 = 12 (got {total})"
+        );
     }
 
     #[test]
@@ -936,18 +1233,230 @@ mod contour_tests {
     }
 
     #[test]
-    fn contour_mesh_of_a_block_is_nonempty_and_upward_facing() {
+    fn contour_mesh_of_a_block_has_top_face_and_walls() {
         let cells: Vec<(u16, u16, u8)> = (0..3)
             .flat_map(|c| (0..3).map(move |r| (c, r, 0u8)))
             .collect();
         let mesh = build_hull_mesh_contour(&cells, 0.32, Vec2::new(1.5, 1.5));
         let pos = mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap();
         assert!(pos.len() >= 3, "a solid block contour has a filled face");
-        // All top-face normals point +Z (toward the top-down camera).
         if let Some(bevy::mesh::VertexAttributeValues::Float32x3(ns)) =
             mesh.attribute(Mesh::ATTRIBUTE_NORMAL)
         {
-            assert!(ns.iter().all(|n| n[2] > 0.5));
+            // Top face points +Z (toward the top-down camera); side walls are horizontal.
+            assert!(ns.iter().any(|n| n[2] > 0.5), "has an upward top face");
+            assert!(
+                ns.iter().any(|n| n[2].abs() < 1e-3),
+                "has vertical side walls"
+            );
         }
+    }
+
+    /// Total area of a contour mesh's TOP face (triangles whose 3 vertices all sit at
+    /// `z = HULL_THICKNESS`) — lets a hole test assert the filled face shrank.
+    fn top_face_area(mesh: &Mesh) -> f32 {
+        let Some(bevy::mesh::VertexAttributeValues::Float32x3(pos)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            return 0.0;
+        };
+        let Some(Indices::U32(idx)) = mesh.indices() else {
+            return 0.0;
+        };
+        let mut area = 0.0;
+        for t in idx.chunks(3) {
+            let (p0, p1, p2) = (pos[t[0] as usize], pos[t[1] as usize], pos[t[2] as usize]);
+            let is_top = |p: &[f32; 3]| (p[2] - HULL_THICKNESS).abs() < 1e-4;
+            if is_top(&p0) && is_top(&p1) && is_top(&p2) {
+                let a = Vec2::new(p0[0], p0[1]);
+                let b = Vec2::new(p1[0], p1[1]);
+                let c = Vec2::new(p2[0], p2[1]);
+                area += (b - a).perp_dot(c - a).abs() * 0.5;
+            }
+        }
+        area
+    }
+
+    /// Count a mesh's vertices sitting at `z == 0` (every side-wall quad contributes two) — a
+    /// proxy for "how many side walls were emitted".
+    fn wall_floor_verts(mesh: &Mesh) -> usize {
+        match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
+            Some(bevy::mesh::VertexAttributeValues::Float32x3(ps)) => {
+                ps.iter().filter(|p| p[2].abs() < 1e-4).count()
+            }
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn contour_with_interior_hole_cuts_a_hole() {
+        // A 5×5 block, solid vs. with the centre cell (2,2) carved out.
+        let solid_cells: Vec<(u16, u16, u8)> = (0..5)
+            .flat_map(|c| (0..5).map(move |r| (c, r, 0u8)))
+            .collect();
+        let holed_cells: Vec<(u16, u16, u8)> = solid_cells
+            .iter()
+            .copied()
+            .filter(|&(c, r, _)| !(c == 2 && r == 2))
+            .collect();
+
+        // The carved set has TWO boundary loops (outer silhouette + the hole).
+        let present: std::collections::HashSet<(u16, u16)> =
+            holed_cells.iter().map(|&(c, r, _)| (c, r)).collect();
+        assert_eq!(
+            cell_boundary_loops(&present).len(),
+            2,
+            "outer silhouette + one interior hole"
+        );
+
+        let solid = build_hull_mesh_contour(&solid_cells, 0.32, Vec2::new(2.5, 2.5));
+        let holed = build_hull_mesh_contour(&holed_cells, 0.32, Vec2::new(2.5, 2.5));
+        let (solid_area, holed_area) = (top_face_area(&solid), top_face_area(&holed));
+        assert!(holed_area > 0.0, "holed hull still has a filled face");
+        assert!(
+            holed_area < solid_area,
+            "carving an interior cell removes top-face area (solid {solid_area}, holed {holed_area})"
+        );
+    }
+
+    #[test]
+    fn contour_emits_side_walls() {
+        let cells: Vec<(u16, u16, u8)> = [(0, 0), (1, 0), (0, 1), (1, 1)]
+            .iter()
+            .map(|&(c, r)| (c, r, 0u8))
+            .collect();
+        let mesh = build_hull_mesh_contour(&cells, 0.32, Vec2::new(1.0, 1.0));
+        if let Some(bevy::mesh::VertexAttributeValues::Float32x3(ps)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        {
+            assert!(
+                ps.iter().any(|p| p[2].abs() < 1e-4),
+                "wall bottoms at z = 0"
+            );
+            assert!(
+                ps.iter().any(|p| (p[2] - HULL_THICKNESS).abs() < 1e-4),
+                "tops at z = HULL_THICKNESS"
+            );
+        } else {
+            panic!("contour mesh has no positions");
+        }
+    }
+
+    #[test]
+    fn voxel_hole_is_walled() {
+        // Regression lock on the ALREADY-working voxel path: carving the centre of a 3×3 adds
+        // interior walls (each of the 4 cells around the hole walls its edge facing the gap).
+        let solid: Vec<(u16, u16, u8)> = (0..3)
+            .flat_map(|c| (0..3).map(move |r| (c, r, 0u8)))
+            .collect();
+        let holed: Vec<(u16, u16, u8)> = solid
+            .iter()
+            .copied()
+            .filter(|&(c, r, _)| !(c == 1 && r == 1))
+            .collect();
+        let solid_walls =
+            wall_floor_verts(&build_hull_mesh(&solid, 0.32, Vec2::new(1.5, 1.5), false));
+        let holed_walls =
+            wall_floor_verts(&build_hull_mesh(&holed, 0.32, Vec2::new(1.5, 1.5), false));
+        assert!(
+            holed_walls > solid_walls,
+            "the interior hole adds side walls (solid {solid_walls}, holed {holed_walls})"
+        );
+    }
+
+    #[test]
+    fn module_palette_is_distinct_per_kind() {
+        // Structural (0) reuses the hull color; the six module kinds are pairwise distinct.
+        assert_eq!(module_palette(0), HULL_COLOR);
+        let kinds = [0u8, 1, 2, 3, 4, 5, 6];
+        for (i, &a) in kinds.iter().enumerate() {
+            for &b in &kinds[i + 1..] {
+                assert_ne!(
+                    module_palette(a),
+                    module_palette(b),
+                    "kinds {a} and {b} must have distinct colors"
+                );
+            }
+        }
+    }
+
+    /// Distinct linear vertex colors present in a mesh's `ATTRIBUTE_COLOR` (rounded so f32 jitter
+    /// doesn't split a color into near-duplicates).
+    fn distinct_vertex_colors(mesh: &Mesh) -> std::collections::HashSet<[i32; 4]> {
+        let mut set = std::collections::HashSet::new();
+        if let Some(bevy::mesh::VertexAttributeValues::Float32x4(cs)) =
+            mesh.attribute(Mesh::ATTRIBUTE_COLOR)
+        {
+            for c in cs {
+                set.insert([
+                    (c[0] * 1000.0) as i32,
+                    (c[1] * 1000.0) as i32,
+                    (c[2] * 1000.0) as i32,
+                    (c[3] * 1000.0) as i32,
+                ]);
+            }
+        }
+        set
+    }
+
+    #[test]
+    fn voxel_mesh_carries_vertex_colors() {
+        // Two cells of different module kinds → ATTRIBUTE_COLOR present, one entry per position,
+        // and at least two distinct colors when module coloring is ON.
+        let cells = [(0u16, 0u16, 1u8), (1, 0, 3)]; // reactor + weapon
+        let mesh = build_hull_mesh(&cells, 0.32, Vec2::new(1.0, 0.5), true);
+        let pos_len = match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
+            Some(bevy::mesh::VertexAttributeValues::Float32x3(p)) => p.len(),
+            _ => panic!("no positions"),
+        };
+        let col_len = match mesh.attribute(Mesh::ATTRIBUTE_COLOR) {
+            Some(bevy::mesh::VertexAttributeValues::Float32x4(c)) => c.len(),
+            _ => panic!("ATTRIBUTE_COLOR must always be present"),
+        };
+        assert_eq!(col_len, pos_len, "one vertex color per position");
+        assert!(
+            distinct_vertex_colors(&mesh).len() >= 2,
+            "mixed module kinds give distinct colors when coloring is on"
+        );
+    }
+
+    #[test]
+    fn voxel_mesh_color_off_is_uniform_white() {
+        // Same mixed-kind cells with coloring OFF → ATTRIBUTE_COLOR still present, all white
+        // (the material's own hull/wreck tint shows through; no pipeline flip-flop).
+        let cells = [(0u16, 0u16, 1u8), (1, 0, 3)];
+        let mesh = build_hull_mesh(&cells, 0.32, Vec2::new(1.0, 0.5), false);
+        let colors = distinct_vertex_colors(&mesh);
+        assert_eq!(
+            colors.len(),
+            1,
+            "all vertices one color when coloring is off"
+        );
+        assert_eq!(
+            colors.into_iter().next().unwrap(),
+            [1000, 1000, 1000, 1000],
+            "the single color is white"
+        );
+    }
+
+    #[test]
+    fn module_overlay_marks_only_module_cells() {
+        // A 2×2 with one module cell (kind 4) and three structural → exactly one marker quad
+        // (4 positions, 6 indices); palette color = shield cyan.
+        let cells = [(0u16, 0u16, 0u8), (1, 0, 0), (0, 1, 4), (1, 1, 0)];
+        let mesh = build_module_overlay_mesh(&cells, 0.32, Vec2::new(1.0, 1.0))
+            .expect("one module cell → an overlay mesh");
+        match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
+            Some(bevy::mesh::VertexAttributeValues::Float32x3(p)) => {
+                assert_eq!(p.len(), 4, "one quad per module cell");
+            }
+            _ => panic!("no positions"),
+        }
+        // All-structural cells → no overlay at all.
+        let plating = [(0u16, 0u16, 0u8), (1, 0, 0)];
+        assert!(
+            build_module_overlay_mesh(&plating, 0.32, Vec2::new(0.5, 0.5)).is_none(),
+            "no module cells → no overlay mesh"
+        );
     }
 }
