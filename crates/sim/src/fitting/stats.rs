@@ -117,6 +117,14 @@ pub struct ShipStats {
     pub power_draw: f32,
     /// CPU/control consumed by the fit: `Σ module.cpu_draw` (`>= 0`).
     pub cpu_draw: f32,
+    /// Phase F — always-on power load: `Σ power_draw` of Shield/Sensor/Utility modules. The energy
+    /// capacitor's net recharge is `power_supply − continuous_draw` (thruster/weapon draw is the
+    /// ACTIVE drain, applied separately when you thrust/fire).
+    pub continuous_draw: f32,
+    /// Phase F — nominal armor capacity: `Σ armor_value` of fitted **Armor** modules. Seeds the
+    /// depleting [`crate::components::ArmorHp`] pool's `max` at live ship spawn (a hull-protecting HP
+    /// layer between shields and the hull carve). Summed flat (a capacity, not health-scaled).
+    pub armor_value: f32,
     /// `true` iff at least one weapon module is installed (FR-016). When `false`
     /// the ship cannot fire and [`ShipStats::weapon`] is `None`.
     pub can_fire: bool,
@@ -263,6 +271,12 @@ pub fn derive_ship_stats_with(
     let mut power_gen = 0.0_f32;
     let mut power_draw = 0.0_f32;
     let mut cpu_draw = 0.0_f32;
+    // Phase F: the always-on power load (shields/sensors/utility) that offsets the energy
+    // capacitor's regen each tick. Thruster/Weapon draw is NOT counted here — they drain the
+    // capacitor when ACTIVE (thrust/fire), so counting their static draw too would double-charge.
+    let mut continuous_draw = 0.0_f32;
+    // Phase F: nominal armor capacity — Σ over fitted Armor modules (a capacity, summed flat).
+    let mut armor_value = 0.0_f32;
     let mut weapon: Option<WeaponProfile> = None;
 
     // Iterate by SlotId (BTreeMap order) so derivation is deterministic — the
@@ -295,6 +309,12 @@ pub fn derive_ship_stats_with(
         // here — Phase M5 derives `total_mass` bottom-up from the layout's cells below.
         power_draw += module.power_draw;
         cpu_draw += module.cpu_draw;
+        if matches!(
+            module.kind,
+            ModuleKind::Shield | ModuleKind::Sensor | ModuleKind::Utility
+        ) {
+            continuous_draw += module.power_draw;
+        }
 
         // Reactor power generation is an OUTPUT — scaled by health so a destroyed
         // reactor (hf == 0) adds no `power_gen`, collapsing `power_supply` (FR-013).
@@ -335,6 +355,11 @@ pub fn derive_ship_stats_with(
                     heat: module.heat,
                 });
             }
+            // Armor plates contribute their nominal `armor_value` to the depleting ArmorHp pool's
+            // capacity. Summed flat (a capacity stat, like power_supply — not health-scaled).
+            ModuleSpecifics::Armor { armor_value: av } => {
+                armor_value += av;
+            }
             _ => {}
         }
     }
@@ -364,6 +389,8 @@ pub fn derive_ship_stats_with(
         power_supply: hull.power_capacity + power_gen,
         power_draw,
         cpu_draw,
+        continuous_draw,
+        armor_value,
         can_fire: weapon.is_some(),
         weapon,
     }

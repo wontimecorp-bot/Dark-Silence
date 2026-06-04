@@ -30,6 +30,7 @@ pub mod camera;
 pub mod dev_panel;
 pub mod fitting_ui;
 pub mod hud;
+pub mod hud_bars;
 pub mod input;
 pub mod interpolation;
 pub mod net;
@@ -92,6 +93,9 @@ pub fn run() -> AppExit {
                 camera::setup_camera,
                 hud::setup_hud,
                 hud::setup_energy_bars,
+                // Camera-anchored trapezoid bars (afterburner ramp + heat double-ramp) —
+                // parented to the camera, so it must exist first.
+                hud_bars::setup_trapezoid_bars.after(camera::setup_camera),
             ),
         )
         // Input runs before the fixed step so intents apply the same frame; the
@@ -127,6 +131,7 @@ pub fn run() -> AppExit {
                 camera::zoom_camera,
                 hud::update_hud,
                 hud::update_energy_hud,
+                hud_bars::update_trapezoid_bars,
             ),
         );
 

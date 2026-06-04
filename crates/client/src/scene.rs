@@ -290,6 +290,39 @@ fn build_arc_band_mesh(inner_frac: f32, half_angle: f32, segments: u32) -> Mesh 
     .with_inserted_indices(Indices::U32(indices))
 }
 
+/// Build a flat **trapezoid** in the XY plane (`z = 0`), **anchored at its bottom edge on
+/// `y = 0`**: the bottom edge spans `[-bottom_w/2, +bottom_w/2]`, the top edge spans
+/// `[-top_w/2, +top_w/2]` at `y = height`. The normal is `+Z` so it faces the top-down
+/// camera (the Phase F HUD trapezoid/ramp bars).
+///
+/// Anchoring the bottom at `y = 0` means a uniform `Transform` `scale.y` grows the shape
+/// **upward**, so a row of segments with increasing `scale.y` reads as a short→tall ramp;
+/// `top_w < bottom_w` gives each segment the tapered "battery cell" look. Two triangles,
+/// wound CCW from `+Z`, with a simple UV so [`StandardMaterial`] is satisfied. NO vertex
+/// color (unlike the shield arc): the HUD material is `unlit` and its `base_color` is set
+/// per segment at draw time, so `base_color` shows as-is (no `vertex × base` multiply).
+pub fn build_trapezoid_mesh(top_w: f32, bottom_w: f32, height: f32) -> Mesh {
+    let hb = bottom_w * 0.5;
+    let ht = top_w * 0.5;
+    let positions: Vec<[f32; 3]> = vec![
+        [-hb, 0.0, 0.0],    // 0 bottom-left
+        [hb, 0.0, 0.0],     // 1 bottom-right
+        [ht, height, 0.0],  // 2 top-right
+        [-ht, height, 0.0], // 3 top-left
+    ];
+    let normals = vec![[0.0, 0.0, 1.0]; 4];
+    let uvs: Vec<[f32; 2]> = vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+    let indices = vec![0u32, 1, 2, 0, 2, 3];
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
 /// Revise-B: build ONE merged **seamless solid hull surface** mesh for a fitted ship
 /// from its present cells, in the ship's LOCAL frame (XY plane), so the whole ship draws
 /// as a single mesh + the single [`RenderAssets::hull_material`].
@@ -1459,5 +1492,59 @@ mod contour_tests {
             build_module_overlay_mesh(&plating, 0.32, Vec2::new(0.5, 0.5)).is_none(),
             "no module cells → no overlay mesh"
         );
+    }
+
+    #[test]
+    fn trapezoid_mesh_is_bottom_anchored_and_camera_facing() {
+        // bottom_w 2, top_w 1, height 3 → a quad (4 verts, 2 tris), bottom edge on y=0
+        // spanning ±1, top edge at y=3 spanning ±0.5, every normal +Z.
+        let mesh = build_trapezoid_mesh(1.0, 2.0, 3.0);
+        let Some(bevy::mesh::VertexAttributeValues::Float32x3(ps)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("trapezoid has no positions");
+        };
+        assert_eq!(ps.len(), 4, "trapezoid is one quad");
+        // Bottom edge anchored on y = 0 (so scale.y grows it upward); top at y = height.
+        assert!(
+            ps.iter().filter(|p| p[1].abs() < 1e-6).count() == 2,
+            "two bottom verts on y=0"
+        );
+        assert!(
+            ps.iter().filter(|p| (p[1] - 3.0).abs() < 1e-6).count() == 2,
+            "two top verts at y=3"
+        );
+        // Widths: bottom spans ±1 (bottom_w/2), top spans ±0.5 (top_w/2).
+        let bottom_x: Vec<f32> = ps
+            .iter()
+            .filter(|p| p[1].abs() < 1e-6)
+            .map(|p| p[0])
+            .collect();
+        let top_x: Vec<f32> = ps
+            .iter()
+            .filter(|p| (p[1] - 3.0).abs() < 1e-6)
+            .map(|p| p[0])
+            .collect();
+        assert!(
+            bottom_x.iter().any(|&x| (x + 1.0).abs() < 1e-6)
+                && bottom_x.iter().any(|&x| (x - 1.0).abs() < 1e-6)
+        );
+        assert!(
+            top_x.iter().any(|&x| (x + 0.5).abs() < 1e-6)
+                && top_x.iter().any(|&x| (x - 0.5).abs() < 1e-6)
+        );
+        if let Some(bevy::mesh::VertexAttributeValues::Float32x3(ns)) =
+            mesh.attribute(Mesh::ATTRIBUTE_NORMAL)
+        {
+            assert!(
+                ns.iter().all(|n| n[2] > 0.99),
+                "all normals +Z (face the top-down camera)"
+            );
+        }
+        // 2 triangles.
+        match mesh.indices() {
+            Some(Indices::U32(i)) => assert_eq!(i.len(), 6, "two triangles"),
+            _ => panic!("trapezoid has no U32 indices"),
+        }
     }
 }

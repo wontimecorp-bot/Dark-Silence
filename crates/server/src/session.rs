@@ -684,6 +684,7 @@ mod tests {
                 turn: 0,
                 fire: false,
                 toggle_assist: false,
+                afterburner: false,
             }],
         )
     }

@@ -82,6 +82,7 @@ fn two_clients_share_one_world_and_see_each_others_ships() {
         turn: 0,
         fire: false,
         toggle_assist: false,
+        afterburner: false,
     };
     client.send_unreliable(
         conn_a,
@@ -166,6 +167,7 @@ fn two_clients_with_different_inputs_drive_their_ships_independently() {
         turn: 0,
         fire: false,
         toggle_assist: false,
+        afterburner: false,
     };
     let reverse = QuantizedIntent {
         forward: -1,
@@ -173,6 +175,7 @@ fn two_clients_with_different_inputs_drive_their_ships_independently() {
         turn: 0,
         fire: false,
         toggle_assist: false,
+        afterburner: false,
     };
 
     // Re-send the per-step input each tick (inputs are consumed per step) and

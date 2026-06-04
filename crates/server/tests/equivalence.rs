@@ -44,6 +44,7 @@ fn scripts() -> Vec<InputScript> {
         turn: 0,
         fire: false,
         toggle_assist: false,
+        afterburner: false,
     };
     vec![
         InputScript::constant(forward_intent()),

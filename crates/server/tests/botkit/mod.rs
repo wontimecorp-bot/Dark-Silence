@@ -219,6 +219,7 @@ impl InputScript {
             turn: 0,
             fire: false,
             toggle_assist: false,
+            afterburner: false,
         }
     }
 
@@ -725,6 +726,7 @@ pub fn forward_intent() -> QuantizedIntent {
         turn: 0,
         fire: false,
         toggle_assist: false,
+        afterburner: false,
     }
 }
 

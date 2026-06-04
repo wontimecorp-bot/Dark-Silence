@@ -446,6 +446,7 @@ mod tests {
                     current: 100.0,
                     max: 100.0,
                     regen: 0.0,
+                    rate: 0.0,
                 },
                 Heat {
                     current: 0.0,

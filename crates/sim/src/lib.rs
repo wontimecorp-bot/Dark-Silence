@@ -133,6 +133,8 @@ pub fn add_fixed_step_systems(schedule: &mut Schedule) {
             // so determinism/botkit worlds are untouched). Before weapon_fire so the firing gate
             // sees this tick's recharged values.
             energy::energy_system,
+            // Phase F: drain/recharge the afterburner pool (no-op without the pool).
+            energy::afterburner_system,
             weapon::weapon_fire_system,
             weapon::projectile_step_system,
             collision::collision_detect_system,

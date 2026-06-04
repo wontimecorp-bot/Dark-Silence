@@ -160,6 +160,17 @@ pub struct SimTuning {
     pub heat_capacity: f32,
     /// Phase E — heat cooling rate per second (`Heat.dissipation`).
     pub heat_dissipation: f32,
+    /// Phase F — energy drained per second per unit of thrust input
+    /// (`thrust_drain = this · (|forward| + |strafe| + turn_power_share·|turn|)`).
+    pub thrust_energy_per_input: f32,
+    /// Phase F — afterburner pool capacity (`Afterburner.max`).
+    pub afterburner_capacity: f32,
+    /// Phase F — afterburner pool drain per second while boosting.
+    pub afterburner_drain_rate: f32,
+    /// Phase F — afterburner pool recharge per second while NOT boosting.
+    pub afterburner_regen_rate: f32,
+    /// Phase F — translational thrust multiplier while boosting (`thrust ×= 1 + this`).
+    pub afterburner_boost_factor: f32,
 }
 
 impl Default for SimTuning {
@@ -189,6 +200,11 @@ impl Default for SimTuning {
             weapon_energy_per_damage: 1.0,
             heat_capacity: 45.0,
             heat_dissipation: 6.0,
+            thrust_energy_per_input: 35.0,
+            afterburner_capacity: 100.0,
+            afterburner_drain_rate: 40.0,
+            afterburner_regen_rate: 20.0,
+            afterburner_boost_factor: 0.6,
         }
     }
 }

@@ -14,29 +14,63 @@
 use bevy_ecs::prelude::*;
 
 use crate::clock::FixedDt;
-use crate::components::{Energy, Heat};
+use crate::components::{Afterburner, Energy, Heat};
 use crate::fitting::ShipStats;
+use crate::intent::ShipIntent;
 use crate::tuning::SimTuning;
 
-/// Recharge Energy + cool Heat each fixed step, re-deriving the caps from the live [`ShipStats`].
-/// `SimTuning` is `Option` so a minimal world degrades to the const defaults rather than panicking.
-/// Pure per-entity integration (f32, fixed order) — deterministic.
+/// Recharge/drain Energy + cool Heat each fixed step, re-deriving the caps from the live
+/// [`ShipStats`]. **Phase F:** the capacitor's net steady rate is `power_supply − continuous_draw −
+/// thrust_drain` (so shields-on lowers it and thrusting drains it); `Energy.rate` carries that net
+/// for the HUD. `ShipIntent` is `Option` (the thrust drain needs the pilot input; absent ⇒ 0).
+/// `SimTuning` is `Option` so a minimal world degrades to the defaults. Pure, deterministic.
 pub fn energy_system(
     dt: Res<FixedDt>,
     sim: Option<Res<SimTuning>>,
-    mut q: Query<(&mut Energy, &mut Heat, &ShipStats)>,
+    mut q: Query<(&mut Energy, &mut Heat, &ShipStats, Option<&ShipIntent>)>,
 ) {
     let dt = dt.0;
     let sim = sim.map(|s| *s).unwrap_or_default();
-    for (mut energy, mut heat, stats) in &mut q {
-        // Energy: capacity + regen track the live reactor output; recharge toward max.
+    for (mut energy, mut heat, stats, intent) in &mut q {
+        // Energy capacity + gross regen track the live reactor output.
         energy.max = (stats.power_supply * sim.energy_capacity_secs).max(0.0);
         energy.regen = stats.power_supply.max(0.0);
-        energy.current = (energy.current + energy.regen * dt).clamp(0.0, energy.max);
+        // Active thrust drain (proportional to pilot input, scaled by the turn-power share so a hard
+        // turn that already saps translational thrust also costs less energy).
+        let thrust_drain = intent.map_or(0.0, |i| {
+            sim.thrust_energy_per_input
+                * (i.forward.abs() + i.strafe.abs() + stats.turn_power_share * i.turn.abs())
+        });
+        // Net steady rate: + charging, − draining. Weapon fire is a separate per-shot impulse.
+        let net = energy.regen - stats.continuous_draw - thrust_drain;
+        energy.rate = net;
+        energy.current = (energy.current + net * dt).clamp(0.0, energy.max);
         // Heat: cool toward 0, clamped into [0, max].
         heat.max = sim.heat_capacity.max(f32::MIN_POSITIVE);
         heat.dissipation = sim.heat_dissipation.max(0.0);
         heat.current = (heat.current - heat.dissipation * dt).clamp(0.0, heat.max);
+    }
+}
+
+/// Phase F — drain/recharge the **afterburner** pool each fixed step: boosting
+/// (`intent.afterburner && current > 0`) drains it; otherwise it recharges toward `max`. The thrust
+/// BOOST itself is applied in [`ship_motion_system`](crate::flight::ship_motion_system) (which reads
+/// this pool + the intent). A self-contained pool (does NOT touch [`Energy`]). Only LIVE ships carry
+/// [`Afterburner`] → a no-op in the headless/determinism/botkit worlds. Pure, deterministic.
+pub fn afterburner_system(
+    dt: Res<FixedDt>,
+    sim: Option<Res<SimTuning>>,
+    mut q: Query<(&mut Afterburner, &ShipIntent)>,
+) {
+    let dt = dt.0;
+    let sim = sim.map(|s| *s).unwrap_or_default();
+    for (mut ab, intent) in &mut q {
+        ab.max = sim.afterburner_capacity.max(f32::MIN_POSITIVE);
+        ab.regen = sim.afterburner_regen_rate.max(0.0);
+        ab.drain = sim.afterburner_drain_rate.max(0.0);
+        let boosting = intent.afterburner && ab.current > 0.0;
+        let delta = if boosting { -ab.drain } else { ab.regen };
+        ab.current = (ab.current + delta * dt).clamp(0.0, ab.max);
     }
 }
 
@@ -78,6 +112,7 @@ mod tests {
                 current: 0.0,
                 max: 0.0,
                 regen: 0.0,
+                rate: 0.0,
             },
             Heat {
                 current: 30.0,
@@ -107,6 +142,7 @@ mod tests {
                 current: 9999.0,
                 max: 0.0,
                 regen: 0.0,
+                rate: 0.0,
             },
             Heat {
                 current: 0.0,
@@ -122,5 +158,81 @@ mod tests {
         let heat = w.get::<Heat>(e).unwrap();
         assert_eq!(energy.current, energy.max, "energy clamps to max");
         assert_eq!(heat.current, 0.0, "heat never goes negative");
+    }
+
+    /// Phase F: full-forward thrust drains the capacitor (net rate < 0) when the thrust cost exceeds
+    /// the reactor surplus; idle (no intent) charges.
+    #[test]
+    fn thrusting_drains_energy_and_sets_negative_rate() {
+        let stats = fighter_stats(); // power_supply 30, continuous_draw 0
+        let mut w = World::new();
+        w.insert_resource(FixedDt(0.1));
+        w.insert_resource(SimTuning::default()); // thrust_energy_per_input 35 → net = 30 − 35 = −5
+        let e = w
+            .spawn((
+                Energy {
+                    current: 100.0,
+                    max: 200.0,
+                    regen: 0.0,
+                    rate: 0.0,
+                },
+                Heat {
+                    current: 0.0,
+                    max: 45.0,
+                    dissipation: 0.0,
+                },
+                stats,
+                ShipIntent {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+            ))
+            .id();
+        let mut sched = Schedule::default();
+        sched.add_systems(energy_system);
+        sched.run(&mut w);
+        let energy = w.get::<Energy>(e).unwrap();
+        assert!(
+            energy.rate < 0.0,
+            "full-forward thrust drains (rate < 0), got {}",
+            energy.rate
+        );
+        assert!(energy.current < 100.0, "energy dropped while thrusting");
+    }
+
+    /// Phase F: the afterburner pool drains while boosting and recharges when released.
+    #[test]
+    fn afterburner_drains_while_boosting_and_recharges_idle() {
+        use crate::components::Afterburner;
+        let sim = SimTuning::default();
+        let mut w = World::new();
+        w.insert_resource(FixedDt(0.1));
+        w.insert_resource(sim);
+        let e = w
+            .spawn((
+                Afterburner::seed(),
+                ShipIntent {
+                    afterburner: true,
+                    ..Default::default()
+                },
+            ))
+            .id();
+        let mut sched = Schedule::default();
+        sched.add_systems(afterburner_system);
+        // Boosting drains by drain_rate·dt.
+        sched.run(&mut w);
+        let after = w.get::<Afterburner>(e).unwrap().current;
+        assert!(after < sim.afterburner_capacity, "boosting drains the pool");
+        assert!(
+            (after - (sim.afterburner_capacity - sim.afterburner_drain_rate * 0.1)).abs() < 1e-3
+        );
+        // Release → recharges.
+        *w.get_mut::<ShipIntent>(e).unwrap() = ShipIntent::default();
+        let before = w.get::<Afterburner>(e).unwrap().current;
+        sched.run(&mut w);
+        assert!(
+            w.get::<Afterburner>(e).unwrap().current > before,
+            "idle recharges the pool"
+        );
     }
 }

@@ -27,4 +27,7 @@ pub struct ShipIntent {
     pub fire: bool,
     /// Toggle the flight-assist mode this step (edge-triggered by the client).
     pub toggle_assist: bool,
+    /// Phase F — hold the afterburner (boost) this step. Boosts translational thrust while the
+    /// [`Afterburner`](crate::components::Afterburner) pool has charge.
+    pub afterburner: bool,
 }

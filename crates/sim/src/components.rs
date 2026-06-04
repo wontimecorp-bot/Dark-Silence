@@ -88,8 +88,12 @@ pub struct Energy {
     pub current: f32,
     /// Capacity (`power_supply · energy_capacity_secs`).
     pub max: f32,
-    /// Recharge rate per second (`= power_supply`).
+    /// Gross recharge rate per second (`= power_supply`).
     pub regen: f32,
+    /// Phase F — the **net** steady rate per second (`regen − continuous_draw − thrust_drain`):
+    /// `> 0` charging, `< 0` draining. Drives the HUD's rate readout. (The per-shot weapon drain is
+    /// an impulse, not part of this steady rate.)
+    pub rate: f32,
 }
 
 /// Phase E — the ship's **heat** pool (the opposite of [`Energy`]). Firing adds heat; it
@@ -117,6 +121,7 @@ impl Energy {
             current: max,
             max,
             regen: power_supply.max(0.0),
+            rate: 0.0,
         }
     }
 }
@@ -130,6 +135,58 @@ impl Heat {
             max: t.heat_capacity,
             dissipation: t.heat_dissipation,
         }
+    }
+}
+
+/// Phase F — the **afterburner** boost pool. Holding the afterburner (`ShipIntent::afterburner`)
+/// drains `current` and multiplies translational thrust in `ship_motion_system`; releasing
+/// recharges it; the boost is gated on `current > 0`. A self-contained resource — it does NOT
+/// touch [`Energy`]. Attached only to LIVE-spawned ships (same `Option`-gate discipline).
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Afterburner {
+    /// Live charge (`0..=max`).
+    pub current: f32,
+    /// Pool capacity.
+    pub max: f32,
+    /// Recharge per second while NOT boosting.
+    pub regen: f32,
+    /// Drain per second while boosting.
+    pub drain: f32,
+}
+
+impl Afterburner {
+    /// Spawn seed for a live ship (Phase F): **full**, sized to the default pool.
+    pub fn seed() -> Self {
+        let t = crate::tuning::SimTuning::default();
+        Self {
+            current: t.afterburner_capacity,
+            max: t.afterburner_capacity,
+            regen: t.afterburner_regen_rate,
+            drain: t.afterburner_drain_rate,
+        }
+    }
+}
+
+/// Phase F — a depleting **armor-HP layer** between the shield and the hull. A penetrating hit
+/// (not a ricochet) that gets past the shield depletes `current` and the hull is **protected from
+/// carving while armor holds** (`current > 0`); once `current <= 0` (or the component is absent),
+/// hits carve the hull as before. Armor does NOT regenerate (it depletes until a repair). `max` is
+/// seeded from `ShipStats.armor_value` (Σ fitted armor plate). Attached only to LIVE-spawned fitted
+/// ships — the headless sim/determinism tests never carry it, so `apply_damage` carves exactly as
+/// today there (the gate is `Option`-skipped), keeping them byte-identical.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ArmorHp {
+    /// Live armor HP (`0..=max`); while `> 0` the hull is shielded from carving.
+    pub current: f32,
+    /// Armor capacity (`= ShipStats.armor_value`).
+    pub max: f32,
+}
+
+impl ArmorHp {
+    /// Spawn seed for a live ship (Phase F): **full** armor at `max = armor_value`.
+    pub fn seed(armor_value: f32) -> Self {
+        let max = armor_value.max(0.0);
+        Self { current: max, max }
     }
 }
 

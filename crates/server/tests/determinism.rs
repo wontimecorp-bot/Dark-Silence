@@ -134,6 +134,7 @@ fn fixed_input_stream() -> Vec<QuantizedIntent> {
         turn,
         fire: false,
         toggle_assist: false,
+        afterburner: false,
     };
     let mut stream = Vec::new();
     // 60 ticks of a deterministic, varied manoeuvre.

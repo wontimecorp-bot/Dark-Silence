@@ -42,6 +42,7 @@ use super::penetration::{resolve_penetration, PenetrationResult};
 use super::resist::{layer_resist, DefenseLayer, ResistanceMatrix};
 use super::sever::Wreck;
 use super::shields::shield_absorb;
+use crate::components::ArmorHp;
 use crate::fitting::{
     resolve_hit, Cell, CellOccupant, Fit, FitLayout, HitResolution, Hull, HullCatalog,
     ModuleCatalog, ModuleRef, SectionId,
@@ -804,6 +805,39 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
             HitKind::OverPenetrated
         }
     };
+
+    // --- 4b. Armor-HP layer (Phase F): a depleting HP buffer between the shield and the
+    // hull carve. A PENETRATING hit (a Ricochet already returned above, so armor is never
+    // touched on a bounce) is SOAKED whole by the armor while it holds (`current > 0`): the
+    // post-armor magnitude `m` (the would-be carve budget) drains the pool and the hull does
+    // NOT carve. There is no spill — a shot that over-depletes still carves nothing; the NEXT
+    // shot finds `current <= 0` and carves. Only once armor is gone (`<= 0`) — or the
+    // component is ABSENT (every determinism/test ship carries none) — does the shot carve the
+    // hull as today, so the headless path stays byte-identical. Armor does not regenerate.
+    if let Some(mut armor) = world.get::<ArmorHp>(target).copied() {
+        if armor.current > 0.0 {
+            let absorbed = armor.current.min(m.max(0.0));
+            armor.current = (armor.current - m.max(0.0)).max(0.0);
+            if let Some(mut comp) = world.get_mut::<ArmorHp>(target) {
+                *comp = armor;
+            }
+            // Hull protected: write back the (uncarved) layout/shields and stop. HUD
+            // attribution is the entry cell's module if it is one (else `None`).
+            let struck = layout
+                .cells
+                .get(&entry_cell)
+                .and_then(|occ| occ.module.map(|mid| ModuleRef::new(occ.slot, mid)));
+            write_back(world, target, layout, shields, hull_structure);
+            return DamageOutcome {
+                struck,
+                applied: absorbed,
+                layer_reached: DefenseLayer::Armor,
+                result,
+                destroyed: false,
+                destroyed_cells: Vec::new(),
+            };
+        }
+    }
 
     // --- 5. Carve budget = the post-armor surviving magnitude ----------------
     // The Hull/Systems matrix passes from the old route-behind model are **not**

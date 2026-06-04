@@ -1,13 +1,14 @@
 //! Minimal diegetic HUD (FR-011): speed/throttle, flight-assist mode, an aiming
 //! reticle, and hit/destroy feedback — no number spam (SC-006).
 //!
-//! Phase E adds two **segmented "VU-meter" bars** at the bottom — **Energy** (the weapon
-//! capacitor; empties as you fire, recharges) and **Heat** (fills as you fire, dissipates) — read
-//! straight from the embedded server world (like the dev panel), color-graded green→amber→red with
-//! a critical pulse so you can track them in combat without looking away.
+//! Phase E added a segmented **"VU-meter"** bar at the bottom — **Energy** (the weapon capacitor;
+//! empties as you fire, recharges) — read straight from the embedded server world (like the dev
+//! panel), color-graded green→amber→red with a critical pulse so you can track it in combat without
+//! looking away. (Phase F moves **Heat** to a trapezoid **double-ramp** mesh bar — see
+//! [`crate::hud_bars`] — so it is no longer a UI VU bar here.)
 
 use bevy::prelude::*;
-use sim::components::{Energy, FlightAssist, Health, Heat, Ship, Velocity};
+use sim::components::{Energy, FlightAssist, Health, Ship, Velocity};
 use sim::damage::HitKind;
 use sim::HitFeedback;
 
@@ -17,36 +18,33 @@ use crate::net::{LoopbackHost, NetClientState};
 #[derive(Component)]
 pub struct HudText;
 
-/// Which bottom HUD pool a segment/label belongs to (Phase E).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum BarKind {
-    /// Weapon capacitor — want it FULL (empties as you fire).
-    Energy,
-    /// Heat — want it EMPTY (fills as you fire; full = overheated).
-    Heat,
-}
-
-/// One lit/unlit segment of a bottom VU-meter bar.
+/// One lit/unlit segment of the bottom Energy VU-meter bar.
 #[derive(Component)]
 pub struct BarSegment {
-    pub bar: BarKind,
     pub index: usize,
 }
 
-/// The text label (`ENRG 72/120`) at the head of a bar — the detail-on-focus layer.
+/// The text label (`ENRG 72/120`) at the head of the Energy bar — the detail-on-focus layer.
 #[derive(Component)]
-pub struct BarLabel(pub BarKind);
+pub struct BarLabel;
+
+/// The Energy net-rate readout at the RIGHT of the ENRG bar (Phase F): a direction glyph + the
+/// signed per-second rate, coloured green (charging) / red (draining) / dim (≈0).
+#[derive(Component)]
+pub struct BarRate;
 
 /// Segments per bar (the "stacked vertical bars" you count at a glance).
 const BAR_SEGMENTS: usize = 24;
 
-/// An unlit segment's colour (dim, so the lit portion reads as the level).
-fn seg_dim() -> Color {
+/// An unlit segment's colour (dim, so the lit portion reads as the level). Shared with the
+/// Phase F trapezoid bars ([`crate::hud_bars`]).
+pub(crate) fn seg_dim() -> Color {
     Color::srgb(0.12, 0.12, 0.16)
 }
 
 /// green→amber→red ramp where `bad = 0` is good (green) and `bad = 1` is critical (red).
-fn grade(bad: f32) -> Color {
+/// Shared with the Phase F trapezoid bars ([`crate::hud_bars`]).
+pub(crate) fn grade(bad: f32) -> Color {
     let b = bad.clamp(0.0, 1.0);
     if b < 0.5 {
         let k = b * 2.0; // green → amber
@@ -57,8 +55,9 @@ fn grade(bad: f32) -> Color {
     }
 }
 
-/// Scale a colour's RGB by `k` (the critical-pulse brightness oscillation).
-fn scale_rgb(c: Color, k: f32) -> Color {
+/// Scale a colour's RGB by `k` (the critical-pulse brightness oscillation). Shared with the
+/// Phase F trapezoid bars ([`crate::hud_bars`]).
+pub(crate) fn scale_rgb(c: Color, k: f32) -> Color {
     let s = c.to_srgba();
     Color::srgb(s.red * k, s.green * k, s.blue * k)
 }
@@ -84,9 +83,9 @@ pub fn setup_hud(mut commands: Commands) {
     ));
 }
 
-/// Spawn the two bottom segmented bars (Energy, Heat) — Phase E. A bottom-anchored, full-width
-/// column that centres its two rows; each row is a text label + `BAR_SEGMENTS` thin vertical
-/// segments (lit by `current/max`, coloured by `update_energy_hud`).
+/// Spawn the bottom segmented **Energy** bar (Phase E; Heat moved to the trapezoid double-ramp in
+/// Phase F). A bottom-anchored, full-width row: a text label + `BAR_SEGMENTS` thin vertical segments
+/// (lit by `current/max`, coloured by `update_energy_hud`) + the net-rate readout.
 pub fn setup_energy_bars(mut commands: Commands) {
     commands
         .spawn(Node {
@@ -95,93 +94,92 @@ pub fn setup_energy_bars(mut commands: Commands) {
             left: Val::Px(0.0),
             right: Val::Px(0.0),
             width: Val::Percent(100.0),
-            flex_direction: FlexDirection::Column,
+            flex_direction: FlexDirection::Row,
             align_items: AlignItems::Center,
-            row_gap: Val::Px(4.0),
+            justify_content: JustifyContent::Center,
+            column_gap: Val::Px(2.0),
             ..default()
         })
-        .with_children(|col| {
-            for (bar, name) in [(BarKind::Energy, "ENRG"), (BarKind::Heat, "HEAT")] {
-                col.spawn(Node {
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(2.0),
+        .with_children(|row| {
+            row.spawn((
+                Text::new("ENRG  --".to_string()),
+                TextFont {
+                    font_size: 13.0,
                     ..default()
-                })
-                .with_children(|row| {
-                    row.spawn((
-                        Text::new(format!("{name}  --")),
-                        TextFont {
-                            font_size: 13.0,
-                            ..default()
-                        },
-                        TextColor(Color::srgb(0.80, 0.90, 1.0)),
-                        Node {
-                            width: Val::Px(96.0),
-                            ..default()
-                        },
-                        BarLabel(bar),
-                    ));
-                    for index in 0..BAR_SEGMENTS {
-                        row.spawn((
-                            Node {
-                                width: Val::Px(7.0),
-                                height: Val::Px(16.0),
-                                ..default()
-                            },
-                            BackgroundColor(seg_dim()),
-                            BarSegment { bar, index },
-                        ));
-                    }
-                });
+                },
+                TextColor(Color::srgb(0.80, 0.90, 1.0)),
+                Node {
+                    width: Val::Px(96.0),
+                    ..default()
+                },
+                BarLabel,
+            ));
+            for index in 0..BAR_SEGMENTS {
+                row.spawn((
+                    Node {
+                        width: Val::Px(7.0),
+                        height: Val::Px(16.0),
+                        ..default()
+                    },
+                    BackgroundColor(seg_dim()),
+                    BarSegment { index },
+                ));
             }
+            // The Energy net-rate readout (direction glyph + signed number).
+            row.spawn((
+                Text::new(" -".to_string()),
+                TextFont {
+                    font_size: 13.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.6, 0.6, 0.65)),
+                Node {
+                    margin: UiRect::left(Val::Px(8.0)),
+                    ..default()
+                },
+                BarRate,
+            ));
         });
 }
 
-/// Refresh the bottom bars each frame from the local ship's live `Energy`/`Heat`, read from the
+/// Refresh the bottom Energy bar each frame from the local ship's live `Energy`, read from the
 /// embedded server world (like the dev panel). Lit segments = `current/max`; colour grades
-/// green→amber→red (Energy reddens as it EMPTIES, Heat as it FILLS) and the critical band pulses.
+/// green→amber→red (reddens as it EMPTIES) and the critical band pulses. (Heat now lives in the
+/// trapezoid double-ramp — [`crate::hud_bars`].)
 pub fn update_energy_hud(
     host: Option<NonSend<LoopbackHost>>,
     net: Option<NonSend<NetClientState>>,
     time: Res<Time>,
     mut segs: Query<(&BarSegment, &mut BackgroundColor)>,
-    mut labels: Query<(&BarLabel, &mut Text), Without<HudText>>,
+    mut labels: Query<&mut Text, (With<BarLabel>, Without<HudText>, Without<BarRate>)>,
+    mut rate_q: Query<(&mut Text, &mut TextColor), (With<BarRate>, Without<HudText>)>,
 ) {
-    // Resolve the local ship's pools (None until it exists / is fitted).
-    let (energy, heat) = match (host.as_ref(), net.as_ref()) {
+    // Resolve the local ship's Energy pool (None until it exists / is fitted).
+    let (energy, erate) = match (host.as_ref(), net.as_ref()) {
         (Some(host), Some(net)) => match host.server.ship_entity_for(net.local_id) {
             Some(e) => {
                 let w = host.server.world();
                 (
                     w.get::<Energy>(e).map(|p| (p.current, p.max)),
-                    w.get::<Heat>(e).map(|p| (p.current, p.max)),
+                    w.get::<Energy>(e).map(|p| p.rate),
                 )
             }
             None => (None, None),
         },
         _ => (None, None),
     };
-    let frac = |v: Option<(f32, f32)>| {
-        v.map(|(c, m)| {
-            if m > 0.0 {
-                (c / m).clamp(0.0, 1.0)
-            } else {
-                0.0
-            }
-        })
-    };
-    let efrac = frac(energy);
-    let hfrac = frac(heat);
-    // Critical-pulse brightness oscillation (0.55..=1.0), applied only in a bar's danger band.
+    let efrac = energy.map(|(c, m)| {
+        if m > 0.0 {
+            (c / m).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    });
+    // Critical-pulse brightness oscillation (0.55..=1.0), applied only in the danger band.
     let pulse = 0.55 + 0.45 * (time.elapsed_secs() * 9.0).sin().abs();
 
     for (seg, mut bg) in &mut segs {
-        let f = match seg.bar {
-            BarKind::Energy => efrac,
-            BarKind::Heat => hfrac,
-        };
-        let Some(f) = f else {
+        let Some(f) = efrac else {
             bg.0 = seg_dim();
             continue;
         };
@@ -189,26 +187,31 @@ pub fn update_energy_hud(
             bg.0 = seg_dim();
             continue;
         }
-        let (bad, critical) = match seg.bar {
-            BarKind::Energy => (1.0 - f, f < 0.2),
-            BarKind::Heat => (f, f > 0.85),
-        };
-        let mut c = grade(bad);
-        if critical {
+        let mut c = grade(1.0 - f);
+        if f < 0.2 {
             c = scale_rgb(c, pulse);
         }
         bg.0 = c;
     }
 
-    for (lbl, mut text) in &mut labels {
-        let (name, v) = match lbl.0 {
-            BarKind::Energy => ("ENRG", energy),
-            BarKind::Heat => ("HEAT", heat),
+    for mut text in &mut labels {
+        text.0 = match energy {
+            Some((c, m)) => format!("ENRG {c:>3.0}/{m:<3.0}"),
+            None => "ENRG  --".to_string(),
         };
-        text.0 = match v {
-            Some((c, m)) => format!("{name} {c:>3.0}/{m:<3.0}"),
-            None => format!("{name}  --"),
+    }
+
+    // Energy net-rate readout (right of the ENRG bar): a direction glyph + the signed rate, coloured
+    // green (charging) / red (draining) / dim (≈0) so the trend reads at a glance.
+    if let Ok((mut text, mut color)) = rate_q.single_mut() {
+        let (glyph, c, num) = match erate {
+            Some(r) if r > 1.0 => ("▲", Color::srgb(0.30, 0.90, 0.35), format!("+{r:.0}")),
+            Some(r) if r < -1.0 => ("▼", Color::srgb(0.95, 0.35, 0.25), format!("{r:.0}")),
+            Some(r) => ("–", Color::srgb(0.60, 0.60, 0.65), format!("{r:+.0}")),
+            None => ("–", Color::srgb(0.60, 0.60, 0.65), String::new()),
         };
+        text.0 = format!(" {glyph} {num}");
+        color.0 = c;
     }
 }
 

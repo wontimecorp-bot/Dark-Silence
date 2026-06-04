@@ -611,6 +611,79 @@ fn clean_penetration_carves_a_channel_to_the_module_behind() {
     );
 }
 
+/// Phase F — the depleting **armor-HP layer**: while `ArmorHp.current > 0`, a penetrating shot is
+/// SOAKED by the armor (the pool drains, the hull is NOT carved); once armor is gone the shot carves
+/// the hull as before. A target WITHOUT `ArmorHp` carves exactly as today (the `Option`-gated path
+/// every determinism/test ship takes) — proven by `clean_penetration_*` above and re-asserted here.
+#[test]
+fn armor_hp_soaks_penetrating_hits_until_depleted_then_the_hull_carves() {
+    use sim::components::ArmorHp;
+
+    // No shield (reach the armor gate directly), thin facet (the shot penetrates the plate angle).
+    let (mut w, ship) = fitted_world(None, thin_entry_facet);
+    // Give the ship a partial armor-HP pool (50 of 80) so a hit both depletes AND leaves some.
+    w.entity_mut(ship).insert(ArmorHp {
+        current: 50.0,
+        max: 80.0,
+    });
+
+    // The cell set before any shot — to prove armor protects the hull (no cells removed).
+    let cells_before = w.get::<FitLayout>(ship).unwrap().cells.len();
+
+    // A strong clean penetration that WOULD carve a deep channel if armor were absent.
+    let strong = downward_shot(Channel::Em, 4000.0, 1000.0, 0.0);
+    let out = apply_damage(&mut w, ship, strong);
+    assert!(
+        matches!(out.result, HitKind::Penetrated | HitKind::OverPenetrated),
+        "the shot penetrated the shield + plate angle (got {:?})",
+        out.result
+    );
+    // Armor held → NO carve: no cells destroyed, the layout is intact.
+    assert!(!out.destroyed, "armor soaks the hit — nothing carves");
+    assert!(
+        out.destroyed_cells.is_empty(),
+        "no cells removed while armor holds"
+    );
+    assert_eq!(
+        w.get::<FitLayout>(ship).unwrap().cells.len(),
+        cells_before,
+        "the hull is protected while armor holds (no cells removed)"
+    );
+    // The armor pool drained.
+    let after = w.get::<ArmorHp>(ship).unwrap().current;
+    assert!(
+        after < 50.0,
+        "the penetrating hit depleted ArmorHp (got {after})"
+    );
+
+    // Deplete the rest of the armor and fire again → the carve RESUMES on the bare hull.
+    w.get_mut::<ArmorHp>(ship).unwrap().current = 0.0;
+    let strong2 = downward_shot(Channel::Em, 4000.0, 1000.0, 0.0);
+    let out2 = apply_damage(&mut w, ship, strong2);
+    assert!(
+        out2.destroyed,
+        "with armor gone the shot carves the hull again (got {:?})",
+        out2.result
+    );
+    assert!(
+        !out2.destroyed_cells.is_empty(),
+        "cells are removed once armor is depleted"
+    );
+
+    // CONTROL: the SAME shot on a ship WITHOUT ArmorHp carves immediately (the Option-gated,
+    // byte-identical headless path) — so the gate only engages when the component is present.
+    let (mut wc, shipc) = fitted_world(None, thin_entry_facet);
+    let outc = apply_damage(
+        &mut wc,
+        shipc,
+        downward_shot(Channel::Em, 4000.0, 1000.0, 0.0),
+    );
+    assert!(
+        outc.destroyed,
+        "a ship with no ArmorHp carves as today (no armor gate)"
+    );
+}
+
 // =================================================================================
 // US2 — emergent damage: per-module live health scales the derived ShipStats
 // (T024/T025). `derive_ship_stats` reads each module's `FitLayout` cell health, so a

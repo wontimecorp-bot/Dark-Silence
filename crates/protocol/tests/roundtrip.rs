@@ -74,6 +74,7 @@ fn client_input_full_tail_roundtrips() {
             turn: [0i8, 1, -1][i % 3],
             fire: i % 2 == 0,
             toggle_assist: i % 3 == 0,
+            afterburner: i % 4 == 0,
         })
         .collect();
     assert_eq!(inputs.len(), MAX_INPUT_TAIL);
@@ -90,6 +91,7 @@ fn client_input_tail_is_capped() {
             turn: -1,
             fire: false,
             toggle_assist: false,
+            afterburner: false,
         })
         .collect();
     let ci = ClientInput::new(1, 1, inputs);
@@ -191,6 +193,7 @@ fn intent_roundtrips_through_quantized_form() {
         turn: 0.0,
         fire: true,
         toggle_assist: false,
+        afterburner: true,
     };
     let q: QuantizedIntent = intent.into();
     let back: ShipIntent = q.into();

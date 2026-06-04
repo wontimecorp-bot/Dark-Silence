@@ -59,6 +59,7 @@ fn client_scripts() -> Vec<InputScript> {
         turn: 0,
         fire: true,
         toggle_assist: false,
+        afterburner: false,
     };
     vec![
         InputScript::constant(forward_fire),
@@ -75,6 +76,7 @@ fn bot_ship_intent() -> sim::ShipIntent {
         turn: 1.0,
         fire: true,
         toggle_assist: false,
+        afterburner: false,
     }
 }
 

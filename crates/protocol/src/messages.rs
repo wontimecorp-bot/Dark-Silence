@@ -141,6 +141,8 @@ pub struct QuantizedIntent {
     pub fire: bool,
     /// Toggle flight-assist this step.
     pub toggle_assist: bool,
+    /// Phase F — hold the afterburner (boost) this step.
+    pub afterburner: bool,
 }
 
 /// Quantize an analog axis in `-1.0..=1.0` to the nearest of −1/0/+1.
@@ -162,6 +164,7 @@ impl From<ShipIntent> for QuantizedIntent {
             turn: quantize_axis(intent.turn),
             fire: intent.fire,
             toggle_assist: intent.toggle_assist,
+            afterburner: intent.afterburner,
         }
     }
 }
@@ -174,6 +177,7 @@ impl From<QuantizedIntent> for ShipIntent {
             turn: q.turn as f32,
             fire: q.fire,
             toggle_assist: q.toggle_assist,
+            afterburner: q.afterburner,
         }
     }
 }

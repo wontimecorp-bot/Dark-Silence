@@ -109,6 +109,7 @@ fn every_snapshot_for_the_baseline_world_fits_the_mtu() {
         turn: 0,
         fire: true,
         toggle_assist: false,
+        afterburner: false,
     };
 
     let mut largest = 0usize;

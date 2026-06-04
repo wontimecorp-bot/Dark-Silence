@@ -8,12 +8,14 @@
 //! ballistic and the integrator↔analytic invariant is untouched.
 
 use crate::clock::FixedDt;
-use crate::components::{AngularVelocity, FlightAssist, Heading, Position, Ship, Velocity};
+use crate::components::{
+    Afterburner, AngularVelocity, FlightAssist, Heading, Position, Ship, Velocity,
+};
 use crate::damage::Wreck;
 use crate::fitting::ShipStats;
 use crate::intent::ShipIntent;
 use crate::motion::{integrate, BodyState};
-use crate::tuning::Tuning;
+use crate::tuning::{SimTuning, Tuning};
 use bevy_ecs::prelude::*;
 use glam::Vec2;
 
@@ -122,6 +124,8 @@ pub fn linear_accel(vel: Vec2, thrust: Vec2, drag: f32, mass: f32) -> Vec2 {
 pub fn ship_motion_system(
     tuning: Res<Tuning>,
     dt: Res<FixedDt>,
+    // Phase F: live afterburner boost factor (absent → const default; absent pool → no boost).
+    sim: Option<Res<SimTuning>>,
     // Fitted ships: per-entity ShipStats override the global Tuning.
     mut fitted: Query<
         (
@@ -132,6 +136,8 @@ pub fn ship_motion_system(
             &mut AngularVelocity,
             &mut FlightAssist,
             &ShipStats,
+            // Phase F: the afterburner pool (only LIVE ships carry it; absent → no boost).
+            Option<&Afterburner>,
         ),
         With<Ship>,
     >,
@@ -149,14 +155,21 @@ pub fn ship_motion_system(
     >,
 ) {
     let dt = dt.0;
+    let boost_factor = sim.map_or(SimTuning::default().afterburner_boost_factor, |s| {
+        s.afterburner_boost_factor
+    });
 
     // Fitted: each ship uses its own fit-derived stats.
-    for (intent, mut pos, mut vel, mut heading, mut omega, mut assist, stats) in &mut fitted {
+    for (intent, mut pos, mut vel, mut heading, mut omega, mut assist, stats, ab) in &mut fitted {
         let params = FlightParams::from_ship_stats(stats);
+        // Phase F: boost translational thrust while the afterburner is held AND has charge.
+        let boosting = intent.afterburner && ab.is_some_and(|a| a.current > 0.0);
+        let boost = if boosting { 1.0 + boost_factor } else { 1.0 };
         step_ship_motion(
             &params,
             dt,
             intent,
+            boost,
             &mut pos,
             &mut vel,
             &mut heading,
@@ -165,13 +178,14 @@ pub fn ship_motion_system(
         );
     }
 
-    // Unfitted: fall back to the single global Tuning.
+    // Unfitted: fall back to the single global Tuning (no afterburner → boost 1.0).
     let fallback = FlightParams::from_tuning(&tuning);
     for (intent, mut pos, mut vel, mut heading, mut omega, mut assist) in &mut unfitted {
         step_ship_motion(
             &fallback,
             dt,
             intent,
+            1.0,
             &mut pos,
             &mut vel,
             &mut heading,
@@ -190,6 +204,9 @@ fn step_ship_motion(
     p: &FlightParams,
     dt: f32,
     intent: &ShipIntent,
+    // Phase F — translational thrust multiplier (`1.0` normally, `1 + afterburner_boost_factor`
+    // while boosting). Affects forward + strafe only, never turning.
+    boost: f32,
     pos: &mut Position,
     vel: &mut Velocity,
     heading: &mut Heading,
@@ -205,12 +222,15 @@ fn step_ship_motion(
 
     let nose = Vec2::from_angle(heading.0);
     let left = Vec2::new(-nose.y, nose.x);
-    // Reverse uses the weaker retro thrusters.
-    let fwd_force = if intent.forward >= 0.0 {
-        p.thrust_force
-    } else {
-        p.reverse_force
-    };
+    // Reverse uses the weaker retro thrusters. Phase F: the afterburner `boost` scales the
+    // translational forces (applied BEFORE the turn-power penalty in the assisted branch).
+    let fwd_force = boost
+        * if intent.forward >= 0.0 {
+            p.thrust_force
+        } else {
+            p.reverse_force
+        };
+    let strafe_force = p.strafe_force * boost;
 
     let accel = match *assist {
         FlightAssist::On => {
@@ -225,7 +245,7 @@ fn step_ship_motion(
             heading.0 += omega.0 * dt;
             let power = turn_power_factor(intent.turn, p.turn_power_share);
             let thrust = (nose * (intent.forward * fwd_force)
-                + left * (intent.strafe * p.strafe_force))
+                + left * (intent.strafe * strafe_force))
                 * power;
             linear_accel(vel.0, thrust, p.linear_drag, p.mass)
         }
@@ -234,7 +254,7 @@ fn step_ship_motion(
             omega.0 = intent.turn * p.max_turn_rate();
             heading.0 += omega.0 * dt;
             let thrust =
-                nose * (intent.forward * fwd_force) + left * (intent.strafe * p.strafe_force);
+                nose * (intent.forward * fwd_force) + left * (intent.strafe * strafe_force);
             thrust / p.mass
         }
     };

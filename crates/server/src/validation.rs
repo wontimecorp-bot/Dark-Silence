@@ -53,6 +53,8 @@ pub struct ValidatedIntent {
     /// Toggle flight-assist this step. Any boolean is in-bounds, so it is
     /// accepted as-is (TR-020).
     pub toggle_assist: bool,
+    /// Phase F — hold the afterburner this step. Accepted as-is (any boolean in-bounds).
+    pub afterburner: bool,
 }
 
 impl From<ValidatedIntent> for ShipIntent {
@@ -63,6 +65,7 @@ impl From<ValidatedIntent> for ShipIntent {
             turn: v.turn,
             fire: v.fire,
             toggle_assist: v.toggle_assist,
+            afterburner: v.afterburner,
         }
     }
 }
@@ -93,6 +96,7 @@ pub fn validate_input(intent: &QuantizedIntent) -> ValidatedIntent {
         turn: clamp_axis(intent.turn),
         fire: intent.fire,
         toggle_assist: intent.toggle_assist,
+        afterburner: intent.afterburner,
     }
 }
 
@@ -303,6 +307,7 @@ mod tests {
             turn,
             fire,
             toggle_assist: toggle,
+            afterburner: false,
         }
     }
 
@@ -351,6 +356,7 @@ mod tests {
             turn: 1.0,
             fire: true,
             toggle_assist: false,
+            afterburner: false,
         };
         let intent: ShipIntent = apply_authoritative(v);
         assert_eq!(intent.forward, 0.5);

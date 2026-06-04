@@ -127,6 +127,7 @@ fn case1_out_of_bounds_axes_are_clamped_to_the_bound() {
         turn: 100,        // → clamps to +1
         fire: false,
         toggle_assist: false,
+        afterburner: false,
     };
     client.send_unreliable(
         conn,
@@ -146,6 +147,7 @@ fn case1_out_of_bounds_axes_are_clamped_to_the_bound() {
         turn: 1,
         fire: false,
         toggle_assist: false,
+        afterburner: false,
     };
     ref_client.send_unreliable(
         ref_conn,
@@ -190,6 +192,7 @@ fn case2_excessive_fire_rate_produces_no_extra_projectile() {
         turn: 0,
         fire: true,
         toggle_assist: false,
+        afterburner: false,
     };
 
     const TICKS: u32 = 6; // one cooldown window at 30 Hz
@@ -227,6 +230,7 @@ fn case3_replayed_and_stale_inputs_are_discarded_state_unmutated() {
         turn: 0,
         fire: false,
         toggle_assist: false,
+        afterburner: false,
     };
     client.send_unreliable(
         conn,
@@ -331,6 +335,7 @@ fn case4_client_cannot_assert_position_motion_comes_only_from_the_sim() {
         turn: 0,
         fire: false,
         toggle_assist: false,
+        afterburner: false,
     };
     let _typecheck: fn(u32, u32, Vec<QuantizedIntent>) -> ClientInput = ClientInput::new;
 

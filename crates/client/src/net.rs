@@ -53,11 +53,14 @@ use protocol::{
     NetTransport, CLIENT_TOKEN_BYTES,
 };
 use server::{RenderEntity, ServerApp, PROTOCOL_VERSION};
-use sim::components::{CollisionRadius, Destructible, Energy, Heat, TargetKind, Velocity};
+use sim::components::{
+    Afterburner, ArmorHp, CollisionRadius, Destructible, Energy, Heat, TargetKind, Velocity,
+};
 use sim::damage::seed_defense_layers;
 use sim::fitting::{
     build_layout, derive_ship_stats, hull_collision_radius, seed_catalogs, Fit, SlotId,
-    HULL_FIGHTER, MODULE_AUTOCANNON, MODULE_REACTOR_BASIC, MODULE_THRUSTER_BASIC,
+    HULL_FIGHTER, MODULE_ARMOR_PLATE, MODULE_AUTOCANNON, MODULE_REACTOR_BASIC,
+    MODULE_THRUSTER_BASIC,
 };
 use sim::{FixedDt, HitFeedback, ShipIntent};
 
@@ -327,12 +330,14 @@ fn attach_starter_fit(server: &mut ServerApp, local_id: EntityId) {
 
     // Build the starter loadout on the fighter via the validate-then-apply install
     // (so the fit is guaranteed legal / within budget). Slot layout:
-    // 0 Reactor, 1+2 Thruster, 3 Weapon.
+    // 0 Reactor, 1+2 Thruster, 3 Weapon, 5 Armor (Phase F — gives the player an armor-HP
+    // layer to show + deplete; mass/cpu/power all stay within the fighter's budget).
     let mut fit = Fit::new(HULL_FIGHTER);
     let _ = fit.install_module(SlotId(0), MODULE_REACTOR_BASIC, &hull, &modules);
     let _ = fit.install_module(SlotId(1), MODULE_THRUSTER_BASIC, &hull, &modules);
     let _ = fit.install_module(SlotId(2), MODULE_THRUSTER_BASIC, &hull, &modules);
     let _ = fit.install_module(SlotId(3), MODULE_AUTOCANNON, &hull, &modules);
+    let _ = fit.install_module(SlotId(5), MODULE_ARMOR_PLATE, &hull, &modules);
 
     // Build the full-health hit/armor map first, then derive stats against it
     // (E007 BREAKING-CHANGE: derive_ship_stats now reads per-cell health). At full
@@ -374,6 +379,11 @@ fn attach_starter_fit(server: &mut ServerApp, local_id: EntityId) {
             // just the spawn seeds (full charge, no heat). Only live ships carry them.
             Energy::seed(stats.power_supply),
             Heat::seed(),
+            // Phase F: the afterburner pool (full) + the depleting armor-HP layer (full at
+            // `armor_value`). `apply_damage` soaks penetrating hits into ArmorHp before carving
+            // the hull, so the hull is protected while armor holds.
+            Afterburner::seed(),
+            ArmorHp::seed(stats.armor_value),
         ));
     }
 }

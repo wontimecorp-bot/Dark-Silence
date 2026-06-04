@@ -86,6 +86,7 @@ fn out_of_bounds_axis_is_clamped_when_driven_over_loopback() {
         turn: 0,
         fire: false,
         toggle_assist: false,
+        afterburner: false,
     };
 
     // Drive the same hostile input each tick over the wire (increasing seq so the
@@ -156,6 +157,7 @@ fn excessive_fire_rate_is_gated_when_driven_over_loopback() {
         turn: 0,
         fire: true,
         toggle_assist: false,
+        afterburner: false,
     };
 
     const TICKS_WITHIN_ONE_COOLDOWN: u32 = 6; // 6 * 33.3 ms ≈ 200 ms = one cooldown

@@ -181,6 +181,7 @@ fn replayed_and_stale_inputs_are_discarded_logged_and_mutate_no_state() {
         turn: 0,
         fire: false,
         toggle_assist: false,
+        afterburner: false,
     };
     client.send_unreliable(
         conn,

@@ -50,6 +50,8 @@ pub fn read_input(keys: Res<ButtonInput<KeyCode>>, mut q: Query<&mut ShipIntent,
     intent.strafe = strafe;
     intent.turn = turn;
     intent.fire = keys.pressed(KeyCode::Space);
+    // Phase F: hold Left Shift to afterburner (boost). Held, not edge-triggered.
+    intent.afterburner = keys.pressed(KeyCode::ShiftLeft);
     // Assist toggle is handled client-side (below) to avoid fixed-step timing
     // edges, so the sim-level intent flag stays false here.
     intent.toggle_assist = false;

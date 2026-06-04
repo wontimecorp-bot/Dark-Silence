@@ -49,6 +49,7 @@ fn neutral() -> QuantizedIntent {
         turn: 0,
         fire: false,
         toggle_assist: false,
+        afterburner: false,
     }
 }
 
