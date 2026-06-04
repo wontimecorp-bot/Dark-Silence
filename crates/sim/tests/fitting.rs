@@ -58,6 +58,7 @@ fn test_module(
 ) -> Module {
     Module {
         id: ModuleId(id),
+        name: "test".to_string(),
         kind,
         power_gen: costs.power_gen,
         power_draw: costs.power_draw,
@@ -84,6 +85,8 @@ fn test_hull(
     Hull {
         id: HullId(900),
         name: "TestHull".to_string(),
+        class: sim::fitting::ShipClass::Fighter,
+        role: sim::fitting::ShipRole::Utility,
         grid_dims: (2, 2),
         cells: vec![GridCell::new((0, 0), SectionId(0))],
         power_capacity,
@@ -659,6 +662,7 @@ mod stats_phase4 {
             fire_rate,
             damage,
             projectile_mass,
+            .. // Phase C added class/ammo/damage_type/secondary — not asserted here.
         } = cannon.specifics
         {
             assert_eq!(profile.muzzle_speed, muzzle_speed);

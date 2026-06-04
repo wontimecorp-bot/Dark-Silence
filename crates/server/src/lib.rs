@@ -48,9 +48,9 @@ use sim::damage::{
     Shields, StatScalingConfig, Wreck,
 };
 use sim::fitting::{
-    build_layout, derive_ship_stats, hull_collision_radius, seed_catalogs, Fit, FitLayout,
-    HullCatalog, ModuleCatalog, SlotId, HULL_FIGHTER, MODULE_ARMOR_PLATE, MODULE_AUTOCANNON,
-    MODULE_REACTOR_BASIC, MODULE_THRUSTER_BASIC,
+    build_layout, derive_ship_stats, hull_collision_radius, parse_catalogs, seed_catalogs, Fit,
+    FitLayout, HullCatalog, ModuleCatalog, SlotId, HULL_FIGHTER, MODULE_ARMOR_PLATE,
+    MODULE_AUTOCANNON, MODULE_REACTOR_BASIC, MODULE_THRUSTER_BASIC,
 };
 use sim::{FixedDt, HitFeedback, ShipIntent, SimTuning, Tuning};
 
@@ -320,12 +320,40 @@ fn hit_dir_of(hit: Option<&LastShieldHit>) -> Vec2 {
     }
 }
 
+/// Phase C3 — load the ship/module catalogs from **external RON** (edit content with no recompile),
+/// or fall back to the embedded default ([`seed_catalogs`]). The content directory is
+/// `$DARK_SILENCE_CONTENT` if set, else `assets/content/` relative to the current working directory
+/// (the workspace root for `cargo run`). On a missing dir / unreadable file / parse error the
+/// embedded default is used (logged on parse error), so a bad edit never breaks startup. This is the
+/// ONLY filesystem read in the gameplay path — the deterministic `sim` crate stays IO-free
+/// ([`parse_catalogs`] is pure). Determinism/botkit tests run unfitted ships, so they are unaffected
+/// regardless of which path is taken.
+fn load_content_or_default() -> (ModuleCatalog, HullCatalog) {
+    let dir = std::env::var_os("DARK_SILENCE_CONTENT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("assets/content"));
+    if let (Ok(m), Ok(s)) = (
+        std::fs::read_to_string(dir.join("modules.ron")),
+        std::fs::read_to_string(dir.join("ships.ron")),
+    ) {
+        match parse_catalogs(&m, &s) {
+            Ok(catalogs) => {
+                eprintln!("[content] loaded external RON from {}", dir.display());
+                return catalogs;
+            }
+            Err(e) => eprintln!("[content] external RON invalid ({e}); using embedded default"),
+        }
+    }
+    // Dir absent / unreadable (the common case for tests + a packaged build) → embedded default.
+    seed_catalogs()
+}
+
 /// The [`RenderCell::kind`] color/role code for one [`CellOccupant`] (Phase 1B,
 /// client-only):
 /// - a **structural** filler cell → `0` (the hull tint);
-/// - a **module** cell → `1..=6` by the installed module's [`ModuleKind`] resolved
+/// - a **module** cell → `1..=7` by the installed module's [`ModuleKind`] resolved
 ///   through `modules`: reactor `1`, thruster `2`, weapon `3`, shield `4`, armor `5`,
-///   utility `6`.
+///   utility `6`, sensor `7`.
 ///
 /// A module cell whose module is `None` or whose id does not resolve in the catalog
 /// (an empty hardpoint, or a defensive dangling ref) falls back to `0` — it reads as
@@ -343,6 +371,7 @@ fn render_cell_kind(occ: &sim::fitting::CellOccupant, modules: &ModuleCatalog) -
         Some(ModuleKind::Shield) => 4,
         Some(ModuleKind::Armor) => 5,
         Some(ModuleKind::Utility) => 6,
+        Some(ModuleKind::Sensor) => 7,
         // Empty module-slot cell or unresolved id → render as plating (no panic).
         None => 0,
     }
@@ -465,7 +494,9 @@ impl ServerApp {
         // resources**, not entities — so the determinism + botkit comparisons (which
         // read per-ship `sim` state) stay bit-identical. This is the change that makes
         // the live damage pipeline resolve for a fitted player ship + demo enemy.
-        let (modules, hulls) = seed_catalogs();
+        // Phase C3: load external RON content if present (edit ships/modules with no recompile),
+        // else the embedded default. Determinism/botkit are unaffected (unfitted ships).
+        let (modules, hulls) = load_content_or_default();
         world.insert_resource(hulls);
         world.insert_resource(modules);
         world.insert_resource(default_resistance_matrix());

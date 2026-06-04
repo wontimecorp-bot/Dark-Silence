@@ -42,17 +42,17 @@ pub mod stats;
 pub mod validate;
 
 pub use content::{
-    baseline_fit, baseline_hull, seed_catalogs, HullCatalog, ModuleCatalog, HULL_BASELINE,
-    HULL_CORVETTE, HULL_FIGHTER, MODULE_ARMOR_PLATE, MODULE_AUTOCANNON, MODULE_BASELINE_THRUSTER,
-    MODULE_REACTOR_BASIC, MODULE_SHIELD_BASIC, MODULE_THRUSTER_BASIC, MODULE_UTILITY_BASIC,
-    STRUCT_CELL_MASS,
+    baseline_fit, baseline_hull, parse_catalogs, seed_catalogs, HullCatalog, ModuleCatalog,
+    HULL_BASELINE, HULL_CORVETTE, HULL_FIGHTER, MODULE_ARMOR_PLATE, MODULE_AUTOCANNON,
+    MODULE_BASELINE_THRUSTER, MODULE_REACTOR_BASIC, MODULE_SHIELD_BASIC, MODULE_THRUSTER_BASIC,
+    MODULE_UTILITY_BASIC, STRUCT_CELL_MASS,
 };
 pub use fit::{
     load_preset, preview_stats, save_preset, Fit, FitPreset, FitRejection, ModuleRef, PresetId,
 };
 pub use hull::{
-    hull_collision_radius, FiringArc, GridCell, Hull, HullId, SectionId, Slot, SlotId,
-    CELL_WORLD_SIZE,
+    hull_collision_radius, FiringArc, GridCell, Hull, HullId, SectionId, ShipClass, ShipRole, Slot,
+    SlotId, CELL_WORLD_SIZE,
 };
 pub use layout::{
     build_layout, build_layout_with, cell_map, cell_mass, cell_mass_with, center_or_anchor,
@@ -61,7 +61,8 @@ pub use layout::{
     HitResolution,
 };
 pub use module::{
-    Axis, HardpointType, Module, ModuleId, ModuleKind, ModuleSpecifics, SlotSize, Violation,
+    AmmoType, Axis, HardpointType, Module, ModuleId, ModuleKind, ModuleSpecifics, PropulsionType,
+    SensorType, SlotSize, Violation, WeaponClass,
 };
 pub use stats::{derive_ship_stats, derive_ship_stats_with, ShipStats, WeaponProfile};
 pub use validate::{

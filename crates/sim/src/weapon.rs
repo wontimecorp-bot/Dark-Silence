@@ -94,10 +94,24 @@ impl WeaponSource {
     }
 
     /// [`from_damage`] with explicit penetration scaling + slug size (Phase M6 live tuning):
-    /// `penetration = damage · pen_per_damage`, `pen_size = pen_size`.
+    /// `penetration = damage · pen_per_damage`, `pen_size = pen_size`. Channel is
+    /// [`Channel::Kinetic`] (the unfitted/legacy default); fitted weapons use
+    /// [`from_damage_typed`](WeaponSource::from_damage_typed) with their own channel.
     pub fn from_damage_with(damage: f32, pen_per_damage: f32, pen_size: f32) -> Self {
+        Self::from_damage_typed(Channel::Kinetic, damage, pen_per_damage, pen_size)
+    }
+
+    /// Phase C — [`from_damage_with`] with an explicit damage [`Channel`] from the fitted weapon's
+    /// `damage_type` (a fitted ship's `WeaponProfile::channel`). A weapon typed `Kinetic` is
+    /// byte-identical to the old hardcoded path.
+    pub fn from_damage_typed(
+        channel: Channel,
+        damage: f32,
+        pen_per_damage: f32,
+        pen_size: f32,
+    ) -> Self {
         Self {
-            channel: Channel::Kinetic,
+            channel,
             penetration: damage.max(0.0) * pen_per_damage,
             pen_size,
         }
@@ -230,10 +244,16 @@ pub fn weapon_fire_system(
                 ProjectileMass(profile.projectile_mass),
                 Lifetime(sim.projectile_lifetime),
                 ProjectileOwner(owner),
-                // E007 damage typing (T037): the fixed-forward gun is Kinetic with penetration
-                // derived from the shot damage (M6: live `pen_per_damage`/`pen_size`). Harmless on
-                // a shot that only ever hits an unfitted target (the legacy path ignores it).
-                WeaponSource::from_damage_with(profile.damage, sim.pen_per_damage, sim.pen_size),
+                // E007 damage typing (T037) + Phase C: the shot carries the fitted weapon's own
+                // damage `Channel` (`profile.channel`) with penetration derived from the shot
+                // damage (M6: live `pen_per_damage`/`pen_size`). Seed autocannon = Kinetic →
+                // byte-identical to the old hardcoded path.
+                WeaponSource::from_damage_typed(
+                    profile.channel,
+                    profile.damage,
+                    sim.pen_per_damage,
+                    sim.pen_size,
+                ),
             ));
             // Phase M4/M5 recoil: conserve momentum against the MUZZLE component only (the inherited
             // part was already the ship's momentum), using the per-weapon slug mass.

@@ -129,6 +129,7 @@ pub fn module_palette(kind: u8) -> Color {
         4 => Color::srgb(0.24, 0.66, 0.96), // Shield — cyan
         5 => Color::srgb(0.72, 0.74, 0.78), // Armor — bright steel
         6 => Color::srgb(0.52, 0.86, 0.42), // Utility — green
+        7 => Color::srgb(0.62, 0.40, 0.92), // Sensor — violet (Phase C4)
         _ => HULL_COLOR,                    // 0 / unknown — structural plating
     }
 }
@@ -1366,9 +1367,9 @@ mod contour_tests {
 
     #[test]
     fn module_palette_is_distinct_per_kind() {
-        // Structural (0) reuses the hull color; the six module kinds are pairwise distinct.
+        // Structural (0) reuses the hull color; the seven module kinds are pairwise distinct.
         assert_eq!(module_palette(0), HULL_COLOR);
-        let kinds = [0u8, 1, 2, 3, 4, 5, 6];
+        let kinds = [0u8, 1, 2, 3, 4, 5, 6, 7];
         for (i, &a) in kinds.iter().enumerate() {
             for &b in &kinds[i + 1..] {
                 assert_ne!(

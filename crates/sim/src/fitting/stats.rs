@@ -34,7 +34,7 @@ use super::fit::Fit;
 use super::hull::Hull;
 use super::layout::{layout_mass_with, CellOccupant, FitLayout};
 use super::module::{Module, ModuleKind, ModuleSpecifics};
-use crate::damage::StatScalingConfig;
+use crate::damage::{Channel, StatScalingConfig};
 use crate::tuning::Tuning;
 
 /// Smallest thrust force a fit can derive to (FR-017): no thruster ⇒ this floor,
@@ -61,6 +61,10 @@ pub const REVERSE_FRACTION: f32 = 0.5;
 /// [`ModuleSpecifics::Weapon`], plus the per-shot `damage`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WeaponProfile {
+    /// Phase C — the damage [`Channel`] this weapon deals (from the weapon module's
+    /// `damage_type`). The fire path stamps it onto the projectile so the armor/resistance
+    /// system mitigates by the real channel instead of a hardcoded `Kinetic`.
+    pub channel: Channel,
     /// Projectile launch speed (`> 0`).
     pub muzzle_speed: f32,
     /// Shots per second (`> 0`).
@@ -297,6 +301,7 @@ pub fn derive_ship_stats_with(
                 thrust_force: t,
                 turn_torque: tq,
                 strafe_force: s,
+                .. // `propulsion` tag is categorization only — not used in derivation.
             } => {
                 // Thruster outputs scale with health (FR-012): a battered drive
                 // gives less thrust/torque/strafe; a destroyed one (hf == 0) none.
@@ -309,12 +314,15 @@ pub fn derive_ship_stats_with(
             // `can_fire` stays false; the surviving profile's `damage` scales by hf
             // (at full health hf == 1.0 → identical, baseline-preserving).
             ModuleSpecifics::Weapon {
+                damage_type,
                 muzzle_speed,
                 fire_rate,
                 damage,
                 projectile_mass,
+                .. // `class`/`ammo`/`secondary_damage_type` are not consumed by derivation yet.
             } if module.kind == ModuleKind::Weapon && weapon.is_none() && hf > 0.0 => {
                 weapon = Some(WeaponProfile {
+                    channel: damage_type,
                     muzzle_speed,
                     fire_rate,
                     damage: damage * hf,

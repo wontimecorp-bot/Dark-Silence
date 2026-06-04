@@ -10,6 +10,9 @@ glam.workspace = true
 serde.workspace = true
 bevy_ecs.workspace = true
 rapier2d.workspace = true
+# Parse the embedded/loaded RON content catalogs (Phase C). Pure (de)serialization,
+# no filesystem IO — `sim` stays engine-agnostic/deterministic; the `server` reads files.
+ron.workspace = true
 
 [dev-dependencies]
 # A concrete serde format, used only to exercise the serialize -> deserialize

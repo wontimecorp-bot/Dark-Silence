@@ -828,6 +828,8 @@ fn corridor_hull() -> Hull {
     Hull {
         id: HULL_CORRIDOR,
         name: "Corridor".to_string(),
+        class: sim::fitting::ShipClass::Fighter,
+        role: sim::fitting::ShipRole::Utility,
         grid_dims: (5, 3),
         cells,
         power_capacity: 100.0,
@@ -1182,6 +1184,7 @@ use sim::fitting::{Module, ModuleId, ModuleKind, ModuleSpecifics};
 fn salvage_module(id: ModuleId, health_max: f32, mass: f32) -> Module {
     Module {
         id,
+        name: "salvage".to_string(),
         kind: ModuleKind::Utility,
         power_gen: 0.0,
         power_draw: 0.0,
@@ -1199,7 +1202,7 @@ fn salvage_module(id: ModuleId, health_max: f32, mass: f32) -> Module {
 fn catalog_of(modules: &[Module]) -> ModuleCatalog {
     let mut catalog = ModuleCatalog::default();
     for m in modules {
-        catalog.modules.insert(m.id, *m);
+        catalog.modules.insert(m.id, m.clone());
     }
     catalog
 }
@@ -1235,7 +1238,7 @@ fn clean_sever_yields_intact_through_kill_yields_scrap() {
     let cfg = SalvageConfig::default(); // intact_fraction 0.5, floor 1.0, per_mass 1.0
     let id = ModuleId(101);
     let module = salvage_module(id, 40.0, 7.0); // threshold = 0.5 * 40 = 20.0
-    let catalog = catalog_of(&[module]);
+    let catalog = catalog_of(std::slice::from_ref(&module));
 
     // --- The boundary itself (intact_threshold, INV-D12) ----------------------
     // At/above the threshold (clean sever) → intact.
@@ -1325,6 +1328,8 @@ fn salvage_world(module_health: f32) -> (World, Entity, ModuleId) {
     let hull = Hull {
         id: HullId(9),
         name: "Salvage".to_string(),
+        class: sim::fitting::ShipClass::Fighter,
+        role: sim::fitting::ShipRole::Utility,
         grid_dims: (3, 1),
         cells: vec![
             GridCell::new((0, 0), SectionId(1)), // the module's (survivor) section
@@ -3062,6 +3067,8 @@ fn offcenter_hull() -> Hull {
     Hull {
         id: HULL_OFFCENTER,
         name: "Offcenter".to_string(),
+        class: sim::fitting::ShipClass::Fighter,
+        role: sim::fitting::ShipRole::Utility,
         grid_dims: (9, 5),
         cells,
         power_capacity: 100.0,
@@ -3387,6 +3394,8 @@ fn thinsliver_hull() -> Hull {
     Hull {
         id: HULL_THINSLIVER,
         name: "ThinSliver".to_string(),
+        class: sim::fitting::ShipClass::Fighter,
+        role: sim::fitting::ShipRole::Utility,
         grid_dims: (5, 5),
         cells,
         power_capacity: 100.0,
@@ -3592,6 +3601,8 @@ fn repro_ship_hull() -> Hull {
     Hull {
         id: HULL_REPRO_SHIP,
         name: "ReproShip".to_string(),
+        class: sim::fitting::ShipClass::Fighter,
+        role: sim::fitting::ShipRole::Utility,
         grid_dims: (5, 5),
         cells,
         power_capacity: 100.0,
@@ -3609,6 +3620,8 @@ fn repro_chunk_hull() -> Hull {
     Hull {
         id: HULL_REPRO_CHUNK,
         name: "ReproChunk".to_string(),
+        class: sim::fitting::ShipClass::Fighter,
+        role: sim::fitting::ShipRole::Utility,
         grid_dims: (1, 1),
         cells: vec![GridCell::new((0, 0), SectionId(0))],
         power_capacity: 100.0,
@@ -3813,6 +3826,8 @@ fn offrow_hull() -> Hull {
     Hull {
         id: HULL_OFFROW,
         name: "Offrow".to_string(),
+        class: sim::fitting::ShipClass::Fighter,
+        role: sim::fitting::ShipRole::Utility,
         grid_dims: (9, 5),
         cells,
         power_capacity: 100.0,
@@ -4000,6 +4015,8 @@ fn wedge_hull() -> Hull {
     Hull {
         id: HULL_WEDGE,
         name: "Wedge".to_string(),
+        class: sim::fitting::ShipClass::Fighter,
+        role: sim::fitting::ShipRole::Utility,
         grid_dims: (11, 11),
         cells,
         power_capacity: 100.0,
@@ -4383,6 +4400,8 @@ fn bar5_hull() -> Hull {
     Hull {
         id: HULL_BAR5,
         name: "Bar5".to_string(),
+        class: sim::fitting::ShipClass::Fighter,
+        role: sim::fitting::ShipRole::Utility,
         grid_dims: (6, 5),
         cells,
         power_capacity: 100.0,

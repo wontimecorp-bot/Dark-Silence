@@ -401,6 +401,7 @@ fn build_equipment(fit: &Fit, catalog: Option<&ModuleCatalog>) -> (Vec<Equipment
             thrust_force,
             turn_torque,
             strafe_force,
+            .. // Phase C `propulsion` tag — not surfaced in the readout.
         } = &m.specifics
         {
             t.thrust += *thrust_force;
@@ -429,6 +430,7 @@ fn build_equipment(fit: &Fit, catalog: Option<&ModuleCatalog>) -> (Vec<Equipment
                 fire_rate,
                 damage,
                 projectile_mass,
+                .. // Phase C class/ammo/damage_type/secondary — not in the equipment rows yet.
             } => {
                 t.weapon_damage += *damage;
                 stats.push((StatId::Dmg, fmt(StatId::Dmg, *damage)));
@@ -436,9 +438,11 @@ fn build_equipment(fit: &Fit, catalog: Option<&ModuleCatalog>) -> (Vec<Equipment
                 stats.push((StatId::Muzzle, fmt(StatId::Muzzle, *muzzle_speed)));
                 stats.push((StatId::Slug, fmt(StatId::Slug, *projectile_mass)));
             }
+            // Phase C: Sensor shows only its common cost rows (range/resolution have no StatId yet).
             ModuleSpecifics::Thruster { .. }
             | ModuleSpecifics::Reactor
-            | ModuleSpecifics::Utility => {}
+            | ModuleSpecifics::Utility
+            | ModuleSpecifics::Sensor { .. } => {}
         }
         rows.push(EquipmentRow {
             slot: slot.0,
@@ -972,6 +976,7 @@ fn dev_panel_ui(
                                         thrust_force,
                                         turn_torque,
                                         strafe_force,
+                                        .. // Phase C `propulsion` tag — not edited here.
                                     } = &mut m.specifics
                                     {
                                         slider(ui, label(StatId::Thrust), thrust_force, 0.0..=60.0);
@@ -1020,6 +1025,7 @@ fn dev_panel_ui(
                                             fire_rate,
                                             damage,
                                             projectile_mass,
+                                            .. // Phase C class/ammo/damage_type/secondary not edited here yet.
                                         } => {
                                             slider(ui, label(StatId::Dmg), damage, 1.0..=100.0);
                                             slider(ui, label(StatId::Rof), fire_rate, 0.5..=30.0);
@@ -1036,9 +1042,11 @@ fn dev_panel_ui(
                                                 0.001..=2.0,
                                             );
                                         }
+                                        // Phase C: Sensor range/resolution have no slider yet (no StatId).
                                         ModuleSpecifics::Thruster { .. }
                                         | ModuleSpecifics::Reactor
-                                        | ModuleSpecifics::Utility => {}
+                                        | ModuleSpecifics::Utility
+                                        | ModuleSpecifics::Sensor { .. } => {}
                                     }
                                 });
                         }

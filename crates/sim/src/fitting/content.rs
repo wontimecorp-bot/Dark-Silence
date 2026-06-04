@@ -20,8 +20,14 @@ use bevy_ecs::prelude::Resource;
 use serde::{Deserialize, Serialize};
 
 use super::fit::Fit;
-use super::hull::{GridCell, Hull, HullId, SectionId, Slot, SlotId};
-use super::module::{HardpointType, Module, ModuleId, ModuleKind, ModuleSpecifics, SlotSize};
+use super::hull::{GridCell, Hull, HullId, SectionId, ShipClass, ShipRole, Slot, SlotId};
+use super::module::{HardpointType, Module, ModuleId, SlotSize};
+// These are used only by the `#[cfg(test)]` code builders (the RON regenerator); the runtime
+// `seed_catalogs`/`parse_catalogs`/`baseline_hull` path does not reference them (Phase C2).
+#[cfg(test)]
+use super::module::{AmmoType, ModuleKind, ModuleSpecifics, PropulsionType, WeaponClass};
+#[cfg(test)]
+use crate::damage::Channel;
 
 /// Singleton resource: every authored [`Module`] keyed by its [`ModuleId`]
 /// (data-model.md). Loaded from content at startup (FR-025); read by validation +
@@ -135,13 +141,59 @@ pub const HULL_BASELINE: HullId = HullId(100);
 /// reproduces `Tuning::default().mass` (`1.0`). The flight-feel reference.
 pub const MODULE_BASELINE_THRUSTER: ModuleId = ModuleId(100);
 
-/// Author the seed [`ModuleCatalog`] + [`HullCatalog`] (FR-022, FR-025).
-///
-/// Returns the 6 module archetypes and 2 scaling hulls as data. This is the
-/// single content-load entry point; both the client preview and a future server
-/// authority load identical content (Principle II). Balance tuning is Phase 6.
+/// The embedded default content (Phase C): the authored ship/module catalogs **live in RON**
+/// (`assets/content/{modules,ships}.ron`), baked in at compile time. [`seed_catalogs`] parses
+/// these; the server can also load external RON at runtime (no recompile) and fall back to these.
+/// Paths are absolute via `CARGO_MANIFEST_DIR` (this crate is `crates/sim`).
+const EMBEDDED_MODULES_RON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/content/modules.ron"
+));
+const EMBEDDED_SHIPS_RON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/content/ships.ron"
+));
+
+/// The seed [`ModuleCatalog`] + [`HullCatalog`] (FR-022, FR-025) — the **embedded default content**,
+/// parsed from the baked-in RON ([`EMBEDDED_MODULES_RON`]/[`EMBEDDED_SHIPS_RON`]). This is the
+/// single content-load entry point (the hermetic, deterministic default used by tests + as the
+/// server's fallback). Both client preview and server authority load identical content
+/// (Principle II). Panics only if the embedded content is malformed (a build-time authoring bug).
 pub fn seed_catalogs() -> (ModuleCatalog, HullCatalog) {
-    (seed_modules(), seed_hulls())
+    parse_catalogs(EMBEDDED_MODULES_RON, EMBEDDED_SHIPS_RON)
+        .expect("embedded seed content (assets/content/*.ron) must parse + validate")
+}
+
+/// Parse a [`ModuleCatalog`] + [`HullCatalog`] from RON strings (Phase C). **Pure — no IO.**
+/// [`seed_catalogs`] parses the embedded content with this; the server parses *external* files with
+/// it (`crates/server`), falling back to [`seed_catalogs`] on `Err`. Returns a human-readable error
+/// string (the server logs it). Validates: non-empty catalogs + every slot coord sits on an
+/// authored cell (the invariant `build_layout`/`resolve_hit` rely on; INV — guards a bad edit).
+pub fn parse_catalogs(
+    modules_ron: &str,
+    ships_ron: &str,
+) -> Result<(ModuleCatalog, HullCatalog), String> {
+    let modules: ModuleCatalog =
+        ron::from_str(modules_ron).map_err(|e| format!("modules.ron parse error: {e}"))?;
+    let hulls: HullCatalog =
+        ron::from_str(ships_ron).map_err(|e| format!("ships.ron parse error: {e}"))?;
+    if modules.is_empty() {
+        return Err("modules.ron: no modules authored".to_string());
+    }
+    if hulls.is_empty() {
+        return Err("ships.ron: no hulls authored".to_string());
+    }
+    for hull in hulls.hulls.values() {
+        for s in &hull.slots {
+            if !hull.cells.iter().any(|c| c.coord == s.coord) {
+                return Err(format!(
+                    "ships.ron: hull {:?} slot {:?} coord {:?} is not on an authored cell",
+                    hull.id, s.id, s.coord
+                ));
+            }
+        }
+    }
+    Ok((modules, hulls))
 }
 
 /// The 6 seed module archetypes (one per [`ModuleKind`]).
@@ -166,12 +218,14 @@ pub fn seed_catalogs() -> (ModuleCatalog, HullCatalog) {
 /// are **unchanged** so the seed two-thruster fighter still reproduces the E002
 /// 30/12/18 flight magnitudes; the `baseline_thruster` (HINT-002) is untouched so
 /// `baseline_fit()` still derives to `Tuning::default()` exactly.
+#[cfg(test)]
 fn seed_modules() -> ModuleCatalog {
     let rows = [
         // reactor_basic — supplies power_supply; dominant cost axis = mass (a heavy
         // power core). Fitting more reactors for power costs mass budget.
         Module {
             id: MODULE_REACTOR_BASIC,
+            name: "Reactor".to_string(),
             kind: ModuleKind::Reactor,
             power_gen: 20.0,
             power_draw: 0.0,
@@ -187,6 +241,7 @@ fn seed_modules() -> ModuleCatalog {
         // + mass. Thrust 15/6/9 UNCHANGED (two of them sum to the E002 30/12/18).
         Module {
             id: MODULE_THRUSTER_BASIC,
+            name: "Thruster".to_string(),
             kind: ModuleKind::Thruster,
             power_gen: 0.0,
             power_draw: 3.0,
@@ -197,6 +252,7 @@ fn seed_modules() -> ModuleCatalog {
             hardpoint_type: HardpointType::Thruster,
             hardpoint_size: SlotSize::Small,
             specifics: ModuleSpecifics::Thruster {
+                propulsion: PropulsionType::MainDrive,
                 thrust_force: 15.0,
                 turn_torque: 6.0,
                 strafe_force: 9.0,
@@ -206,6 +262,7 @@ fn seed_modules() -> ModuleCatalog {
         // (with some power). Maxing weapons starves the CPU budget.
         Module {
             id: MODULE_AUTOCANNON,
+            name: "Autocannon".to_string(),
             kind: ModuleKind::Weapon,
             power_gen: 0.0,
             power_draw: 3.0,
@@ -216,6 +273,12 @@ fn seed_modules() -> ModuleCatalog {
             hardpoint_type: HardpointType::Weapon,
             hardpoint_size: SlotSize::Small,
             specifics: ModuleSpecifics::Weapon {
+                // Phase C: ballistic shell gun. `damage_type: Kinetic` keeps the live
+                // damage byte-identical to the old hardcoded `Channel::Kinetic`.
+                class: WeaponClass::Ballistic,
+                ammo: AmmoType::Shell,
+                damage_type: Channel::Kinetic,
+                secondary_damage_type: None,
                 muzzle_speed: 200.0,
                 fire_rate: 5.0,
                 damage: 12.0,
@@ -228,6 +291,7 @@ fn seed_modules() -> ModuleCatalog {
         // (a power-hungry projector). Maxing shields starves the power budget.
         Module {
             id: MODULE_SHIELD_BASIC,
+            name: "Shield".to_string(),
             kind: ModuleKind::Shield,
             power_gen: 0.0,
             power_draw: 6.0,
@@ -246,6 +310,7 @@ fn seed_modules() -> ModuleCatalog {
         // plate, no power/cpu). Maxing armor starves the mass budget → low agility.
         Module {
             id: MODULE_ARMOR_PLATE,
+            name: "Armor Plate".to_string(),
             kind: ModuleKind::Armor,
             power_gen: 0.0,
             power_draw: 0.0,
@@ -260,6 +325,7 @@ fn seed_modules() -> ModuleCatalog {
         // utility_basic — extensibility seam; cost = cpu_draw.
         Module {
             id: MODULE_UTILITY_BASIC,
+            name: "Utility".to_string(),
             kind: ModuleKind::Utility,
             power_gen: 0.0,
             power_draw: 1.0,
@@ -280,6 +346,7 @@ fn seed_modules() -> ModuleCatalog {
         // Outside the player-facing ladder; used only by `baseline_fit`.
         Module {
             id: MODULE_BASELINE_THRUSTER,
+            name: "Baseline Thruster".to_string(),
             kind: ModuleKind::Thruster,
             power_gen: 0.0,
             power_draw: 0.0,
@@ -290,6 +357,7 @@ fn seed_modules() -> ModuleCatalog {
             hardpoint_type: HardpointType::Thruster,
             hardpoint_size: SlotSize::Small,
             specifics: ModuleSpecifics::Thruster {
+                propulsion: PropulsionType::MainDrive,
                 thrust_force: 30.0,
                 turn_torque: 12.0,
                 strafe_force: 18.0,
@@ -303,6 +371,7 @@ fn seed_modules() -> ModuleCatalog {
 
 /// The 2 seed hulls on the scaling ladder: `fighter` (small/agile) and
 /// `corvette` (larger/tankier, more slots+power, more base mass → less agile).
+#[cfg(test)]
 fn seed_hulls() -> HullCatalog {
     let hulls = [seed_fighter(), seed_corvette()];
     let map = hulls.into_iter().map(|h| (h.id, h)).collect();
@@ -316,6 +385,7 @@ fn seed_hulls() -> HullCatalog {
 /// as a ship (pointed nose, swept wings, engine block) and gives Phase 2 a much
 /// finer-grained body to erode. The 7 hardpoint slots keep the **one-slot-one-cell**
 /// model and are re-placed at sensible fine-grid coords inside the silhouette.
+#[cfg(test)]
 fn seed_fighter() -> Hull {
     // Slot layout (col,row) on the 9×11 grid; one section per slot for the coarse
     // section-granularity authoring (cell-upgrade-ready, HINT-004). Forward = +row
@@ -394,6 +464,8 @@ fn seed_fighter() -> Hull {
     Hull {
         id: HULL_FIGHTER,
         name: "Fighter".to_string(),
+        class: ShipClass::Fighter,
+        role: ShipRole::Interceptor,
         grid_dims: (9, 11),
         cells: dense_cells((9, 11), &slots, fighter_shape),
         // Caps tuned (T026) so each single-axis-max fit is valid but filling every
@@ -416,6 +488,7 @@ fn seed_fighter() -> Hull {
 /// a coarse 57-cell 9×9): a bigger, beamier capital silhouette on a 13×15 grid (103
 /// cells) with the 14 hardpoint slots re-placed at sensible fine-grid coords. Same
 /// one-slot-one-cell model and the same module-vs-structural scheme as the fighter.
+#[cfg(test)]
 fn seed_corvette() -> Hull {
     // Slot layout (col,row) on the 13×15 grid; one section per slot. Forward = +row;
     // centre column = 6. Placement rationale on the finer grid:
@@ -574,6 +647,8 @@ fn seed_corvette() -> Hull {
     Hull {
         id: HULL_CORVETTE,
         name: "Corvette".to_string(),
+        class: ShipClass::Corvette,
+        role: ShipRole::LineCombatant,
         grid_dims: (13, 15),
         cells: dense_cells((13, 15), &slots, corvette_shape),
         // Scales OVER the fighter on every capacity (more slots/power/cpu/mass) but
@@ -613,6 +688,8 @@ pub fn baseline_hull() -> Hull {
     Hull {
         id: HULL_BASELINE,
         name: "Baseline".to_string(),
+        class: ShipClass::Fighter,
+        role: ShipRole::Utility,
         grid_dims: (1, 1),
         cells: dense_cells((1, 1), &slots, baseline_shape),
         power_capacity: 100.0,
@@ -709,6 +786,63 @@ fn dense_cells(
 mod tests {
     use super::*;
 
+    /// TEMPORARY (Phase C2): regenerate the embedded RON content files from the code
+    /// builders. Run once with `cargo test -p sim dump_seed_ron -- --ignored --nocapture`,
+    /// then this test + the `seed_modules`/`seed_hulls` builders are removed (RON is the
+    /// single source). `#[ignore]` so normal test runs never touch the filesystem.
+    #[test]
+    #[ignore]
+    fn dump_seed_ron_to_assets() {
+        let cfg = ron::ser::PrettyConfig::default();
+        let m = ron::ser::to_string_pretty(&seed_modules(), cfg.clone()).unwrap();
+        let h = ron::ser::to_string_pretty(&seed_hulls(), cfg).unwrap();
+        std::fs::write(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../assets/content/modules.ron"
+            ),
+            m,
+        )
+        .unwrap();
+        std::fs::write(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../assets/content/ships.ron"
+            ),
+            h,
+        )
+        .unwrap();
+    }
+
+    /// Phase C2: the new C1 taxonomy fields survive the embedded-RON round-trip
+    /// (`seed_catalogs` parses `assets/content/*.ron`).
+    #[test]
+    fn embedded_ron_round_trips_the_taxonomy() {
+        let (modules, hulls) = seed_catalogs();
+        let fighter = hulls.get(HULL_FIGHTER).unwrap();
+        assert_eq!(fighter.class, ShipClass::Fighter);
+        assert_eq!(fighter.role, ShipRole::Interceptor);
+        let cannon = modules.get(MODULE_AUTOCANNON).unwrap();
+        assert_eq!(cannon.name, "Autocannon");
+        match cannon.specifics {
+            ModuleSpecifics::Weapon {
+                class, damage_type, ..
+            } => {
+                assert_eq!(class, WeaponClass::Ballistic);
+                assert_eq!(damage_type, Channel::Kinetic);
+            }
+            _ => panic!("autocannon is a Weapon"),
+        }
+    }
+
+    /// Phase C2: `parse_catalogs` returns `Err` (not panic) on malformed RON — the
+    /// server uses this to fall back to the embedded default.
+    #[test]
+    fn parse_catalogs_errors_on_malformed_ron() {
+        assert!(parse_catalogs("not ron at all", EMBEDDED_SHIPS_RON).is_err());
+        assert!(parse_catalogs(EMBEDDED_MODULES_RON, "{ garbage").is_err());
+    }
+
     #[test]
     fn seed_catalogs_have_two_hulls_and_the_archetypes_plus_baseline() {
         let (modules, hulls) = seed_catalogs();
@@ -716,8 +850,8 @@ mod tests {
         // thruster (HINT-002) — 7 module rows in total.
         assert_eq!(
             modules.len(),
-            7,
-            "expected the 6 archetypes + baseline reference thruster"
+            18,
+            "6 archetypes + baseline thruster + 11 Phase C4 seed rows (propulsion/sensors/weapons)"
         );
         assert!(modules.get(MODULE_BASELINE_THRUSTER).is_some());
         assert_eq!(hulls.len(), 2, "expected the fighter + corvette seed hulls");

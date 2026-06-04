@@ -14,6 +14,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::damage::Channel;
+
 /// Which class of device a [`Module`] is — selects the effective-stat it
 /// contributes and which [`ModuleSpecifics`] payload it carries (data-model.md).
 ///
@@ -31,8 +33,69 @@ pub enum ModuleKind {
     Shield,
     /// Defensive armor value (carried for E007); its mass is the agility cost.
     Armor,
+    /// Detection device — range/resolution sensing (Phase C; gameplay is a later
+    /// feature, this carries the data shape).
+    Sensor,
     /// Generic extensibility seam; no flight/weapon contribution this epic.
     Utility,
+}
+
+/// Weapon delivery family (Phase C) — the axis the fire system **branches on**
+/// (projectile vs guided vs dropped vs hitscan beam). Distinct from the damage
+/// [`Channel`] (which the armor/resistance system indexes). Only [`Ballistic`](WeaponClass::Ballistic)
+/// is simulated today; the rest are data-staged for future delivery behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WeaponClass {
+    /// Unguided kinetic/shell projectile on a ballistic path (the only delivery today).
+    Ballistic,
+    /// Guided self-propelled ordnance (rocket / missile / torpedo). Future tracking.
+    Missile,
+    /// Dropped/lobbed ordnance (guided or unguided). Future delivery.
+    Bomb,
+    /// Hitscan / continuous energy beam (particle / plasma / laser). Future delivery.
+    DirectedEnergy,
+}
+
+/// Weapon ammunition / sub-category (Phase C) — a grouping tag (reload/UI/balance
+/// bands), one level under [`WeaponClass`]. Categorical, not behavioral.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AmmoType {
+    Kinetic,
+    Shell,
+    Rocket,
+    Missile,
+    Torpedo,
+    UnguidedBomb,
+    GuidedBomb,
+    Particle,
+    Photon,
+    Plasma,
+}
+
+/// Propulsion role tag (Phase C) — categorizes a [`ModuleKind::Thruster`] as a main
+/// drive, a maneuvering thruster, or reaction-control. Purely a grouping tag: the
+/// stat derivation already SUMS `thrust_force`/`turn_torque`/`strafe_force` across all
+/// thruster modules, so an engine + an RCS unit combine automatically; the numbers
+/// (not the tag) differentiate them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PropulsionType {
+    /// Forward thrust (top speed / acceleration).
+    MainDrive,
+    /// Angular drive (turn torque).
+    Maneuver,
+    /// Reaction-control / strafe + attitude.
+    Rcs,
+}
+
+/// Sensor family (Phase C) — the kind of detection a [`ModuleKind::Sensor`] provides.
+/// Detection gameplay (AOI / signatures) is a later feature; this is the data shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SensorType {
+    Radar,
+    Lidar,
+    Thermal,
+    Em,
+    Gravimetric,
 }
 
 /// The type gate on a slot/hardpoint (FR-006). A [`Module`] installs into a slot
@@ -45,6 +108,7 @@ pub enum HardpointType {
     Weapon,
     Shield,
     Armor,
+    Sensor,
     Utility,
 }
 
@@ -116,6 +180,9 @@ pub enum ModuleSpecifics {
     Reactor,
     /// Thruster: sums into total thrust/torque (against total mass).
     Thruster {
+        /// Propulsion role tag (main drive / maneuver / RCS) — categorizes the module
+        /// (Phase C); the numbers below differentiate behavior.
+        propulsion: PropulsionType,
         /// Forward thrust force contribution (`> 0`).
         thrust_force: f32,
         /// Angular drive torque contribution (`> 0`).
@@ -125,6 +192,15 @@ pub enum ModuleSpecifics {
     },
     /// Weapon: populates the `Weapon` component fire params (FR-016).
     Weapon {
+        /// Delivery family (Phase C) — the axis the fire system branches on.
+        class: WeaponClass,
+        /// Ammunition / sub-category grouping tag (Phase C).
+        ammo: AmmoType,
+        /// Primary damage type (Phase C) — the armor/resistance [`Channel`] this weapon deals.
+        /// Replaces the old hardcoded `Channel::Kinetic`.
+        damage_type: Channel,
+        /// Optional secondary damage type (Phase C) — e.g. a shell is `Kinetic` + `Blast`.
+        secondary_damage_type: Option<Channel>,
         /// Projectile launch speed (`> 0`).
         muzzle_speed: f32,
         /// Shots per second (`> 0`).
@@ -150,6 +226,15 @@ pub enum ModuleSpecifics {
         /// Armor value (`>= 0`).
         armor_value: f32,
     },
+    /// Sensor: detection device (Phase C) — gameplay (AOI/signatures) is a later feature.
+    Sensor {
+        /// Sensor family.
+        sensor_type: SensorType,
+        /// Detection range (sim units, `> 0`).
+        range: f32,
+        /// Angular/positional resolution (`> 0`; higher = finer).
+        resolution: f32,
+    },
     /// Utility: generic seam; no flight/weapon contribution this epic.
     Utility,
 }
@@ -161,10 +246,13 @@ pub enum ModuleSpecifics {
 /// only, in practice); `health_max` seeds the per-cell hit-map health (the live
 /// health lives in the hit-map instance state, not here). `specifics` carries
 /// the per-kind effective-stat parameters and must correspond to `kind`.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Module {
     /// Stable catalog key referenced by a `Fit`.
     pub id: ModuleId,
+    /// Display name (Phase C; e.g. "Autocannon", "Plasma Cannon"). Non-empty. (Adding this
+    /// `String` makes `Module` no longer `Copy` — clone it, like [`super::hull::Hull`].)
+    pub name: String,
     /// Selects which effective-stat this contributes.
     pub kind: ModuleKind,
     /// Power **supplied** to the budget (reactors `> 0`; most modules `0`).

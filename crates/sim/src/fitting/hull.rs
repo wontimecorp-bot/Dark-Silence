@@ -42,6 +42,44 @@ pub const CELL_WORLD_SIZE: f32 = 0.32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct HullId(pub u32);
 
+/// A hull's **size tier** (Phase C) — the ordered displacement ladder, smallest→largest.
+/// `#[repr(u8)]` + derived `Ord` make size-band comparisons a plain `<`. Distinct from
+/// [`ShipRole`] (battlefield function): a tier groups many hull models; role is what one does.
+/// Adding a *ship* of an existing tier is RON data; adding a *tier* is an enum edit (rare).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ShipClass {
+    Fighter = 0,
+    Corvette = 1,
+    Frigate = 2,
+    Destroyer = 3,
+    LightCruiser = 4,
+    HeavyCruiser = 5,
+    Battlecruiser = 6,
+    Battleship = 7,
+    Carrier = 8,
+    HeavyCarrier = 9,
+    Capital = 10,
+    Station = 11,
+}
+
+/// A hull's **battlefield role** (Phase C) — its function, orthogonal to [`ShipClass`] size.
+/// E.g. a small hull can be (Corvette, Gunship) or (Corvette, Interceptor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ShipRole {
+    Interceptor,
+    FastAttack,
+    Patrol,
+    Gunship,
+    LineCombatant,
+    Carrier,
+    Support,
+    Recon,
+    Miner,
+    Hauler,
+    Utility,
+}
+
 /// Identifies the **section** a [`GridCell`] belongs to — the coarse
 /// damage/occupancy unit cells group into (ADR-0008). Multiple cells may share a
 /// section; a [`Slot`] occupies cells within a single section.
@@ -150,6 +188,10 @@ pub struct Hull {
     pub id: HullId,
     /// Display name (e.g. "Fighter", "Corvette"); non-empty.
     pub name: String,
+    /// Size tier (Phase C) — the ordered displacement ladder.
+    pub class: ShipClass,
+    /// Battlefield role (Phase C) — function, orthogonal to `class`.
+    pub role: ShipRole,
     /// Cell-grid dimensions `(cols, rows)`; both `> 0`.
     pub grid_dims: (u16, u16),
     /// The authored set of occupiable cells — a **dense filled silhouette** (every
@@ -218,6 +260,8 @@ mod tests {
         Hull {
             id: HullId(1),
             name: "Test".to_string(),
+            class: ShipClass::Fighter,
+            role: ShipRole::Utility,
             grid_dims: (3, 3),
             cells: vec![
                 GridCell::new((0, 0), SectionId(0)),
