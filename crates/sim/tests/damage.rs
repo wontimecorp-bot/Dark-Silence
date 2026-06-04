@@ -3936,29 +3936,30 @@ fn offcentre_wreck_carves_head_on_instead_of_permanent_ricochet() {
     );
 }
 
-/// COMPANION (Fix #4 keeps the mechanic): the SAME off-centre chunk, struck genuinely
-/// edge-on, STILL ricochets — the fix corrected the angle REFERENCE, it did not disable
-/// ricochet/armor for wreckage. The bore enters the chunk's `-col` tip cell, whose outward
-/// normal (from the chunk's cell-COM) is along `-col`, perpendicular to the `-row` approach
-/// → ~90° → a real glancing ricochet that carves nothing.
+/// Fix #10: a THIN (1-cell-wide) scrap row no longer ricochets at its tip. The 3-cell
+/// `HULL_OFFROW` is 1 cell tall, so every cell has ≤2 present neighbours → its local normal is
+/// degenerate (points along the row). The `RICOCHET_MIN_NEIGHBORS` gate treats such a shard as
+/// head-on → it carves from every angle, including the `-col` tip that used to bounce. (Genuine
+/// grazes of a SOLID chunk still ricochet — see `solid_hulk_scrap_still_ricochets_on_a_graze`.)
 #[test]
-fn genuinely_glancing_shot_at_offcentre_wreck_still_ricochets() {
+fn thin_row_scrap_carves_from_every_angle_no_spurious_ricochet() {
     let mut w = World::new();
     insert_full_combat_resources(&mut w);
     let wreck = spawn_offrow_wreck(&mut w);
     let tpos = w.get::<Position>(wreck).unwrap().0;
 
-    // Enter the END (`-col`) tip column: one cell of world-Y offset from the chunk's centre.
+    // The END (`-col`) tip column — the case the old code ricocheted (~90° degenerate normal).
     let (removed, kind) = fire_forward_at_y(&mut w, wreck, tpos.y - CELL_WORLD_SIZE, 40.0);
-    assert_eq!(
-        kind,
-        Some(HitKind::Ricochet),
-        "a genuinely glancing hit on the chunk still RICOCHETS — the mechanic is preserved; \
-         got {kind:?}"
+    assert!(
+        matches!(
+            kind,
+            Some(HitKind::Penetrated) | Some(HitKind::OverPenetrated)
+        ),
+        "a thin 1-wide scrap row no longer ricochets at its tip — it carves; got {kind:?}"
     );
     assert!(
-        removed.is_empty(),
-        "the glancing ricochet carves nothing off the chunk (got {removed:?})"
+        !removed.is_empty(),
+        "the thin-row tip hit carves a cell (got {removed:?})"
     );
 }
 
@@ -4464,11 +4465,11 @@ fn scrap_carves_by_its_own_shape_not_the_original_hull() {
 
 /// COMPANION (Fix #9 keeps the mechanic): on a multi-cell chunk, a head-on hit on its broad
 /// face carves, while a genuine graze of its actual END edge still ricochets — both judged by
-/// the CHUNK's own shape.
+/// the CHUNK's own shape — and a THIN (1-wide) bar carves from EVERY angle (Fix #10): its
+/// cells have ≤2 present neighbours, so the degenerate normal never triggers a ricochet.
 #[test]
-fn scrap_head_on_carves_but_its_own_edge_graze_still_ricochets() {
-    // (a) Head-on on the broad face: a downward shot at the MIDDLE cell (2,2) of the full bar →
-    // its own-shape normal is 0 (left/right present, up/down cancel) → head-on → carve.
+fn thin_bar_scrap_carves_from_every_angle() {
+    // (a) Broad face: a downward shot at the MIDDLE cell (2,2) of the full bar → carve.
     let mut w = World::new();
     insert_full_combat_resources(&mut w);
     let bar = spawn_bar_wreck(&mut w, &[(0, 2), (1, 2), (2, 2), (3, 2), (4, 2)]);
@@ -4484,17 +4485,17 @@ fn scrap_head_on_carves_but_its_own_edge_graze_still_ricochets() {
     let o1 = apply_damage(&mut w, bar, head_on);
     assert!(
         matches!(o1.result, HitKind::Penetrated | HitKind::OverPenetrated),
-        "a head-on hit on the chunk's broad face carves; got {:?}",
+        "a downward hit on the thin bar's broad face carves; got {:?}",
         o1.result
     );
 
-    // (b) Genuine edge-graze: a downward shot at the END cell (4,2) — by the chunk's OWN shape
-    // its only neighbour is to the left so it faces `+col`, ⊥ to the downward ray → ~90° →
-    // still ricochets (the mechanic is preserved for a real edge graze).
+    // (b) The END cell (4,2) — a 1-wide bar TIP (1 present neighbour). Old code read its
+    // degenerate `+col` normal as ~90° → ricochet; Fix #10's neighbour gate treats a thin
+    // shard head-on → it CARVES from this angle too (no spurious bounce on debris slivers).
     let mut w2 = World::new();
     insert_full_combat_resources(&mut w2);
     let bar2 = spawn_bar_wreck(&mut w2, &[(0, 2), (1, 2), (2, 2), (3, 2), (4, 2)]);
-    let graze = DamageEvent {
+    let end = DamageEvent {
         channel: Channel::Kinetic,
         magnitude: 1000.0,
         penetration: 5000.0,
@@ -4503,11 +4504,75 @@ fn scrap_head_on_carves_but_its_own_edge_graze_still_ricochets() {
         dir: Vec2::new(0.0, -1.0),
         source: None,
     };
-    let o2 = apply_damage(&mut w2, bar2, graze);
-    assert_eq!(
-        o2.result,
-        HitKind::Ricochet,
-        "a genuine graze of the chunk's own END edge still RICOCHETS; got {:?}",
+    let o2 = apply_damage(&mut w2, bar2, end);
+    assert!(
+        matches!(o2.result, HitKind::Penetrated | HitKind::OverPenetrated),
+        "the thin bar's end no longer ricochets — it carves; got {:?}",
         o2.result
+    );
+    assert!(
+        o2.destroyed_cells.contains(&(4, 2)),
+        "the thin bar's end cell (4,2) is carved; got {:?}",
+        o2.destroyed_cells
+    );
+}
+
+/// Fix #10 repro: a 2-cell bar wreck broad-side shot CARVES (was a spurious ricochet). The bar
+/// cell's only neighbour is along the bar, so its computed normal points along the bar (not the
+/// broad face) — old code read a perpendicular shot as ~90° → Ricochet. The ≥3-neighbour gate
+/// treats the 1-wide shard head-on → carve.
+#[test]
+fn thin_two_cell_bar_carves_broadside_not_ricochet() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    let bar = spawn_bar_wreck(&mut w, &[(2, 2), (3, 2)]);
+    let broadside = DamageEvent {
+        channel: Channel::Kinetic,
+        magnitude: 1000.0,
+        penetration: 5000.0,
+        pen_size: 1.0,
+        point: Vec2::new(2.5, 8.0), // perpendicular (downward) to the horizontal bar
+        dir: Vec2::new(0.0, -1.0),
+        source: None,
+    };
+    let out = apply_damage(&mut w, bar, broadside);
+    assert!(
+        matches!(out.result, HitKind::Penetrated | HitKind::OverPenetrated),
+        "a broad-side shot on a 2-cell bar CARVES (thin shard → head-on), not a spurious \
+         ricochet; got {:?} (pre-fix this ricocheted off the degenerate normal)",
+        out.result
+    );
+    assert!(
+        out.destroyed_cells.contains(&(2, 2)),
+        "the bar cell (2,2) is carved; got {:?}",
+        out.destroyed_cells
+    );
+}
+
+/// Fix #10 keeps the mechanic for SUBSTANTIAL chunks: a full-fighter HULK (a solid 2-D body)
+/// still ricochets a genuine graze. A lateral shot across the forward-facing nose tip `(4,10)`
+/// — which has ≥3 present neighbours in the solid hulk — reads ~90° → Ricochet. (Only thin
+/// 1-wide shards were made non-ricocheting.)
+#[test]
+fn solid_hulk_scrap_still_ricochets_on_a_graze() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    let hulk = spawn_wreck(&mut w, true); // full fighter hulk = solid, ≥3-neighbour edges
+    let graze = DamageEvent {
+        channel: Channel::Kinetic,
+        magnitude: 1000.0,
+        penetration: 5000.0,
+        pen_size: 1.0,
+        point: Vec2::new(12.0, 10.5), // far +col side, on the nose-tip row
+        dir: Vec2::new(-1.0, 0.0),    // sideways across the forward-facing nose tip
+        source: None,
+    };
+    let out = apply_damage(&mut w, hulk, graze);
+    assert_eq!(
+        out.result,
+        HitKind::Ricochet,
+        "a genuine lateral graze of a SOLID hulk's nose tip still RICOCHETS (mechanic preserved \
+         for substantial chunks); got {:?}",
+        out.result
     );
 }
