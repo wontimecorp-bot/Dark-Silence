@@ -23,9 +23,7 @@ use super::sever::{
     connected_region, core_cell, disconnected_regions, sever_chunk, Wreck, WreckOrigin,
 };
 use crate::clock::FixedDt;
-use crate::components::{
-    Destructible, MeshAnchor, Ship, Target, WreckLifetime,
-};
+use crate::components::{Destructible, MeshAnchor, Ship, Target, WreckLifetime};
 use crate::fitting::{Cell, Fit, FitLayout, HullCatalog, ModuleCatalog, SectionId};
 use glam::Vec2;
 

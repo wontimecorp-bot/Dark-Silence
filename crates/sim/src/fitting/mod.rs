@@ -56,8 +56,9 @@ pub use hull::{
 };
 pub use layout::{
     build_layout, build_layout_with, cell_map, cell_mass, cell_mass_with, center_or_anchor,
-    hardpoint_arc, layout_center, layout_inertia, layout_inertia_with, layout_mass, layout_mass_with,
-    module_at, resolve_hit, Cell, CellMap, CellOccupant, FitLayout, HitResolution,
+    hardpoint_arc, layout_center, layout_inertia, layout_inertia_with, layout_mass,
+    layout_mass_with, module_at, resolve_hit, Cell, CellMap, CellOccupant, FitLayout,
+    HitResolution,
 };
 pub use module::{
     Axis, HardpointType, Module, ModuleId, ModuleKind, ModuleSpecifics, SlotSize, Violation,

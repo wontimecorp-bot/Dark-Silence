@@ -20,10 +20,13 @@ use bevy_ecs::prelude::Resource;
 use crate::collision::{ASTEROID_MASS, SHIP_MASS};
 use crate::components::WRECK_LIFETIME_SECS;
 use crate::damage::layers::{
-    CARVE_FALLOFF, CARVE_MIN_CELL_COST, CARVE_PEN_COST, RICOCHET_MIN_NEIGHBORS, SMOOTH_NORMAL_RADIUS,
+    CARVE_FALLOFF, CARVE_MIN_CELL_COST, CARVE_PEN_COST, RICOCHET_MIN_NEIGHBORS,
+    SMOOTH_NORMAL_RADIUS,
 };
 use crate::fitting::content::{STRUCT_CELL_HP, STRUCT_CELL_MASS};
-use crate::weapon::{PEN_PER_DAMAGE, PEN_SIZE, PROJECTILE_DAMAGE, PROJECTILE_LIFETIME, PROJECTILE_MASS};
+use crate::weapon::{
+    PEN_PER_DAMAGE, PEN_SIZE, PROJECTILE_DAMAGE, PROJECTILE_LIFETIME, PROJECTILE_MASS,
+};
 
 /// Global gameplay tuning. One instance is inserted by the client at startup
 /// and read by the `sim` systems. All magnitudes are positive (INV-10);
@@ -112,11 +115,11 @@ impl Tuning {
 /// never inserts it (e.g. the headless determinism harness) behaves byte-identically to the old
 /// consts.
 ///
-/// **`Default` reproduces every promoted const EXACTLY** — the `simtuning_default_matches_consts`
-/// drift-guard test asserts each field equals its source const, so the consts (still defined at
-/// their read-sites + threaded into the pure helpers) and this resource can never silently
-/// diverge. Editing a field is **solo / server-authoritative only** (a networked client has no
-/// authority over server tuning, and divergent tuning would break reconciliation).
+/// **`Default` reproduces every promoted const EXACTLY** because it references each source const
+/// BY NAME (the consts stay defined at their read-sites + threaded into the pure carve/mass
+/// helpers), so the resource and the consts can never silently diverge — the consts remain the
+/// single source of truth. Editing a field is **solo / server-authoritative only** (a networked
+/// client has no authority over server tuning, and divergent tuning would break reconciliation).
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
 pub struct SimTuning {
     /// Structural (filler-plating) cell hit points — hull erosion rate (`STRUCT_CELL_HP`).
@@ -191,7 +194,9 @@ mod tests {
         let t = SimTuning::default();
         assert!(t.struct_cell_hp > 0.0 && t.struct_cell_mass > 0.0);
         assert!(t.carve_falloff > 0.0 && t.carve_pen_cost > 0.0 && t.carve_min_cell_cost >= 0.0);
-        assert!(t.projectile_mass > 0.0 && t.projectile_damage > 0.0 && t.projectile_lifetime > 0.0);
+        assert!(
+            t.projectile_mass > 0.0 && t.projectile_damage > 0.0 && t.projectile_lifetime > 0.0
+        );
         assert!(t.pen_per_damage > 0.0 && t.pen_size > 0.0 && t.wreck_lifetime_secs > 0.0);
         assert!(t.ship_ram_mass > 0.0 && t.asteroid_ram_mass > 0.0);
     }

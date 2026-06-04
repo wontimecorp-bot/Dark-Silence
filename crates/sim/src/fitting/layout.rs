@@ -176,7 +176,11 @@ pub fn cell_mass(occupant: &CellOccupant, modules: &ModuleCatalog) -> f32 {
 
 /// [`cell_mass`] with an explicit structural-cell mass (Phase M6 live tuning): a module cell
 /// weighs its module's mass; a structural / empty / dangling cell weighs `struct_cell_mass`.
-pub fn cell_mass_with(occupant: &CellOccupant, modules: &ModuleCatalog, struct_cell_mass: f32) -> f32 {
+pub fn cell_mass_with(
+    occupant: &CellOccupant,
+    modules: &ModuleCatalog,
+    struct_cell_mass: f32,
+) -> f32 {
     occupant
         .module
         .and_then(|m| modules.get(m))
@@ -211,7 +215,11 @@ pub fn layout_inertia(layout: &FitLayout, modules: &ModuleCatalog) -> f32 {
 }
 
 /// [`layout_inertia`] with an explicit structural-cell mass (Phase M6 live tuning).
-pub fn layout_inertia_with(layout: &FitLayout, modules: &ModuleCatalog, struct_cell_mass: f32) -> f32 {
+pub fn layout_inertia_with(
+    layout: &FitLayout,
+    modules: &ModuleCatalog,
+    struct_cell_mass: f32,
+) -> f32 {
     let total = layout_mass_with(layout, modules, struct_cell_mass);
     if total <= f32::MIN_POSITIVE {
         return f32::MIN_POSITIVE;
@@ -224,7 +232,8 @@ pub fn layout_inertia_with(layout: &FitLayout, modules: &ModuleCatalog, struct_c
         .cells
         .iter()
         .map(|(&coord, occ)| {
-            cell_mass_with(occ, modules, struct_cell_mass) * (cell_center(coord) - com).length_squared()
+            cell_mass_with(occ, modules, struct_cell_mass)
+                * (cell_center(coord) - com).length_squared()
         })
         .sum();
     (i_cellspace * CELL_WORLD_SIZE * CELL_WORLD_SIZE).max(f32::MIN_POSITIVE)

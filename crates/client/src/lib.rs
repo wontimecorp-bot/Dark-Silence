@@ -26,6 +26,8 @@
 #![allow(clippy::type_complexity)]
 
 pub mod camera;
+#[cfg(feature = "dev_panel")]
+pub mod dev_panel;
 pub mod fitting_ui;
 pub mod hud;
 pub mod input;
@@ -68,8 +70,8 @@ pub const TICK_HZ: f64 = 30.0;
 /// `protocol`/`server` netcode) are unchanged and remain the path real *remote*
 /// multiplayer uses.
 pub fn run() -> AppExit {
-    App::new()
-        .add_plugins(DefaultPlugins)
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins)
         // Fixed-step clock the embedded-server lifecycle runs on, and the matching
         // dt the shared sim reads (the embedded server uses its announced rate).
         .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
@@ -120,8 +122,15 @@ pub fn run() -> AppExit {
                 camera::zoom_camera,
                 hud::update_hud,
             ),
-        )
-        .run()
+        );
+
+    // Live DEV tuning panel (Phase M6) — an egui overlay (backtick to toggle) bound to the
+    // embedded server's tuning resources. Default-on `dev_panel` feature; compiled out by
+    // `--no-default-features` (then this is absent and the egui dep is dropped).
+    #[cfg(feature = "dev_panel")]
+    app.add_plugins(dev_panel::DevPanelPlugin);
+
+    app.run()
 }
 
 /// Toggle between the flying view and the interactive fitting screen on a fresh

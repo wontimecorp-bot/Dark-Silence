@@ -266,7 +266,11 @@ pub fn weapon_fire_system(
                 // path (those targets resolve via the flat `Health` clamp, which
                 // never reads `WeaponSource`); present so a fitted target a legacy
                 // shot happens to hit still routes through the new pipeline.
-                WeaponSource::from_damage_with(sim.projectile_damage, sim.pen_per_damage, sim.pen_size),
+                WeaponSource::from_damage_with(
+                    sim.projectile_damage,
+                    sim.pen_per_damage,
+                    sim.pen_size,
+                ),
             ));
             // Phase M4/M6 recoil — unfitted ships use the global Tuning mass + live slug mass.
             ship_vel.0 -= sim.projectile_mass * muzzle / tuning.mass.max(f32::MIN_POSITIVE);
