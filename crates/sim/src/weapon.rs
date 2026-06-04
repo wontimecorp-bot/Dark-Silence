@@ -10,8 +10,8 @@
 
 use crate::clock::FixedDt;
 use crate::components::{
-    Damage, Heading, Lifetime, Position, PrevPosition, Projectile, ProjectileMass, ProjectileOwner,
-    Ship, Velocity, Weapon,
+    Damage, Energy, Heading, Heat, Lifetime, Position, PrevPosition, Projectile, ProjectileMass,
+    ProjectileOwner, Ship, Velocity, Weapon,
 };
 use crate::damage::{Channel, DamageEvent};
 use crate::fitting::ShipStats;
@@ -200,6 +200,10 @@ pub fn weapon_fire_system(
             &mut Velocity,
             &ShipStats,
             Option<&mut Weapon>,
+            // Phase E: the dynamic pools — present only on LIVE-spawned fitted ships. `Option` so the
+            // headless sim/determinism worlds (no pools) keep the exact prior firing behavior.
+            Option<&mut Energy>,
+            Option<&mut Heat>,
         ),
         With<Ship>,
     >,
@@ -220,7 +224,9 @@ pub fn weapon_fire_system(
     let sim = sim.map(|s| *s).unwrap_or_default();
 
     // Fitted path: fit-derived can_fire + WeaponProfile (FR-016).
-    for (owner, intent, pos, heading, mut ship_vel, stats, weapon) in &mut fitted {
+    for (owner, intent, pos, heading, mut ship_vel, stats, weapon, mut energy, mut heat) in
+        &mut fitted
+    {
         // No weapon module ⇒ cannot fire; if a Weapon component lingers, still
         // tick its cooldown so it stays a valid (idle) state machine.
         let (Some(profile), Some(mut weapon)) = (stats.weapon, weapon) else {
@@ -229,7 +235,12 @@ pub fn weapon_fire_system(
         if weapon.cooldown > 0.0 {
             weapon.cooldown -= dt;
         }
-        if stats.can_fire && intent.fire && can_fire(weapon.cooldown) {
+        // Phase E: a shot costs Energy + builds Heat, and is gated on both (when the pools exist).
+        // `is_none_or` ⇒ a ship without the pools (the headless/test path) fires exactly as before.
+        let shot_cost = profile.damage * sim.weapon_energy_per_damage;
+        let energy_ok = energy.as_ref().is_none_or(|e| e.current >= shot_cost);
+        let heat_ok = heat.as_ref().is_none_or(|h| h.current < h.max);
+        if stats.can_fire && intent.fire && can_fire(weapon.cooldown) && energy_ok && heat_ok {
             // Phase M4: the muzzle velocity (the gun's contribution) plus the shooter's own
             // velocity, so a moving ship's shots carry its motion (a true Newtonian gun).
             let muzzle = Vec2::from_angle(heading.0) * profile.muzzle_speed;
@@ -260,6 +271,13 @@ pub fn weapon_fire_system(
             // Δv = −(projectile_mass·muzzle)/ship_mass.
             ship_vel.0 -=
                 profile.projectile_mass * muzzle / stats.total_mass.max(f32::MIN_POSITIVE);
+            // Phase E: spend energy + add heat on the shot (no-op when the pools are absent).
+            if let Some(e) = energy.as_mut() {
+                e.current = (e.current - shot_cost).max(0.0);
+            }
+            if let Some(h) = heat.as_mut() {
+                h.current += profile.heat;
+            }
             weapon.cooldown = cooldown_after_fire(profile.fire_rate);
         }
     }
@@ -378,5 +396,97 @@ mod tests {
             "dir is the normalized incoming travel direction"
         );
         assert_eq!(ev.source, Some(owner), "source is the ProjectileOwner");
+    }
+
+    /// Phase E: a fitted ship's shot **drains Energy + adds Heat**, and firing is **gated** on
+    /// having enough energy AND not being overheated.
+    #[test]
+    fn firing_drains_energy_adds_heat_and_gates_on_both() {
+        use crate::components::{Energy, Heat};
+        use crate::fitting::content::{
+            MODULE_AUTOCANNON, MODULE_REACTOR_BASIC, MODULE_THRUSTER_BASIC,
+        };
+        use crate::fitting::{build_layout, derive_ship_stats, seed_catalogs, Fit, SlotId};
+        use crate::fitting::{ShipStats, HULL_FIGHTER};
+
+        // A fighter fit that can fire (autocannon: damage 12, fire_rate 5, heat 3).
+        let (modules, hulls) = seed_catalogs();
+        let hull = hulls.get(HULL_FIGHTER).unwrap();
+        let mut fit = Fit::new(HULL_FIGHTER);
+        fit.install_raw(SlotId(0), MODULE_REACTOR_BASIC);
+        fit.install_raw(SlotId(1), MODULE_THRUSTER_BASIC);
+        fit.install_raw(SlotId(3), MODULE_AUTOCANNON);
+        let layout = build_layout(hull, &fit, &modules);
+        let stats: ShipStats = derive_ship_stats(hull, &fit, &modules, &layout);
+        let profile = stats.weapon.expect("autocannon fitted");
+        let sim = SimTuning::default();
+        let shot_cost = profile.damage * sim.weapon_energy_per_damage;
+
+        let mut w = World::new();
+        w.insert_resource(FixedDt(0.05));
+        w.insert_resource(Tuning::default());
+        w.insert_resource(sim);
+        let ship = w
+            .spawn((
+                Ship,
+                ShipIntent {
+                    fire: true,
+                    ..Default::default()
+                },
+                Position(Vec2::ZERO),
+                Heading(0.0),
+                Velocity(Vec2::ZERO),
+                stats,
+                Weapon {
+                    cooldown: 0.0,
+                    fire_rate: profile.fire_rate,
+                    muzzle_speed: profile.muzzle_speed,
+                },
+                Energy {
+                    current: 100.0,
+                    max: 100.0,
+                    regen: 0.0,
+                },
+                Heat {
+                    current: 0.0,
+                    max: 45.0,
+                    dissipation: 0.0,
+                },
+            ))
+            .id();
+
+        let mut sched = Schedule::default();
+        sched.add_systems(weapon_fire_system);
+
+        // (1) Plenty of energy, cold → fires: energy drops by shot_cost, heat rises by profile.heat.
+        sched.run(&mut w);
+        assert!(
+            (w.get::<Energy>(ship).unwrap().current - (100.0 - shot_cost)).abs() < 1e-3,
+            "a shot drains shot_cost from energy"
+        );
+        assert!(
+            (w.get::<Heat>(ship).unwrap().current - profile.heat).abs() < 1e-3,
+            "a shot adds profile.heat"
+        );
+
+        // (2) Energy below one shot → no fire (no further drain).
+        w.get_mut::<Energy>(ship).unwrap().current = shot_cost * 0.5;
+        w.get_mut::<Weapon>(ship).unwrap().cooldown = 0.0;
+        sched.run(&mut w);
+        assert!(
+            (w.get::<Energy>(ship).unwrap().current - shot_cost * 0.5).abs() < 1e-6,
+            "blocked when below shot cost → energy unchanged"
+        );
+
+        // (3) Refill energy but overheated (heat == max) → still no fire.
+        w.get_mut::<Energy>(ship).unwrap().current = 100.0;
+        w.get_mut::<Heat>(ship).unwrap().current = 45.0;
+        w.get_mut::<Weapon>(ship).unwrap().cooldown = 0.0;
+        sched.run(&mut w);
+        assert_eq!(
+            w.get::<Energy>(ship).unwrap().current,
+            100.0,
+            "blocked while overheated → energy unchanged"
+        );
     }
 }

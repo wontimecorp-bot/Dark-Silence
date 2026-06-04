@@ -21,6 +21,7 @@ pub mod collision;
 pub mod combat;
 pub mod components;
 pub mod damage;
+pub mod energy;
 pub mod fitting;
 pub mod flight;
 pub mod intent;
@@ -128,6 +129,10 @@ pub fn add_fixed_step_systems(schedule: &mut Schedule) {
             // are no-ops in a world with no `Wreck` entities.
             flight::wreck_motion_system,
             damage::destruction::wreck_lifetime_system,
+            // Phase E: recharge the Energy capacitor + cool Heat each tick (no-op without the pools,
+            // so determinism/botkit worlds are untouched). Before weapon_fire so the firing gate
+            // sees this tick's recharged values.
+            energy::energy_system,
             weapon::weapon_fire_system,
             weapon::projectile_step_system,
             collision::collision_detect_system,

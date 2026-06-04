@@ -75,6 +75,10 @@ pub struct WeaponProfile {
     /// target + the shooter's recoil (`momentum = projectile_mass · muzzle_velocity`). NOT
     /// health-scaled (a slug's mass is a physical property, not a working-condition output).
     pub projectile_mass: f32,
+    /// Phase E — **heat generated per shot** (from the weapon module's authored `heat`). Builds the
+    /// ship's [`Heat`](crate::components::Heat) pool when firing; not health-scaled (a physical
+    /// property, like `projectile_mass`).
+    pub heat: f32,
 }
 
 /// The fit-derived effective stats for a ship — the per-entity flight + weapon
@@ -326,8 +330,9 @@ pub fn derive_ship_stats_with(
                     muzzle_speed,
                     fire_rate,
                     damage: damage * hf,
-                    // The slug's mass is a physical property — NOT health-scaled.
+                    // The slug's mass + per-shot heat are physical properties — NOT health-scaled.
                     projectile_mass,
+                    heat: module.heat,
                 });
             }
             _ => {}

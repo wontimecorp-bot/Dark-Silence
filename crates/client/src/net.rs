@@ -53,7 +53,7 @@ use protocol::{
     NetTransport, CLIENT_TOKEN_BYTES,
 };
 use server::{RenderEntity, ServerApp, PROTOCOL_VERSION};
-use sim::components::{CollisionRadius, Destructible, TargetKind, Velocity};
+use sim::components::{CollisionRadius, Destructible, Energy, Heat, TargetKind, Velocity};
 use sim::damage::seed_defense_layers;
 use sim::fitting::{
     build_layout, derive_ship_stats, hull_collision_radius, seed_catalogs, Fit, SlotId,
@@ -369,6 +369,11 @@ fn attach_starter_fit(server: &mut ServerApp, local_id: EntityId) {
             // `Destructible`. The flag carries over to the hulk + severed chunks so the
             // player's wreckage stays destructible too (a per-entity toggle for later).
             Destructible,
+            // Phase E: the dynamic combat pools — Energy full, Heat cold. `energy_system`
+            // re-derives `max`/`regen`/`dissipation` from the live tuning each tick; these are
+            // just the spawn seeds (full charge, no heat). Only live ships carry them.
+            Energy::seed(stats.power_supply),
+            Heat::seed(),
         ));
     }
 }

@@ -76,6 +76,63 @@ pub struct AngularVelocity(pub f32);
 #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Health(pub f32);
 
+/// Phase E — the ship's **energy capacitor** (a dynamic, drainable power pool). Firing a weapon
+/// drains `current`; it recharges from the reactor at `regen`/s toward `max` while you hold fire.
+/// A weapon cannot fire when `current` is below its shot cost. `max`/`regen` are re-derived each
+/// tick from the live `ShipStats.power_supply` (so reactor damage shrinks the pool). Attached only
+/// to LIVE-spawned fitted ships — the headless sim/determinism tests never carry it (the weapon
+/// gate is `Option`-skipped without it), keeping them byte-identical.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Energy {
+    /// Live charge (`0..=max`).
+    pub current: f32,
+    /// Capacity (`power_supply · energy_capacity_secs`).
+    pub max: f32,
+    /// Recharge rate per second (`= power_supply`).
+    pub regen: f32,
+}
+
+/// Phase E — the ship's **heat** pool (the opposite of [`Energy`]). Firing adds heat; it
+/// dissipates at `dissipation`/s. A weapon cannot fire while `current >= max` (overheated) until it
+/// cools. The combat loop: fire to spend Energy + build Heat, then ease off to recover both.
+/// Attached only to LIVE-spawned fitted ships (same `Option`-gate discipline as [`Energy`]).
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Heat {
+    /// Live heat (`0..=max`); at `max` the ship is overheated.
+    pub current: f32,
+    /// Overheat threshold.
+    pub max: f32,
+    /// Cooling rate per second.
+    pub dissipation: f32,
+}
+
+impl Energy {
+    /// Spawn seed for a live ship (Phase E): **full charge**, sized to the default capacitor.
+    /// `energy_system` re-derives `max`/`regen` from the live `ShipStats`/`SimTuning` each tick, so
+    /// this only needs to be a sensible tick-0 value.
+    pub fn seed(power_supply: f32) -> Self {
+        let t = crate::tuning::SimTuning::default();
+        let max = (power_supply * t.energy_capacity_secs).max(0.0);
+        Self {
+            current: max,
+            max,
+            regen: power_supply.max(0.0),
+        }
+    }
+}
+
+impl Heat {
+    /// Spawn seed for a live ship (Phase E): **cold**, sized to the default heat pool.
+    pub fn seed() -> Self {
+        let t = crate::tuning::SimTuning::default();
+        Self {
+            current: 0.0,
+            max: t.heat_capacity,
+            dissipation: t.heat_dissipation,
+        }
+    }
+}
+
 /// Flight-assist mode: `On` damps drift toward heading; `Off` is decoupled,
 /// full-momentum flight.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

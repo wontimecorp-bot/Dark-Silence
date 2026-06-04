@@ -87,7 +87,12 @@ pub fn run() -> AppExit {
         .init_resource::<net::ModuleColorMode>()
         .add_systems(
             Startup,
-            (scene::setup_scene, camera::setup_camera, hud::setup_hud),
+            (
+                scene::setup_scene,
+                camera::setup_camera,
+                hud::setup_hud,
+                hud::setup_energy_bars,
+            ),
         )
         // Input runs before the fixed step so intents apply the same frame; the
         // net plugin reads the local ship's `ShipIntent` in FixedUpdate.
@@ -121,6 +126,7 @@ pub fn run() -> AppExit {
                     .after(render_sync::interpolate_transforms),
                 camera::zoom_camera,
                 hud::update_hud,
+                hud::update_energy_hud,
             ),
         );
 

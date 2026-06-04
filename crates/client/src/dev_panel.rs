@@ -20,7 +20,7 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 
-use sim::components::{Heading, Health, Velocity};
+use sim::components::{Energy, Heading, Health, Heat, Velocity};
 use sim::damage::{
     default_resistance_matrix, HullStructure, PenetrationConfig, SalvageConfig, ShieldConfig,
     Shields, StatScalingConfig,
@@ -93,6 +93,11 @@ enum StatId {
     WreckLifetime,
     ShipRamMass,
     AsteroidRamMass,
+    // Phase E energy/heat tuning.
+    EnergyCapacitySecs,
+    WeaponEnergyPerDamage,
+    HeatCapacity,
+    HeatDissipation,
     // Hull capacities.
     BaseMass,
     PowerCap,
@@ -105,6 +110,8 @@ enum StatId {
     Health,
     HullStruct,
     ShieldsState,
+    Energy,
+    Heat,
     Cells,
 }
 
@@ -284,6 +291,28 @@ impl StatId {
                 1,
                 "",
             ),
+            EnergyCapacitySecs => (
+                "energy_capacity_secs",
+                "Energy capacitor (s of output)",
+                "energy_capacity_secs",
+                1,
+                " s",
+            ),
+            WeaponEnergyPerDamage => (
+                "weapon_energy_per_damage",
+                "Weapon energy per damage",
+                "weapon_energy_per_damage",
+                2,
+                "",
+            ),
+            HeatCapacity => ("heat_capacity", "Heat capacity", "heat_capacity", 0, ""),
+            HeatDissipation => (
+                "heat_dissipation",
+                "Heat dissipation",
+                "heat_dissipation",
+                1,
+                "/s",
+            ),
             BaseMass => ("hull_base_mass", "Hull base mass", "hull_base_mass", 1, ""),
             PowerCap => ("power_capacity", "Power capacity", "power_capacity", 1, ""),
             CpuCap => ("cpu_capacity", "CPU capacity", "cpu_capacity", 1, ""),
@@ -294,6 +323,8 @@ impl StatId {
             Health => ("health", "Health", "health", 0, ""),
             HullStruct => ("hull", "Hull structure", "hull_structure", 0, ""),
             ShieldsState => ("shields", "Shields", "shields", 0, ""),
+            Energy => ("energy", "Energy", "energy", 0, ""),
+            Heat => ("heat", "Heat", "heat", 0, ""),
             Cells => ("cells", "Cells", "cells", 0, ""),
         };
         StatMeta {
@@ -337,6 +368,9 @@ struct ShipReadout {
     health: Option<f32>,
     hull: Option<(f32, f32)>,
     shields: Option<(f32, f32)>,
+    /// Phase E — (current, max) of the live Energy capacitor / Heat pools, if present.
+    energy: Option<(f32, f32)>,
+    heat: Option<(f32, f32)>,
     cells: usize,
     /// The ship's installed modules (one row per `Fit` assignment), pre-formatted.
     equipment: Vec<EquipmentRow>,
@@ -567,6 +601,16 @@ fn render_ship_stats(ui: &mut egui::Ui, r: &ShipReadout) {
                 r.shields
                     .map_or("—".to_string(), |(c, m)| format!("{:.0} / {:.0}", c, m)),
             ),
+            (
+                StatId::Energy,
+                r.energy
+                    .map_or("—".to_string(), |(c, m)| format!("{:.0} / {:.0}", c, m)),
+            ),
+            (
+                StatId::Heat,
+                r.heat
+                    .map_or("—".to_string(), |(c, m)| format!("{:.0} / {:.0}", c, m)),
+            ),
             (StatId::Cells, format!("{}", r.cells)),
         ],
     );
@@ -668,6 +712,8 @@ fn dev_panel_ui(
         let health = w.get::<Health>(e).map(|h| h.0);
         let hull = w.get::<HullStructure>(e).map(|h| (h.current, h.max));
         let shields = w.get::<Shields>(e).map(|s| (s.current, s.max));
+        let energy = w.get::<Energy>(e).map(|p| (p.current, p.max));
+        let heat = w.get::<Heat>(e).map(|p| (p.current, p.max));
         let cells = w.get::<FitLayout>(e).map_or(0, |l| l.cells.len());
         // M6c: the ship's installed equipment + nominal summed contributions (from its Fit against
         // the cloned catalog). Owned strings/scalars → no borrow escapes the closure.
@@ -682,6 +728,8 @@ fn dev_panel_ui(
             health,
             hull,
             shields,
+            energy,
+            heat,
             cells,
             equipment,
             totals,
@@ -868,6 +916,31 @@ fn dev_panel_ui(
                         label(StatId::AsteroidRamMass),
                         &mut sim.asteroid_ram_mass,
                         0.1..=40.0,
+                    );
+                    // Phase E energy/heat feel (live — no Apply needed; energy_system reads it each tick).
+                    slider(
+                        ui,
+                        label(StatId::EnergyCapacitySecs),
+                        &mut sim.energy_capacity_secs,
+                        0.5..=20.0,
+                    );
+                    slider(
+                        ui,
+                        label(StatId::WeaponEnergyPerDamage),
+                        &mut sim.weapon_energy_per_damage,
+                        0.0..=5.0,
+                    );
+                    slider(
+                        ui,
+                        label(StatId::HeatCapacity),
+                        &mut sim.heat_capacity,
+                        5.0..=300.0,
+                    );
+                    slider(
+                        ui,
+                        label(StatId::HeatDissipation),
+                        &mut sim.heat_dissipation,
+                        0.0..=60.0,
                     );
                     ui.label("⟳ = needs Apply / Re-derive to update existing ships");
                 });

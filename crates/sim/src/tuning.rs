@@ -152,6 +152,14 @@ pub struct SimTuning {
     pub ship_ram_mass: f32,
     /// Asteroid inertial mass for ram impulses (`ASTEROID_MASS`).
     pub asteroid_ram_mass: f32,
+    /// Phase E — energy capacitor size, in seconds of reactor output (`Energy.max = power_supply · this`).
+    pub energy_capacity_secs: f32,
+    /// Phase E — weapon energy cost per point of shot damage (`shot_cost = damage · this`).
+    pub weapon_energy_per_damage: f32,
+    /// Phase E — heat overheat threshold (`Heat.max`); a weapon locks while `Heat.current >= this`.
+    pub heat_capacity: f32,
+    /// Phase E — heat cooling rate per second (`Heat.dissipation`).
+    pub heat_dissipation: f32,
 }
 
 impl Default for SimTuning {
@@ -175,6 +183,12 @@ impl Default for SimTuning {
             wreck_lifetime_secs: WRECK_LIFETIME_SECS,
             ship_ram_mass: SHIP_MASS,
             asteroid_ram_mass: ASTEROID_MASS,
+            // Phase E energy/heat feel — first-pass; tuned live in the dev panel. (No source const:
+            // these are read only via this resource, so a literal default has nothing to drift from.)
+            energy_capacity_secs: 4.0,
+            weapon_energy_per_damage: 1.0,
+            heat_capacity: 45.0,
+            heat_dissipation: 6.0,
         }
     }
 }
