@@ -110,6 +110,33 @@ impl FitLayout {
     }
 }
 
+/// The cell-space **center** that both the carve entry ray and the armor-angle radial
+/// anchor on for `layout` — chosen to MATCH the client's `hull_mesh_center` so the carve
+/// enters, and the impact angle is measured, where the cells actually are:
+///
+/// - a **`Wreck`** target (`is_wreck == true`) → the **cell-COM** `mean(col+0.5, row+0.5)`
+///   over its CURRENT [`cells`](FitLayout::cells). A severed chunk's `Position` is its
+///   cell-COM and its cells render around it, so an off-centre piece is referenced where
+///   it sits — not at the (often empty) original grid centre.
+/// - a **live ship** (`is_wreck == false`) → the **grid centre** `(cols·0.5, rows·0.5)`:
+///   its `Position` sits at the grid centre (byte-identical to the prior behaviour).
+///
+/// Single-sources the centre formula for both `fitted_damage_system` (the entry point) and
+/// `apply_damage` (the armor angle) so the two references can never drift apart — that
+/// drift was the wreckage-ricochet bug. Deterministic: the `BTreeMap` cells iterate in
+/// sorted [`Cell`] order.
+pub fn layout_center(layout: &FitLayout, grid_dims: (u16, u16), is_wreck: bool) -> Vec2 {
+    if is_wreck {
+        let n = layout.cells.len().max(1) as f32;
+        let sum = layout.cells.keys().fold(Vec2::ZERO, |acc, &(col, row)| {
+            acc + Vec2::new(col as f32 + 0.5, row as f32 + 0.5)
+        });
+        sum / n
+    } else {
+        Vec2::new(grid_dims.0 as f32 * 0.5, grid_dims.1 as f32 * 0.5)
+    }
+}
+
 /// The local-space center of a unit cell `(col, row)` — its mid-point on the grid
 /// (`coord + 0.5`). The hit-line `p0`→`p1` and the cell circles in [`resolve_hit`]
 /// share this local cell-space.

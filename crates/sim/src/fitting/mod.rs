@@ -54,8 +54,8 @@ pub use hull::{
     CELL_WORLD_SIZE,
 };
 pub use layout::{
-    build_layout, cell_map, hardpoint_arc, module_at, resolve_hit, Cell, CellMap, CellOccupant,
-    FitLayout, HitResolution,
+    build_layout, cell_map, hardpoint_arc, layout_center, module_at, resolve_hit, Cell, CellMap,
+    CellOccupant, FitLayout, HitResolution,
 };
 pub use module::{
     Axis, HardpointType, Module, ModuleId, ModuleKind, ModuleSpecifics, SlotSize, Violation,

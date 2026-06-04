@@ -15,7 +15,7 @@ use crate::components::{
 use crate::damage::{
     apply_damage, core_cell, first_cell_hit, on_cells_carved, DamageEvent, HitKind, Wreck, REACH,
 };
-use crate::fitting::{FitLayout, HullCatalog, CELL_WORLD_SIZE};
+use crate::fitting::{layout_center, FitLayout, HullCatalog, CELL_WORLD_SIZE};
 use crate::physics::{Physics, RapierPhysics, SweptHit};
 use crate::tuning::Tuning;
 use crate::weapon::{damage_event_from_hit, WeaponSource};
@@ -349,19 +349,16 @@ pub fn fitted_damage_system(world: &mut World) {
     let centers: std::collections::BTreeMap<Entity, Vec2> = target_q
         .iter(world)
         .filter_map(|(e, _, _, _, layout, wreck)| {
-            let center = if wreck.is_some() {
-                // Cell-COM over the chunk's current cells (matches client Debris layout).
-                let n = layout.cells.len().max(1) as f32;
-                let sum = layout.cells.keys().fold(Vec2::ZERO, |acc, &(col, row)| {
-                    acc + Vec2::new(col as f32 + 0.5, row as f32 + 0.5)
-                });
-                sum / n
+            let is_wreck = wreck.is_some();
+            // A live ship needs its resolved grid dims (skip the target if unresolvable,
+            // matching `hull_dims`); a `Wreck` uses its cell-COM and ignores the dims.
+            // Single-sourced with `apply_damage`'s armor-angle reference via `layout_center`.
+            let grid_dims = if is_wreck {
+                (0, 0)
             } else {
-                // Live ship: the hull grid centre.
-                let (cols, rows) = *hull_dims.get(&e)?;
-                Vec2::new(cols as f32 * 0.5, rows as f32 * 0.5)
+                *hull_dims.get(&e)?
             };
-            Some((e, center))
+            Some((e, layout_center(layout, grid_dims, is_wreck)))
         })
         .collect();
     // Snapshot each target's selection inputs, INCLUDING a clone of its `FitLayout` so the

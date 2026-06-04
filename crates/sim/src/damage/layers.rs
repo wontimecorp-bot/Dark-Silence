@@ -40,10 +40,11 @@ use super::content::{ArmorMaterial, PenetrationConfig};
 use super::event::DamageEvent;
 use super::penetration::{resolve_penetration, PenetrationResult};
 use super::resist::{layer_resist, DefenseLayer, ResistanceMatrix};
+use super::sever::Wreck;
 use super::shields::shield_absorb;
 use crate::fitting::{
-    resolve_hit, Cell, CellOccupant, Fit, FitLayout, HitResolution, Hull, HullCatalog,
-    ModuleCatalog, ModuleRef, SectionId,
+    layout_center, resolve_hit, Cell, CellOccupant, Fit, FitLayout, HitResolution, Hull,
+    HullCatalog, ModuleCatalog, ModuleRef, SectionId,
 };
 use crate::physics::{Physics, RapierPhysics};
 
@@ -411,6 +412,36 @@ fn carve_path(layout: &FitLayout, p0: Vec2, p1: Vec2) -> Vec<(Cell, CellOccupant
         .collect()
 }
 
+/// Whether the AUTHORED hull has any cell **in front of** `entry_cell` along the actual shot
+/// line (toward the shooter, `-dir_n`) — i.e. the shot bored through authored hull to reach
+/// the entry (a **tunnel** → head-on), as opposed to the entry being the first authored cell
+/// the shot meets (a **fresh outer surface** → its obliquity, and a genuine glancing
+/// ricochet, applies).
+///
+/// Replaces the old single dominant-axis `front` cell, which rounded `-dir_n` to ONE
+/// orthogonal step and so misfired for an off-axis (diagonal) bore on a SHAPED hull — the
+/// orthogonal neighbour could land OFF the silhouette even though the shot drilled a real
+/// tunnel, mis-reading a buried cell as a fresh surface and **stalling the drill on a
+/// permanent ricochet** (Fix #5). This walks the authored cells along the REAL ray instead:
+/// a cell `c` is "in front" iff it lies toward the shooter (`d·(−dir_n) > 0`) AND on the
+/// shot line (perpendicular offset `< CARVE_CELL_RADIUS`, the same inscribe the carve uses).
+/// Length-independent, direction-accurate, and works for any ray on any shaped hull. Pure +
+/// deterministic (a `hull.cells.iter().any(..)` over a `Vec`).
+fn authored_cell_in_front(hull: &Hull, entry_cell: Cell, dir_n: Vec2) -> bool {
+    let entry_center = Vec2::new(entry_cell.0 as f32 + 0.5, entry_cell.1 as f32 + 0.5);
+    let back = -dir_n; // unit vector toward the shooter (dir_n is normalized)
+    hull.cells.iter().any(|gc| {
+        if gc.coord == entry_cell {
+            return false;
+        }
+        let d = Vec2::new(gc.coord.0 as f32 + 0.5, gc.coord.1 as f32 + 0.5) - entry_center;
+        let along = d.dot(back);
+        // Toward the shooter (`along > 0`) AND on the shot line (perpendicular within the
+        // per-cell carve inscribe) → authored material the shot bored through to get here.
+        along > 0.0 && (d - back * along).length() < CARVE_CELL_RADIUS
+    })
+}
+
 /// The legible "what happened" tag the HUD reads (FR-024, SC-005) — never numeric
 /// spam, advisory only (the server owns the authoritative mutation).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -519,6 +550,11 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
         .get::<SectionArmor>(target)
         .cloned()
         .unwrap_or_default();
+    // Whether this target is severed wreckage — selects the armor-angle reference centre
+    // below (a `Wreck`'s real centre is its cell-COM, not the original hull grid centre),
+    // the SAME choice `fitted_damage_system` makes for the entry point (single-sourced via
+    // `layout_center`). Read with the other per-target components, before the resource borrow.
+    let is_wreck = world.get::<Wreck>(target).is_some();
 
     let Some(hulls) = world.get_resource::<HullCatalog>() else {
         return no_module();
@@ -596,8 +632,10 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
     // Impact angle = the shot's obliquity against the **original outer hull surface**
     // at the entry cell — with a tunnel guard so a bored channel does not re-ricochet.
     //
-    // The entry cell's radial (`entry_cell_center − grid_centre`) is its outward
-    // surface normal: a +x-rim cell faces +x, a wing-tip faces outward, etc. A shot
+    // The entry cell's radial (`entry_cell_center − center`, where `center` is the
+    // target's OWN centre — cell-COM for a `Wreck` chunk, grid centre for a live ship)
+    // is its outward surface normal: a +x-rim cell faces +x, a wing-tip faces outward,
+    // etc. A shot
     // meeting that surface square-on (`cos_impact ≈ 1`) penetrates; a glancing edge hit
     // (`cos_impact ≈ 0`) ricochets. BUT as a channel is carved inward, the first
     // surviving cell recedes toward the core, whose radial is perpendicular to a
@@ -617,30 +655,23 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
     } else {
         Vec2::X
     };
-    // The cell one step in front of the entry along the approach (toward the shooter,
-    // `-dir_n`), rounded to the dominant axis — the cell the shot would have passed
-    // through just before reaching the entry on the original hull.
-    let front = {
-        let step = -dir_n;
-        let (dc, dr) = if step.x.abs() >= step.y.abs() {
-            (step.x.signum() as i32, 0)
-        } else {
-            (0, step.y.signum() as i32)
-        };
-        let fc = entry_cell.0 as i32 + dc;
-        let fr = entry_cell.1 as i32 + dr;
-        (fc, fr)
-    };
-    let buried = front.0 >= 0
-        && front.1 >= 0
-        && hull
-            .cells
-            .iter()
-            .any(|gc| gc.coord == (front.0 as u16, front.1 as u16));
+    // Tunnel vs fresh surface, tested **direction-accurately along the real ray**: the entry
+    // is buried (a bored tunnel → head-on) iff the AUTHORED hull had any cell in front of it
+    // toward the shooter on the shot line ([`authored_cell_in_front`]). The previous
+    // single-dominant-axis check misfired for off-axis bores on a shaped hull — the
+    // orthogonal neighbour fell outside the silhouette mid-tunnel → a permanent ricochet
+    // stall (Fix #5).
+    let buried = authored_cell_in_front(&hull, entry_cell, dir_n);
 
-    let grid_centre_local = Vec2::new(hull.grid_dims.0 as f32 * 0.5, hull.grid_dims.1 as f32 * 0.5);
+    // The angle's surface-normal reference is the target's OWN centre — the cell-COM for a
+    // `Wreck` chunk (an off-centre subset of the original hull), the grid centre for a live
+    // ship. Using the original hull grid centre for a chunk pointed every cell's radial the
+    // same way (away from the far-off centre) → almost any shot read as glancing → spurious
+    // permanent `Ricochet`. `layout_center` single-sources this with the entry-point centre
+    // in `fitted_damage_system`, so the angle is measured where the cells actually are.
+    let center = layout_center(&layout, hull.grid_dims, is_wreck);
     let entry_cell_center = Vec2::new(entry_cell.0 as f32 + 0.5, entry_cell.1 as f32 + 0.5);
-    let radial = entry_cell_center - grid_centre_local;
+    let radial = entry_cell_center - center;
     let angle = if buried || radial.length_squared() <= f32::EPSILON {
         // Down a bored tunnel (entry was buried in the intact hull), or a centred
         // surface cell with no outward direction → head-on, never a ricochet.

@@ -3778,3 +3778,322 @@ fn shooting_a_piece_next_to_the_ship_carves_the_piece_not_the_ship() {
          fallback carved the SHIP instead ('continues carving from the original piece')"
     );
 }
+
+// =================================================================================
+// Fix #4 — wreckage ricochets every shot ("RICOCHET, never carves again"). The armor
+// angle was measured from the ORIGINAL hull's grid centre for ALL targets; for an
+// off-centre chunk that far-off reference made even a head-on shot read as steeply
+// glancing → permanent `Ricochet`. The fix measures the angle from the target's OWN
+// centre (cell-COM for a `Wreck`) — the SAME reference the entry point uses — so a
+// head-on shot at the chunk carves while a genuinely glancing one still ricochets.
+//
+// The hull authored here IS exactly the wreck's cells (a single off-centre row), so the
+// tunnel/buried guard reads NO cell in front of the entry (`buried == false`) and the
+// radial angle actually applies — unlike `HULL_OFFCENTER`'s filled silhouette, whose
+// buried guard forces head-on and MASKS this bug.
+// =================================================================================
+
+/// The off-centre single-row hull id used by the Fix #4 ricochet regression.
+const HULL_OFFROW: HullId = HullId(12);
+
+/// A hull whose authored cells are a single horizontal row of three cells off to the
+/// `-col` side — `{(0,2),(1,2),(2,2)}` on a 9×5 grid (cell-COM col `1.5`, vs the grid
+/// centre col `4.5`: off-centre by 3 cells). Crucially the authored silhouette is ONLY
+/// these cells, so a shot's "cell in front" is never authored → the carve's tunnel guard
+/// stays `false` and the armor-angle radial is exercised (the bug's actual code path).
+fn offrow_hull() -> Hull {
+    let coords = [(0u16, 2u16), (1, 2), (2, 2)];
+    let cells: Vec<GridCell> = coords
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| GridCell::new(c, SectionId(i as u32)))
+        .collect();
+    Hull {
+        id: HULL_OFFROW,
+        name: "Offrow".to_string(),
+        grid_dims: (9, 5),
+        cells,
+        power_capacity: 100.0,
+        cpu_capacity: 100.0,
+        mass_capacity: 100.0,
+        hull_base_mass: 1.0,
+        slots: Vec::new(),
+    }
+}
+
+/// Spawn a `Wreck` whose residual [`FitLayout`] is the off-centre row `{(0,2),(1,2),(2,2)}`
+/// (small structural HP so a carve removes cells), placed at its cell-COM world `Position`
+/// exactly as `sever_chunk` would, with its footprint collider + `Destructible` + `Wreck`
+/// and NO `Fit`. The authored `HULL_OFFROW` is registered so the Fit-independent carve can
+/// resolve `layout.hull`.
+fn spawn_offrow_wreck(w: &mut World) -> Entity {
+    {
+        let mut hulls = w.get_resource_mut::<HullCatalog>().unwrap();
+        hulls.hulls.insert(HULL_OFFROW, offrow_hull());
+    }
+    let mut cells = CellMap::new();
+    for (col, row) in [(0u16, 2u16), (1, 2), (2, 2)] {
+        let depth = col.min(8 - col).min(row).min(4 - row);
+        cells.insert(
+            (col, row),
+            CellOccupant {
+                slot: SlotId(u32::MAX),
+                module: None,
+                health: 5.0, // small structural HP so a carve does real work
+                depth,
+                structural: true,
+            },
+        );
+    }
+    let layout = FitLayout {
+        hull: HULL_OFFROW,
+        cells,
+    };
+    // The chunk's cell-COM in WORLD space (heading 0): cell-space COM minus grid centre,
+    // axis-swapped (world X ← row, world Y ← col) and scaled — the offset `sever_chunk`
+    // bakes into a chunk `Position`, and where its cells render. The off-centre axis is col,
+    // which maps to world Y.
+    let com_local = Vec2::new(1.5, 2.5); // mean(col+0.5,row+0.5) over the row
+    let grid_centre = Vec2::new(9.0 * 0.5, 5.0 * 0.5);
+    let pos = Vec2::new(
+        (com_local.y - grid_centre.y) * CELL_WORLD_SIZE, // world X ← row offset (0)
+        (com_local.x - grid_centre.x) * CELL_WORLD_SIZE, // world Y ← col offset (the off-centre axis)
+    );
+    w.spawn((
+        Position(pos),
+        Velocity(Vec2::ZERO),
+        Heading(0.0),
+        AngularVelocity(0.0),
+        CollisionRadius(hull_collision_radius((9, 5))),
+        layout,
+        Destructible,
+        Wreck::new(WreckOrigin::SeveredChunk),
+    ))
+    .id()
+}
+
+/// Fire one forward (`-X`) projectile sweeping the wreck's collider at world `y`, run one
+/// `fitted_damage_system` step, and return `(cells_removed_from_target, last_HitKind)`.
+/// World `y` selects which COLUMN of the chunk the bore enters (`-X` sweeps `-row`); the
+/// entry column is fixed by `y` relative to the chunk's cell-COM `Position`.
+fn fire_forward_at_y(
+    w: &mut World,
+    target: Entity,
+    y: f32,
+    damage: f32,
+) -> (std::collections::BTreeSet<(u16, u16)>, Option<HitKind>) {
+    let tpos = w.get::<Position>(target).unwrap().0;
+    w.spawn((
+        Projectile,
+        Position(Vec2::new(tpos.x - 6.0, y)),
+        PrevPosition(Vec2::new(tpos.x + 6.0, y)),
+        Velocity(Vec2::new(-200.0, 0.0)),
+        Damage(damage),
+        Lifetime(3.0),
+        WeaponSource::from_damage(damage),
+    ));
+    let before: std::collections::BTreeSet<(u16, u16)> = w
+        .get::<FitLayout>(target)
+        .map(|l| l.cells.keys().copied().collect())
+        .unwrap_or_default();
+    sim::fitted_damage_system(w);
+    let after: std::collections::BTreeSet<(u16, u16)> = w
+        .get::<FitLayout>(target)
+        .map(|l| l.cells.keys().copied().collect())
+        .unwrap_or_default();
+    let removed = before.difference(&after).copied().collect();
+    let last_kind = w.get_resource::<HitFeedback>().unwrap().last_kind;
+    (removed, last_kind)
+}
+
+/// REGRESSION (Fix #4): a head-on shot at an OFF-CENTRE chunk's own centre column CARVES
+/// it — it no longer permanently ricochets. PRE-FIX the armor angle came from the original
+/// hull's grid centre (col `4.5`), three cells from this chunk → ~90° glancing → `Ricochet`,
+/// removing nothing on every shot (the user's "every shot says RICOCHET and never carves").
+/// POST-FIX the angle uses the chunk's cell-COM, so a centre-column shot reads head-on.
+#[test]
+fn offcentre_wreck_carves_head_on_instead_of_permanent_ricochet() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    let wreck = spawn_offrow_wreck(&mut w);
+    let tpos = w.get::<Position>(wreck).unwrap().0;
+
+    // Head-on at the chunk's OWN centre column (world y = the wreck's Position.y).
+    let (removed, kind) = fire_forward_at_y(&mut w, wreck, tpos.y, 5000.0);
+    assert!(
+        !removed.is_empty(),
+        "a head-on shot at the off-centre chunk carves it (removed: {removed:?}); pre-fix it \
+         permanently ricocheted off the far-away grid-centre angle reference, removing nothing"
+    );
+    assert!(
+        matches!(
+            kind,
+            Some(HitKind::Penetrated) | Some(HitKind::OverPenetrated)
+        ),
+        "the head-on chunk shot penetrates/carves — NOT a ricochet; got {kind:?}"
+    );
+}
+
+/// COMPANION (Fix #4 keeps the mechanic): the SAME off-centre chunk, struck genuinely
+/// edge-on, STILL ricochets — the fix corrected the angle REFERENCE, it did not disable
+/// ricochet/armor for wreckage. The bore enters the chunk's `-col` tip cell, whose outward
+/// normal (from the chunk's cell-COM) is along `-col`, perpendicular to the `-row` approach
+/// → ~90° → a real glancing ricochet that carves nothing.
+#[test]
+fn genuinely_glancing_shot_at_offcentre_wreck_still_ricochets() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    let wreck = spawn_offrow_wreck(&mut w);
+    let tpos = w.get::<Position>(wreck).unwrap().0;
+
+    // Enter the END (`-col`) tip column: one cell of world-Y offset from the chunk's centre.
+    let (removed, kind) = fire_forward_at_y(&mut w, wreck, tpos.y - CELL_WORLD_SIZE, 40.0);
+    assert_eq!(
+        kind,
+        Some(HitKind::Ricochet),
+        "a genuinely glancing hit on the chunk still RICOCHETS — the mechanic is preserved; \
+         got {kind:?}"
+    );
+    assert!(
+        removed.is_empty(),
+        "the glancing ricochet carves nothing off the chunk (got {removed:?})"
+    );
+}
+
+// =================================================================================
+// Fix #5 — live-ship (and hulk) bore STALL: drilling ONE spot carves a few cells then
+// permanently RICOCHETS, mid-body, while the ship is still alive. The armor gate's tunnel
+// guard decided "fresh surface vs bored tunnel" with a SINGLE dominant-axis cell, which
+// misfires for an off-axis (diagonal) bore on a SHAPED hull (the orthogonal neighbour falls
+// outside the silhouette even though the shot drilled a real tunnel). So the grid-centre
+// radial obliquity applies, and at the bore's closest approach to the centre the radial is
+// ⊥ to the shot → ~90° → permanent `Ricochet`, the entry never advances.
+//
+// `HULL_WEDGE` is a filled lower silhouette (`r <= c+2` on an 11×11 grid) whose diagonal
+// EDGE reproduces the fighter's neck/wing edge: a `(1,1)` bore runs along that edge, and the
+// authored cell one ORTHOGONAL step toward the shooter sits OFF the silhouette → the old
+// guard reads `buried=false` exactly where it should read "tunnel". The core `(5,5)` is in
+// the bulk (off the edge), so the stall is mid-body with the ship alive — the user's case.
+// =================================================================================
+
+/// The off-axis-bore-stall hull id used by the Fix #5 regression.
+const HULL_WEDGE: HullId = HullId(13);
+
+/// A filled lower silhouette on an 11×11 grid: every cell with `r <= c+2` (85 cells), each
+/// its own [`SectionId`]. The diagonal edge `r = c+2` is a genuine outer surface; a `(1,1)`
+/// bore runs along it, and the cell one orthogonal step toward the shooter from an edge cell
+/// is OFF the silhouette — the shape that makes the OLD single-axis tunnel guard misfire.
+fn wedge_hull() -> Hull {
+    let mut cells: Vec<GridCell> = Vec::new();
+    let mut section = 0u32;
+    for c in 0u16..11 {
+        for r in 0u16..11 {
+            if r <= c + 2 {
+                cells.push(GridCell::new((c, r), SectionId(section)));
+                section += 1;
+            }
+        }
+    }
+    Hull {
+        id: HULL_WEDGE,
+        name: "Wedge".to_string(),
+        grid_dims: (11, 11),
+        cells,
+        power_capacity: 100.0,
+        cpu_capacity: 100.0,
+        mass_capacity: 100.0,
+        hull_base_mass: 1.0,
+        slots: Vec::new(),
+    }
+}
+
+/// Spawn a LIVE (non-`Wreck`) `Destructible` wedge ship whose `(1,1)` bore along the diagonal
+/// edge has ALREADY been drilled to the stall cell `(4,6)`: the front edge cells
+/// `{(0,2),(1,3),(2,4),(3,5)}` are pre-removed, so the next shot's first SURVIVING cell is
+/// `(4,6)` — whose grid-centre radial `(-1,1)` is ⊥ to the `(1,1)` bore (a 90° read). The
+/// core `(5,5)` is intact (the ship is alive). NO `Wreck`, so the armor angle uses the grid
+/// centre (the live-ship regime the bug lives in).
+fn spawn_drilled_wedge(w: &mut World) -> Entity {
+    {
+        let mut hulls = w.get_resource_mut::<HullCatalog>().unwrap();
+        hulls.hulls.insert(HULL_WEDGE, wedge_hull());
+    }
+    let drilled: [(u16, u16); 4] = [(0, 2), (1, 3), (2, 4), (3, 5)];
+    let mut cells = CellMap::new();
+    for gc in wedge_hull().cells {
+        let (c, r) = gc.coord;
+        if drilled.contains(&(c, r)) {
+            continue; // already bored away
+        }
+        let depth = c.min(10 - c).min(r).min(10 - r);
+        cells.insert(
+            (c, r),
+            CellOccupant {
+                slot: SlotId(u32::MAX),
+                module: None,
+                health: 5.0, // small structural HP so a carve removes the cell
+                depth,
+                structural: true,
+            },
+        );
+    }
+    let layout = FitLayout {
+        hull: HULL_WEDGE,
+        cells,
+    };
+    w.spawn((
+        Position(Vec2::ZERO),
+        Velocity(Vec2::ZERO),
+        Heading(0.0),
+        AngularVelocity(0.0),
+        CollisionRadius(hull_collision_radius((11, 11))),
+        layout,
+        Destructible,
+    ))
+    .id()
+}
+
+/// REGRESSION (Fix #5): a live ship being bored along ONE off-axis line does NOT permanently
+/// ricochet mid-body. The bore has drilled to `(4,6)`; the next shot's entry IS `(4,6)`, whose
+/// grid-centre radial is ⊥ to the `(1,1)` bore. PRE-FIX the single-axis tunnel guard reads
+/// `front=(3,6)` (off the silhouette) → `buried=false` → the 90° radial → `Ricochet`, nothing
+/// carved, the hole stuck forever. POST-FIX the robust authored-cell-in-front test sees the
+/// drilled tunnel (`(3,5)` is authored and in front along the real ray) → head-on → the bore
+/// drills on through. The ship stays ALIVE (the core `(5,5)` is untouched).
+#[test]
+fn live_ship_bore_does_not_permanently_ricochet_mid_body() {
+    let mut w = World::new();
+    insert_full_combat_resources(&mut w);
+    let ship = spawn_drilled_wedge(&mut w);
+
+    let ev = DamageEvent {
+        channel: Channel::Kinetic,
+        magnitude: 1000.0,
+        penetration: 5000.0,
+        pen_size: 1.0, // < overmatch_ratio * default facet thickness (1.5*1.0) → the angle decides
+        point: Vec2::new(3.5, 5.5), // centre of the drilled (3,5), just before the (4,6) entry
+        dir: Vec2::new(1.0, 1.0).normalize(), // the diagonal bore
+        source: None,
+    };
+    let out = apply_damage(&mut w, ship, ev);
+
+    assert!(
+        matches!(out.result, HitKind::Penetrated | HitKind::OverPenetrated),
+        "the bore drills THROUGH the buried tunnel cell (4,6) instead of permanently \
+         ricocheting mid-body; got {:?} (pre-fix this was Ricochet — the stall)",
+        out.result
+    );
+    assert!(
+        out.destroyed_cells.contains(&(4, 6)),
+        "the stall cell (4,6) is carved (the bore advances); got {:?}",
+        out.destroyed_cells
+    );
+    // The ship is still ALIVE — the stall was mid-body, the core (5,5) is intact.
+    let layout = w
+        .get::<FitLayout>(ship)
+        .expect("the live ship still exists (mid-body stall, not a kill)");
+    assert!(
+        layout.cells.contains_key(&(5, 5)),
+        "the core (5,5) is untouched — this reproduces a MID-BODY stall on a live ship"
+    );
+}
