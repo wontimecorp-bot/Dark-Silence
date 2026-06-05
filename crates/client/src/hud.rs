@@ -1,11 +1,10 @@
 //! Minimal diegetic HUD (FR-011): speed/throttle, flight-assist mode, an aiming
 //! reticle, and hit/destroy feedback — no number spam (SC-006).
 //!
-//! Phase E added a segmented **"VU-meter"** bar at the bottom — **Energy** (the weapon capacitor;
-//! empties as you fire, recharges) — read straight from the embedded server world (like the dev
-//! panel), color-graded green→amber→red with a critical pulse so you can track it in combat without
-//! looking away. (Phase F moves **Heat** to a trapezoid **double-ramp** mesh bar — see
-//! [`crate::hud_bars`] — so it is no longer a UI VU bar here.)
+//! The Phase-F HUD status bars (Energy/Heat/Afterburner + Shield/Armor/Hull) are camera-anchored
+//! trapezoid MESH bars — see [`crate::hud_bars`]. This module keeps only the **Energy numeric +
+//! net-rate text** (the detail-on-focus readout beside the Energy bar), read straight from the
+//! embedded server world like the dev panel.
 
 use bevy::prelude::*;
 use sim::components::{Energy, FlightAssist, Health, Ship, Velocity};
@@ -18,23 +17,16 @@ use crate::net::{LoopbackHost, NetClientState};
 #[derive(Component)]
 pub struct HudText;
 
-/// One lit/unlit segment of the bottom Energy VU-meter bar.
-#[derive(Component)]
-pub struct BarSegment {
-    pub index: usize,
-}
-
-/// The text label (`ENRG 72/120`) at the head of the Energy bar — the detail-on-focus layer.
+/// The numeric Energy readout (`ENRG 72/120`) — the detail-on-focus layer beside the Energy mesh
+/// bar (the bar itself is a camera-anchored trapezoid in [`crate::hud_bars`]).
 #[derive(Component)]
 pub struct BarLabel;
 
-/// The Energy net-rate readout at the RIGHT of the ENRG bar (Phase F): a direction glyph + the
-/// signed per-second rate, coloured green (charging) / red (draining) / dim (≈0).
+/// The Energy net-rate readout next to the ENRG number (Phase F): an ASCII direction glyph (`^`
+/// charging / `v` draining / `~` ≈0 — the default font has no triangle glyphs) + the signed
+/// per-second rate, coloured green (charging) / red (draining) / dim (≈0).
 #[derive(Component)]
 pub struct BarRate;
-
-/// Segments per bar (the "stacked vertical bars" you count at a glance).
-const BAR_SEGMENTS: usize = 24;
 
 /// An unlit segment's colour (dim, so the lit portion reads as the level). Shared with the
 /// Phase F trapezoid bars ([`crate::hud_bars`]).
@@ -83,21 +75,18 @@ pub fn setup_hud(mut commands: Commands) {
     ));
 }
 
-/// Spawn the bottom segmented **Energy** bar (Phase E; Heat moved to the trapezoid double-ramp in
-/// Phase F). A bottom-anchored, full-width row: a text label + `BAR_SEGMENTS` thin vertical segments
-/// (lit by `current/max`, coloured by `update_energy_hud`) + the net-rate readout.
+/// Spawn the **Energy numeric + net-rate** text readout (the Energy BAR itself is a camera-anchored
+/// trapezoid mesh in [`crate::hud_bars`]). A compact row anchored at the bottom, left-of-centre so it
+/// floats just above the Energy bar in the bottom EHA row. (Position is a first-pass guess — tunable.)
 pub fn setup_energy_bars(mut commands: Commands) {
     commands
         .spawn(Node {
             position_type: PositionType::Absolute,
-            bottom: Val::Px(16.0),
-            left: Val::Px(0.0),
-            right: Val::Px(0.0),
-            width: Val::Percent(100.0),
+            bottom: Val::Px(46.0),
+            left: Val::Percent(24.0),
             flex_direction: FlexDirection::Row,
             align_items: AlignItems::Center,
-            justify_content: JustifyContent::Center,
-            column_gap: Val::Px(2.0),
+            column_gap: Val::Px(8.0),
             ..default()
         })
         .with_children(|row| {
@@ -108,49 +97,26 @@ pub fn setup_energy_bars(mut commands: Commands) {
                     ..default()
                 },
                 TextColor(Color::srgb(0.80, 0.90, 1.0)),
-                Node {
-                    width: Val::Px(96.0),
-                    ..default()
-                },
                 BarLabel,
             ));
-            for index in 0..BAR_SEGMENTS {
-                row.spawn((
-                    Node {
-                        width: Val::Px(7.0),
-                        height: Val::Px(16.0),
-                        ..default()
-                    },
-                    BackgroundColor(seg_dim()),
-                    BarSegment { index },
-                ));
-            }
-            // The Energy net-rate readout (direction glyph + signed number).
             row.spawn((
-                Text::new(" -".to_string()),
+                Text::new("~".to_string()),
                 TextFont {
                     font_size: 13.0,
                     ..default()
                 },
                 TextColor(Color::srgb(0.6, 0.6, 0.65)),
-                Node {
-                    margin: UiRect::left(Val::Px(8.0)),
-                    ..default()
-                },
                 BarRate,
             ));
         });
 }
 
-/// Refresh the bottom Energy bar each frame from the local ship's live `Energy`, read from the
-/// embedded server world (like the dev panel). Lit segments = `current/max`; colour grades
-/// green→amber→red (reddens as it EMPTIES) and the critical band pulses. (Heat now lives in the
-/// trapezoid double-ramp — [`crate::hud_bars`].)
+/// Refresh the Energy numeric + net-rate text each frame from the local ship's live `Energy`, read
+/// from the embedded server world (like the dev panel). The Energy BAR fill is drawn by the mesh
+/// bar in [`crate::hud_bars`]; this is only the detail-on-focus number + the trend readout.
 pub fn update_energy_hud(
     host: Option<NonSend<LoopbackHost>>,
     net: Option<NonSend<NetClientState>>,
-    time: Res<Time>,
-    mut segs: Query<(&BarSegment, &mut BackgroundColor)>,
     mut labels: Query<&mut Text, (With<BarLabel>, Without<HudText>, Without<BarRate>)>,
     mut rate_q: Query<(&mut Text, &mut TextColor), (With<BarRate>, Without<HudText>)>,
 ) {
@@ -168,31 +134,6 @@ pub fn update_energy_hud(
         },
         _ => (None, None),
     };
-    let efrac = energy.map(|(c, m)| {
-        if m > 0.0 {
-            (c / m).clamp(0.0, 1.0)
-        } else {
-            0.0
-        }
-    });
-    // Critical-pulse brightness oscillation (0.55..=1.0), applied only in the danger band.
-    let pulse = 0.55 + 0.45 * (time.elapsed_secs() * 9.0).sin().abs();
-
-    for (seg, mut bg) in &mut segs {
-        let Some(f) = efrac else {
-            bg.0 = seg_dim();
-            continue;
-        };
-        if (seg.index as f32) >= f * BAR_SEGMENTS as f32 {
-            bg.0 = seg_dim();
-            continue;
-        }
-        let mut c = grade(1.0 - f);
-        if f < 0.2 {
-            c = scale_rgb(c, pulse);
-        }
-        bg.0 = c;
-    }
 
     for mut text in &mut labels {
         text.0 = match energy {
@@ -201,16 +142,17 @@ pub fn update_energy_hud(
         };
     }
 
-    // Energy net-rate readout (right of the ENRG bar): a direction glyph + the signed rate, coloured
-    // green (charging) / red (draining) / dim (≈0) so the trend reads at a glance.
+    // Energy net-rate readout: an ASCII direction glyph + the signed rate, coloured green (charging)
+    // / red (draining) / dim (≈0) so the trend reads at a glance. ASCII `^`/`v`/`~` because the
+    // default font has no triangle glyphs (the old `▲`/`▼` rendered as blank squares).
     if let Ok((mut text, mut color)) = rate_q.single_mut() {
         let (glyph, c, num) = match erate {
-            Some(r) if r > 1.0 => ("▲", Color::srgb(0.30, 0.90, 0.35), format!("+{r:.0}")),
-            Some(r) if r < -1.0 => ("▼", Color::srgb(0.95, 0.35, 0.25), format!("{r:.0}")),
-            Some(r) => ("–", Color::srgb(0.60, 0.60, 0.65), format!("{r:+.0}")),
-            None => ("–", Color::srgb(0.60, 0.60, 0.65), String::new()),
+            Some(r) if r > 1.0 => ("^", Color::srgb(0.30, 0.90, 0.35), format!("+{r:.0}")),
+            Some(r) if r < -1.0 => ("v", Color::srgb(0.95, 0.35, 0.25), format!("{r:.0}")),
+            Some(r) => ("~", Color::srgb(0.60, 0.60, 0.65), format!("{r:+.0}")),
+            None => ("~", Color::srgb(0.60, 0.60, 0.65), String::new()),
         };
-        text.0 = format!(" {glyph} {num}");
+        text.0 = format!("{glyph} {num}");
         color.0 = c;
     }
 }

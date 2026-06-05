@@ -22,7 +22,7 @@
 //! and the dev panel).
 
 use bevy::prelude::*;
-use sim::components::{Afterburner, ArmorHp, Heat};
+use sim::components::{Afterburner, ArmorHp, Energy, Heat};
 use sim::damage::{HullStructure, Shields};
 
 use crate::camera::MainCamera;
@@ -42,6 +42,8 @@ const SEG_FILL: f32 = 0.8;
 /// Which Phase-F trapezoid bar a segment belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrapBar {
+    /// Energy capacitor — a uniform (level) right-tapered row; want it FULL (drains as you fire).
+    Energy,
     /// Boost pool — a single short→tall ramp; want it FULL (drains while boosting).
     Afterburner,
     /// Heat — a double-ramp; want it EMPTY (fills as you fire; full = overheated).
@@ -91,57 +93,78 @@ struct BarLayout {
     shape: Shape,
 }
 
-/// The Phase-F bars. First-pass placement — TUNABLE; refine after playtest. The afterburner + heat
-/// ramps sit centred near the bottom; the Shield/Armor/Hull stacks run up the left side (kept within
-/// `x ≈ ±6` so they stay on-screen down to a 4:3 window).
+/// The Phase-F bars (camera-local units at [`HUD_DEPTH`]; screen ≈ `x ∈ ±half_w`, `y ∈ ±4.97` for
+/// the default ~45° FOV — kept within `x ≈ ±6.5` so it stays on-screen down to a 4:3 window).
+///
+/// **Layout** (first-pass placement — TUNABLE; refine after playtest):
+/// - **SAH** (Shield/Armor/Hull) — three half-height vertical stacks in the **bottom-left** corner,
+///   rising from the bottom edge.
+/// - **EHA** (Energy/Heat/Afterburner) — a horizontal **row across the bottom**, to the right of the
+///   SAH cluster: Energy = a uniform (level) right-tapered row, Heat = double-ramp, Afterburner = a
+///   single short→tall ramp.
 const BARS: &[BarLayout] = &[
+    // --- EHA: resource bars in a row across the bottom (all on the same baseline) -----------
     BarLayout {
-        bar: TrapBar::Afterburner,
+        // Energy = a LEVEL right-tapered row (`min_h == max_h` → constant height); want-full.
+        bar: TrapBar::Energy,
         count: 16,
-        x_center: 0.0,
-        y_base: -3.2,
-        extent: 5.5,
+        x_center: -3.4,
+        y_base: -4.6,
+        extent: 3.0,
         shape: Shape::Ramp {
             double: false,
-            min_h: 0.35,
-            max_h: 1.0,
+            min_h: 0.7,
+            max_h: 0.7,
         },
     },
     BarLayout {
         bar: TrapBar::Heat,
         count: 24,
-        x_center: 0.0,
-        y_base: -4.4,
-        extent: 6.0,
+        x_center: 0.4,
+        y_base: -4.6,
+        extent: 3.6,
         shape: Shape::Ramp {
             double: true,
-            min_h: 0.3,
-            max_h: 0.95,
+            min_h: 0.28,
+            max_h: 0.72,
         },
     },
     BarLayout {
+        bar: TrapBar::Afterburner,
+        count: 16,
+        x_center: 4.4,
+        y_base: -4.6,
+        extent: 3.2,
+        shape: Shape::Ramp {
+            double: false,
+            min_h: 0.3,
+            max_h: 0.72,
+        },
+    },
+    // --- SAH: half-height defense stacks in the bottom-left corner --------------------------
+    BarLayout {
         bar: TrapBar::Shield,
         count: 10,
-        x_center: -5.6,
-        y_base: -2.5,
-        extent: 5.0,
-        shape: Shape::Stack { width: 0.5 },
+        x_center: -6.3,
+        y_base: -4.6,
+        extent: 2.5,
+        shape: Shape::Stack { width: 0.4 },
     },
     BarLayout {
         bar: TrapBar::Armor,
         count: 10,
-        x_center: -5.0,
-        y_base: -2.5,
-        extent: 5.0,
-        shape: Shape::Stack { width: 0.5 },
+        x_center: -5.8,
+        y_base: -4.6,
+        extent: 2.5,
+        shape: Shape::Stack { width: 0.4 },
     },
     BarLayout {
         bar: TrapBar::Hull,
         count: 10,
-        x_center: -4.4,
-        y_base: -2.5,
-        extent: 5.0,
-        shape: Shape::Stack { width: 0.5 },
+        x_center: -5.3,
+        y_base: -4.6,
+        extent: 2.5,
+        shape: Shape::Stack { width: 0.4 },
     },
 ];
 
@@ -254,9 +277,10 @@ const SHIELD_HUE: Color = Color::srgb(0.25, 0.70, 1.0);
 const ARMOR_HUE: Color = Color::srgb(0.95, 0.72, 0.20);
 const HULL_HUE: Color = Color::srgb(0.95, 0.42, 0.28);
 
-/// One frame's snapshot of the five pool fractions (`None` until the ship exists / is fitted).
+/// One frame's snapshot of the six pool fractions (`None` until the ship exists / is fitted).
 #[derive(Default)]
 struct PoolFracs {
+    energy: Option<f32>,
     afterburner: Option<f32>,
     heat: Option<f32>,
     shield: Option<f32>,
@@ -281,6 +305,7 @@ pub fn update_trapezoid_bars(
             Some(e) => {
                 let w = host.server.world();
                 PoolFracs {
+                    energy: w.get::<Energy>(e).map(|p| frac(p.current, p.max)),
                     afterburner: w.get::<Afterburner>(e).map(|p| frac(p.current, p.max)),
                     heat: w.get::<Heat>(e).map(|p| frac(p.current, p.max)),
                     shield: w.get::<Shields>(e).map(|p| frac(p.current, p.max)),
@@ -297,6 +322,7 @@ pub fn update_trapezoid_bars(
 
     for seg in &segs {
         let f = match seg.bar {
+            TrapBar::Energy => pools.energy,
             TrapBar::Afterburner => pools.afterburner,
             TrapBar::Heat => pools.heat,
             TrapBar::Shield => pools.shield,
@@ -309,8 +335,9 @@ pub fn update_trapezoid_bars(
             Some(frac) if seg.index >= lit_count(frac, seg.count) => seg_dim(),
             Some(frac) => {
                 let (mut c, critical) = match seg.bar {
-                    // Ramp bars: graded green→amber→red. Afterburner is "want full" (bad as it
-                    // empties); Heat is "want empty" (bad as it fills).
+                    // Ramp bars: graded green→amber→red. Energy + Afterburner are "want full" (bad as
+                    // they EMPTY); Heat is "want empty" (bad as it FILLS).
+                    TrapBar::Energy => (grade(1.0 - frac), frac < 0.2),
                     TrapBar::Afterburner => (grade(1.0 - frac), frac < 0.2),
                     TrapBar::Heat => (grade(frac), frac > 0.85),
                     // Defense stacks: a FIXED per-layer hue (identity), pulsing only when low.
@@ -446,5 +473,37 @@ mod tests {
             "uniform width"
         );
         assert!((h0 - h9).abs() < 1e-6, "uniform height (no ramp)");
+    }
+
+    #[test]
+    fn level_ramp_min_eq_max_is_uniform_height() {
+        // The Energy bar is a `Ramp` with `min_h == max_h` → every segment the SAME height (a level
+        // right-tapered row), but still laid out left→right like the other ramp bars.
+        let layout = BarLayout {
+            bar: TrapBar::Energy,
+            count: 8,
+            x_center: -3.4,
+            y_base: -4.6,
+            extent: 3.0,
+            shape: Shape::Ramp {
+                double: false,
+                min_h: 0.7,
+                max_h: 0.7,
+            },
+        };
+        let h0 = seg_placement(&layout, 0).3;
+        for i in 1..layout.count {
+            let (x, y, _w, h) = seg_placement(&layout, i);
+            assert!(
+                (h - h0).abs() < 1e-6,
+                "every segment is the same height (i={i})"
+            );
+            assert!((h - 0.7).abs() < 1e-6, "height is the level min==max value");
+            assert!((y + 4.6).abs() < 1e-6, "all on the same baseline");
+            assert!(
+                x > seg_placement(&layout, i - 1).0,
+                "still advances along +x"
+            );
+        }
     }
 }
