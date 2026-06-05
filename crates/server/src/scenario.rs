@@ -15,9 +15,13 @@ use sim::components::{
     AngularVelocity, CollisionRadius, Faction, Heading, Health, Position, RenderScale, Ship,
     Target, TargetKind, Velocity,
 };
+use sim::fitting::{
+    hull_collision_radius, station_hull, HullCatalog, HullId, CELL_WORLD_SIZE, HULL_OUTPOST,
+    HULL_TRANSPORT,
+};
 use sim::{
     Cargo, FactionSpawns, MiningState, MiningTransport, MiningTuning, RefinedResources, Turret,
-    TurretSpec,
+    TurretSpec, VoxelizeOnHit,
 };
 
 use crate::ServerApp;
@@ -29,8 +33,8 @@ use crate::ServerApp;
 struct ScenarioContent {
     arena: ArenaSpec,
     mine_node: StructureSpec,
-    outpost: StructureSpec,
-    transport: StructureSpec,
+    outpost: VoxelStructureSpec,
+    transport: VoxelStructureSpec,
     mining: MiningTuning,
     transport_turret: TurretLoadout,
     outpost_turret: TurretLoadout,
@@ -47,7 +51,7 @@ struct ArenaSpec {
     spawn_offset: (f32, f32),
 }
 
-/// One structure's render size + collision + durability.
+/// A flat (non-carveable) structure — render size + collision + durability. Used for the asteroid.
 #[derive(Debug, Clone, Deserialize)]
 struct StructureSpec {
     /// Render mesh extent `(x, y, z)` — scales the client's UNIT mesh ([`RenderScale`]).
@@ -55,6 +59,19 @@ struct StructureSpec {
     /// Collision circle radius (combat hitbox).
     collision_radius: f32,
     health: f32,
+}
+
+/// A carveable structure (Refinement 5): a `(cols, rows)` voxel hull grid + plating thickness +
+/// per-cell HP. Spawns as a cheap flat box marked [`VoxelizeOnHit`]; the first hit converts it to the
+/// cell hull (size = `grid · CELL_WORLD_SIZE`, so render + collision derive from the grid).
+#[derive(Debug, Clone, Deserialize)]
+struct VoxelStructureSpec {
+    /// Hull grid `(cols, rows)` — world size is `grid · CELL_WORLD_SIZE` (≈0.32 u/cell).
+    grid: (u16, u16),
+    /// Perimeter-shell + strut thickness in cells (larger → more filled / tougher).
+    plating: u16,
+    /// HP per structural cell (toughness of carving; cells × this ≈ the old flat HP).
+    cell_hp: f32,
 }
 
 /// A host's turret battery: the shared aim spec + (kinetic) weapon stats + per-turret mount offsets.
@@ -150,6 +167,25 @@ impl ServerApp {
         // The transport's live movement/economy tuning comes from the content (Refinement 3/4).
         self.world.insert_resource(content.mining);
 
+        // Refinement 5: inject the procedural station hulls into the catalog so the lazy-voxelize
+        // conversion (`voxelize_pending_system`) + render can resolve them by id. Windowed-only.
+        {
+            let (tc, tr) = content.transport.grid;
+            let (oc, or) = content.outpost.grid;
+            let t_hull = station_hull(
+                HULL_TRANSPORT,
+                "Transport",
+                tc,
+                tr,
+                content.transport.plating,
+            );
+            let o_hull = station_hull(HULL_OUTPOST, "Outpost", oc, or, content.outpost.plating);
+            if let Some(mut hulls) = self.world.get_resource_mut::<HullCatalog>() {
+                hulls.hulls.insert(HULL_TRANSPORT, t_hull);
+                hulls.hulls.insert(HULL_OUTPOST, o_hull);
+            }
+        }
+
         let hw = content.arena.half_width;
         let start = content.arena.transport_start_offset;
         let (sx, sy) = content.arena.spawn_offset;
@@ -181,8 +217,13 @@ impl ServerApp {
     /// Spawn a faction's refinery outpost (Phase 4): the beefy `Health` structure + its turret
     /// battery (the better-aim outpost loadout from `scenario.ron`). Returns the outpost entity.
     fn spawn_outpost(&mut self, pos: Vec2, faction: Faction, content: &ScenarioContent) -> Entity {
-        let outpost =
-            self.spawn_structure(TargetKind::Outpost, pos, &content.outpost, Some(faction));
+        let outpost = self.spawn_voxel_structure(
+            TargetKind::Outpost,
+            pos,
+            faction,
+            &content.outpost,
+            HULL_OUTPOST,
+        );
         self.mount_turrets(outpost, faction, &content.outpost_turret);
         outpost
     }
@@ -237,11 +278,12 @@ impl ServerApp {
         mine_node: Entity,
         content: &ScenarioContent,
     ) -> Entity {
-        let t = self.spawn_structure(
+        let t = self.spawn_voxel_structure(
             TargetKind::Transport,
             pos,
+            faction,
             &content.transport,
-            Some(faction),
+            HULL_TRANSPORT,
         );
         self.world.entity_mut(t).insert((
             MiningTransport {
@@ -257,11 +299,54 @@ impl ServerApp {
         t
     }
 
-    /// Spawn one stationary `Health`-based scenario structure (asteroid / outpost / transport) from
-    /// its [`StructureSpec`]. A non-`Ship`, non-`FitLayout` entity: `ship_motion_system` never moves
-    /// it (immobile), and the flat `collision_detect_system` path applies damage on a hit. Carries a
-    /// [`RenderScale`] (the authored render size) so the client scales its unit mesh. An optional
-    /// [`Faction`] tags its side (the asteroid is neutral). Returns the entity.
+    /// Spawn a **carveable** structure (Refinement 5 — outpost / transport): a cheap flat box NOW
+    /// (`Target` + flat `Health` + a `CollisionRadius` sized to the eventual voxel footprint + a
+    /// `RenderScale` box) carrying a [`VoxelizeOnHit`] marker. It stays out of the carve/voxel-render
+    /// path until its first hit, when `voxelize_pending_system` swaps in `hull`'s cell layout (size =
+    /// `grid · CELL_WORLD_SIZE`). `faction` tags its side. Returns the entity.
+    fn spawn_voxel_structure(
+        &mut self,
+        kind: TargetKind,
+        pos: Vec2,
+        faction: Faction,
+        spec: &VoxelStructureSpec,
+        hull: HullId,
+    ) -> Entity {
+        let (cols, rows) = spec.grid;
+        // The pre-conversion box matches the eventual voxel hull's footprint (grid · cell size), so
+        // the shape doesn't jump on first hit; a modest fixed depth for thickness.
+        let render = Vec3::new(
+            cols as f32 * CELL_WORLD_SIZE,
+            rows as f32 * CELL_WORLD_SIZE,
+            4.0,
+        );
+        self.world
+            .spawn((
+                Target,
+                kind,
+                Position(pos),
+                Velocity(Vec2::ZERO),
+                Heading(0.0),
+                // Hitbox = the eventual voxel footprint (right both before + after conversion).
+                CollisionRadius(hull_collision_radius(spec.grid)),
+                // Placeholder flat HP: never reduced (the voxelize path TAGS instead of damaging) and
+                // removed on conversion, so it sits high enough to ignore any stray flat damage.
+                Health(1.0e6),
+                RenderScale(render),
+                faction,
+                VoxelizeOnHit {
+                    hull,
+                    cell_hp: spec.cell_hp,
+                },
+            ))
+            .id()
+    }
+
+    /// Spawn one stationary flat-`Health` structure (the asteroid) from its [`StructureSpec`]. A
+    /// non-`Ship`, non-`FitLayout` entity: `ship_motion_system` never moves it, and the flat
+    /// `collision_detect_system` path applies damage on a hit. Carries a [`RenderScale`] (the authored
+    /// render size) so the client scales its unit mesh. An optional [`Faction`] tags its side (the
+    /// asteroid is neutral). Returns the entity.
     fn spawn_structure(
         &mut self,
         kind: TargetKind,

@@ -32,6 +32,7 @@ pub mod physics;
 pub mod scenario;
 pub mod tuning;
 pub mod turret;
+pub mod voxelize;
 pub mod weapon;
 
 pub use clock::FixedDt;
@@ -58,6 +59,7 @@ pub use physics::{Physics, RapierPhysics, SweptHit};
 pub use scenario::{FactionSpawns, ScenarioActive};
 pub use tuning::{SimTuning, Tuning};
 pub use turret::{aim_angle, turret_system, Turret, TurretSpec};
+pub use voxelize::{voxelize_pending_system, PendingVoxelize, VoxelizeOnHit};
 pub use weapon::{damage_event_from_hit, WeaponSource};
 
 use bevy_ecs::schedule::common_conditions::resource_exists;
@@ -156,6 +158,10 @@ pub fn add_fixed_step_systems(schedule: &mut Schedule) {
             turret::turret_system.run_if(resource_exists::<scenario::ScenarioActive>),
             weapon::projectile_step_system,
             collision::collision_detect_system,
+            // Mining skirmish: lazy-voxelize a structure the first time it's hit (the flat path tagged
+            // it `PendingVoxelize`) — build its cell hull + swap, BEFORE `fitted_damage_system` so it
+            // is a carve target from here on. Gated on `ScenarioActive` → a no-op everywhere else.
+            voxelize::voxelize_pending_system.run_if(resource_exists::<scenario::ScenarioActive>),
             collision::fitted_damage_system,
             collision::ram_collision_system,
             // E007 powered shield regen/decay — gated so an unfitted world (no

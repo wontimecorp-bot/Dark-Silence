@@ -252,6 +252,47 @@ pub fn hull_collision_radius(grid_dims: (u16, u16)) -> f32 {
     max_dim * CELL_WORLD_SIZE * 0.5
 }
 
+/// Build a procedural **station hull** (Refinement 5 Phase 2) — a plated frame for the mining
+/// structures: a perimeter shell `plating` cells thick plus a horizontal + vertical strut through the
+/// centre. So it's mostly hollow (a bounded cell count instead of a solid `cols·rows` fill) yet fully
+/// connected, and — since [`cell_depth`](crate::fitting::layout) is distance-to-nearest-edge — the
+/// CENTRE cell is the deepest, i.e. the carve-to-core death point. All cells are structural (no
+/// modules/slots); the carve pipeline seeds each with the structural-cell HP. World size is
+/// `grid · CELL_WORLD_SIZE`. A larger `plating` fills more of the interior (→ solid at the limit).
+pub fn station_hull(id: HullId, name: &str, cols: u16, rows: u16, plating: u16) -> Hull {
+    let p = plating.max(1);
+    let cx = cols.saturating_sub(1) / 2;
+    let cy = rows.saturating_sub(1) / 2;
+    let mut cells = Vec::new();
+    for row in 0..rows {
+        for col in 0..cols {
+            let near_edge = col < p || col + p >= cols || row < p || row + p >= rows;
+            let on_v_strut = col.abs_diff(cx) < p;
+            let on_h_strut = row.abs_diff(cy) < p;
+            if near_edge || on_v_strut || on_h_strut {
+                cells.push(GridCell {
+                    coord: (col, row),
+                    section: SectionId(1),
+                    structural: true,
+                });
+            }
+        }
+    }
+    Hull {
+        id,
+        name: name.to_string(),
+        class: ShipClass::Station,
+        role: ShipRole::Utility,
+        grid_dims: (cols, rows),
+        cells,
+        power_capacity: 0.0,
+        cpu_capacity: 0.0,
+        mass_capacity: 0.0,
+        hull_base_mass: 0.0,
+        slots: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -25,6 +25,7 @@ use crate::fitting::{
 use crate::motion::{apply_angular_impulse, apply_linear_impulse};
 use crate::physics::{Physics, RapierPhysics, SweptHit};
 use crate::tuning::Tuning;
+use crate::voxelize::{PendingVoxelize, VoxelizeOnHit};
 use crate::weapon::{damage_event_from_hit, WeaponSource, PROJECTILE_MASS};
 use bevy_ecs::prelude::*;
 use glam::Vec2;
@@ -157,14 +158,21 @@ pub fn collision_detect_system(
         With<Projectile>,
     >,
     mut targets: Query<
-        (&Position, &CollisionRadius, &mut Health, Option<&Faction>),
+        (
+            Entity,
+            &Position,
+            &CollisionRadius,
+            &mut Health,
+            Option<&Faction>,
+            Option<&VoxelizeOnHit>,
+        ),
         (With<Target>, Without<FitLayout>),
     >,
 ) {
     let friendly_fire = rules.is_some_and(|r| r.friendly_fire);
     let physics = RapierPhysics::new();
     for (projectile, pos, prev, dmg, proj_faction) in &projectiles {
-        for (tpos, radius, mut health, target_faction) in &mut targets {
+        for (tentity, tpos, radius, mut health, target_faction, voxelize) in &mut targets {
             // Mining-skirmish friend/foe gate: a FACTIONED shot skips a non-enemy target. A no-op
             // for an unfactioned shot (`proj_faction` is `None`) → today's free-for-all, so every
             // determinism/botkit/test world (no factioned projectiles) is byte-identical.
@@ -177,7 +185,15 @@ pub fn collision_detect_system(
                 .swept_cast(prev.0, pos.0, tpos.0, radius.0)
                 .is_some()
             {
-                health.0 = combat::apply_damage(health.0, dmg.0);
+                if voxelize.is_some() {
+                    // Lazy voxelization (Refinement 5): the FIRST shot "cracks the shell" — tag the
+                    // structure for conversion to a carve-hull (`voxelize_pending_system`) and consume
+                    // the shot; NO flat damage. `Option` is `None` for every non-structure target, so
+                    // every headless/determinism world is byte-identical.
+                    commands.entity(tentity).insert(PendingVoxelize);
+                } else {
+                    health.0 = combat::apply_damage(health.0, dmg.0);
+                }
                 feedback.hit_flash = combat::FLASH_TIME;
                 commands.entity(projectile).despawn();
                 break; // a projectile strikes at most one target

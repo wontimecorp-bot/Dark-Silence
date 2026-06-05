@@ -516,6 +516,17 @@ fn capture_render_state(
                     vel.0 = e.vel;
                 }
             }
+            // Refinement 5: keep the rendered scale in sync with the authoritative `RenderEntity.scale`
+            // each tick (not just at spawn). A structure that lazily voxelizes drops from its box
+            // `RenderScale` to ONE, so its newly-attached hull child (`Transform::IDENTITY`, which
+            // INHERITS the parent transform) renders at the natural cell size instead of the stale box
+            // scale. Skip `Debris` — a fragment sets its own per-chunk Transform scale at spawn.
+            // `bubble_q` is the existing `&mut Transform` query (reused to avoid a second one).
+            if e.kind != EntityKind::Debris {
+                if let Ok((_, mut tf)) = bubble_q.get_mut(bevy_entity) {
+                    tf.scale = e.scale;
+                }
+            }
             // Revise-B: seamless hull-surface LOD for a fitted ship (non-empty cell payload).
             sync_ship_hull(
                 &mut commands,
@@ -782,7 +793,14 @@ fn sync_ship_hull(
         (true, true) => assets.wreck_hull_material_white.clone(),
         (true, false) => assets.wreck_hull_material.clone(),
         (false, true) => assets.hull_material_white.clone(),
-        (false, false) => assets.hull_material.clone(),
+        // Plain voxel look: tint a live factioned hull by its team (Refinement 5) so the carveable
+        // structures + ships read red/blue; `0` (neutral / no faction) keeps the default steel. The
+        // module-colour view + wrecks keep their own materials above.
+        (false, false) => match e.faction {
+            1 => assets.faction_red_hull_material.clone(),
+            2 => assets.faction_blue_hull_material.clone(),
+            _ => assets.hull_material.clone(),
+        },
     };
     let center = hull_mesh_center(e);
 

@@ -85,6 +85,11 @@ pub struct RenderAssets {
     /// quad (see [`build_hull_mesh`]'s `exposed` hook). Shared across all near ships (the
     /// per-ship variation is the geometry, not the material).
     pub hull_material: Handle<StandardMaterial>,
+    /// Faction-tinted hull plates (Refinement 5): the metallic hull material with a red/blue team
+    /// base, selected by `RenderEntity.faction` in `sync_ship_hull` for the plain voxel look so a
+    /// factioned structure/ship reads as its team colour.
+    pub faction_red_hull_material: Handle<StandardMaterial>,
+    pub faction_blue_hull_material: Handle<StandardMaterial>,
     /// The wreck hull plate material — the same metallic hull material but tinted with the
     /// darkened/desaturated [`WRECK_HULL_COLOR`] ("dead metal"). A severed chunk's / dead
     /// hulk's hull mesh ([`build_hull_mesh`]) wears it so a broken piece reads as debris
@@ -1119,6 +1124,23 @@ pub fn setup_scene(
         ..default()
     });
 
+    // Faction-tinted hull plates (Refinement 5): the SAME metallic plate, base shifted toward the
+    // team colour so a factioned VOXEL hull (the carveable structures, and ships) reads red/blue at a
+    // glance — a moderate steel tint, not flat paint. Used by the plain (non-module-colour) voxel look
+    // in `sync_ship_hull`; the white-base module-colour view + wrecks keep their own materials.
+    let faction_red_hull_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.55, 0.22, 0.20),
+        metallic: 0.6,
+        perceptual_roughness: 0.55,
+        ..default()
+    });
+    let faction_blue_hull_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.22, 0.34, 0.62),
+        metallic: 0.6,
+        perceptual_roughness: 0.55,
+        ..default()
+    });
+
     // Wreck hull plate: the SAME metallic plate as a live ship but tinted "dead metal"
     // (the darkened/desaturated `WRECK_HULL_COLOR`) so a severed chunk / destroyed hulk
     // reads as debris while keeping the real cell shape/size/scale (it shares
@@ -1180,6 +1202,8 @@ pub fn setup_scene(
         debris_mesh,
         debris_material,
         hull_material,
+        faction_red_hull_material,
+        faction_blue_hull_material,
         wreck_hull_material,
         hull_material_white,
         wreck_hull_material_white,

@@ -342,6 +342,84 @@ fn turret_acquires_and_destroys_an_enemy_but_spares_a_friendly() {
     );
 }
 
+/// Refinement 5 — lazy voxelization: a flat-`Health` structure marked `VoxelizeOnHit` is NOT a carve
+/// target until shot. The first hit tags it (no flat damage), `voxelize_pending_system` swaps in its
+/// cell hull (gains `FitLayout` + `Destructible`, loses `Health`), and from then on it carves like a
+/// ship. Proves the cheap-box → carve-hull conversion end to end.
+#[test]
+fn voxelize_on_hit_converts_a_structure_to_a_carve_hull() {
+    use sim::fitting::{station_hull, HullCatalog, HullId, ModuleCatalog};
+
+    let mut w = make_world();
+    w.insert_resource(ScenarioActive);
+    w.insert_resource(ModuleCatalog::default());
+    let hull_id = HullId(9001);
+    let mut hulls = HullCatalog::default();
+    hulls
+        .hulls
+        .insert(hull_id, station_hull(hull_id, "TestStation", 7, 7, 2));
+    w.insert_resource(hulls);
+
+    let radius = sim::fitting::hull_collision_radius((7, 7));
+    let structure = w
+        .spawn((
+            Target,
+            TargetKind::Outpost,
+            Position(Vec2::ZERO),
+            Velocity(Vec2::ZERO),
+            Heading(0.0),
+            CollisionRadius(radius),
+            Health(1.0e6),
+            sim::VoxelizeOnHit {
+                hull: hull_id,
+                cell_hp: 4.0,
+            },
+        ))
+        .id();
+    // A shot sweeping straight across the structure circle.
+    w.spawn((
+        Projectile,
+        Position(Vec2::new(radius + 1.0, 0.0)),
+        PrevPosition(Vec2::new(-radius - 1.0, 0.0)),
+        Velocity(Vec2::new(100.0, 0.0)),
+        Damage(10.0),
+    ));
+
+    // Pre: a flat box — has `Health`, is NOT a carve target.
+    assert!(w.get::<Health>(structure).is_some());
+    assert!(w.get::<sim::fitting::FitLayout>(structure).is_none());
+
+    // collision_detect tags it (consuming the shot) → voxelize_pending converts it. Two ticks so the
+    // tag set via deferred `Commands` is applied before the conversion reads it.
+    let mut s = Schedule::default();
+    s.add_systems(
+        (
+            sim::collision::collision_detect_system,
+            sim::voxelize_pending_system,
+        )
+            .chain(),
+    );
+    for _ in 0..2 {
+        s.run(&mut w);
+    }
+
+    // Post: converted to a carve-hull — gained `FitLayout` + `Destructible`, lost flat `Health`.
+    let layout = w.get::<sim::fitting::FitLayout>(structure);
+    assert!(layout.is_some(), "gained a FitLayout (now carveable)");
+    assert!(
+        w.get::<Destructible>(structure).is_some(),
+        "gained Destructible"
+    );
+    assert!(
+        w.get::<Health>(structure).is_none(),
+        "flat Health removed on conversion"
+    );
+    assert!(
+        !layout.unwrap().cells.is_empty(),
+        "the cell hull has cells to carve"
+    );
+}
+
 #[test]
 fn sub_lethal_ram_bounces_and_ship_survives() {
     let mut w = make_world();

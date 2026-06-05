@@ -89,6 +89,11 @@ impl HullCatalog {
 pub const HULL_FIGHTER: HullId = HullId(1);
 /// Seed hull id: the tankier, more-firepower, less-agile `corvette`.
 pub const HULL_CORVETTE: HullId = HullId(2);
+/// Mining-skirmish station hull ids (Refinement 5): procedural plated frames built by
+/// [`station_hull`](super::hull::station_hull) and injected into the catalog at scenario spawn (not
+/// authored in `ships.ron`). Ids chosen well clear of the authored seeds.
+pub const HULL_TRANSPORT: HullId = HullId(1001);
+pub const HULL_OUTPOST: HullId = HullId(1002);
 
 /// Live structural HP seeded onto every **structural** hull cell in
 /// [`build_layout`](super::layout::build_layout) (Phase 1A). Module cells take their
