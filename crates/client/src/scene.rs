@@ -323,6 +323,34 @@ pub fn build_trapezoid_mesh(top_w: f32, bottom_w: f32, height: f32) -> Mesh {
     .with_inserted_indices(Indices::U32(indices))
 }
 
+/// Build a **horizontally-tapered** flat trapezoid in the XY plane (`z = 0`), **anchored at its
+/// bottom edge on `y = 0`** (so `scale.y` still grows it upward into a ramp). The bottom edge is
+/// flat spanning `[-width/2, +width/2]`; the **left edge has height `left_h`, the right edge
+/// `right_h`**, and the TOP edge slants between them. With `right_h < left_h` the segment **tapers
+/// toward the right** on a clean flat baseline — the Phase-F afterburner/heat ramp look (vs
+/// [`build_trapezoid_mesh`], which tapers toward the TOP and is used by the vertical stacks). `+Z`
+/// normal (faces the top-down camera); two triangles wound CCW from `+Z`, with a simple UV.
+pub fn build_trapezoid_mesh_h(left_h: f32, right_h: f32, width: f32) -> Mesh {
+    let hw = width * 0.5;
+    let positions: Vec<[f32; 3]> = vec![
+        [-hw, 0.0, 0.0],    // 0 bottom-left
+        [hw, 0.0, 0.0],     // 1 bottom-right
+        [hw, right_h, 0.0], // 2 right edge (short side)
+        [-hw, left_h, 0.0], // 3 left edge  (tall side)
+    ];
+    let normals = vec![[0.0, 0.0, 1.0]; 4];
+    let uvs: Vec<[f32; 2]> = vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+    let indices = vec![0u32, 1, 2, 0, 2, 3];
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
 /// Revise-B: build ONE merged **seamless solid hull surface** mesh for a fitted ship
 /// from its present cells, in the ship's LOCAL frame (XY plane), so the whole ship draws
 /// as a single mesh + the single [`RenderAssets::hull_material`].
@@ -1545,6 +1573,49 @@ mod contour_tests {
         match mesh.indices() {
             Some(Indices::U32(i)) => assert_eq!(i.len(), 6, "two triangles"),
             _ => panic!("trapezoid has no U32 indices"),
+        }
+    }
+
+    #[test]
+    fn h_trapezoid_is_bottom_anchored_and_tapers_right() {
+        // left_h 1.0, right_h 0.5, width 2 → flat bottom on y=0 spanning ±1; left edge taller than
+        // the right edge (tapers toward the right); +Z normals.
+        let mesh = build_trapezoid_mesh_h(1.0, 0.5, 2.0);
+        let Some(bevy::mesh::VertexAttributeValues::Float32x3(ps)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("h-trapezoid has no positions");
+        };
+        assert_eq!(ps.len(), 4, "one quad");
+        // Two bottom verts flat on y = 0.
+        assert_eq!(
+            ps.iter().filter(|p| p[1].abs() < 1e-6).count(),
+            2,
+            "flat bottom baseline on y=0"
+        );
+        // The left edge (x = -1) is taller than the right edge (x = +1).
+        let left_top = ps
+            .iter()
+            .filter(|p| (p[0] + 1.0).abs() < 1e-6)
+            .map(|p| p[1])
+            .fold(0.0_f32, f32::max);
+        let right_top = ps
+            .iter()
+            .filter(|p| (p[0] - 1.0).abs() < 1e-6)
+            .map(|p| p[1])
+            .fold(0.0_f32, f32::max);
+        assert!(
+            (left_top - 1.0).abs() < 1e-6 && (right_top - 0.5).abs() < 1e-6,
+            "left edge tall ({left_top}), right edge short ({right_top}) — tapers right"
+        );
+        if let Some(bevy::mesh::VertexAttributeValues::Float32x3(ns)) =
+            mesh.attribute(Mesh::ATTRIBUTE_NORMAL)
+        {
+            assert!(ns.iter().all(|n| n[2] > 0.99), "all normals +Z");
+        }
+        match mesh.indices() {
+            Some(Indices::U32(i)) => assert_eq!(i.len(), 6, "two triangles"),
+            _ => panic!("h-trapezoid has no U32 indices"),
         }
     }
 }

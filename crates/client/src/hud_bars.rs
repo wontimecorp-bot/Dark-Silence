@@ -28,7 +28,7 @@ use sim::damage::{HullStructure, Shields};
 use crate::camera::MainCamera;
 use crate::hud::{grade, scale_rgb, seg_dim};
 use crate::net::{LoopbackHost, NetClientState};
-use crate::scene::build_trapezoid_mesh;
+use crate::scene::{build_trapezoid_mesh, build_trapezoid_mesh_h};
 
 /// Local depth (units in front of the camera, toward the gameplay plane) the HUD bars sit at. The
 /// gameplay plane is `camera.height` (≈45) units away, so the bars float well in front of every
@@ -210,12 +210,19 @@ pub fn setup_trapezoid_bars(
     let Ok(cam) = cam_q.single() else {
         return;
     };
-    // ONE unit trapezoid (bottom width 1, height 1, tapered top): each segment's Transform scales
-    // it to its column width and ramp height (the taper ratio is preserved under x-scale).
-    let mesh = meshes.add(build_trapezoid_mesh(SEG_TAPER, 1.0, 1.0));
+    // TWO unit trapezoids, scaled per segment to its `(width, height)`:
+    //  - Ramp bars (afterburner/heat) taper toward the RIGHT on a flat baseline (left edge tall,
+    //    right edge `SEG_TAPER` short) — `build_trapezoid_mesh_h`.
+    //  - Stack bars (shield/armor/hull) taper toward the TOP (battery-cell look) — `build_trapezoid_mesh`.
+    let ramp_mesh = meshes.add(build_trapezoid_mesh_h(1.0, SEG_TAPER, 1.0));
+    let stack_mesh = meshes.add(build_trapezoid_mesh(SEG_TAPER, 1.0, 1.0));
 
     commands.entity(cam).with_children(|parent| {
         for layout in BARS {
+            let mesh = match layout.shape {
+                Shape::Ramp { .. } => &ramp_mesh,
+                Shape::Stack { .. } => &stack_mesh,
+            };
             for i in 0..layout.count {
                 let (x, y, w, h) = seg_placement(layout, i);
                 // Each segment starts dim (unlit); the update system lights it by fill.
