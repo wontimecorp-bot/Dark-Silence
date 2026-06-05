@@ -16,6 +16,7 @@
 #![allow(clippy::type_complexity)]
 
 pub mod ai;
+pub mod broadphase;
 pub mod clock;
 pub mod collision;
 pub mod combat;

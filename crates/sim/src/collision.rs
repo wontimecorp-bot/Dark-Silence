@@ -6,6 +6,7 @@
 //! math behind the `Physics` trait (ADR-0004). Same inputs → same outputs, so
 //! there is never per-frame flicker.
 
+use crate::broadphase::SpatialHash;
 use crate::clock::FixedDt;
 use crate::combat::{self, HitFeedback};
 use crate::components::AngularVelocity;
@@ -351,6 +352,28 @@ pub fn fitted_damage_system(world: &mut World) {
         Option<&MeshAnchor>,
         Option<&Faction>,
     ), (With<FitLayout>, With<Destructible>)>();
+
+    // Refinement 5 Phase 1 — broad-phase gate. Build the spatial hash from the carve-targets (cheap:
+    // Entity + circle, no layout clone), then collect the targets near SOME projectile's swept
+    // segment this tick. We snapshot/clone ONLY those `relevant` layouts below, instead of every
+    // target's layout every tick. A target no projectile's segment reaches is never selected as a hit
+    // (the per-projectile `swept_cast` + cell test below still decides each hit), so excluding it is
+    // byte-identical — it just drops the per-tick clone cost from ∝ total cells to ∝ active combat.
+    let mut hash = SpatialHash::new();
+    for (e, p, r, _, _, _, _, _) in target_q.iter(world) {
+        hash.insert(e, p.0, r.0);
+    }
+    let relevant: std::collections::BTreeSet<Entity> = {
+        let mut seg_q = world.query_filtered::<(&PrevPosition, &Position), With<Projectile>>();
+        let mut set = std::collections::BTreeSet::new();
+        for (prev, pos) in seg_q.iter(world) {
+            for e in hash.query_segment(prev.0, pos.0) {
+                set.insert(e);
+            }
+        }
+        set
+    };
+
     // Resolve each target's grid dims from its **`FitLayout.hull`** (→ `HullCatalog`),
     // not a `Fit` — the `Fit`-independent lookup that lets wreckage (no `Fit`) carve too.
     // The grid is the cell-space the carve maps the real impact into (see
@@ -360,6 +383,7 @@ pub fn fitted_damage_system(world: &mut World) {
         let hulls = world.get_resource::<HullCatalog>();
         target_q
             .iter(world)
+            .filter(|t| relevant.contains(&t.0))
             .filter_map(|(e, _, _, _, layout, _, _, _)| {
                 hulls
                     .and_then(|h| h.get(layout.hull))
@@ -382,6 +406,7 @@ pub fn fitted_damage_system(world: &mut World) {
     // unresolvable has no entry and is skipped in the apply loop alongside `hull_dims`.
     let centers: std::collections::BTreeMap<Entity, Vec2> = target_q
         .iter(world)
+        .filter(|t| relevant.contains(&t.0))
         .filter_map(|(e, _, _, _, layout, wreck, anchor, _)| {
             let is_wreck = wreck.is_some();
             // A live ship needs its resolved grid dims (skip the target if unresolvable,
@@ -404,6 +429,7 @@ pub fn fitted_damage_system(world: &mut World) {
     // collected hit data.
     let targets: Vec<(Entity, Vec2, f32, f32, FitLayout, Option<Faction>)> = target_q
         .iter(world)
+        .filter(|t| relevant.contains(&t.0))
         .map(|(e, p, r, h, layout, _, _, faction)| {
             (e, p.0, r.0, h.0, layout.clone(), faction.copied())
         })
