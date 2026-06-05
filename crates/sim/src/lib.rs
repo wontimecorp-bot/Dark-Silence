@@ -49,7 +49,9 @@ pub use fitting::{
     FitPreset, HitResolution, PresetId, ShipStats, WeaponProfile,
 };
 pub use intent::ShipIntent;
-pub use mining::{mining_transport_system, Cargo, MiningState, MiningTransport, RefinedResources};
+pub use mining::{
+    mining_transport_system, Cargo, MiningState, MiningTransport, MiningTuning, RefinedResources,
+};
 pub use motion::{analytic, integrate, simulate, BodyState};
 pub use physics::{Physics, RapierPhysics, SweptHit};
 pub use scenario::{FactionSpawns, ScenarioActive};

@@ -11,10 +11,12 @@ use bevy_ecs::entity::Entity;
 use bevy_ecs::prelude::With;
 use glam::Vec2;
 use sim::components::{
-    CollisionRadius, Faction, Heading, Health, Position, Ship, Target, TargetKind, Velocity,
+    AngularVelocity, CollisionRadius, Faction, Heading, Health, Position, Ship, Target, TargetKind,
+    Velocity,
 };
 use sim::{
-    Cargo, FactionSpawns, MiningState, MiningTransport, RefinedResources, Turret, TurretSpec,
+    Cargo, FactionSpawns, MiningState, MiningTransport, MiningTuning, RefinedResources, Turret,
+    TurretSpec,
 };
 
 use crate::ServerApp;
@@ -45,17 +47,9 @@ const OUTPOST_RADIUS: f32 = 3.0;
 const OUTPOST_HEALTH: f32 = 800.0;
 const TRANSPORT_RADIUS: f32 = 1.6;
 const TRANSPORT_HEALTH: f32 = 200.0;
-// Mining-loop tunables (Phase 3 + Refinement 1): cruise speed (so the ±1200 haul is ~20 s one-way),
-// momentum (`accel`/`slow_radius` give natural ease-in/out instead of a rail snap), `turn_rate` (the
-// box turns to face travel), arrival tolerance (clears the 30-radius asteroid), cargo + rates.
-const TRANSPORT_NAV_SPEED: f32 = 60.0;
-const TRANSPORT_ACCEL: f32 = 30.0;
-const TRANSPORT_SLOW_RADIUS: f32 = 90.0;
-const TRANSPORT_TURN_RATE: f32 = 1.5;
-const TRANSPORT_ARRIVE_RADIUS: f32 = 40.0;
-const CARGO_CAPACITY: f32 = 100.0;
-const LOAD_RATE: f32 = 25.0;
-const UNLOAD_RATE: f32 = 50.0;
+// The transport's movement + economy tunables (mass/thrust/drag/turn/cargo/rates) now live in the
+// live-editable `MiningTuning` resource (Refinement 3), inserted by `spawn_scenario` and tweakable in
+// the dev panel — they are no longer fixed consts here.
 
 /// Which authoritative world the embedded server populates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -79,6 +73,10 @@ impl ServerApp {
         // gated `mining_transport_system` has its `ResMut<RefinedResources>` whenever it runs; it is
         // a harmless zeroed tally in Sandbox (no transports update it).
         self.world.insert_resource(RefinedResources::default());
+        // Live-tunable transport movement + economy (Refinement 3). Inserted for both scenarios so
+        // the gated `mining_transport_system` always has its `Res<MiningTuning>`; harmless in Sandbox
+        // (no transports read it). Editable in the dev panel.
+        self.world.insert_resource(MiningTuning::default());
         match scenario {
             Scenario::Sandbox => {
                 // The original demo composition (byte-for-byte): the demo targets + the two fitted
@@ -184,19 +182,11 @@ impl ServerApp {
             MiningTransport {
                 home_outpost,
                 mine_node,
-                load_rate: LOAD_RATE,
-                unload_rate: UNLOAD_RATE,
-                nav_speed: TRANSPORT_NAV_SPEED,
-                accel: TRANSPORT_ACCEL,
-                slow_radius: TRANSPORT_SLOW_RADIUS,
-                turn_rate: TRANSPORT_TURN_RATE,
-                arrive_radius: TRANSPORT_ARRIVE_RADIUS,
             },
-            Cargo {
-                current: 0.0,
-                capacity: CARGO_CAPACITY,
-            },
+            Cargo { current: 0.0 },
             MiningState::default(),
+            // Angular-velocity state for the Newtonian turn model (Refinement 3).
+            AngularVelocity(0.0),
         ));
         // 2 mounted LIGHT turrets (the weaker-aim transport preset) for self-defense.
         for offset in [Vec2::new(0.0, 1.1), Vec2::new(0.0, -1.1)] {

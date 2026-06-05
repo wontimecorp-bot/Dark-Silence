@@ -35,6 +35,13 @@ pub fn seek_system(
     let dt = dt.0;
     let player = ship_q.iter().next().map(|p| p.0);
     for (mut pos, mut vel, kind) in &mut targets {
+        // The mining transport owns its FULL Newtonian integration in `mining_transport_system`
+        // (Refinement 3), so this generic Target integrator must not also advance it. Transports
+        // exist only in the windowed mining scenario, so this is a byte-identical no-op everywhere
+        // else (determinism / botkit / demo worlds spawn no Transport-kind targets).
+        if matches!(*kind, TargetKind::Transport) {
+            continue;
+        }
         let accel = match (*kind, player) {
             (TargetKind::Seeker, Some(player_pos)) => {
                 seek_accel(pos.0, player_pos, tuning.thrust_force / tuning.mass)

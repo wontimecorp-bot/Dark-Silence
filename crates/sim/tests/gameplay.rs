@@ -13,8 +13,8 @@ use bevy_ecs::prelude::*;
 use glam::Vec2;
 use sim::components::*;
 use sim::{
-    Cargo, FixedDt, HitFeedback, MiningState, MiningTransport, RefinedResources, ScenarioActive,
-    ShipIntent, Tuning, Turret, TurretSpec,
+    Cargo, FixedDt, HitFeedback, MiningState, MiningTransport, MiningTuning, RefinedResources,
+    ScenarioActive, ShipIntent, Tuning, Turret, TurretSpec,
 };
 
 const DT: f32 = 1.0 / 60.0;
@@ -185,15 +185,31 @@ fn factioned_fire_spares_friendlies_but_destroys_enemies() {
     );
 }
 
-/// Phase 3 mining loop: a transport cruises to the asteroid, loads, returns to its outpost, and
-/// unloads — and the faction's `RefinedResources` grows on each unload. (`seek_system` integrates
-/// the transport's velocity since it is a `Target`; `mining_transport_system` drives the state +
-/// steering.)
+/// Phase 3 + Refinement 3 mining loop: a transport flies its Newtonian model to the asteroid, loads,
+/// hauls back to its outpost, and unloads — and the faction's `RefinedResources` grows on each unload.
+/// (`mining_transport_system` now owns the FULL pos+vel+heading integration; `seek_system` skips
+/// `TargetKind::Transport`.)
 #[test]
 fn mining_transport_runs_the_loop_and_grows_the_score() {
     let mut w = make_world();
     w.insert_resource(ScenarioActive);
     w.insert_resource(RefinedResources::default());
+    // A brisk tuning so the loop converges fast in this tiny (~30-unit) test arena: light + punchy,
+    // small arrive/cargo. (The shipped default is a slow heavy barge for the ±1200 game arena.)
+    w.insert_resource(MiningTuning {
+        mass: 1.0,
+        thrust_force: 40.0,
+        linear_drag: 2.0,
+        turn_torque: 20.0,
+        angular_drag: 4.0,
+        angular_inertia: 1.0,
+        slow_radius: 12.0,
+        arrive_radius: 6.0,
+        dock_speed: 12.0,
+        load_rate: 80.0,
+        unload_rate: 100.0,
+        cargo_capacity: 40.0,
+    });
     let mine = w
         .spawn((
             Target,
@@ -225,26 +241,17 @@ fn mining_transport_runs_the_loop_and_grows_the_score() {
             CollisionRadius(1.6),
             Health(200.0),
             Faction::Red,
+            AngularVelocity(0.0),
             MiningTransport {
                 home_outpost: outpost,
                 mine_node: mine,
-                load_rate: 25.0,
-                unload_rate: 50.0,
-                nav_speed: 30.0,
-                accel: 60.0,
-                slow_radius: 15.0,
-                turn_rate: 2.0,
-                arrive_radius: 7.0,
             },
-            Cargo {
-                current: 0.0,
-                capacity: 100.0,
-            },
+            Cargo { current: 0.0 },
             MiningState::default(),
         ))
         .id();
 
-    // seek_system integrates the transport's velocity; mining_transport_system drives the loop.
+    // seek_system runs (and skips the Transport); mining_transport_system drives the whole loop.
     let mut s = Schedule::default();
     s.add_systems((sim::ai::seek_system, sim::mining::mining_transport_system).chain());
     // Enough ticks (at 1/60 dt) for several full loops.

@@ -29,7 +29,7 @@ use sim::fitting::{
     force_rederive_all, seed_catalogs, Fit, FitLayout, HullCatalog, ModuleCatalog, ModuleSpecifics,
     ShipStats,
 };
-use sim::{SimTuning, Tuning};
+use sim::{MiningTuning, SimTuning, Tuning};
 
 use crate::net::{LoopbackHost, NetClientState};
 
@@ -104,6 +104,14 @@ enum StatId {
     AfterburnerDrainRate,
     AfterburnerRegenRate,
     AfterburnerBoostFactor,
+    // Mining transport tuning (Refinement 3). Mass/Thrust/LinearDrag/Torque/AngularDrag/
+    // AngularInertia are shared with the ship-flight group above.
+    SlowRadius,
+    ArriveRadius,
+    DockSpeed,
+    LoadRate,
+    UnloadRate,
+    CargoCapacity,
     // Hull capacities.
     BaseMass,
     PowerCap,
@@ -371,6 +379,12 @@ impl StatId {
             Heat => ("heat", "Heat", "heat", 0, ""),
             AfterburnerState => ("afterburner", "Afterburner", "afterburner", 0, ""),
             Cells => ("cells", "Cells", "cells", 0, ""),
+            SlowRadius => ("slow radius", "Arrive slow radius", "slow_radius", 0, ""),
+            ArriveRadius => ("arrive radius", "Arrive radius", "arrive_radius", 0, ""),
+            DockSpeed => ("dock speed", "Dock speed", "dock_speed", 1, ""),
+            LoadRate => ("load rate", "Cargo load rate", "load_rate", 1, "/s"),
+            UnloadRate => ("unload rate", "Cargo unload rate", "unload_rate", 1, "/s"),
+            CargoCapacity => ("cargo cap", "Cargo capacity", "cargo_capacity", 0, ""),
         };
         StatMeta {
             short,
@@ -758,6 +772,10 @@ fn dev_panel_ui(
         .unwrap_or_default();
     let mut modules = world.get_resource::<ModuleCatalog>().cloned();
     let mut hulls = world.get_resource::<HullCatalog>().cloned();
+    let mut mining = world
+        .get_resource::<MiningTuning>()
+        .copied()
+        .unwrap_or_default();
 
     // M6b: snapshot the LOCAL player ship's derived stats + live state (read-only). Resolve the
     // server entity from the client's wire `local_id`; gather into an owned struct so the egui
@@ -894,6 +912,89 @@ fn dev_panel_ui(
                         5.0..=120.0,
                     );
                 });
+
+                egui::CollapsingHeader::new("Mining transport — MiningTuning (live)").show(
+                    ui,
+                    |ui| {
+                        // Newtonian flight: mass + thrust + drag set the emergent cruise speed; turn
+                        // torque / drag / inertia set the (ponderous) turn feel.
+                        slider(ui, label(StatId::Mass), &mut mining.mass, 0.5..=40.0);
+                        slider(
+                            ui,
+                            label(StatId::Thrust),
+                            &mut mining.thrust_force,
+                            1.0..=80.0,
+                        );
+                        slider(
+                            ui,
+                            label(StatId::LinearDrag),
+                            &mut mining.linear_drag,
+                            0.05..=2.0,
+                        );
+                        slider(
+                            ui,
+                            label(StatId::Torque),
+                            &mut mining.turn_torque,
+                            0.5..=30.0,
+                        );
+                        slider(
+                            ui,
+                            label(StatId::AngularDrag),
+                            &mut mining.angular_drag,
+                            0.5..=16.0,
+                        );
+                        slider(
+                            ui,
+                            label(StatId::AngularInertia),
+                            &mut mining.angular_inertia,
+                            0.5..=20.0,
+                        );
+                        // Read-only emergent cruise speed (thrust / drag) — the same relation ships use.
+                        stat(
+                            ui,
+                            "cruise≈",
+                            format!("{:.0}", mining.thrust_force / mining.linear_drag.max(1e-3)),
+                        );
+                        // Arrive / dock geometry.
+                        slider(
+                            ui,
+                            label(StatId::SlowRadius),
+                            &mut mining.slow_radius,
+                            20.0..=600.0,
+                        );
+                        slider(
+                            ui,
+                            label(StatId::ArriveRadius),
+                            &mut mining.arrive_radius,
+                            5.0..=200.0,
+                        );
+                        slider(
+                            ui,
+                            label(StatId::DockSpeed),
+                            &mut mining.dock_speed,
+                            0.5..=30.0,
+                        );
+                        // Economy.
+                        slider(
+                            ui,
+                            label(StatId::LoadRate),
+                            &mut mining.load_rate,
+                            1.0..=200.0,
+                        );
+                        slider(
+                            ui,
+                            label(StatId::UnloadRate),
+                            &mut mining.unload_rate,
+                            1.0..=200.0,
+                        );
+                        slider(
+                            ui,
+                            label(StatId::CargoCapacity),
+                            &mut mining.cargo_capacity,
+                            10.0..=1000.0,
+                        );
+                    },
+                );
 
                 egui::CollapsingHeader::new(
                     "Sim consts — SimTuning (carve / mass / projectile / wreck / ram)",
@@ -1283,6 +1384,7 @@ fn dev_panel_ui(
         world.insert_resource(SalvageConfig::default());
         world.insert_resource(StatScalingConfig::default());
         world.insert_resource(default_resistance_matrix());
+        world.insert_resource(MiningTuning::default());
         let (m, h) = seed_catalogs();
         world.insert_resource(m);
         world.insert_resource(h);
@@ -1294,6 +1396,7 @@ fn dev_panel_ui(
         world.insert_resource(shield);
         world.insert_resource(salvage);
         world.insert_resource(scaling);
+        world.insert_resource(mining);
         if let Some(m) = modules {
             world.insert_resource(m);
         }
