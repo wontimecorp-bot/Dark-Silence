@@ -35,6 +35,7 @@ pub mod input;
 pub mod interpolation;
 pub mod net;
 pub mod prediction;
+pub mod radar;
 pub mod render_sync;
 pub mod scene;
 
@@ -97,6 +98,8 @@ pub fn run() -> AppExit {
                 // Camera-anchored trapezoid bars (afterburner ramp + heat double-ramp) —
                 // parented to the camera, so it must exist first.
                 hud_bars::setup_trapezoid_bars.after(camera::setup_camera),
+                // Camera-anchored ranged sensor radar (top-right) — also a camera child.
+                radar::setup_radar.after(camera::setup_camera),
             ),
         )
         // Input runs before the fixed step so intents apply the same frame; the
@@ -134,6 +137,7 @@ pub fn run() -> AppExit {
                 hud::update_energy_hud,
                 hud::update_score_hud,
                 hud_bars::update_trapezoid_bars,
+                radar::update_radar,
             ),
         );
 

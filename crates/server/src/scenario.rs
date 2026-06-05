@@ -32,9 +32,11 @@ const RED_OUTPOST_POS: Vec2 = Vec2::new(-HALF_WIDTH, 0.0);
 const BLUE_OUTPOST_POS: Vec2 = Vec2::new(HALF_WIDTH, 0.0);
 const RED_TRANSPORT_POS: Vec2 = Vec2::new(-HALF_WIDTH + 50.0, 0.0);
 const BLUE_TRANSPORT_POS: Vec2 = Vec2::new(HALF_WIDTH - 50.0, 0.0);
-// Player spawn points (Phase 5): in open space just outside each faction's home outpost.
-const RED_SPAWN_POS: Vec2 = Vec2::new(-HALF_WIDTH, -60.0);
-const BLUE_SPAWN_POS: Vec2 = Vec2::new(HALF_WIDTH, -60.0);
+// Player spawn points (Phase 5 + Refinement 2): right beside each faction's home outpost, on the
+// arena-facing side, so the outpost is clearly ON-SCREEN at spawn (the top-down camera only shows
+// ~±33×±18 world units, so the old ±60 offset put the outpost off-screen in the empty ±1200 arena).
+const RED_SPAWN_POS: Vec2 = Vec2::new(-HALF_WIDTH + 12.0, -8.0);
+const BLUE_SPAWN_POS: Vec2 = Vec2::new(HALF_WIDTH - 12.0, -8.0);
 // Role sizes / toughness (HP). The asteroid is a big, effectively-permanent landmark; the outpost is
 // far beefier than the transport (but not a "battle outpost").
 const MINE_NODE_RADIUS: f32 = 30.0;
