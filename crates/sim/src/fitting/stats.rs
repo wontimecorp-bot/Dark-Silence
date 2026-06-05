@@ -34,7 +34,7 @@ use super::fit::Fit;
 use super::hull::Hull;
 use super::layout::{layout_mass_with, CellOccupant, FitLayout};
 use super::module::{Module, ModuleKind, ModuleSpecifics};
-use crate::damage::{Channel, StatScalingConfig};
+use crate::damage::{Channel, StatScalingConfig, DEFAULT_SHIELD_HP, DEFAULT_SHIELD_REGEN};
 use crate::tuning::Tuning;
 
 /// Smallest thrust force a fit can derive to (FR-017): no thruster ⇒ this floor,
@@ -125,6 +125,16 @@ pub struct ShipStats {
     /// depleting [`crate::components::ArmorHp`] pool's `max` at live ship spawn (a hull-protecting HP
     /// layer between shields and the hull carve). Summed flat (a capacity, not health-scaled).
     pub armor_value: f32,
+    /// Shield capacity from the fitted **Shield** generator — `Σ shield_hp · health_factor` (so a
+    /// DAMAGED generator degrades the cap and a CARVED-off one zeroes it). Falls back to
+    /// [`crate::damage::DEFAULT_SHIELD_HP`] when the fit carries no shield module (matches
+    /// `seed_defense_layers`). `recompute_ship_stats_system` syncs the live [`crate::damage::Shields`]
+    /// pool's `max` to this, so shields follow the generator's health (Refinement 10).
+    pub shield_max: f32,
+    /// Shield regen/sec from the fitted **Shield** generator — `Σ regen · health_factor` (degrades
+    /// with generator damage). Falls back to [`crate::damage::DEFAULT_SHIELD_REGEN`] with no shield
+    /// module. Synced into [`crate::damage::Shields`]`::regen_rate` by `recompute_ship_stats_system`.
+    pub shield_regen: f32,
     /// `true` iff at least one weapon module is installed (FR-016). When `false`
     /// the ship cannot fire and [`ShipStats::weapon`] is `None`.
     pub can_fire: bool,
@@ -277,6 +287,14 @@ pub fn derive_ship_stats_with(
     let mut continuous_draw = 0.0_f32;
     // Phase F: nominal armor capacity — Σ over fitted Armor modules (a capacity, summed flat).
     let mut armor_value = 0.0_f32;
+    // Refinement 10: shield capacity/regen from the fitted Shield generator — health-scaled (a
+    // damaged generator degrades, a carved one zeroes). `has_shield_module` distinguishes "no
+    // generator fitted" (→ the default fallback, like `seed_defense_layers`) from "generator fitted
+    // but carved away" (→ 0, no shields), since a carved module is gone from the layout but its
+    // slot ASSIGNMENT remains in the fit.
+    let mut shield_max = 0.0_f32;
+    let mut shield_regen = 0.0_f32;
+    let mut has_shield_module = false;
     let mut weapon: Option<WeaponProfile> = None;
 
     // Iterate by SlotId (BTreeMap order) so derivation is deterministic — the
@@ -360,8 +378,25 @@ pub fn derive_ship_stats_with(
             ModuleSpecifics::Armor { armor_value: av } => {
                 armor_value += av;
             }
+            // Shield generator: shield capacity + regen, HEALTH-SCALED (a battered generator gives
+            // less, a destroyed/carved one — `hf == 0` — gives none → the live `Shields` pool the
+            // sync drives drops to 0). `has_shield_module` is set even when `hf == 0` so a carved
+            // generator does NOT fall back to the default pool below.
+            ModuleSpecifics::Shield { shield_hp, regen } => {
+                has_shield_module = true;
+                shield_max += shield_hp * hf;
+                shield_regen += regen * hf;
+            }
             _ => {}
         }
+    }
+
+    // No shield generator fitted at all → the small default pool (matches `seed_defense_layers`,
+    // keeping default-shield ships — e.g. the demo enemy — byte-identical). A fitted-but-carved
+    // generator keeps `has_shield_module == true`, so it stays at the health-scaled 0.
+    if !has_shield_module {
+        shield_max = DEFAULT_SHIELD_HP;
+        shield_regen = DEFAULT_SHIELD_REGEN;
     }
 
     // Graceful floors (FR-017, INV-F07): never zero a denominator or a drive.
@@ -391,6 +426,8 @@ pub fn derive_ship_stats_with(
         cpu_draw,
         continuous_draw,
         armor_value,
+        shield_max,
+        shield_regen,
         can_fire: weapon.is_some(),
         weapon,
     }
@@ -424,6 +461,63 @@ mod tests {
         assert_eq!(stats.turn_power_share, t.turn_power_share);
         assert!((stats.top_speed() - t.top_speed()).abs() < 1e-3);
         assert!((stats.max_turn_rate() - t.max_turn_rate()).abs() < 1e-3);
+    }
+
+    #[test]
+    fn shield_generator_health_drives_the_shield_cap() {
+        // Refinement 10: shields come from the fitted Shield generator, HEALTH-SCALED — a damaged
+        // generator degrades the cap and a carved-off one zeroes it; no generator → the small
+        // default pool (matching `seed_defense_layers`, so default-shield ships are unchanged).
+        use crate::fitting::content::{HULL_FIGHTER, MODULE_SHIELD_BASIC};
+        use crate::fitting::SlotId;
+        let (modules, hulls) = seed_catalogs();
+        let hull = hulls.get(HULL_FIGHTER).unwrap().clone();
+
+        // No shield module → the default fallback pool (byte-identical to the old behaviour).
+        let bare = Fit::new(hull.id);
+        let bare_layout = build_layout(&hull, &bare, &modules);
+        let bare_stats = derive_ship_stats(&hull, &bare, &modules, &bare_layout);
+        assert_eq!(bare_stats.shield_max, DEFAULT_SHIELD_HP);
+        assert_eq!(bare_stats.shield_regen, DEFAULT_SHIELD_REGEN);
+
+        // A full-health generator (slot 6 is the fighter's Shield hardpoint) → its full cap/regen.
+        let mut fit = Fit::new(hull.id);
+        fit.install_module(SlotId(6), MODULE_SHIELD_BASIC, &hull, &modules)
+            .unwrap();
+        let mut layout = build_layout(&hull, &fit, &modules);
+        let full = derive_ship_stats(&hull, &fit, &modules, &layout);
+        assert!(
+            (full.shield_max - 60.0).abs() < 1e-4,
+            "full generator → 60 cap, got {}",
+            full.shield_max
+        );
+        assert!((full.shield_regen - 5.0).abs() < 1e-4);
+
+        // The generator's cell, halved → ~half the cap (continuous degrade, not a cliff).
+        let shield_cell = *layout
+            .cells
+            .iter()
+            .find(|(_, o)| o.module == Some(MODULE_SHIELD_BASIC))
+            .map(|(c, _)| c)
+            .expect("the installed shield generator has a cell");
+        let hp_max = modules.get(MODULE_SHIELD_BASIC).unwrap().health_max;
+        layout.cells.get_mut(&shield_cell).unwrap().health = hp_max * 0.5;
+        let half = derive_ship_stats(&hull, &fit, &modules, &layout);
+        assert!(
+            (half.shield_max - 30.0).abs() < 1.0,
+            "half-health generator → ~30 cap, got {}",
+            half.shield_max
+        );
+
+        // Carved away (the cell is gone from the layout, but the slot ASSIGNMENT remains in the
+        // fit) → NO shields (it does NOT fall back to the default pool).
+        layout.cells.remove(&shield_cell);
+        let carved = derive_ship_stats(&hull, &fit, &modules, &layout);
+        assert_eq!(
+            carved.shield_max, 0.0,
+            "a carved-off generator gives no shields"
+        );
+        assert_eq!(carved.shield_regen, 0.0);
     }
 
     #[test]

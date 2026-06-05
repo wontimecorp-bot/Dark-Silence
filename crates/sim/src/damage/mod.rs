@@ -86,6 +86,6 @@ pub use layers::{
 pub use penetration::{resolve_penetration, PenetrationResult};
 pub use resist::{layer_resist, DefenseLayer, ResistanceMatrix};
 pub use salvage::{intact_threshold, salvage, salvage_layout, SalvageOutcome};
-pub use seed::seed_defense_layers;
+pub use seed::{seed_defense_layers, DEFAULT_SHIELD_HP, DEFAULT_SHIELD_REGEN};
 pub use sever::{connected_region, core_cell, sever_chunk, Wreck, WreckChunk, WreckOrigin};
 pub use shields::{regen_shield, shield_absorb, shield_regen_system};

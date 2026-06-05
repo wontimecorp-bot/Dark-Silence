@@ -198,6 +198,36 @@ impl ArmorHp {
     }
 }
 
+/// Refinement 10 — a structure's inertial mass for ship↔structure RAM collisions (the outpost /
+/// transport, which have no fit-derived mass before voxelization). A heavier `RamMass` means a ram
+/// barely nudges it; paired with [`Movable`] it can drift. Windowed-scenario only.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RamMass(pub f32);
+
+/// Refinement 11 — a structure's **oriented-box** collision half-extents (world units), so a square
+/// block collides as a tight box instead of an under-covering inscribed circle (you bump at the real
+/// edge, not ~6 u deep into a corner). `= grid · CELL_WORLD_SIZE · 0.5`. Used by the ship↔structure
+/// ram (`structure_ram_system`) with the structure's `Heading` for orientation. The round rock has
+/// NO `BoxCollider` → it keeps exact circle collision. Windowed-scenario only.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BoxCollider(pub Vec2);
+
+/// Refinement 10 — marks a structure the player can **shove** (a movable station): the ram imparts
+/// velocity (finite mass) and [`structure_motion_system`](crate::collision::structure_motion_system)
+/// integrates it (with drag). Absent → the structure is an immovable wall in the ram (the ship
+/// bounces, the structure does not move). Windowed-scenario only.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Movable;
+
+/// Refinement 10 — the ship's **authored** (full-fit) cell count: the integrity BASELINE for the
+/// HUD hull bar. Set once at fitted-ship spawn = the freshly-built `FitLayout.cells.len()`; it does
+/// NOT shrink as cells are carved, so `live_cells / AuthoredCells` is the remaining hull-integrity
+/// fraction the hull bar reads (a ship carved to 1–2 cells reads near-empty). Render-only — no sim
+/// system reads it, it is off the wire, and it is attached only on the windowed player spawn, so
+/// the headless/determinism worlds are byte-identical.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoredCells(pub u32);
+
 /// Flight-assist mode: `On` damps drift toward heading; `Off` is decoupled,
 /// full-momentum flight.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

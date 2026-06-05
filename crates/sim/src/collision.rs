@@ -11,13 +11,14 @@ use crate::clock::FixedDt;
 use crate::combat::{self, HitFeedback};
 use crate::components::AngularVelocity;
 use crate::components::{
-    hostile, CollisionRadius, CombatRules, Damage, DamageFlash, Destructible, Faction, Heading,
-    Health, LastShieldHit, MeshAnchor, Position, PrevPosition, Projectile, ProjectileFaction,
-    ProjectileMass, ProjectileOwner, ShieldHitFlash, Ship, Target, TargetKind, Velocity,
+    hostile, BoxCollider, CollisionRadius, CombatRules, Damage, DamageFlash, Destructible, Faction,
+    Heading, Health, LastShieldHit, MeshAnchor, Movable, Position, PrevPosition, Projectile,
+    ProjectileFaction, ProjectileMass, ProjectileOwner, RamMass, ShieldHitFlash, Ship, Target,
+    TargetKind, Velocity,
 };
 use crate::damage::{
-    apply_damage, core_cell, first_cell_hit, on_cells_carved, surface_entry, DamageEvent, HitKind,
-    Wreck, REACH,
+    apply_damage, core_cell, first_cell_hit, on_cells_carved, surface_entry, Channel, DamageEvent,
+    HitKind, Wreck, REACH,
 };
 use crate::fitting::{
     center_or_anchor, layout_inertia_with, layout_mass_with, FitLayout, HullCatalog, ModuleCatalog,
@@ -25,7 +26,7 @@ use crate::fitting::{
 };
 use crate::motion::{apply_angular_impulse, apply_linear_impulse};
 use crate::physics::{Physics, RapierPhysics, SweptHit};
-use crate::tuning::Tuning;
+use crate::tuning::{SimTuning, Tuning};
 use crate::voxelize::{PendingVoxelize, VoxelizeOnHit};
 use crate::weapon::{damage_event_from_hit, WeaponSource, PROJECTILE_MASS};
 use bevy_ecs::prelude::*;
@@ -36,6 +37,17 @@ use glam::Vec2;
 pub(crate) const SHIP_MASS: f32 = 2.0;
 /// Asteroid inertial mass for ram impulses.
 pub(crate) const ASTEROID_MASS: f32 = 8.0;
+
+/// Refinement 10 — ship↔structure ram carve magnitude per unit of closing speed (world u/s). The
+/// impact runs the full `apply_damage` pipeline (shields → armor → carve), so a gentle bump just
+/// dings shields while a fast slam blows through and carves the craft apart. Tunable.
+const RAM_CARVE_PER_SPEED: f32 = 3.0;
+/// Minimum closing speed for a ship↔structure contact to carve at all — below this it is purely a
+/// wall bounce (so easing/resting against a station does not grind the hull). Tunable.
+const RAM_MIN_CLOSING_SPEED: f32 = 8.0;
+/// Linear drag (per second) a shoved [`Movable`] structure settles under, so a ram-imparted drift
+/// eases to rest instead of coasting forever.
+const STRUCTURE_DRAG: f32 = 0.8;
 
 /// Earliest time-of-impact `t ∈ [0, 1]` at which the point sweeping `p0`→`p1`
 /// first touches the circle `(center, radius)`, or `None` if it never does
@@ -96,6 +108,50 @@ pub fn circle_contact(a: Vec2, a_radius: f32, b: Vec2, b_radius: f32) -> Option<
     } else {
         None
     }
+}
+
+/// Refinement 11 — overlap of a circle with an **oriented box** (a tight fit for a square/rect
+/// structure, vs an under-covering inscribed circle). Returns the push-out `normal` (pointing from
+/// the box toward the circle centre) + penetration `depth`, or `None` when separate.
+///
+/// Transforms the circle centre into the box's local frame (rotated by `-box_angle`), finds the
+/// closest point on the box by clamping to `±half_extents`, and tests the gap against the circle
+/// radius. The degenerate case (circle centre exactly at the box centre) pushes out along the box's
+/// local +X. Deterministic, pure f32.
+pub fn circle_obb_contact(
+    circle_c: Vec2,
+    circle_r: f32,
+    box_c: Vec2,
+    box_angle: f32,
+    half: Vec2,
+) -> Option<Contact> {
+    // World → box-local: translate to the box centre, then un-rotate.
+    let rel = Vec2::from_angle(-box_angle).rotate(circle_c - box_c);
+    // Closest point on the box (local frame) to the circle centre, then the gap to it.
+    let closest = rel.clamp(-half, half);
+    let offset = rel - closest; // local vector from the box surface to the circle centre
+    let dist = offset.length();
+    // Local outward normal + penetration depth.
+    let (local_n, depth) = if dist > f32::EPSILON {
+        // Centre OUTSIDE the box: overlap only if the gap is within the radius.
+        if dist >= circle_r {
+            return None;
+        }
+        (offset / dist, circle_r - dist)
+    } else {
+        // Centre INSIDE the box (`clamp` left `rel` unchanged): always overlapping — push out along
+        // the axis of LEAST penetration to the nearest face.
+        let pen_x = half.x - rel.x.abs();
+        let pen_y = half.y - rel.y.abs();
+        if pen_x < pen_y {
+            (Vec2::new(rel.x.signum(), 0.0), pen_x + circle_r)
+        } else {
+            (Vec2::new(0.0, rel.y.signum()), pen_y + circle_r)
+        }
+    };
+    // Box-local normal → world (rotation preserves the unit length of `local_n`).
+    let normal = Vec2::from_angle(box_angle).rotate(local_n);
+    Some(Contact { normal, depth })
 }
 
 /// Closed-form elastic 2-body collision (restitution = 1). Returns the new
@@ -786,45 +842,261 @@ pub fn ram_collision_system(
     }
 }
 
-/// Mining-skirmish: make the refinery **outpost / transport** a SOLID obstacle the player
-/// ship cannot fly through (Refinement 9). Unlike [`ram_collision_system`]'s elastic
-/// asteroid (which drifts + can lethally ram), a structure is treated as an **immovable
-/// wall**: on overlap the ship is pushed back out along the contact normal and the inward
-/// component of its velocity is removed (it scrapes/stops along the surface rather than
-/// bouncing or phasing through). The structure neither moves nor takes ram damage — carving
-/// stays projectile-only.
-///
-/// Gated on `ScenarioActive` (see `add_fixed_step_systems`); it only ever inspects
-/// `Outpost`/`Transport` targets, which exist solely in the windowed mining scenario, so it
-/// is a no-op (byte-identical) in every headless / determinism / botkit / demo world. The
-/// `With<Ship>` / `Without<Ship>` split keeps the two queries disjoint. Works on a structure
-/// both before AND after lazy voxelization (the swap keeps `CollisionRadius`/`Target`).
-/// Deterministic (stable query order; no RNG); pure f32 over [`circle_contact`].
-pub fn structure_collision_system(
-    mut ship_q: Query<(&mut Position, &mut Velocity, &CollisionRadius), With<Ship>>,
-    structures: Query<(&Position, &CollisionRadius, &TargetKind), (With<Target>, Without<Ship>)>,
+/// Refinement 10 — integrate a **[`Movable`] structure's drift** (a station the player has shoved).
+/// Pure Newtonian coast with a light [`STRUCTURE_DRAG`] so a ram-imparted velocity drifts then
+/// settles. Gated on `ScenarioActive`; only `Movable` structures (windowed-only) are matched → a
+/// no-op headless. Transports are NOT `Movable` (the mining system owns their motion), so this never
+/// fights it. Deterministic; pure f32.
+pub fn structure_motion_system(
+    dt: Res<FixedDt>,
+    mut q: Query<(&mut Position, &mut Velocity), (With<Movable>, With<Target>)>,
 ) {
-    let Some((mut ship_pos, mut ship_vel, ship_radius)) = ship_q.iter_mut().next() else {
+    let dt = dt.0;
+    for (mut pos, mut vel) in &mut q {
+        pos.0 += vel.0 * dt;
+        // A gameplay drag (space has no friction, but a nudged station should ease to rest rather
+        // than coast away forever).
+        vel.0 *= (1.0 - STRUCTURE_DRAG * dt).max(0.0);
+    }
+}
+
+/// Route ONE ram impact through the carve pipeline (Refinement 11) — map the world contact into the
+/// `target`'s cell-space (the SAME [`hull_local_entry_ray`] + [`surface_entry`] projectiles use),
+/// build a Kinetic [`DamageEvent`], and [`apply_damage`] (shields → armor → carve) + [`on_cells_carved`]
+/// on death. Reads the target's CURRENT `FitLayout`/hull/anchor fresh from the world, so it is correct
+/// for either body (the fitted ship OR a voxelized structure) and after a prior carve this tick.
+/// `world_impact`/`world_dir` are world-space: the contact point on the target's surface + the inward
+/// carve direction. No-op if the target has no `FitLayout` (not carveable / not yet voxelized).
+#[allow(clippy::too_many_arguments)]
+fn ram_carve(
+    world: &mut World,
+    target: Entity,
+    target_pos: Vec2,
+    heading: f32,
+    world_impact: Vec2,
+    world_dir: Vec2,
+    magnitude: f32,
+    sim: &SimTuning,
+) {
+    let Some(layout) = world.get::<FitLayout>(target).cloned() else {
         return;
     };
-    let ship_radius = ship_radius.0;
-    for (spos, sradius, kind) in &structures {
-        if !matches!(*kind, TargetKind::Outpost | TargetKind::Transport) {
+    let Some(grid_dims) = world
+        .get_resource::<HullCatalog>()
+        .and_then(|h| h.get(layout.hull))
+        .map(|hu| hu.grid_dims)
+    else {
+        return;
+    };
+    let is_wreck = world.get::<Wreck>(target).is_some();
+    let anchor = world.get::<MeshAnchor>(target).map(|a| a.0);
+    let center = center_or_anchor(anchor, &layout, grid_dims, is_wreck);
+    let (point, dir_cell) =
+        hull_local_entry_ray(world_dir, world_impact, target_pos, heading, center);
+    let Some((fwd_cell, _)) = first_cell_hit(&layout, point, point + dir_cell * REACH) else {
+        return;
+    };
+    let back = (grid_dims.0.max(grid_dims.1) as f32) * 1.5;
+    let entry = surface_entry(&layout, point, dir_cell, back, fwd_cell);
+    let ev = DamageEvent {
+        channel: Channel::Kinetic,
+        magnitude,
+        penetration: magnitude * sim.pen_per_damage,
+        pen_size: sim.pen_size,
+        point: entry,
+        dir: dir_cell.normalize_or_zero(),
+        source: None,
+    };
+    let pre_core = world.get::<FitLayout>(target).and_then(core_cell);
+    let outcome = apply_damage(world, target, ev);
+    if outcome.destroyed {
+        on_cells_carved(world, target, pre_core);
+    }
+}
+
+/// Refinement 10/11 — ship↔structure **RAM**: a craft that flies into the refinery outpost /
+/// transport / central rock **bounces off** (elastically, by mass) AND **MUTUALLY** takes carve
+/// damage **proportional to the impact speed** — the craft takes the brunt while the body takes a
+/// smaller dent scaled by the mass ratio (a light fighter wrecks itself and only chips a heavy
+/// station). A [`Movable`] structure is shoved (finite mass); a fixed one is an immovable wall (huge
+/// mass). A body with a [`BoxCollider`] collides as a **tight oriented box** (you bump at the real
+/// square edge, not deep in a corner); the round rock keeps exact circle collision. If a body is not
+/// yet voxelized, the ram TAGS it [`PendingVoxelize`] (like a shot) so it converts + carves on the
+/// next contact.
+///
+/// Exclusive (`&mut World`) so impacts route through the same [`apply_damage`]/[`on_cells_carved`]
+/// pipeline projectiles use. Gated on `ScenarioActive` — structures + the fitted player exist only in
+/// the windowed scenario → a no-op (byte-identical) in every headless / determinism / botkit / demo
+/// world. No RNG.
+pub fn structure_ram_system(world: &mut World) {
+    // 1. The player's fitted (carveable) ship — pos/vel/radius/heading + a layout clone (for mass).
+    let mut ship_q = world.query_filtered::<(
+        Entity,
+        &Position,
+        &Velocity,
+        &CollisionRadius,
+        &Heading,
+        &FitLayout,
+    ), With<Ship>>();
+    let Some((ship, mut ship_pos, mut ship_vel, ship_radius, ship_heading, layout)) = ship_q
+        .iter(world)
+        .next()
+        .map(|(e, p, v, r, h, l)| (e, p.0, v.0, r.0, h.0, l.clone()))
+    else {
+        return;
+    };
+    let sim = world
+        .get_resource::<SimTuning>()
+        .copied()
+        .unwrap_or_default();
+    let ship_mass = world
+        .get_resource::<ModuleCatalog>()
+        .map(|m| layout_mass_with(&layout, m, sim.struct_cell_mass))
+        .unwrap_or(1.0)
+        .max(f32::MIN_POSITIVE);
+
+    // 2. The solid bodies (outpost / transport / rock) + their ram mass / movability / box shape /
+    // voxel state.
+    let mut struct_q = world.query_filtered::<(
+        Entity,
+        &Position,
+        &Velocity,
+        &CollisionRadius,
+        &TargetKind,
+        &Heading,
+        Option<&RamMass>,
+        Has<Movable>,
+        Option<&BoxCollider>,
+        Has<FitLayout>,
+        Has<VoxelizeOnHit>,
+    ), (With<Target>, Without<Ship>)>();
+    #[allow(clippy::type_complexity)]
+    let bodies: Vec<(
+        Entity,
+        Vec2,
+        Vec2,
+        f32,
+        f32,
+        bool,
+        Option<Vec2>,
+        f32,
+        bool,
+        bool,
+    )> = struct_q
+        .iter(world)
+        .filter(|t| {
+            matches!(
+                t.4,
+                TargetKind::Outpost | TargetKind::Transport | TargetKind::MineNode
+            )
+        })
+        .map(|(e, p, v, r, _, h, m, movable, bc, has_layout, has_vox)| {
+            (
+                e,
+                p.0,
+                v.0,
+                r.0,
+                m.map(|m| m.0).unwrap_or(1.0e6),
+                movable,
+                bc.map(|b| b.0),
+                h.0,
+                has_layout,
+                has_vox,
+            )
+        })
+        .collect();
+
+    // 3. Resolve each contact: separation + elastic bounce + the mutual carve list.
+    let mut struct_vel_updates: Vec<(Entity, Vec2)> = Vec::new();
+    // (target, target_pos, heading, world_impact, world_dir_into_target, magnitude)
+    let mut carves: Vec<(Entity, Vec2, f32, Vec2, Vec2, f32)> = Vec::new();
+    let mut voxelize_tags: Vec<Entity> = Vec::new();
+    for (be, bpos, bvel, brad, bmass, movable, box_half, bheading, has_layout, has_vox) in &bodies {
+        // Tight oriented box for a block structure; exact circle for the round rock.
+        let contact = match box_half {
+            Some(half) => circle_obb_contact(ship_pos, ship_radius, *bpos, *bheading, *half),
+            None => circle_contact(ship_pos, ship_radius, *bpos, *brad),
+        };
+        let Some(contact) = contact else {
             continue;
-        }
-        // `circle_contact(a, .., b, ..)` returns the normal pointing from `b` (the structure)
-        // toward `a` (the ship) = the push-out direction, plus the penetration depth.
-        if let Some(contact) = circle_contact(ship_pos.0, ship_radius, spos.0, sradius.0) {
-            // Eject the ship to the surface (the structure is immovable → it does not move).
-            ship_pos.0 += contact.normal * contact.depth;
-            // Cancel only the INWARD velocity (`into < 0` = heading into the structure) so the
-            // ship slides along the wall instead of bouncing or punching through; leave an
-            // already-outward velocity alone so it can depart.
-            let into = ship_vel.0.dot(contact.normal);
-            if into < 0.0 {
-                ship_vel.0 -= contact.normal * into;
+        };
+        // Separate the ship out (normal points body → ship = the push-out direction).
+        ship_pos += contact.normal * contact.depth;
+        // Elastic impulse ALONG THE CONTACT NORMAL (works for both box + circle). `rel_n < 0` =
+        // approaching; a non-`Movable` body uses a huge mass so the ship reflects + the body stays.
+        let rel_n = (ship_vel - *bvel).dot(contact.normal);
+        let bmass_eff = if *movable { *bmass } else { 1.0e9 };
+        if rel_n < 0.0 {
+            let j = -2.0 * rel_n / (1.0 / ship_mass + 1.0 / bmass_eff);
+            ship_vel += contact.normal * (j / ship_mass);
+            if *movable {
+                struct_vel_updates.push((*be, *bvel - contact.normal * (j / bmass_eff)));
             }
         }
+        // Carve only above a min closing speed (a rested/easing contact is just a wall, no grind).
+        let closing = (-rel_n).max(0.0);
+        if closing > RAM_MIN_CLOSING_SPEED {
+            // The contact point on the touching surfaces (the ship's surface toward the body ≈ the
+            // body's surface toward the ship).
+            let contact_point = ship_pos - contact.normal * ship_radius;
+            let mag_ship = RAM_CARVE_PER_SPEED * closing;
+            // Craft takes the brunt (carve INTO the ship along +normal).
+            carves.push((
+                ship,
+                ship_pos,
+                ship_heading,
+                contact_point,
+                contact.normal,
+                mag_ship,
+            ));
+            // Body takes a dent scaled by the mass ratio (a light craft barely scratches a heavy
+            // body); carve INTO the body along -normal. Uses the body's REAL `RamMass` (not the
+            // bounce's immovable 1e9), so a PINNED structure still dents — only its physical mass
+            // governs the dent. Voxelized → carve now; else TAG to voxelize.
+            let mag_body = mag_ship * (ship_mass / bmass.max(f32::MIN_POSITIVE));
+            if *has_layout {
+                carves.push((
+                    *be,
+                    *bpos,
+                    *bheading,
+                    contact_point,
+                    -contact.normal,
+                    mag_body,
+                ));
+            } else if *has_vox {
+                voxelize_tags.push(*be);
+            }
+        }
+    }
+
+    // 4. Write the ship + movable-body motion back.
+    if let Some(mut p) = world.get_mut::<Position>(ship) {
+        p.0 = ship_pos;
+    }
+    if let Some(mut v) = world.get_mut::<Velocity>(ship) {
+        v.0 = ship_vel;
+    }
+    for (be, nv) in struct_vel_updates {
+        if let Some(mut v) = world.get_mut::<Velocity>(be) {
+            v.0 = nv;
+        }
+    }
+
+    // 5. Apply the carves (ship + any voxelized body), then tag the not-yet-voxelized bodies.
+    for (target, target_pos, heading, world_impact, world_dir, magnitude) in carves {
+        ram_carve(
+            world,
+            target,
+            target_pos,
+            heading,
+            world_impact,
+            world_dir,
+            magnitude,
+            &sim,
+        );
+    }
+    for be in voxelize_tags {
+        world.entity_mut(be).insert(PendingVoxelize);
     }
 }
 
@@ -888,6 +1160,37 @@ mod tests {
             circle_contact(Vec2::ZERO, 1.0, Vec2::new(3.0, 0.0), 1.0),
             None
         );
+    }
+
+    #[test]
+    fn obb_contact_covers_a_square_corner_the_inscribed_circle_misses() {
+        // A 10×10 axis-aligned box (half-extents 5) at the origin. Its corner is at (5,5) — distance
+        // 7.07 — but an INSCRIBED circle would be radius 5, so a ship near the corner would sink deep
+        // before a circle fired. The OBB catches it at the real edge.
+        let half = Vec2::splat(5.0);
+        // Ship just outside the corner along the diagonal (0.707 from the corner) → overlaps (r = 1).
+        let c = circle_obb_contact(Vec2::new(5.5, 5.5), 1.0, Vec2::ZERO, 0.0, half)
+            .expect("overlap at the corner");
+        assert!(
+            c.normal.x > 0.0 && c.normal.y > 0.0,
+            "corner normal points outward diagonally"
+        );
+        // A face approach: 0.5 outside the +x face → overlap, normal +x, depth 0.5.
+        let f = circle_obb_contact(Vec2::new(5.5, 0.0), 1.0, Vec2::ZERO, 0.0, half)
+            .expect("face overlap");
+        assert!(close(f.normal, Vec2::new(1.0, 0.0), 1e-4));
+        assert!((f.depth - 0.5).abs() < 1e-4);
+        // Clear of the box → no contact.
+        assert!(circle_obb_contact(Vec2::new(10.0, 10.0), 1.0, Vec2::ZERO, 0.0, half).is_none());
+        // Rotated 90°: the box is symmetric, so the same face approach still contacts.
+        assert!(circle_obb_contact(
+            Vec2::new(5.5, 0.0),
+            1.0,
+            Vec2::ZERO,
+            std::f32::consts::FRAC_PI_2,
+            half
+        )
+        .is_some());
     }
 
     #[test]

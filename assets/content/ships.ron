@@ -318,7 +318,7 @@
                 ),
                 (
                     id: (6),
-                    slot_type: Utility,
+                    slot_type: Shield,
                     size: Small,
                     coord: (4, 2),
                     facing: 0.0,

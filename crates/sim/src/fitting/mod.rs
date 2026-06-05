@@ -43,16 +43,16 @@ pub mod validate;
 
 pub use content::{
     baseline_fit, baseline_hull, parse_catalogs, seed_catalogs, HullCatalog, ModuleCatalog,
-    HULL_BASELINE, HULL_CORVETTE, HULL_FIGHTER, HULL_OUTPOST, HULL_TRANSPORT, MODULE_ARMOR_PLATE,
-    MODULE_AUTOCANNON, MODULE_BASELINE_THRUSTER, MODULE_REACTOR_BASIC, MODULE_SHIELD_BASIC,
-    MODULE_THRUSTER_BASIC, MODULE_UTILITY_BASIC, STRUCT_CELL_MASS,
+    HULL_BASELINE, HULL_CORVETTE, HULL_FIGHTER, HULL_MINENODE, HULL_OUTPOST, HULL_TRANSPORT,
+    MODULE_ARMOR_PLATE, MODULE_AUTOCANNON, MODULE_BASELINE_THRUSTER, MODULE_REACTOR_BASIC,
+    MODULE_SHIELD_BASIC, MODULE_THRUSTER_BASIC, MODULE_UTILITY_BASIC, STRUCT_CELL_MASS,
 };
 pub use fit::{
     load_preset, preview_stats, save_preset, Fit, FitPreset, FitRejection, ModuleRef, PresetId,
 };
 pub use hull::{
-    hull_collision_radius, station_hull, FiringArc, GridCell, Hull, HullId, SectionId, ShipClass,
-    ShipRole, Slot, SlotId, CELL_WORLD_SIZE,
+    disc_hull, hull_collision_radius, station_hull, FiringArc, GridCell, Hull, HullId, SectionId,
+    ShipClass, ShipRole, Slot, SlotId, CELL_WORLD_SIZE,
 };
 pub use layout::{
     build_layout, build_layout_with, cell_map, cell_mass, cell_mass_with, center_or_anchor,
@@ -70,6 +70,9 @@ pub use validate::{
 };
 
 use bevy_ecs::prelude::*;
+
+use crate::components::ArmorHp;
+use crate::damage::Shields;
 
 /// Re-derive a ship's [`ShipStats`] whenever its [`Fit`] **or** its [`FitLayout`]
 /// changes (INV-F08, FR-012/013/014/019, INV-D13) — the E007 emergent-damage hook.
@@ -111,12 +114,18 @@ pub fn recompute_ship_stats_system(
     // HP/mass. Absent (a minimal world) → the const defaults.
     sim: Option<Res<crate::tuning::SimTuning>>,
     mut q: Query<
-        (Ref<Fit>, &mut ShipStats, &mut FitLayout),
+        (
+            Ref<Fit>,
+            &mut ShipStats,
+            &mut FitLayout,
+            Option<&mut Shields>,
+            Option<&mut ArmorHp>,
+        ),
         Or<(Changed<Fit>, Changed<FitLayout>)>,
     >,
 ) {
     let sim = sim.map(|s| *s).unwrap_or_default();
-    for (fit, mut stats, mut layout) in &mut q {
+    for (fit, mut stats, mut layout, shields, armor) in &mut q {
         let Some(hull) = hulls.get(fit.hull) else {
             // Unknown hull: cannot derive; leave the prior stats/layout untouched.
             continue;
@@ -127,6 +136,23 @@ pub fn recompute_ship_stats_system(
             *layout = build_layout_with(hull, &fit, &modules, sim.struct_cell_hp);
         }
         *stats = derive_ship_stats_with(hull, &fit, &modules, &layout, sim.struct_cell_mass);
+
+        // Refinement 10: sync the live defense pools' CAPS to the freshly-derived stats so a
+        // carved/damaged generator (or armor module) shrinks — or zeroes — the pool. Shields now
+        // follow the shield generator's health (a destroyed generator → `shield_max == 0` → no
+        // shields); armor follows the fitted armor modules. For an UNDAMAGED ship the derived caps
+        // equal the spawn-time seed, so this is a no-op (determinism-safe); only a damaged/carved
+        // module moves them. `current` is clamped down so a shrunken cap can't leave an over-full
+        // pool.
+        if let Some(mut shields) = shields {
+            shields.max = stats.shield_max;
+            shields.regen_rate = stats.shield_regen;
+            shields.current = shields.current.min(shields.max);
+        }
+        if let Some(mut armor) = armor {
+            armor.max = stats.armor_value;
+            armor.current = armor.current.min(armor.max);
+        }
     }
 }
 

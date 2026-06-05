@@ -169,11 +169,12 @@ pub fn add_fixed_step_systems(schedule: &mut Schedule) {
             // keeps the whole group between `fitted_damage_system` and `shield_regen_system`.
             (
                 collision::ram_collision_system,
-                // Mining skirmish: the outpost/transport is a SOLID wall the player ship can't fly
-                // through — push the ship out + cancel its inward velocity. Gated on
-                // `ScenarioActive` (only ever touches `Outpost`/`Transport`) → a no-op in every
-                // headless world.
-                collision::structure_collision_system
+                // Mining skirmish (Refinement 10): ship↔structure RAM — the craft bounces off the
+                // outpost/transport (by mass) and takes carve damage proportional to the impact (a
+                // fast slam can wreck it); then integrate any shoved movable structure's drift. Both
+                // gated on `ScenarioActive` (only touch windowed-only entities) → a no-op headless.
+                collision::structure_ram_system.run_if(resource_exists::<scenario::ScenarioActive>),
+                collision::structure_motion_system
                     .run_if(resource_exists::<scenario::ScenarioActive>),
             )
                 .chain(),

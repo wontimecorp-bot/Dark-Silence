@@ -284,6 +284,44 @@ pub fn station_hull(id: HullId, name: &str, cols: u16, rows: u16) -> Hull {
     }
 }
 
+/// Build a procedural **disc station hull** (Refinement 11) for the carveable central rock: a
+/// `diameter × diameter` grid filled to a **circle** (cells within `diameter/2` of the centre), so a
+/// voxelized asteroid reads ROUND, not a square block. Like [`station_hull`] the cells are all
+/// structural; the centre cell is the deepest ([`cell_depth`](crate::fitting::layout)) = the
+/// carve-to-core death point. World diameter is `diameter · CELL_WORLD_SIZE`.
+pub fn disc_hull(id: HullId, name: &str, diameter: u16) -> Hull {
+    let d = diameter.max(1);
+    let r = d as f32 * 0.5;
+    let c = (d as f32 - 1.0) * 0.5; // grid centre (cell coords)
+    let mut cells = Vec::new();
+    for row in 0..d {
+        for col in 0..d {
+            let dx = col as f32 - c;
+            let dy = row as f32 - c;
+            if dx * dx + dy * dy <= r * r {
+                cells.push(GridCell {
+                    coord: (col, row),
+                    section: SectionId(1),
+                    structural: true,
+                });
+            }
+        }
+    }
+    Hull {
+        id,
+        name: name.to_string(),
+        class: ShipClass::Station,
+        role: ShipRole::Utility,
+        grid_dims: (d, d),
+        cells,
+        power_capacity: 0.0,
+        cpu_capacity: 0.0,
+        mass_capacity: 0.0,
+        hull_base_mass: 0.0,
+        slots: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -22,8 +22,9 @@
 //! and the dev panel).
 
 use bevy::prelude::*;
-use sim::components::{Afterburner, ArmorHp, Energy, Heat};
+use sim::components::{Afterburner, ArmorHp, AuthoredCells, Energy, Heat};
 use sim::damage::{HullStructure, Shields};
+use sim::fitting::FitLayout;
 
 use crate::camera::MainCamera;
 use crate::hud::{grade, scale_rgb, seg_dim};
@@ -310,7 +311,16 @@ pub fn update_trapezoid_bars(
                     heat: w.get::<Heat>(e).map(|p| frac(p.current, p.max)),
                     shield: w.get::<Shields>(e).map(|p| frac(p.current, p.max)),
                     armor: w.get::<ArmorHp>(e).map(|p| frac(p.current, p.max)),
-                    hull: w.get::<HullStructure>(e).map(|p| frac(p.current, p.max)),
+                    // Refinement 10: a fitted ship's hull bar tracks remaining cell INTEGRITY
+                    // (live cells / authored cells), so it depletes as you're carved apart and
+                    // reads near-empty at 1–2 cells. Fall back to the structural backstop for an
+                    // unfitted/legacy ship that lacks the integrity baseline.
+                    hull: match (w.get::<FitLayout>(e), w.get::<AuthoredCells>(e)) {
+                        (Some(l), Some(a)) if a.0 > 0 => {
+                            Some(frac(l.cells.len() as f32, a.0 as f32))
+                        }
+                        _ => w.get::<HullStructure>(e).map(|p| frac(p.current, p.max)),
+                    },
                 }
             }
             None => PoolFracs::default(),

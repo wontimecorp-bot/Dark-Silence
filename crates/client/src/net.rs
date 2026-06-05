@@ -54,13 +54,13 @@ use protocol::{
 };
 use server::{RenderEntity, Scenario, ServerApp, PROTOCOL_VERSION};
 use sim::components::{
-    Afterburner, ArmorHp, CollisionRadius, Destructible, Energy, Heat, Position, TargetKind,
-    Velocity,
+    Afterburner, ArmorHp, AuthoredCells, CollisionRadius, Destructible, Energy, Heat, Position,
+    TargetKind, Velocity,
 };
 use sim::damage::seed_defense_layers;
 use sim::fitting::{
     build_layout, derive_ship_stats, hull_collision_radius, seed_catalogs, Fit, SlotId,
-    HULL_FIGHTER, MODULE_ARMOR_PLATE, MODULE_AUTOCANNON, MODULE_REACTOR_BASIC,
+    HULL_FIGHTER, MODULE_ARMOR_PLATE, MODULE_AUTOCANNON, MODULE_REACTOR_BASIC, MODULE_SHIELD_BASIC,
     MODULE_THRUSTER_BASIC,
 };
 use sim::{FactionSpawns, FixedDt, HitFeedback, ShipIntent};
@@ -349,25 +349,31 @@ fn attach_starter_fit(server: &mut ServerApp, local_id: EntityId) {
 
     // Build the starter loadout on the fighter via the validate-then-apply install
     // (so the fit is guaranteed legal / within budget). Slot layout:
-    // 0 Reactor, 1+2 Thruster, 3 Weapon, 5 Armor (Phase F — gives the player an armor-HP
-    // layer to show + deplete; mass/cpu/power all stay within the fighter's budget).
+    // 0 Reactor, 1+2 Thruster, 3 Weapon, 5 Armor, 6 Shield (Refinement 10: slot 6 is now a SHIELD
+    // hardpoint — a real, carveable shield generator at cell (4,2) so shields follow the generator's
+    // health and zero out when it's shot off; mass/cpu/power all stay within the fighter's budget:
+    // cpu 5→7 ≤ 8, power_draw 9→15 ≤ 30 supply).
     let mut fit = Fit::new(HULL_FIGHTER);
     let _ = fit.install_module(SlotId(0), MODULE_REACTOR_BASIC, &hull, &modules);
     let _ = fit.install_module(SlotId(1), MODULE_THRUSTER_BASIC, &hull, &modules);
     let _ = fit.install_module(SlotId(2), MODULE_THRUSTER_BASIC, &hull, &modules);
     let _ = fit.install_module(SlotId(3), MODULE_AUTOCANNON, &hull, &modules);
     let _ = fit.install_module(SlotId(5), MODULE_ARMOR_PLATE, &hull, &modules);
+    let _ = fit.install_module(SlotId(6), MODULE_SHIELD_BASIC, &hull, &modules);
 
     // Build the full-health hit/armor map first, then derive stats against it
     // (E007 BREAKING-CHANGE: derive_ship_stats now reads per-cell health). At full
     // health every module's health-factor is 1.0, so stats match the pre-E007 derive.
     let layout = build_layout(&hull, &fit, &modules);
     let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
+    // Refinement 10: record the authored (full-fit) cell count as the hull-integrity baseline the
+    // HUD hull bar divides by, so the bar depletes as the player is carved apart.
+    let authored_cells = AuthoredCells(layout.cells.len() as u32);
     // Seed the player ship's E007 defense layers from the same shared helper the demo
-    // enemy uses (Principle II) — so the player is damageable on identical rules. The
-    // fighter has no Shield hardpoint, so the shield is the default pool from
-    // `seed_defense_layers`. Nothing fires at the player yet (enemy AI fire is a
-    // follow-on), but the layer state is now complete and live.
+    // enemy uses (Principle II) — so the player is damageable on identical rules. With the
+    // Refinement-10 shield generator fitted (slot 4), the shield pool is seeded from that
+    // module (60 hp / 5 regen), and `recompute_ship_stats_system` keeps `Shields.max`/`regen_rate`
+    // synced to the generator's live health — shooting it off zeroes the shields.
     let (shields, section_armor, hull_structure) = seed_defense_layers(&hull, &fit, &modules);
 
     let Some(ship) = server.ship_entity_for(local_id) else {
@@ -403,6 +409,7 @@ fn attach_starter_fit(server: &mut ServerApp, local_id: EntityId) {
             // the hull, so the hull is protected while armor holds.
             Afterburner::seed(),
             ArmorHp::seed(stats.armor_value),
+            authored_cells,
         ));
     }
 }

@@ -94,6 +94,10 @@ pub const HULL_CORVETTE: HullId = HullId(2);
 /// authored in `ships.ron`). Ids chosen well clear of the authored seeds.
 pub const HULL_TRANSPORT: HullId = HullId(1001);
 pub const HULL_OUTPOST: HullId = HullId(1002);
+/// Refinement 11 — the carveable central rock's procedural **disc** hull
+/// ([`disc_hull`](super::hull::disc_hull)), injected at scenario spawn so the mine node can
+/// lazy-voxelize into a round, diggable asteroid.
+pub const HULL_MINENODE: HullId = HullId(1003);
 
 /// Live structural HP seeded onto every **structural** hull cell in
 /// [`build_layout`](super::layout::build_layout) (Phase 1A). Module cells take their
@@ -432,9 +436,14 @@ fn seed_fighter() -> Hull {
         slot(3, HardpointType::Weapon, SlotSize::Small, (2, 6), 0.0, true),
         slot(4, HardpointType::Weapon, SlotSize::Small, (6, 6), 0.0, true),
         slot(5, HardpointType::Armor, SlotSize::Small, (4, 5), 0.0, false),
+        // Refinement 10: the fighter's (unused) Utility hardpoint is repurposed as a SHIELD
+        // hardpoint at (4,2) so the player can fit a real, carveable shield generator — while BOTH
+        // weapon slots stay weapons (preserving the no-fit-maxes-all CPU guard). The demo
+        // enemy/determinism ships never install slot 6, and an empty slot's hardpoint type doesn't
+        // affect derivation, so this is byte-identical for them.
         slot(
             6,
-            HardpointType::Utility,
+            HardpointType::Shield,
             SlotSize::Small,
             (4, 2),
             0.0,

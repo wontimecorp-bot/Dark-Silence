@@ -14,11 +14,16 @@
         // view at spawn). Mirrored per faction: Red at (-half_width + x, y), Blue at (half_width - x, y).
         spawn_offset: (12.0, -8.0),
     ),
-    // The central asteroid — a big, effectively-permanent landmark (radius 30, unchanged).
+    // The central asteroid — a big landmark (radius 30). Refinement 11: now a SOLID, CARVEABLE rock —
+    // `carve_cell_hp: Some(_)` makes it lazy-voxelize on first hit into a round disc (~27k fine cells)
+    // you can dig into with sustained fire; high per-cell HP keeps it a permanent-feeling landmark
+    // (rams bounce + hurt your craft but barely dent it). Set `carve_cell_hp: None` to revert to the
+    // old permanent flat-HP sphere.
     mine_node: (
         render_size: (60.0, 60.0, 60.0),
         collision_radius: 30.0,
         health: 1000000.0,
+        carve_cell_hp: Some(20.0),
     ),
     // Refinery outpost — a carveable SOLID voxel station (Refinement 7). grid · 0.32 ≈ world size:
     // 94 · 0.32 ≈ 30 u → a solid 94×94 block (~8.8k fine cells). Cheap flat box until first hit;
@@ -26,11 +31,21 @@
     outpost: (
         grid: (94, 94),
         cell_hp: 5.0,
+        // Refinement 10: ram mass + movability. `movable: true` lets a craft SHOVE the station (it
+        // drifts, with drag); the heavy mass means only a hard slam nudges it. Set `movable: false`
+        // (or raise `mass`) to pin it.
+        mass: 1500.0,
+        movable: true,
     ),
     // Mining transport — a carveable SOLID voxel hull. 32 · 0.32 ≈ 10 u long (~580 fine cells).
     transport: (
         grid: (32, 18),
         cell_hp: 5.0,
+        // The transport is mining-controlled (its nav owns its motion), so it stays an immovable
+        // wall in a ram (the craft just bounces + gets carved); `mass` is unused while `movable` is
+        // false.
+        mass: 300.0,
+        movable: false,
     ),
     // Transport Newtonian movement + economy (the live MiningTuning resource; also tweakable in the
     // dev panel at runtime). Emergent cruise speed = thrust_force / linear_drag.

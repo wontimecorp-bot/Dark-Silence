@@ -31,10 +31,10 @@ use crate::fitting::{Fit, Hull, ModuleCatalog, ModuleSpecifics, SectionId};
 /// hull has a Shield hardpoint, so the demo ships take this path). A small pool so a
 /// target is shield-defended (the pipeline's Shields layer is exercised) but the
 /// shield depletes under sustained fire rather than being an impenetrable wall.
-const DEFAULT_SHIELD_HP: f32 = 12.0;
+pub const DEFAULT_SHIELD_HP: f32 = 12.0;
 /// Fallback shield regen/sec for the no-shield-module path — slow enough that
 /// continuous fire out-damages it (the shield does not fully tank a stream).
-const DEFAULT_SHIELD_REGEN: f32 = 1.0;
+pub const DEFAULT_SHIELD_REGEN: f32 = 1.0;
 
 /// Per-section plate thickness when the fit carries **no** armor module. Thin steel
 /// so the autocannon (penetration ≈ 3× damage) clean-penetrates and routes damage to

@@ -12,12 +12,12 @@ use bevy_ecs::prelude::With;
 use glam::{Vec2, Vec3};
 use serde::Deserialize;
 use sim::components::{
-    AngularVelocity, CollisionRadius, Faction, Heading, Health, Position, RenderScale, Ship,
-    Target, TargetKind, Velocity,
+    AngularVelocity, BoxCollider, CollisionRadius, Faction, Heading, Health, Movable, Position,
+    RamMass, RenderScale, Ship, Target, TargetKind, Velocity,
 };
 use sim::fitting::{
-    hull_collision_radius, station_hull, HullCatalog, HullId, CELL_WORLD_SIZE, HULL_OUTPOST,
-    HULL_TRANSPORT,
+    disc_hull, hull_collision_radius, station_hull, HullCatalog, HullId, CELL_WORLD_SIZE,
+    HULL_MINENODE, HULL_OUTPOST, HULL_TRANSPORT,
 };
 use sim::{
     Cargo, FactionSpawns, MiningState, MiningTransport, MiningTuning, RefinedResources, Turret,
@@ -59,6 +59,12 @@ struct StructureSpec {
     /// Collision circle radius (combat hitbox).
     collision_radius: f32,
     health: f32,
+    /// Refinement 11 — per-cell HP if this body is **carveable**: when present (`Some`), the body
+    /// lazy-voxelizes on first hit into a round [`disc_hull`](sim::fitting::disc_hull) (diameter =
+    /// `collision_radius · 2 / CELL_WORLD_SIZE`) and can be dug into. `None`/absent → a permanent
+    /// flat-HP landmark (the old behaviour). High HP = a slow dig.
+    #[serde(default)]
+    carve_cell_hp: Option<f32>,
 }
 
 /// A carveable structure (Refinement 5): a `(cols, rows)` voxel hull grid + plating thickness +
@@ -71,6 +77,19 @@ struct VoxelStructureSpec {
     grid: (u16, u16),
     /// HP per structural cell (toughness of carving; deeper carve to the centre core = destroyed).
     cell_hp: f32,
+    /// Refinement 10 — inertial mass for ship↔structure rams (`RamMass`). A heavier station is barely
+    /// nudged. Defaults large (effectively immovable) when omitted.
+    #[serde(default = "default_ram_mass")]
+    mass: f32,
+    /// Refinement 10 — whether a ram can SHOVE this station (it drifts, with drag) vs being an
+    /// immovable wall the craft just bounces off. Defaults `false`.
+    #[serde(default)]
+    movable: bool,
+}
+
+/// Default `RamMass` for a structure with no `mass` in RON — large enough that a ram barely moves it.
+fn default_ram_mass() -> f32 {
+    5000.0
 }
 
 /// A host's turret battery: the shared aim spec + (kinetic) weapon stats + per-turret mount offsets.
@@ -173,9 +192,19 @@ impl ServerApp {
             let (oc, or) = content.outpost.grid;
             let t_hull = station_hull(HULL_TRANSPORT, "Transport", tc, tr);
             let o_hull = station_hull(HULL_OUTPOST, "Outpost", oc, or);
+            // Refinement 11: the carveable central rock's ROUND disc hull (only if it has carve HP).
+            // Diameter (cells) = world diameter / cell size, so the voxel disc ≈ the rendered sphere.
+            let mine_disc = content.mine_node.carve_cell_hp.map(|_| {
+                let diameter =
+                    (content.mine_node.collision_radius * 2.0 / CELL_WORLD_SIZE).round() as u16;
+                disc_hull(HULL_MINENODE, "MineNode", diameter)
+            });
             if let Some(mut hulls) = self.world.get_resource_mut::<HullCatalog>() {
                 hulls.hulls.insert(HULL_TRANSPORT, t_hull);
                 hulls.hulls.insert(HULL_OUTPOST, o_hull);
+                if let Some(d) = mine_disc {
+                    hulls.hulls.insert(HULL_MINENODE, d);
+                }
             }
         }
 
@@ -189,6 +218,15 @@ impl ServerApp {
         });
 
         let mine = self.spawn_structure(TargetKind::MineNode, Vec2::ZERO, &content.mine_node, None);
+        // Refinement 11: if the rock has carve HP, mark it for lazy voxelization — the first shot/ram
+        // converts the cheap flat sphere into the carveable disc hull. It stays immovable (no
+        // `Movable`/`RamMass`), so rams bounce + hurt the craft while fire digs into the rock.
+        if let Some(cell_hp) = content.mine_node.carve_cell_hp {
+            self.world.entity_mut(mine).insert(VoxelizeOnHit {
+                hull: HULL_MINENODE,
+                cell_hp,
+            });
+        }
         let red_outpost = self.spawn_outpost(Vec2::new(-hw, 0.0), Faction::Red, &content);
         let blue_outpost = self.spawn_outpost(Vec2::new(hw, 0.0), Faction::Blue, &content);
         self.spawn_transport(
@@ -313,7 +351,8 @@ impl ServerApp {
             rows as f32 * CELL_WORLD_SIZE,
             4.0,
         );
-        self.world
+        let entity = self
+            .world
             .spawn((
                 Target,
                 kind,
@@ -331,8 +370,21 @@ impl ServerApp {
                     hull,
                     cell_hp: spec.cell_hp,
                 },
+                // Refinement 10: inertial mass for ship↔structure rams (a craft that slams it bounces
+                // off + gets carved; a `Movable` station is shoved, a heavy/fixed one barely moves).
+                RamMass(spec.mass),
+                // Refinement 11: an oriented-box hitbox (half-extents = grid · cell · 0.5) so a square
+                // block collides as a TIGHT box, not an under-covering inscribed circle (no deep sink).
+                BoxCollider(Vec2::new(
+                    cols as f32 * CELL_WORLD_SIZE * 0.5,
+                    rows as f32 * CELL_WORLD_SIZE * 0.5,
+                )),
             ))
-            .id()
+            .id();
+        if spec.movable {
+            self.world.entity_mut(entity).insert(Movable);
+        }
+        entity
     }
 
     /// Spawn one stationary flat-`Health` structure (the asteroid) from its [`StructureSpec`]. A
