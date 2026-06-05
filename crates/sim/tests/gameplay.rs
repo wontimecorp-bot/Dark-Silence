@@ -12,7 +12,10 @@
 use bevy_ecs::prelude::*;
 use glam::Vec2;
 use sim::components::*;
-use sim::{FixedDt, HitFeedback, ShipIntent, Tuning};
+use sim::{
+    Cargo, FixedDt, HitFeedback, MiningState, MiningTransport, RefinedResources, ScenarioActive,
+    ShipIntent, Tuning, Turret, TurretSpec,
+};
 
 const DT: f32 = 1.0 / 60.0;
 
@@ -123,6 +126,208 @@ fn firing_destroys_a_target_ahead() {
         count::<With<Target>>(&mut w),
         0,
         "a swept projectile hit should destroy and despawn the target (no tunneling)"
+    );
+}
+
+/// Phase 2 friend/foe gate (mining skirmish): a FACTIONED shot does NOT damage a SAME-faction
+/// target (friendly fire off by default) but DOES destroy an enemy-faction target. The unfactioned
+/// case (today's free-for-all) is covered by `firing_destroys_a_target_ahead`.
+#[test]
+fn factioned_fire_spares_friendlies_but_destroys_enemies() {
+    // A FRIENDLY (same-faction) target is not hit by a same-faction shot.
+    let mut w = make_world();
+    let ship = spawn_ship(&mut w, Vec2::ZERO, 0.0, Vec2::ZERO); // nose +x, faction Red
+    w.entity_mut(ship).insert(Faction::Red);
+    let friendly = w
+        .spawn((
+            Target,
+            TargetKind::Dummy,
+            Position(Vec2::new(20.0, 0.0)),
+            Velocity(Vec2::ZERO),
+            CollisionRadius(1.0),
+            Health(5.0),
+            Faction::Red,
+        ))
+        .id();
+    let mut sched = make_schedule();
+    set_intent(&mut w, ship, |i| i.fire = true);
+    for _ in 0..20 {
+        sched.run(&mut w);
+    }
+    assert_eq!(
+        w.get::<Health>(friendly).map(|h| h.0),
+        Some(5.0),
+        "a same-faction shot passes through a friendly target (no friendly fire)"
+    );
+
+    // An ENEMY (different-faction) target IS destroyed by the same shot.
+    let mut w2 = make_world();
+    let ship2 = spawn_ship(&mut w2, Vec2::ZERO, 0.0, Vec2::ZERO);
+    w2.entity_mut(ship2).insert(Faction::Red);
+    w2.spawn((
+        Target,
+        TargetKind::Dummy,
+        Position(Vec2::new(20.0, 0.0)),
+        Velocity(Vec2::ZERO),
+        CollisionRadius(1.0),
+        Health(5.0),
+        Faction::Blue,
+    ));
+    let mut sched2 = make_schedule();
+    set_intent(&mut w2, ship2, |i| i.fire = true);
+    for _ in 0..20 {
+        sched2.run(&mut w2);
+    }
+    assert_eq!(
+        count::<With<Target>>(&mut w2),
+        0,
+        "an enemy-faction target is destroyed by a factioned shot"
+    );
+}
+
+/// Phase 3 mining loop: a transport cruises to the asteroid, loads, returns to its outpost, and
+/// unloads — and the faction's `RefinedResources` grows on each unload. (`seek_system` integrates
+/// the transport's velocity since it is a `Target`; `mining_transport_system` drives the state +
+/// steering.)
+#[test]
+fn mining_transport_runs_the_loop_and_grows_the_score() {
+    let mut w = make_world();
+    w.insert_resource(ScenarioActive);
+    w.insert_resource(RefinedResources::default());
+    let mine = w
+        .spawn((
+            Target,
+            TargetKind::MineNode,
+            Position(Vec2::new(0.0, 0.0)),
+            Velocity(Vec2::ZERO),
+            CollisionRadius(5.0),
+            Health(1.0e6),
+        ))
+        .id();
+    let outpost = w
+        .spawn((
+            Target,
+            TargetKind::Outpost,
+            Position(Vec2::new(30.0, 0.0)),
+            Velocity(Vec2::ZERO),
+            CollisionRadius(3.0),
+            Health(800.0),
+            Faction::Red,
+        ))
+        .id();
+    let transport = w
+        .spawn((
+            Target,
+            TargetKind::Transport,
+            Position(Vec2::new(20.0, 0.0)),
+            Velocity(Vec2::ZERO),
+            CollisionRadius(1.6),
+            Health(200.0),
+            Faction::Red,
+            MiningTransport {
+                home_outpost: outpost,
+                mine_node: mine,
+                load_rate: 25.0,
+                unload_rate: 50.0,
+                nav_speed: 30.0,
+                arrive_radius: 7.0,
+            },
+            Cargo {
+                current: 0.0,
+                capacity: 100.0,
+            },
+            MiningState::default(),
+        ))
+        .id();
+
+    // seek_system integrates the transport's velocity; mining_transport_system drives the loop.
+    let mut s = Schedule::default();
+    s.add_systems((sim::ai::seek_system, sim::mining::mining_transport_system).chain());
+    // Enough ticks (at 1/60 dt) for several full loops.
+    for _ in 0..3000 {
+        s.run(&mut w);
+    }
+
+    // The transport actually moved (it didn't sit at its spawn).
+    assert!(
+        (w.get::<Position>(transport).unwrap().0 - Vec2::new(20.0, 0.0)).length() > 1.0,
+        "the transport navigated away from its spawn"
+    );
+    // The faction refined a positive amount — at least one full deliver→unload cycle completed.
+    assert!(
+        w.resource::<RefinedResources>().red > 0.0,
+        "the transport delivered refined resources (got {})",
+        w.resource::<RefinedResources>().red
+    );
+    // Only Red ran a transport → Blue's tally stays zero.
+    assert_eq!(w.resource::<RefinedResources>().blue, 0.0);
+}
+
+/// Phase 4 turret: a mounted turret acquires the nearest ENEMY-factioned body in range, leads +
+/// fires along its own heading, and its shots (factioned) destroy the enemy via the friend/foe
+/// pipeline — while a SAME-faction body in range is never targeted.
+#[test]
+fn turret_acquires_and_destroys_an_enemy_but_spares_a_friendly() {
+    let mut w = make_world();
+    w.insert_resource(ScenarioActive);
+    w.insert_resource(sim::SimTuning::default());
+    // Host (Red) at origin — the turret reads its position/velocity.
+    let host = w
+        .spawn((Position(Vec2::ZERO), Velocity(Vec2::ZERO), Faction::Red))
+        .id();
+    // Turret (Red, outpost preset = better aim) mounted on the host, aimed along +x to start.
+    w.spawn((
+        Turret::heavy(host, Vec2::ZERO),
+        TurretSpec::outpost_preset(),
+        Faction::Red,
+        Heading(0.0),
+    ));
+    // A FRIENDLY (Red) body sitting closer than the enemy — must NOT be targeted/hit.
+    let friendly = w
+        .spawn((
+            Target,
+            TargetKind::Dummy,
+            Position(Vec2::new(0.0, 10.0)),
+            Velocity(Vec2::ZERO),
+            CollisionRadius(1.5),
+            Health(30.0),
+            Faction::Red,
+        ))
+        .id();
+    // An ENEMY (Blue) along +x, in range — the turret's target.
+    w.spawn((
+        Target,
+        TargetKind::Dummy,
+        Position(Vec2::new(20.0, 0.0)),
+        Velocity(Vec2::ZERO),
+        CollisionRadius(1.5),
+        Health(30.0),
+        Faction::Blue,
+    ));
+
+    let mut s = Schedule::default();
+    s.add_systems(
+        (
+            sim::turret::turret_system,
+            sim::weapon::projectile_step_system,
+            sim::collision::collision_detect_system,
+            sim::combat::destruction_system,
+        )
+            .chain(),
+    );
+    for _ in 0..600 {
+        s.run(&mut w);
+    }
+
+    // The enemy is destroyed; the friendly survives untouched (only the Blue Target remains gone).
+    assert!(
+        w.get::<Health>(friendly).map(|h| h.0) == Some(30.0),
+        "the friendly (same-faction) body is never targeted or hit"
+    );
+    assert_eq!(
+        count::<With<Target>>(&mut w),
+        1,
+        "the turret destroyed only the enemy (the friendly Target remains)"
     );
 }
 

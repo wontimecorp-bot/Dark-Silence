@@ -26,6 +26,7 @@
 // `clippy::type_complexity` with no readability win, so allow it crate-wide.
 #![allow(clippy::type_complexity)]
 
+pub mod scenario;
 mod session;
 pub mod snapshot;
 pub mod validation;
@@ -39,9 +40,9 @@ use protocol::{
     LoopbackTransport, Message, NetTransport, QAngle, QVec2, Snapshot,
 };
 use sim::components::{
-    AngularVelocity, CollisionRadius, DamageFlash, Destructible, FlightAssist, Heading, Health,
-    LastShieldHit, MeshAnchor, Position, Projectile, ShieldHitFlash, Ship, Target, TargetKind,
-    Velocity, Weapon,
+    AngularVelocity, CollisionRadius, CombatRules, DamageFlash, Destructible, Faction,
+    FlightAssist, Heading, Health, LastShieldHit, MeshAnchor, Position, Projectile, ShieldHitFlash,
+    Ship, Target, TargetKind, Velocity, Weapon,
 };
 use sim::damage::{
     default_resistance_matrix, seed_defense_layers, PenetrationConfig, SalvageConfig, ShieldConfig,
@@ -54,6 +55,7 @@ use sim::fitting::{
 };
 use sim::{FixedDt, HitFeedback, ShipIntent, SimTuning, Tuning};
 
+pub use scenario::Scenario;
 pub use session::{
     decode_inbound, ClientState, DropReason, InputDisposition, RateDecision, RejectionCategory,
     RejectionEvent, RejectionLog, Session, IDLE_TIMEOUT_SECS, INBOUND_RATE_LIMIT_PER_SEC,
@@ -275,6 +277,10 @@ pub struct RenderEntity {
     /// for a live ship (the client uses the grid centre) or a layout-less wreck. Never on the
     /// snapshot wire (no protocol/determinism impact).
     pub mesh_anchor: Option<Vec2>,
+    /// Mining-skirmish faction tint tag (**client-only / in-process**): `0` = none, `1` = Red,
+    /// `2` = Blue (see [`Faction::tint_tag`]). The client tints the entity's material by this so
+    /// friend/foe reads at a glance. `0` for every non-scenario entity. Never on the wire.
+    pub faction: u8,
 }
 
 /// The [`RenderEntity::shield_frac`] of an optional [`Shields`]: `current / max`
@@ -504,6 +510,10 @@ impl ServerApp {
         world.insert_resource(ShieldConfig::default());
         world.insert_resource(StatScalingConfig::default());
         world.insert_resource(SalvageConfig::default());
+        // Mining-skirmish combat rules (friendly-fire OFF by default). Harmless for every other
+        // world: the faction gate is a no-op until a projectile carries a `ProjectileFaction`, which
+        // only scenario shooters do — so determinism/botkit/Sandbox stay bit-identical.
+        world.insert_resource(CombatRules::default());
 
         let mut schedule = Schedule::default();
         // The single shared entry point: server steps the SAME systems in the
@@ -1112,6 +1122,16 @@ impl ServerApp {
             _ => seed_catalogs(),
         };
 
+        // Mining-skirmish faction tint lookup (Entity → tag): filled once, read at each emit site so
+        // ships/projectiles/structures/debris carry their team colour. Empty in every non-scenario
+        // world (no `Faction` entities), so the `unwrap_or(0)` keeps those untinted. Render-only.
+        let factions: std::collections::BTreeMap<Entity, u8> = {
+            let mut q = self.world.query::<(Entity, &Faction)>();
+            q.iter(&self.world)
+                .map(|(e, f)| (e, f.tint_tag()))
+                .collect()
+        };
+
         // Ships (carry a `Heading`). A ship may carry `Shields` (E007 fitted player /
         // enemy) → its `shield_frac`, a live `DamageFlash` → its `flash`, and a live
         // `ShieldHitFlash` → its `shield_flash`; all default to 0 for an unfitted/
@@ -1186,6 +1206,7 @@ impl ServerApp {
                 grid_dims,
                 // A live ship uses the grid centre (no frozen anchor).
                 mesh_anchor: None,
+                faction: factions.get(&entity).copied().unwrap_or(0),
             });
         }
 
@@ -1213,6 +1234,7 @@ impl ServerApp {
                 cells: Vec::new(),
                 grid_dims: (0, 0),
                 mesh_anchor: None,
+                faction: factions.get(&entity).copied().unwrap_or(0),
             });
         }
 
@@ -1330,6 +1352,7 @@ impl ServerApp {
                 grid_dims,
                 // A live fitted enemy (or plain target) uses the grid centre — no anchor.
                 mesh_anchor: None,
+                faction: factions.get(&entity).copied().unwrap_or(0),
             });
         }
 
@@ -1415,6 +1438,8 @@ impl ServerApp {
                 cells,
                 grid_dims,
                 mesh_anchor,
+                // Wreckage keeps its faction tint (a destroyed outpost/transport stays its colour).
+                faction: factions.get(&entity).copied().unwrap_or(0),
             });
         }
 

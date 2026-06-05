@@ -10,9 +10,9 @@ use crate::clock::FixedDt;
 use crate::combat::{self, HitFeedback};
 use crate::components::AngularVelocity;
 use crate::components::{
-    CollisionRadius, Damage, DamageFlash, Destructible, Heading, Health, LastShieldHit, MeshAnchor,
-    Position, PrevPosition, Projectile, ProjectileMass, ProjectileOwner, ShieldHitFlash, Ship,
-    Target, TargetKind, Velocity,
+    hostile, CollisionRadius, CombatRules, Damage, DamageFlash, Destructible, Faction, Heading,
+    Health, LastShieldHit, MeshAnchor, Position, PrevPosition, Projectile, ProjectileFaction,
+    ProjectileMass, ProjectileOwner, ShieldHitFlash, Ship, Target, TargetKind, Velocity,
 };
 use crate::damage::{
     apply_damage, core_cell, first_cell_hit, on_cells_carved, DamageEvent, HitKind, Wreck, REACH,
@@ -144,15 +144,34 @@ pub fn is_lethal_ram(closing_speed: f32, threshold: f32) -> bool {
 pub fn collision_detect_system(
     mut commands: Commands,
     mut feedback: ResMut<HitFeedback>,
-    projectiles: Query<(Entity, &Position, &PrevPosition, &Damage), With<Projectile>>,
+    rules: Option<Res<CombatRules>>,
+    projectiles: Query<
+        (
+            Entity,
+            &Position,
+            &PrevPosition,
+            &Damage,
+            Option<&ProjectileFaction>,
+        ),
+        With<Projectile>,
+    >,
     mut targets: Query<
-        (&Position, &CollisionRadius, &mut Health),
+        (&Position, &CollisionRadius, &mut Health, Option<&Faction>),
         (With<Target>, Without<FitLayout>),
     >,
 ) {
+    let friendly_fire = rules.is_some_and(|r| r.friendly_fire);
     let physics = RapierPhysics::new();
-    for (projectile, pos, prev, dmg) in &projectiles {
-        for (tpos, radius, mut health) in &mut targets {
+    for (projectile, pos, prev, dmg, proj_faction) in &projectiles {
+        for (tpos, radius, mut health, target_faction) in &mut targets {
+            // Mining-skirmish friend/foe gate: a FACTIONED shot skips a non-enemy target. A no-op
+            // for an unfactioned shot (`proj_faction` is `None`) → today's free-for-all, so every
+            // determinism/botkit/test world (no factioned projectiles) is byte-identical.
+            if let Some(pf) = proj_faction {
+                if !hostile(pf.0, target_faction.copied(), friendly_fire) {
+                    continue;
+                }
+            }
             if physics
                 .swept_cast(prev.0, pos.0, tpos.0, radius.0)
                 .is_some()
@@ -330,6 +349,7 @@ pub fn fitted_damage_system(world: &mut World) {
         &FitLayout,
         Option<&Wreck>,
         Option<&MeshAnchor>,
+        Option<&Faction>,
     ), (With<FitLayout>, With<Destructible>)>();
     // Resolve each target's grid dims from its **`FitLayout.hull`** (→ `HullCatalog`),
     // not a `Fit` — the `Fit`-independent lookup that lets wreckage (no `Fit`) carve too.
@@ -340,7 +360,7 @@ pub fn fitted_damage_system(world: &mut World) {
         let hulls = world.get_resource::<HullCatalog>();
         target_q
             .iter(world)
-            .filter_map(|(e, _, _, _, layout, _, _)| {
+            .filter_map(|(e, _, _, _, layout, _, _, _)| {
                 hulls
                     .and_then(|h| h.get(layout.hull))
                     .map(|hull| (e, hull.grid_dims))
@@ -362,7 +382,7 @@ pub fn fitted_damage_system(world: &mut World) {
     // unresolvable has no entry and is skipped in the apply loop alongside `hull_dims`.
     let centers: std::collections::BTreeMap<Entity, Vec2> = target_q
         .iter(world)
-        .filter_map(|(e, _, _, _, layout, wreck, anchor)| {
+        .filter_map(|(e, _, _, _, layout, wreck, anchor, _)| {
             let is_wreck = wreck.is_some();
             // A live ship needs its resolved grid dims (skip the target if unresolvable,
             // matching `hull_dims`); a `Wreck` uses its frozen anchor / cell-COM and ignores
@@ -382,10 +402,19 @@ pub fn fitted_damage_system(world: &mut World) {
     // re-borrowing the world. `FitLayout` is `Clone` (a `BTreeMap` of small `Copy`
     // occupants); the clone is released before any `&mut World` use, like the rest of the
     // collected hit data.
-    let targets: Vec<(Entity, Vec2, f32, f32, FitLayout)> = target_q
+    let targets: Vec<(Entity, Vec2, f32, f32, FitLayout, Option<Faction>)> = target_q
         .iter(world)
-        .map(|(e, p, r, h, layout, _, _)| (e, p.0, r.0, h.0, layout.clone()))
+        .map(|(e, p, r, h, layout, _, _, faction)| {
+            (e, p.0, r.0, h.0, layout.clone(), faction.copied())
+        })
         .collect();
+
+    // Mining-skirmish friend/foe: a factioned shot only carves an ENEMY fitted target (mirrors the
+    // flat path). Read before the projectile borrow; `Option<Res>`/default so a world without the
+    // rules (every determinism/test world) keeps today's behavior.
+    let friendly_fire = world
+        .get_resource::<CombatRules>()
+        .is_some_and(|r| r.friendly_fire);
 
     let mut proj_q = world.query_filtered::<(
         Entity,
@@ -396,8 +425,9 @@ pub fn fitted_damage_system(world: &mut World) {
         &WeaponSource,
         Option<&ProjectileOwner>,
         Option<&ProjectileMass>,
+        Option<&ProjectileFaction>,
     ), With<Projectile>>();
-    for (projectile, pos, prev, vel, dmg, src, owner, pmass) in proj_q.iter(world) {
+    for (projectile, pos, prev, vel, dmg, src, owner, pmass, pfac) in proj_q.iter(world) {
         let owner_e = owner.map(|o| o.0);
         // Phase M5: the per-weapon slug mass the shot carries (falls back to the global
         // `PROJECTILE_MASS` for a projectile spawned without one — e.g. a minimal-world test shot).
@@ -424,9 +454,17 @@ pub fn fitted_damage_system(world: &mut World) {
         // point `world_impact` (shield-impact dir, FIX 0a) and the already-computed cell-
         // space entry ray `(point, dir_cell)` so the apply phase reuses them.
         let mut best: Option<(Entity, f32, Vec2, Vec2, Vec2, Vec2)> = None; // (target, cell_toi, tpos, world_impact, point, dir_cell)
-        for (target, tpos, radius, heading, layout) in &targets {
+        for (target, tpos, radius, heading, layout, target_faction) in &targets {
             if owner_e == Some(*target) {
                 continue; // self-hit prevention (E002 ProjectileOwner)
+            }
+            // Mining-skirmish friend/foe gate: a FACTIONED shot skips a non-enemy fitted target. A
+            // no-op for an unfactioned shot (`pfac` is `None`) → every determinism/test world (no
+            // factioned projectiles) is byte-identical.
+            if let Some(pf) = pfac {
+                if !hostile(pf.0, *target_faction, friendly_fire) {
+                    continue;
+                }
             }
             // Broad-phase: cheap circle reject — skip targets the projectile clearly misses.
             let Some(hit) = physics.swept_cast(prev.0, pos.0, *tpos, *radius) else {

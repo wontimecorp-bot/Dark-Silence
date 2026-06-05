@@ -52,9 +52,10 @@ use protocol::{
     ClientInput, Connect, ConnectionId, EntityId, EntityKind, LoopbackTransport, Message,
     NetTransport, CLIENT_TOKEN_BYTES,
 };
-use server::{RenderEntity, ServerApp, PROTOCOL_VERSION};
+use server::{RenderEntity, Scenario, ServerApp, PROTOCOL_VERSION};
 use sim::components::{
-    Afterburner, ArmorHp, CollisionRadius, Destructible, Energy, Heat, TargetKind, Velocity,
+    Afterburner, ArmorHp, CollisionRadius, Destructible, Energy, Heat, Position, TargetKind,
+    Velocity,
 };
 use sim::damage::seed_defense_layers;
 use sim::fitting::{
@@ -62,7 +63,7 @@ use sim::fitting::{
     HULL_FIGHTER, MODULE_ARMOR_PLATE, MODULE_AUTOCANNON, MODULE_REACTOR_BASIC,
     MODULE_THRUSTER_BASIC,
 };
-use sim::{FixedDt, HitFeedback, ShipIntent};
+use sim::{FactionSpawns, FixedDt, HitFeedback, ShipIntent};
 
 use crate::input::{build_client_input, InputSequencer};
 use crate::render_sync::{
@@ -224,22 +225,19 @@ impl Plugin for NetClientPlugin {
 /// never races scene setup. We map `local_id → that entity` here so
 /// [`capture_render_state`] drives the existing local ship rather than spawning a
 /// duplicate.
+/// Which scenario the windowed client populates the embedded server with. The mining skirmish is
+/// the new default game mode; `Scenario::Sandbox` reproduces the original demo (kept selectable).
+const SELECTED_SCENARIO: Scenario = Scenario::MiningSkirmish;
+
 fn setup_loopback_host(world: &mut World) {
     let (mut server, mut transport) = ServerApp::loopback();
-    // Populate the authoritative world with the demo targets BEFORE the handshake
-    // tick below, so they exist the first time `capture_render_state` reads the
-    // server world.
-    server.spawn_demo_world();
-    // E007 live-demo: spawn fitted enemies the player can shoot apart so the whole
-    // damage pipeline (typed hits → module degrade → section sever → drifting chunks
-    // → wreck) is visible live. One is placed directly ahead of the player (which
-    // starts at the origin facing +x), a second offset for variety. Both are
-    // stationary, slowly-spinning, fully-defended `Target`+`FitLayout` entities the
-    // E007 `fitted_damage_system` resolves hits against (see
-    // `ServerApp::spawn_fitted_enemy`). They are NOT in `spawn_demo_world` (tests
-    // depend on its contents) — they are demo-only.
-    server.spawn_fitted_enemy(Vec2::new(14.0, 0.0));
-    server.spawn_fitted_enemy(Vec2::new(18.0, 6.0));
+    // Populate the authoritative world with the selected scenario BEFORE the handshake
+    // tick below, so its entities exist the first time `capture_render_state` reads the
+    // server world. `Scenario::Sandbox` reproduces the original demo (practice dummies +
+    // drifting asteroids + seeker + the two fitted E007 enemies); `MiningSkirmish` is the
+    // new game mode. The headless tests never call `spawn_scenario`, so `spawn_demo_world`
+    // + the test entity sets are untouched.
+    server.spawn_scenario(SELECTED_SCENARIO);
     let conn = NetTransport::connect(&mut transport, loopback_addr());
 
     // Handshake: send Connect, tick the server once so it accepts + replies, then
@@ -270,6 +268,20 @@ fn setup_loopback_host(world: &mut World) {
     // global `Tuning` — "fit drives the ship". `spawn_demo_world` targets are
     // untouched (only this one ship entity is fitted).
     attach_starter_fit(&mut server, local_id);
+
+    // Phase 5: auto-join a side + spawn at that faction's base (mining skirmish only).
+    // `attach_starter_fit` stays the pure reusable fit; this sets the player's team + spawn position
+    // around it, so the player's shots are factioned (enemy structures/turrets hostile, friendlies
+    // not) and they start near their refinery. Sandbox has no `FactionSpawns` → the player stays
+    // unfactioned at the origin (the original free-for-all behaviour).
+    if let Some(spawns) = server.world().get_resource::<FactionSpawns>().copied() {
+        let faction = server.assign_faction();
+        if let Some(ship) = server.ship_entity_for(local_id) {
+            let mut entity = server.world_mut().entity_mut(ship);
+            entity.insert(faction);
+            entity.insert(Position(spawns.for_faction(faction)));
+        }
+    }
 
     // Register the pre-spawned local ship under its authoritative id so the capture
     // system updates it in place (the scene spawns exactly one `LocalShip`).
@@ -621,6 +633,18 @@ fn spawn_render_entity(
             Some(TargetKind::Seeker) => {
                 (assets.seeker_mesh.clone(), assets.seeker_material.clone())
             }
+            // Mining-skirmish structures (Phase 1): outpost / transport / central asteroid.
+            Some(TargetKind::Outpost) => {
+                (assets.outpost_mesh.clone(), assets.outpost_material.clone())
+            }
+            Some(TargetKind::Transport) => (
+                assets.transport_mesh.clone(),
+                assets.transport_material.clone(),
+            ),
+            Some(TargetKind::MineNode) => (
+                assets.minenode_mesh.clone(),
+                assets.minenode_material.clone(),
+            ),
             _ => (assets.dummy_mesh.clone(), assets.dummy_material.clone()),
         },
         EntityKind::Projectile => (
@@ -630,6 +654,15 @@ fn spawn_render_entity(
         // FIX 0b: a destroyed ship's severed chunks + hulk render as tinted, tumbling
         // ship-fragment boxes (not grey asteroid spheres).
         EntityKind::Debris => (assets.debris_mesh.clone(), assets.debris_material.clone()),
+    };
+    // Phase 2 (mining skirmish): override a factioned simple-mesh entity's material with its team
+    // colour (red/blue) so friend/foe reads at a glance — the mesh shape still conveys role. `0` =
+    // neutral (keeps the base look). Fitted ships render via the voxel hull path, not this material,
+    // so they are unaffected (ship faction tint is a later follow-up).
+    let material = match e.faction {
+        1 => assets.faction_red_material.clone(),
+        2 => assets.faction_blue_material.clone(),
+        _ => material,
     };
 
     // A LAYOUT-LESS debris fragment (no cell payload) gets a deterministic, id-derived

@@ -17,6 +17,7 @@
 
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
+use bevy_ecs::prelude::Resource;
 use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
@@ -227,6 +228,23 @@ pub struct PrevPosition(pub Vec2);
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProjectileOwner(pub Entity);
 
+/// The shooter's [`Faction`] stamped onto a projectile at fire (mining-skirmish friend/foe). Like
+/// [`ProjectileOwner`], runtime-local (not serialized). `None` = an unfactioned shot → the
+/// faction gate is a no-op (today's free-for-all), so every non-scenario / determinism / test world
+/// is byte-unchanged.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProjectileFaction(pub Option<Faction>);
+
+/// Mining-skirmish combat rules (a world resource). `friendly_fire` defaults OFF → a factioned
+/// projectile only damages an ENEMY (faction-gated); a projectile with no [`ProjectileFaction`] is
+/// unaffected by the gate (today's behavior). Read as `Option<Res<CombatRules>>` so a world that
+/// never inserts it (the sim unit tests) degrades to the default.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CombatRules {
+    /// `false` (default) = friendly fire OFF (a factioned shot only damages an enemy).
+    pub friendly_fire: bool,
+}
+
 /// Marker: a destructible target.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target;
@@ -240,18 +258,28 @@ pub enum TargetKind {
     Asteroid,
     /// Thrusts toward the player each step.
     Seeker,
+    /// Mining-skirmish: a faction's stationary **refinery outpost** (beefy, mounts good turrets).
+    Outpost,
+    /// Mining-skirmish: a faction's **mining transport** (runs the load/unload loop; light turrets).
+    Transport,
+    /// Mining-skirmish: the central important **asteroid** both factions mine from.
+    MineNode,
 }
 
 impl TargetKind {
     /// Stable wire tag for the target sub-kind, carried in
     /// `protocol::EntityRecord.flags` so a networked client can pick the right
     /// visual — the wire `EntityKind` only distinguishes Ship/Projectile/Target.
-    /// Additive; not part of any gameplay invariant.
+    /// Additive; not part of any gameplay invariant. **Append-only**: existing tags
+    /// 0/1/2 are stable; scenario kinds extend with 3/4/5.
     pub fn as_u8(self) -> u8 {
         match self {
             TargetKind::Dummy => 0,
             TargetKind::Asteroid => 1,
             TargetKind::Seeker => 2,
+            TargetKind::Outpost => 3,
+            TargetKind::Transport => 4,
+            TargetKind::MineNode => 5,
         }
     }
 
@@ -261,8 +289,45 @@ impl TargetKind {
             0 => Some(TargetKind::Dummy),
             1 => Some(TargetKind::Asteroid),
             2 => Some(TargetKind::Seeker),
+            3 => Some(TargetKind::Outpost),
+            4 => Some(TargetKind::Transport),
+            5 => Some(TargetKind::MineNode),
             _ => None,
         }
+    }
+}
+
+/// Mining-skirmish **team allegiance** (the first faction/team concept). Friend/foe is `a != b`
+/// (see [`hostile`]); an entity WITHOUT a `Faction` — every ship/target outside the skirmish,
+/// including ALL determinism/botkit/test worlds — is neutral and behaves exactly as before, so the
+/// faction-gated combat path is a strict no-op there. Attached only to scenario entities.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Faction {
+    Red,
+    Blue,
+}
+
+impl Faction {
+    /// Render tint tag for `RenderEntity.faction` (client-only): `1` = Red, `2` = Blue (`0` = none).
+    pub fn tint_tag(self) -> u8 {
+        match self {
+            Faction::Red => 1,
+            Faction::Blue => 2,
+        }
+    }
+}
+
+/// Friend/foe test for the faction-gated combat path. `friendly_fire` → always hostile (damage
+/// applies, today's free-for-all). Otherwise an entity with NO faction (`None`) is neutral and
+/// hits/gets-hit by anyone (so every faction-less test/determinism world is byte-identical to
+/// today); two factioned entities are hostile iff they differ.
+pub fn hostile(a: Option<Faction>, b: Option<Faction>, friendly_fire: bool) -> bool {
+    if friendly_fire {
+        return true;
+    }
+    match (a, b) {
+        (Some(a), Some(b)) => a != b,
+        _ => true,
     }
 }
 
@@ -389,6 +454,34 @@ pub struct Weapon {
 mod tests {
     use super::*;
     use bevy_ecs::world::World;
+
+    /// Friend/foe truth table (mining skirmish). A faction-less side (`None`) is neutral and always
+    /// hostile (so every non-scenario / determinism world is unchanged); two factions are hostile
+    /// iff they differ; `friendly_fire` forces hostile regardless.
+    #[test]
+    fn hostile_truth_table() {
+        use Faction::{Blue, Red};
+        // Friendly fire OFF (the default scenario rule):
+        assert!(
+            !hostile(Some(Red), Some(Red), false),
+            "same faction = not hostile"
+        );
+        assert!(!hostile(Some(Blue), Some(Blue), false));
+        assert!(
+            hostile(Some(Red), Some(Blue), false),
+            "different factions = hostile"
+        );
+        assert!(hostile(Some(Blue), Some(Red), false));
+        // A faction-less side is neutral → hostile to anyone (today's free-for-all, the gate no-op).
+        assert!(hostile(None, Some(Red), false));
+        assert!(hostile(Some(Red), None, false));
+        assert!(hostile(None, None, false));
+        // Friendly fire ON → always hostile (damage applies to anyone).
+        assert!(
+            hostile(Some(Red), Some(Red), true),
+            "friendly fire on = hostile even to allies"
+        );
+    }
 
     /// The components must actually be usable as ECS data: spawn an entity with
     /// both, then read them back. This is the headless-ECS smoke test that proves

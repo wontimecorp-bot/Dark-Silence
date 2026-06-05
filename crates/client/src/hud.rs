@@ -9,13 +9,56 @@
 use bevy::prelude::*;
 use sim::components::{Energy, FlightAssist, Health, Ship, Velocity};
 use sim::damage::HitKind;
-use sim::HitFeedback;
+use sim::{HitFeedback, RefinedResources};
 
 use crate::net::{LoopbackHost, NetClientState};
 
 /// Marker for the readout text node.
 #[derive(Component)]
 pub struct HudText;
+
+/// Marker for the mining-skirmish per-faction refined-resources score line (top-centre).
+#[derive(Component)]
+pub struct ScoreText;
+
+/// Spawn the mining-skirmish score readout (top-centre): `RED <n>   BLUE <n>`, the per-faction
+/// refined-resources tally read from the embedded server world each frame. Hidden (blank) in any
+/// world without the [`RefinedResources`] resource (e.g. the Sandbox before anything refines).
+pub fn setup_score_hud(mut commands: Commands) {
+    commands.spawn((
+        Text::new(String::new()),
+        TextFont {
+            font_size: 20.0,
+            ..default()
+        },
+        TextColor(Color::srgb(0.92, 0.92, 0.96)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(10.0),
+            left: Val::Percent(38.0),
+            ..default()
+        },
+        ScoreText,
+    ));
+}
+
+/// Refresh the score line from the embedded server world's [`RefinedResources`] (like the energy
+/// readout reads the server world). Blank when the resource is absent.
+pub fn update_score_hud(
+    host: Option<NonSend<LoopbackHost>>,
+    mut q: Query<&mut Text, With<ScoreText>>,
+) {
+    let Ok(mut text) = q.single_mut() else {
+        return;
+    };
+    text.0 = match host
+        .as_ref()
+        .and_then(|h| h.server.world().get_resource::<RefinedResources>())
+    {
+        Some(r) => format!("RED {:.0}    BLUE {:.0}", r.red, r.blue),
+        None => String::new(),
+    };
+}
 
 /// The numeric Energy readout (`ENRG 72/120`) — the detail-on-focus layer beside the Energy mesh
 /// bar (the bar itself is a camera-anchored trapezoid in [`crate::hud_bars`]).

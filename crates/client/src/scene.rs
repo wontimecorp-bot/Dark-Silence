@@ -44,6 +44,21 @@ pub struct RenderAssets {
     pub asteroid_material: Handle<StandardMaterial>,
     pub seeker_mesh: Handle<Mesh>,
     pub seeker_material: Handle<StandardMaterial>,
+    /// Mining-skirmish structures (Phase 1): a beefy refinery outpost, an industrial mining
+    /// transport, and the large central asteroid mine node. Faction tint is applied per-entity at
+    /// draw time (Phase 2), so these base materials are neutral.
+    pub outpost_mesh: Handle<Mesh>,
+    pub outpost_material: Handle<StandardMaterial>,
+    pub transport_mesh: Handle<Mesh>,
+    pub transport_material: Handle<StandardMaterial>,
+    pub minenode_mesh: Handle<Mesh>,
+    pub minenode_material: Handle<StandardMaterial>,
+    /// Phase 2 faction TINT materials (mining skirmish): a saturated team red / blue applied to any
+    /// factioned **simple-mesh** entity (structures + projectiles) so friend/foe reads at a glance —
+    /// the mesh shape conveys role, the colour conveys team. (Fitted ships render via the voxel hull
+    /// path, so ship faction tint is a later follow-up.)
+    pub faction_red_material: Handle<StandardMaterial>,
+    pub faction_blue_material: Handle<StandardMaterial>,
     /// Localized shield-impact flash (FIX 0a refinement): a glowing cyan **arc segment
     /// of the shield ring** ([`build_arc_band_mesh`]) spawned once as a child of a
     /// rendered ship and **rotated** about Z so the lit slice faces the bullet impact
@@ -1029,6 +1044,26 @@ pub fn setup_scene(
     let asteroid_material = materials.add(Color::srgb(0.55, 0.5, 0.45));
     let seeker_mesh = meshes.add(Cuboid::new(1.2, 0.6, 0.3)); // green seeker dart
     let seeker_material = materials.add(Color::srgb(0.35, 0.85, 0.40));
+    // Mining-skirmish structures (Phase 1), sized to roughly match their collision radii so the
+    // visual matches the hitbox; faction tint is applied per-entity at draw time (Phase 2).
+    let outpost_mesh = meshes.add(Cuboid::new(5.2, 5.2, 3.0)); // beefy refinery outpost
+    let outpost_material = materials.add(Color::srgb(0.46, 0.47, 0.53));
+    let transport_mesh = meshes.add(Cuboid::new(3.4, 1.9, 1.2)); // industrial mining transport
+    let transport_material = materials.add(Color::srgb(0.55, 0.52, 0.46));
+    let minenode_mesh = meshes.add(Sphere::new(5.0)); // the central mining asteroid
+    let minenode_material = materials.add(Color::srgb(0.50, 0.46, 0.40));
+    // Phase 2 faction tint materials (saturated team colours, slightly emissive so they read as
+    // team identity under the top-down light).
+    let faction_red_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.85, 0.22, 0.20),
+        emissive: LinearRgba::rgb(0.25, 0.03, 0.02),
+        ..default()
+    });
+    let faction_blue_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.22, 0.42, 0.92),
+        emissive: LinearRgba::rgb(0.03, 0.08, 0.30),
+        ..default()
+    });
 
     // Localized shield-impact flash (FIX 0a polish): a sleek glowing cyan ENERGY CRESCENT
     // of the shield ring — a flat annular sliver in the XY plane whose per-vertex colors
@@ -1131,6 +1166,14 @@ pub fn setup_scene(
         asteroid_material,
         seeker_mesh,
         seeker_material,
+        outpost_mesh,
+        outpost_material,
+        transport_mesh,
+        transport_material,
+        minenode_mesh,
+        minenode_material,
+        faction_red_material,
+        faction_blue_material,
         shield_arc_mesh,
         shield_material,
         debris_mesh,

@@ -5,7 +5,74 @@
 
 use glam::Vec2;
 use protocol::EntityKind;
-use server::ServerApp;
+use server::{Scenario, ServerApp};
+
+/// Phase 0 lock: `spawn_scenario(Sandbox)` reproduces the original inline demo composition (the
+/// `spawn_demo_world` targets + the two fitted enemies). The refactor that moved the windowed
+/// client's spawn calls behind a `Scenario` dispatcher is behaviour-preserving.
+#[test]
+fn sandbox_scenario_reproduces_the_original_demo_composition() {
+    let (mut server, _t) = ServerApp::loopback();
+    server.spawn_scenario(Scenario::Sandbox);
+    server.tick();
+    let rs = server.render_state();
+
+    // The 5 plain practice targets (2 dummies + 2 asteroids + 1 seeker) render as Targets.
+    let targets = rs.iter().filter(|e| e.kind == EntityKind::Target).count();
+    assert_eq!(
+        targets, 5,
+        "Sandbox keeps the 5 spawn_demo_world targets (got {targets})"
+    );
+    // The 2 fitted enemies render as Ships at their fixed positions.
+    let ships: Vec<_> = rs.iter().filter(|e| e.kind == EntityKind::Ship).collect();
+    assert_eq!(
+        ships.len(),
+        2,
+        "Sandbox keeps the 2 fitted enemies as Ships (got {})",
+        ships.len()
+    );
+    assert!(ships
+        .iter()
+        .any(|e| (e.pos - Vec2::new(14.0, 0.0)).length() < 0.6));
+    assert!(ships
+        .iter()
+        .any(|e| (e.pos - Vec2::new(18.0, 6.0)).length() < 0.6));
+}
+
+/// Phase 1 lock: `spawn_scenario(MiningSkirmish)` builds the static arena — the central asteroid
+/// mine node + each faction's outpost + transport, all `Target`s with the right sub-kind flags.
+#[test]
+fn mining_skirmish_scenario_spawns_the_static_arena() {
+    use sim::components::TargetKind;
+
+    let (mut server, _t) = ServerApp::loopback();
+    server.spawn_scenario(Scenario::MiningSkirmish);
+    server.tick();
+    let rs = server.render_state();
+
+    let count = |k: TargetKind| {
+        rs.iter()
+            .filter(|e| e.kind == EntityKind::Target && e.flags == k.as_u8())
+            .count()
+    };
+    assert_eq!(count(TargetKind::MineNode), 1, "one central mine node");
+    assert_eq!(
+        count(TargetKind::Outpost),
+        2,
+        "two refinery outposts (Red + Blue)"
+    );
+    assert_eq!(
+        count(TargetKind::Transport),
+        2,
+        "two mining transports (Red + Blue)"
+    );
+    // No leftover demo targets bleed into the skirmish arena.
+    assert_eq!(
+        count(TargetKind::Dummy),
+        0,
+        "no demo dummies in the skirmish"
+    );
+}
 
 #[test]
 fn fitted_enemies_render_as_distinct_ships() {

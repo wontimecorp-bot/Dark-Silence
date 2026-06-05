@@ -10,8 +10,8 @@
 
 use crate::clock::FixedDt;
 use crate::components::{
-    Damage, Energy, Heading, Heat, Lifetime, Position, PrevPosition, Projectile, ProjectileMass,
-    ProjectileOwner, Ship, Velocity, Weapon,
+    Damage, Energy, Faction, Heading, Heat, Lifetime, Position, PrevPosition, Projectile,
+    ProjectileFaction, ProjectileMass, ProjectileOwner, Ship, Velocity, Weapon,
 };
 use crate::damage::{Channel, DamageEvent};
 use crate::fitting::ShipStats;
@@ -204,6 +204,9 @@ pub fn weapon_fire_system(
             // headless sim/determinism worlds (no pools) keep the exact prior firing behavior.
             Option<&mut Energy>,
             Option<&mut Heat>,
+            // Mining-skirmish: the shooter's team, stamped onto the shot for the friend/foe gate.
+            // `Option` so an unfactioned ship (every determinism/test world) shoots exactly as before.
+            Option<&Faction>,
         ),
         With<Ship>,
     >,
@@ -216,6 +219,7 @@ pub fn weapon_fire_system(
             &Heading,
             &mut Velocity,
             &mut Weapon,
+            Option<&Faction>,
         ),
         (With<Ship>, Without<ShipStats>),
     >,
@@ -224,7 +228,7 @@ pub fn weapon_fire_system(
     let sim = sim.map(|s| *s).unwrap_or_default();
 
     // Fitted path: fit-derived can_fire + WeaponProfile (FR-016).
-    for (owner, intent, pos, heading, mut ship_vel, stats, weapon, mut energy, mut heat) in
+    for (owner, intent, pos, heading, mut ship_vel, stats, weapon, mut energy, mut heat, faction) in
         &mut fitted
     {
         // No weapon module ⇒ cannot fire; if a Weapon component lingers, still
@@ -265,6 +269,8 @@ pub fn weapon_fire_system(
                     sim.pen_per_damage,
                     sim.pen_size,
                 ),
+                // Mining-skirmish friend/foe: the shot carries the shooter's team (None = neutral).
+                ProjectileFaction(faction.copied()),
             ));
             // Phase M4/M5 recoil: conserve momentum against the MUZZLE component only (the inherited
             // part was already the ship's momentum), using the per-weapon slug mass.
@@ -283,7 +289,7 @@ pub fn weapon_fire_system(
     }
 
     // Unfitted path: the original Weapon-component behavior (E001/E002/E003) + M4 recoil.
-    for (owner, intent, pos, heading, mut ship_vel, mut weapon) in &mut unfitted {
+    for (owner, intent, pos, heading, mut ship_vel, mut weapon, faction) in &mut unfitted {
         if weapon.cooldown > 0.0 {
             weapon.cooldown -= dt;
         }
@@ -309,6 +315,8 @@ pub fn weapon_fire_system(
                     sim.pen_per_damage,
                     sim.pen_size,
                 ),
+                // Mining-skirmish friend/foe: the shot carries the shooter's team (None = neutral).
+                ProjectileFaction(faction.copied()),
             ));
             // Phase M4/M6 recoil — unfitted ships use the global Tuning mass + live slug mass.
             ship_vel.0 -= sim.projectile_mass * muzzle / tuning.mass.max(f32::MIN_POSITIVE);

@@ -93,6 +93,7 @@ pub fn run() -> AppExit {
                 camera::setup_camera,
                 hud::setup_hud,
                 hud::setup_energy_bars,
+                hud::setup_score_hud,
                 // Camera-anchored trapezoid bars (afterburner ramp + heat double-ramp) —
                 // parented to the camera, so it must exist first.
                 hud_bars::setup_trapezoid_bars.after(camera::setup_camera),
@@ -131,6 +132,7 @@ pub fn run() -> AppExit {
                 camera::zoom_camera,
                 hud::update_hud,
                 hud::update_energy_hud,
+                hud::update_score_hud,
                 hud_bars::update_trapezoid_bars,
             ),
         );

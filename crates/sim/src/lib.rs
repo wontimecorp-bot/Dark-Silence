@@ -25,9 +25,12 @@ pub mod energy;
 pub mod fitting;
 pub mod flight;
 pub mod intent;
+pub mod mining;
 pub mod motion;
 pub mod physics;
+pub mod scenario;
 pub mod tuning;
+pub mod turret;
 pub mod weapon;
 
 pub use clock::FixedDt;
@@ -36,9 +39,9 @@ pub use collision::{
 };
 pub use combat::HitFeedback;
 pub use components::{
-    AngularVelocity, CollisionRadius, Damage, DamageFlash, Destructible, FlightAssist, Heading,
-    Health, Lifetime, Position, PrevPosition, Projectile, ProjectileOwner, ShieldHitFlash, Ship,
-    Target, TargetKind, Velocity, Weapon,
+    hostile, AngularVelocity, CollisionRadius, CombatRules, Damage, DamageFlash, Destructible,
+    Faction, FlightAssist, Heading, Health, Lifetime, Position, PrevPosition, Projectile,
+    ProjectileFaction, ProjectileOwner, ShieldHitFlash, Ship, Target, TargetKind, Velocity, Weapon,
 };
 pub use fitting::{
     build_layout, cell_map, derive_ship_stats, hardpoint_arc, load_preset, module_at,
@@ -46,9 +49,12 @@ pub use fitting::{
     FitPreset, HitResolution, PresetId, ShipStats, WeaponProfile,
 };
 pub use intent::ShipIntent;
+pub use mining::{mining_transport_system, Cargo, MiningState, MiningTransport, RefinedResources};
 pub use motion::{analytic, integrate, simulate, BodyState};
 pub use physics::{Physics, RapierPhysics, SweptHit};
+pub use scenario::{FactionSpawns, ScenarioActive};
 pub use tuning::{SimTuning, Tuning};
+pub use turret::{aim_angle, turret_system, Turret, TurretSpec};
 pub use weapon::{damage_event_from_hit, WeaponSource};
 
 use bevy_ecs::schedule::common_conditions::resource_exists;
@@ -122,6 +128,11 @@ pub fn add_fixed_step_systems(schedule: &mut Schedule) {
     schedule.add_systems(
         (
             ai::seek_system,
+            // Mining skirmish: the AI transports' navigate→load→return→unload economy loop. Runs
+            // after `seek_system` (which integrates a transport's Velocity→Position, since the
+            // transport is a `Target`) so it reads the fresh position + sets next-tick velocity.
+            // Gated on `ScenarioActive` → a no-op in every non-scenario / determinism / test world.
+            mining::mining_transport_system.run_if(resource_exists::<scenario::ScenarioActive>),
             flight::ship_motion_system,
             // Phase M4: wreckage drifts/tumbles on its inherited velocity+spin (no thrust/drag),
             // moved before collision so a drifting wreck is hit at its current-tick position; and
@@ -136,6 +147,10 @@ pub fn add_fixed_step_systems(schedule: &mut Schedule) {
             // Phase F: drain/recharge the afterburner pool (no-op without the pool).
             energy::afterburner_system,
             weapon::weapon_fire_system,
+            // Mining skirmish: automated turrets aim (intercept lead + deterministic jitter) + fire
+            // along their own heading; gated on `ScenarioActive` → a no-op in every non-scenario
+            // world. After weapon_fire so turret shots spawn in the same phase as ship shots.
+            turret::turret_system.run_if(resource_exists::<scenario::ScenarioActive>),
             weapon::projectile_step_system,
             collision::collision_detect_system,
             collision::fitted_damage_system,
