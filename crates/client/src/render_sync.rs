@@ -22,9 +22,22 @@
 
 use bevy::prelude::*;
 use protocol::{EntityId, EntityKind};
-use sim::components::{Heading, Position, Projectile, Ship};
+use sim::components::{Energy, Heading, Heat, Position, Projectile, Ship};
+use sim::fitting::ShipStats;
+use sim::SimTuning;
 
+use crate::net::{LoopbackHost, NetClientState};
 use crate::scene::RenderAssets;
+
+/// The gunsight pip's normal colour (cyan) + its **can't-fire** colour (red) — used by
+/// [`update_aim_pip`] to redden the reticle when the player can't sustain fire (Phase F: energy
+/// below a shot's cost OR overheated), the eye-on-target counterpart to the energy/heat bars.
+const AIM_PIP_READY: (Color, LinearRgba) =
+    (Color::srgb(0.4, 1.0, 0.9), LinearRgba::rgb(0.2, 1.0, 0.8));
+const AIM_PIP_BLOCKED: (Color, LinearRgba) = (
+    Color::srgb(1.0, 0.28, 0.22),
+    LinearRgba::rgb(1.3, 0.12, 0.08),
+);
 
 /// How far ahead of the ship's nose the gunsight pip sits, in sim units.
 const AIM_DISTANCE: f32 = 5.0;
@@ -204,16 +217,59 @@ pub fn add_projectile_visuals(
 /// (interpolated) heading — so it shows the actual firing line for the fixed
 /// forward weapon. Runs after `interpolate_transforms` so it reads the smoothed
 /// ship pose.
+///
+/// **Phase F — can't-fire tint:** the pip reddens when the local ship can't sustain fire, using the
+/// SAME gate the sim's `weapon_fire_system` applies (`energy.current >= shot_cost && heat.current <
+/// heat.max`, with `shot_cost = weapon.damage · weapon_energy_per_damage`), read from the embedded
+/// server world. The eye is already on the reticle, so this registers "no shot" without looking away
+/// at the bars. Ships with no weapon / no Energy+Heat pools stay the ready cyan.
 pub fn update_aim_pip(
     ship_q: Query<&Transform, (With<Ship>, Without<AimPip>)>,
-    mut pip_q: Query<&mut Transform, With<AimPip>>,
+    mut pip_q: Query<(&mut Transform, &MeshMaterial3d<StandardMaterial>), With<AimPip>>,
+    host: Option<NonSend<LoopbackHost>>,
+    net: Option<NonSend<NetClientState>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let Ok(ship) = ship_q.single() else {
         return;
     };
     let forward = ship.rotation * Vec3::X; // ship nose is +X local
-    for mut pip in &mut pip_q {
+
+    // Resolve "can't fire now" from the live pools via the exact sim gate (false when the ship /
+    // weapon / pools are absent — e.g. before spawn, or an unarmed ship).
+    let blocked = match (host.as_ref(), net.as_ref()) {
+        (Some(host), Some(net)) => host
+            .server
+            .ship_entity_for(net.local_id)
+            .map(|e| {
+                let w = host.server.world();
+                let sim = w.get_resource::<SimTuning>().copied().unwrap_or_default();
+                match (w.get::<ShipStats>(e), w.get::<Energy>(e), w.get::<Heat>(e)) {
+                    (Some(stats), Some(energy), Some(heat)) => match stats.weapon {
+                        Some(weapon) => {
+                            let shot_cost = weapon.damage * sim.weapon_energy_per_damage;
+                            energy.current < shot_cost || heat.current >= heat.max
+                        }
+                        None => false,
+                    },
+                    _ => false,
+                }
+            })
+            .unwrap_or(false),
+        _ => false,
+    };
+    let (base, emissive) = if blocked {
+        AIM_PIP_BLOCKED
+    } else {
+        AIM_PIP_READY
+    };
+
+    for (mut pip, mat) in &mut pip_q {
         pip.translation = ship.translation + forward * AIM_DISTANCE;
+        if let Some(m) = materials.get_mut(&mat.0) {
+            m.base_color = base;
+            m.emissive = emissive;
+        }
     }
 }
 
