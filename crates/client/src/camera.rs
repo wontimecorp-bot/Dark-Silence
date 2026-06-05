@@ -11,7 +11,7 @@ pub struct MainCamera {
 }
 
 const MIN_HEIGHT: f32 = 12.0;
-const MAX_HEIGHT: f32 = 120.0;
+const MAX_HEIGHT: f32 = 240.0;
 const ZOOM_SPEED: f32 = 60.0;
 
 /// Spawn the 3D camera looking straight down at the origin.

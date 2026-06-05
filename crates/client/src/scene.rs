@@ -1044,13 +1044,14 @@ pub fn setup_scene(
     let asteroid_material = materials.add(Color::srgb(0.55, 0.5, 0.45));
     let seeker_mesh = meshes.add(Cuboid::new(1.2, 0.6, 0.3)); // green seeker dart
     let seeker_material = materials.add(Color::srgb(0.35, 0.85, 0.40));
-    // Mining-skirmish structures (Phase 1), sized to roughly match their collision radii so the
-    // visual matches the hitbox; faction tint is applied per-entity at draw time (Phase 2).
-    let outpost_mesh = meshes.add(Cuboid::new(5.2, 5.2, 3.0)); // beefy refinery outpost
+    // Mining-skirmish structures (Phase 1; Refinement 4): UNIT meshes scaled per-entity by the
+    // structure's `RenderScale` (from `assets/content/scenario.ron`, carried over `RenderEntity.scale`)
+    // so the on-screen size is data-driven. Faction tint is applied per-entity at draw time (Phase 2).
+    let outpost_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0)); // beefy refinery outpost (unit box)
     let outpost_material = materials.add(Color::srgb(0.46, 0.47, 0.53));
-    let transport_mesh = meshes.add(Cuboid::new(3.4, 1.9, 1.2)); // industrial mining transport
+    let transport_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0)); // industrial mining transport (unit box)
     let transport_material = materials.add(Color::srgb(0.55, 0.52, 0.46));
-    let minenode_mesh = meshes.add(Sphere::new(30.0)); // the big central mining asteroid (landmark)
+    let minenode_mesh = meshes.add(Sphere::new(0.5)); // central asteroid (unit-diameter sphere)
     let minenode_material = materials.add(Color::srgb(0.50, 0.46, 0.40));
     // Phase 2 faction tint materials (saturated team colours, slightly emissive so they read as
     // team identity under the top-down light).

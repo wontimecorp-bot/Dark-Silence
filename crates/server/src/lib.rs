@@ -34,15 +34,15 @@ pub mod validation;
 use std::collections::HashMap;
 
 use bevy_ecs::prelude::*;
-use glam::Vec2;
+use glam::{Vec2, Vec3};
 use protocol::{
     ClientInput, ConnectionId, DisconnectReason, EntityId, EntityKind, EntityRecord, FullState,
     LoopbackTransport, Message, NetTransport, QAngle, QVec2, Snapshot,
 };
 use sim::components::{
     AngularVelocity, CollisionRadius, CombatRules, DamageFlash, Destructible, Faction,
-    FlightAssist, Heading, Health, LastShieldHit, MeshAnchor, Position, Projectile, ShieldHitFlash,
-    Ship, Target, TargetKind, Velocity, Weapon,
+    FlightAssist, Heading, Health, LastShieldHit, MeshAnchor, Position, Projectile, RenderScale,
+    ShieldHitFlash, Ship, Target, TargetKind, Velocity, Weapon,
 };
 use sim::damage::{
     default_resistance_matrix, seed_defense_layers, PenetrationConfig, SalvageConfig, ShieldConfig,
@@ -281,6 +281,11 @@ pub struct RenderEntity {
     /// `2` = Blue (see [`Faction::tint_tag`]). The client tints the entity's material by this so
     /// friend/foe reads at a glance. `0` for every non-scenario entity. Never on the wire.
     pub faction: u8,
+    /// **Render-only** mesh scale (x,y,z), from a [`RenderScale`] component if present, else
+    /// `Vec3::ONE`. The client scales a UNIT structure mesh by it, so a mining structure's on-screen
+    /// size is data-driven (`assets/content/scenario.ron`). `ONE` for every other entity. Never on
+    /// the wire.
+    pub scale: Vec3,
 }
 
 /// The [`RenderEntity::shield_frac`] of an optional [`Shields`]: `current / max`
@@ -1132,6 +1137,14 @@ impl ServerApp {
                 .collect()
         };
 
+        // Mining-skirmish render-size lookup (Entity → mesh scale): the structures carry a
+        // `RenderScale` from `scenario.ron`; read at each emit site so the client scales a unit mesh.
+        // Empty in every non-scenario world → the `unwrap_or(ONE)` keeps everything else 1:1.
+        let render_scales: std::collections::BTreeMap<Entity, Vec3> = {
+            let mut q = self.world.query::<(Entity, &RenderScale)>();
+            q.iter(&self.world).map(|(e, s)| (e, s.0)).collect()
+        };
+
         // Ships (carry a `Heading`). A ship may carry `Shields` (E007 fitted player /
         // enemy) → its `shield_frac`, a live `DamageFlash` → its `flash`, and a live
         // `ShieldHitFlash` → its `shield_flash`; all default to 0 for an unfitted/
@@ -1207,6 +1220,7 @@ impl ServerApp {
                 // A live ship uses the grid centre (no frozen anchor).
                 mesh_anchor: None,
                 faction: factions.get(&entity).copied().unwrap_or(0),
+                scale: render_scales.get(&entity).copied().unwrap_or(Vec3::ONE),
             });
         }
 
@@ -1235,6 +1249,7 @@ impl ServerApp {
                 grid_dims: (0, 0),
                 mesh_anchor: None,
                 faction: factions.get(&entity).copied().unwrap_or(0),
+                scale: render_scales.get(&entity).copied().unwrap_or(Vec3::ONE),
             });
         }
 
@@ -1358,6 +1373,7 @@ impl ServerApp {
                 // A live fitted enemy (or plain target) uses the grid centre — no anchor.
                 mesh_anchor: None,
                 faction: factions.get(&entity).copied().unwrap_or(0),
+                scale: render_scales.get(&entity).copied().unwrap_or(Vec3::ONE),
             });
         }
 
@@ -1445,6 +1461,7 @@ impl ServerApp {
                 mesh_anchor,
                 // Wreckage keeps its faction tint (a destroyed outpost/transport stays its colour).
                 faction: factions.get(&entity).copied().unwrap_or(0),
+                scale: render_scales.get(&entity).copied().unwrap_or(Vec3::ONE),
             });
         }
 

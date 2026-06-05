@@ -65,7 +65,7 @@ pub struct MiningTransport {
 /// Live-tunable transport movement + economy stats — a world resource, shared by both factions'
 /// transports and editable in the dev panel (same pattern as [`crate::Tuning`]). Read `Option`-ally by
 /// [`mining_transport_system`] with a default fallback, so a world that never inserts it still runs.
-#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+#[derive(Resource, Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MiningTuning {
     /// Transport mass (kg-ish) — higher = more sluggish acceleration (`a = F/m`).
     pub mass: f32,

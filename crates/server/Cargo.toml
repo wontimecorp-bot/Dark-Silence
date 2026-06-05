@@ -8,6 +8,7 @@ description = "Headless authoritative simulation server (E003). A synchronous fi
 [dependencies]
 bevy_ecs.workspace = true
 glam.workspace = true
+ron.workspace = true
 serde.workspace = true
 sim = { path = "../sim" }
 protocol = { path = "../protocol" }

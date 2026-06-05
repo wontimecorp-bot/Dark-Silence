@@ -681,8 +681,13 @@ fn spawn_render_entity(
             scale: Vec3::splat(scale),
         }
     } else {
+        // `e.scale` is `Vec3::ONE` for everything except the mining structures (transport / outpost /
+        // asteroid), which carry a `RenderScale` from `scenario.ron` → their unit mesh is scaled to
+        // the authored size. `interpolate_transforms` only rewrites translation+rotation each frame,
+        // so this spawn-time scale persists.
         Transform::from_rotation(Quat::from_rotation_z(e.heading))
             .with_translation(Vec3::new(e.pos.x, e.pos.y, 0.0))
+            .with_scale(e.scale)
     };
 
     commands

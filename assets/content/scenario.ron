@@ -1,0 +1,94 @@
+// Mining-skirmish scenario content (Refinement 4). Hot-editable: edit this file + relaunch the
+// client — no recompile. Loaded by the server with an external-file override
+// ($DARK_SILENCE_CONTENT / assets/content) and an embedded include_str! fallback, exactly like
+// ships.ron / modules.ron. All sizes/positions are in sim units; vectors are plain tuples.
+(
+    arena: (
+        // Half the east-west span: each faction's refinery outpost sits at (±half_width, 0); the
+        // contested asteroid is at the origin.
+        half_width: 1200.0,
+        // How far toward the asteroid each transport STARTS from its outpost (so the player escorts
+        // the full run from home).
+        transport_start_offset: 50.0,
+        // Player spawn offset from the home outpost, on the arena-facing side (so the outpost is in
+        // view at spawn). Mirrored per faction: Red at (-half_width + x, y), Blue at (half_width - x, y).
+        spawn_offset: (12.0, -8.0),
+    ),
+    // The central asteroid — a big, effectively-permanent landmark (radius 30, unchanged).
+    mine_node: (
+        render_size: (60.0, 60.0, 60.0),
+        collision_radius: 30.0,
+        health: 1000000.0,
+    ),
+    // Refinery outpost — ~3x the transport: beefy, with the better turrets.
+    outpost: (
+        render_size: (30.6, 30.6, 12.0),
+        collision_radius: 15.0,
+        health: 800.0,
+    ),
+    // Mining transport — 3x its old size.
+    transport: (
+        render_size: (10.2, 5.7, 3.6),
+        collision_radius: 4.8,
+        health: 200.0,
+    ),
+    // Transport Newtonian movement + economy (the live MiningTuning resource; also tweakable in the
+    // dev panel at runtime). Emergent cruise speed = thrust_force / linear_drag.
+    mining: (
+        mass: 8.0,
+        thrust_force: 14.0,
+        linear_drag: 0.5,
+        turn_torque: 5.0,
+        angular_drag: 4.0,
+        angular_inertia: 6.0,
+        slow_radius: 260.0,
+        arrive_radius: 55.0,
+        dock_speed: 6.0,
+        load_rate: 25.0,
+        unload_rate: 50.0,
+        cargo_capacity: 100.0,
+    ),
+    // Transport self-defense turrets (weaker aim), mounts scaled to the bigger hull.
+    transport_turret: (
+        spec: (
+            lead_order: 1,
+            aim_sigma: 0.12,
+            reaction_delay: 0.6,
+            turn_rate: 1.6,
+            fire_range: 26.0,
+            fire_tolerance: 0.1,
+        ),
+        weapon: (
+            damage: 6.0,
+            muzzle_speed: 220.0,
+            fire_rate: 3.0,
+            projectile_mass: 0.02,
+        ),
+        mounts: [
+            (0.0, 2.6),
+            (0.0, -2.6),
+        ],
+    ),
+    // Refinery-outpost turrets (better aim, longer range), mounts scaled to the bigger hull.
+    outpost_turret: (
+        spec: (
+            lead_order: 1,
+            aim_sigma: 0.035,
+            reaction_delay: 0.3,
+            turn_rate: 3.0,
+            fire_range: 38.0,
+            fire_tolerance: 0.06,
+        ),
+        weapon: (
+            damage: 10.0,
+            muzzle_speed: 240.0,
+            fire_rate: 2.5,
+            projectile_mass: 0.03,
+        ),
+        mounts: [
+            (11.0, 0.0),
+            (-8.0, 9.5),
+            (-8.0, -9.5),
+        ],
+    ),
+)

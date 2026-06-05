@@ -5253,6 +5253,7 @@ dependencies = [
  "bevy_ecs",
  "glam 0.30.10",
  "protocol",
+ "ron 0.8.1",
  "serde",
  "sim",
 ]

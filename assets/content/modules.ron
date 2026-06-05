@@ -28,7 +28,7 @@
             hardpoint_size: Small,
             specifics: Thruster(
                 propulsion: MainDrive,
-                thrust_force: 15.0,
+                thrust_force: 60.0,
                 turn_torque: 6.0,
                 strafe_force: 9.0,
             ),

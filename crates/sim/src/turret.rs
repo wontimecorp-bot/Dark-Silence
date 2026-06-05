@@ -79,6 +79,27 @@ impl Turret {
         }
     }
 
+    /// Build a turret from explicit (kinetic) weapon stats — used by the scenario when the loadout is
+    /// authored in `assets/content/scenario.ron`.
+    pub fn mounted(
+        host: Entity,
+        mount_offset: Vec2,
+        damage: f32,
+        muzzle_speed: f32,
+        fire_rate: f32,
+        projectile_mass: f32,
+    ) -> Self {
+        Self::new(
+            host,
+            mount_offset,
+            Channel::Kinetic,
+            damage,
+            muzzle_speed,
+            fire_rate,
+            projectile_mass,
+        )
+    }
+
     /// A LIGHT turret weapon (mining transport): modest damage + rate of fire.
     pub fn light(host: Entity, mount_offset: Vec2) -> Self {
         Self::new(host, mount_offset, Channel::Kinetic, 6.0, 220.0, 3.0, 0.02)
@@ -91,8 +112,9 @@ impl Turret {
 }
 
 /// The turret's aiming knobs — **orthogonal + independently upgradeable**. `lead_order` (the
-/// prediction "smarts") is SEPARATE from the aim-quality fields (the "competence").
-#[derive(Component, Clone, Copy, Debug)]
+/// prediction "smarts") is SEPARATE from the aim-quality fields (the "competence"). `Serialize`/
+/// `Deserialize` so the scenario's turret loadouts can be authored in `assets/content/scenario.ron`.
+#[derive(Component, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TurretSpec {
     /// `0` = aim the target's current position, `1` = first-order velocity lead, `2` = + accel.
     pub lead_order: u8,

@@ -9,10 +9,11 @@
 
 use bevy_ecs::entity::Entity;
 use bevy_ecs::prelude::With;
-use glam::Vec2;
+use glam::{Vec2, Vec3};
+use serde::Deserialize;
 use sim::components::{
-    AngularVelocity, CollisionRadius, Faction, Heading, Health, Position, Ship, Target, TargetKind,
-    Velocity,
+    AngularVelocity, CollisionRadius, Faction, Heading, Health, Position, RenderScale, Ship,
+    Target, TargetKind, Velocity,
 };
 use sim::{
     Cargo, FactionSpawns, MiningState, MiningTransport, MiningTuning, RefinedResources, Turret,
@@ -21,35 +22,87 @@ use sim::{
 
 use crate::ServerApp;
 
-/// Mining-skirmish arena layout (camera/sim units; tunable). The central asteroid sits north of the
-/// origin (where unfitted client ships spawn until Phase 5's faction spawn), so the arena is in
-/// clear view. Red is the left flank, Blue the right; each faction's transport sits between its
-/// outpost and the shared asteroid.
-// MASSIVE arena on the x-axis (Refinement 1): the central asteroid at the origin, each faction's
-// outpost ±1200 out (~2400-wide theatre). The transports START at their home base, so the player
-// escorts the full ~20 s run to the contested asteroid and back.
-const HALF_WIDTH: f32 = 1200.0;
-const MINE_NODE_POS: Vec2 = Vec2::new(0.0, 0.0);
-const RED_OUTPOST_POS: Vec2 = Vec2::new(-HALF_WIDTH, 0.0);
-const BLUE_OUTPOST_POS: Vec2 = Vec2::new(HALF_WIDTH, 0.0);
-const RED_TRANSPORT_POS: Vec2 = Vec2::new(-HALF_WIDTH + 50.0, 0.0);
-const BLUE_TRANSPORT_POS: Vec2 = Vec2::new(HALF_WIDTH - 50.0, 0.0);
-// Player spawn points (Phase 5 + Refinement 2): right beside each faction's home outpost, on the
-// arena-facing side, so the outpost is clearly ON-SCREEN at spawn (the top-down camera only shows
-// ~±33×±18 world units, so the old ±60 offset put the outpost off-screen in the empty ±1200 arena).
-const RED_SPAWN_POS: Vec2 = Vec2::new(-HALF_WIDTH + 12.0, -8.0);
-const BLUE_SPAWN_POS: Vec2 = Vec2::new(HALF_WIDTH - 12.0, -8.0);
-// Role sizes / toughness (HP). The asteroid is a big, effectively-permanent landmark; the outpost is
-// far beefier than the transport (but not a "battle outpost").
-const MINE_NODE_RADIUS: f32 = 30.0;
-const MINE_NODE_HEALTH: f32 = 1_000_000.0;
-const OUTPOST_RADIUS: f32 = 3.0;
-const OUTPOST_HEALTH: f32 = 800.0;
-const TRANSPORT_RADIUS: f32 = 1.6;
-const TRANSPORT_HEALTH: f32 = 200.0;
-// The transport's movement + economy tunables (mass/thrust/drag/turn/cargo/rates) now live in the
-// live-editable `MiningTuning` resource (Refinement 3), inserted by `spawn_scenario` and tweakable in
-// the dev panel — they are no longer fixed consts here.
+/// The mining-skirmish data, authored in `assets/content/scenario.ron` (Refinement 4): structure
+/// sizes / collision / HP, the transport's [`MiningTuning`], the turret loadouts, and the arena
+/// layout. Hot-editable like `ships.ron`/`modules.ron` — see [`load_scenario_content`].
+#[derive(Debug, Clone, Deserialize)]
+struct ScenarioContent {
+    arena: ArenaSpec,
+    mine_node: StructureSpec,
+    outpost: StructureSpec,
+    transport: StructureSpec,
+    mining: MiningTuning,
+    transport_turret: TurretLoadout,
+    outpost_turret: TurretLoadout,
+}
+
+/// Arena layout: the east-west span + where the transports start + where players spawn.
+#[derive(Debug, Clone, Deserialize)]
+struct ArenaSpec {
+    /// Half the span: outposts at `(±half_width, 0)`, the asteroid at the origin.
+    half_width: f32,
+    /// How far toward the asteroid each transport starts from its outpost.
+    transport_start_offset: f32,
+    /// Player spawn offset from the home outpost, arena-facing (mirrored per faction).
+    spawn_offset: (f32, f32),
+}
+
+/// One structure's render size + collision + durability.
+#[derive(Debug, Clone, Deserialize)]
+struct StructureSpec {
+    /// Render mesh extent `(x, y, z)` — scales the client's UNIT mesh ([`RenderScale`]).
+    render_size: (f32, f32, f32),
+    /// Collision circle radius (combat hitbox).
+    collision_radius: f32,
+    health: f32,
+}
+
+/// A host's turret battery: the shared aim spec + (kinetic) weapon stats + per-turret mount offsets.
+#[derive(Debug, Clone, Deserialize)]
+struct TurretLoadout {
+    spec: TurretSpec,
+    weapon: TurretWeapon,
+    mounts: Vec<(f32, f32)>,
+}
+
+/// Kinetic weapon stats for a turret (maps to [`Turret::mounted`]).
+#[derive(Debug, Clone, Deserialize)]
+struct TurretWeapon {
+    damage: f32,
+    muzzle_speed: f32,
+    fire_rate: f32,
+    projectile_mass: f32,
+}
+
+/// The mining-scenario content baked into the binary as a fallback (mirrors the external file).
+const EMBEDDED_SCENARIO_RON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/content/scenario.ron"
+));
+
+/// Load `scenario.ron` — external file (under `$DARK_SILENCE_CONTENT` or `assets/content`) if present
+/// and valid, else the embedded default (logged on a parse error so a bad edit never breaks startup).
+/// Mirrors [`crate::load_content_or_default`]; only ever called on the windowed `MiningSkirmish` path.
+fn load_scenario_content() -> ScenarioContent {
+    let dir = std::env::var_os("DARK_SILENCE_CONTENT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("assets/content"));
+    if let Ok(s) = std::fs::read_to_string(dir.join("scenario.ron")) {
+        match ron::from_str::<ScenarioContent>(&s) {
+            Ok(c) => {
+                eprintln!(
+                    "[content] loaded external scenario.ron from {}",
+                    dir.display()
+                );
+                return c;
+            }
+            Err(e) => {
+                eprintln!("[content] external scenario.ron invalid ({e}); using embedded default")
+            }
+        }
+    }
+    ron::from_str(EMBEDDED_SCENARIO_RON).expect("embedded scenario.ron must parse")
+}
 
 /// Which authoritative world the embedded server populates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -73,12 +126,11 @@ impl ServerApp {
         // gated `mining_transport_system` has its `ResMut<RefinedResources>` whenever it runs; it is
         // a harmless zeroed tally in Sandbox (no transports update it).
         self.world.insert_resource(RefinedResources::default());
-        // Live-tunable transport movement + economy (Refinement 3). Inserted for both scenarios so
-        // the gated `mining_transport_system` always has its `Res<MiningTuning>`; harmless in Sandbox
-        // (no transports read it). Editable in the dev panel.
-        self.world.insert_resource(MiningTuning::default());
         match scenario {
             Scenario::Sandbox => {
+                // Harmless zeroed tuning so the gated `mining_transport_system` has its
+                // `Res<MiningTuning>` (no transports read it in Sandbox).
+                self.world.insert_resource(MiningTuning::default());
                 // The original demo composition (byte-for-byte): the demo targets + the two fitted
                 // enemies the windowed client used to spawn inline in `setup_loopback_host`.
                 self.spawn_demo_world();
@@ -89,57 +141,70 @@ impl ServerApp {
         }
     }
 
-    /// Build the static mining-skirmish arena (Phase 1): the central asteroid + each faction's
-    /// refinery outpost + mining transport. All are stationary `Health`-based destructibles (no
-    /// `Ship`/`FitLayout` → immobile + shot via the flat-`Health` path). Phase 3 makes the
-    /// transports mobile + adds the mining loop; Phase 4 mounts turrets.
+    /// Build the static mining-skirmish arena (Phase 1) from [`ScenarioContent`] (`scenario.ron`):
+    /// the central asteroid + each faction's refinery outpost + mining transport. All are stationary
+    /// `Health`-based destructibles (no `Ship`/`FitLayout` → immobile + shot via the flat-`Health`
+    /// path), carrying a [`RenderScale`] so the client renders them at the authored size.
     fn spawn_mining_skirmish(&mut self) {
-        // Phase 5: where an auto-joining human spawns (near their home outpost).
+        let content = load_scenario_content();
+        // The transport's live movement/economy tuning comes from the content (Refinement 3/4).
+        self.world.insert_resource(content.mining);
+
+        let hw = content.arena.half_width;
+        let start = content.arena.transport_start_offset;
+        let (sx, sy) = content.arena.spawn_offset;
+        // Phase 5: where an auto-joining human spawns (just outside their home outpost, arena-facing).
         self.world.insert_resource(FactionSpawns {
-            red: RED_SPAWN_POS,
-            blue: BLUE_SPAWN_POS,
+            red: Vec2::new(-hw + sx, sy),
+            blue: Vec2::new(hw - sx, sy),
         });
-        let mine = self.spawn_structure(
-            TargetKind::MineNode,
-            MINE_NODE_POS,
-            MINE_NODE_RADIUS,
-            MINE_NODE_HEALTH,
-            None,
+
+        let mine = self.spawn_structure(TargetKind::MineNode, Vec2::ZERO, &content.mine_node, None);
+        let red_outpost = self.spawn_outpost(Vec2::new(-hw, 0.0), Faction::Red, &content);
+        let blue_outpost = self.spawn_outpost(Vec2::new(hw, 0.0), Faction::Blue, &content);
+        self.spawn_transport(
+            Vec2::new(-hw + start, 0.0),
+            Faction::Red,
+            red_outpost,
+            mine,
+            &content,
         );
-        let red_outpost = self.spawn_outpost(RED_OUTPOST_POS, Faction::Red);
-        let blue_outpost = self.spawn_outpost(BLUE_OUTPOST_POS, Faction::Blue);
-        self.spawn_transport(RED_TRANSPORT_POS, Faction::Red, red_outpost, mine);
-        self.spawn_transport(BLUE_TRANSPORT_POS, Faction::Blue, blue_outpost, mine);
+        self.spawn_transport(
+            Vec2::new(hw - start, 0.0),
+            Faction::Blue,
+            blue_outpost,
+            mine,
+            &content,
+        );
     }
 
-    /// Spawn a faction's refinery outpost (Phase 4): the beefy `Health` structure + 3 mounted
-    /// **heavy** turrets (the better-aim [`TurretSpec::outpost_preset`]). Returns the outpost entity.
-    fn spawn_outpost(&mut self, pos: Vec2, faction: Faction) -> Entity {
-        let outpost = self.spawn_structure(
-            TargetKind::Outpost,
-            pos,
-            OUTPOST_RADIUS,
-            OUTPOST_HEALTH,
-            Some(faction),
-        );
-        for offset in [
-            Vec2::new(2.2, 0.0),
-            Vec2::new(-1.6, 1.9),
-            Vec2::new(-1.6, -1.9),
-        ] {
-            self.mount_turret(
-                faction,
-                Turret::heavy(outpost, offset),
-                TurretSpec::outpost_preset(),
-            );
-        }
+    /// Spawn a faction's refinery outpost (Phase 4): the beefy `Health` structure + its turret
+    /// battery (the better-aim outpost loadout from `scenario.ron`). Returns the outpost entity.
+    fn spawn_outpost(&mut self, pos: Vec2, faction: Faction, content: &ScenarioContent) -> Entity {
+        let outpost =
+            self.spawn_structure(TargetKind::Outpost, pos, &content.outpost, Some(faction));
+        self.mount_turrets(outpost, faction, &content.outpost_turret);
         outpost
     }
 
-    /// Spawn one turret entity (no `Position` — its muzzle is computed from the host each tick;
-    /// carries the host's [`Faction`] + a [`Heading`] aim). `turret_system` drives aim + fire.
-    fn mount_turret(&mut self, faction: Faction, turret: Turret, spec: TurretSpec) {
-        self.world.spawn((turret, spec, faction, Heading(0.0)));
+    /// Mount a host's turret battery from a [`TurretLoadout`]: one turret entity per mount offset, all
+    /// sharing the loadout's aim `spec` + (kinetic) weapon stats. Each turret has no `Position` (its
+    /// muzzle is `host.Position + mount_offset` each tick), carries the host's [`Faction`] + a
+    /// [`Heading`] aim; `turret_system` drives aim + fire.
+    fn mount_turrets(&mut self, host: Entity, faction: Faction, loadout: &TurretLoadout) {
+        let w = &loadout.weapon;
+        for &(mx, my) in &loadout.mounts {
+            let turret = Turret::mounted(
+                host,
+                Vec2::new(mx, my),
+                w.damage,
+                w.muzzle_speed,
+                w.fire_rate,
+                w.projectile_mass,
+            );
+            self.world
+                .spawn((turret, loadout.spec, faction, Heading(0.0)));
+        }
     }
 
     /// Auto-join (Phase 5): the side with FEWER human ships (Red on a tie). A method the future
@@ -170,12 +235,12 @@ impl ServerApp {
         faction: Faction,
         home_outpost: Entity,
         mine_node: Entity,
+        content: &ScenarioContent,
     ) -> Entity {
         let t = self.spawn_structure(
             TargetKind::Transport,
             pos,
-            TRANSPORT_RADIUS,
-            TRANSPORT_HEALTH,
+            &content.transport,
             Some(faction),
         );
         self.world.entity_mut(t).insert((
@@ -188,37 +253,32 @@ impl ServerApp {
             // Angular-velocity state for the Newtonian turn model (Refinement 3).
             AngularVelocity(0.0),
         ));
-        // 2 mounted LIGHT turrets (the weaker-aim transport preset) for self-defense.
-        for offset in [Vec2::new(0.0, 1.1), Vec2::new(0.0, -1.1)] {
-            self.mount_turret(
-                faction,
-                Turret::light(t, offset),
-                TurretSpec::transport_preset(),
-            );
-        }
+        self.mount_turrets(t, faction, &content.transport_turret);
         t
     }
 
-    /// Spawn one stationary `Health`-based scenario structure (asteroid / outpost / transport). A
-    /// non-`Ship`, non-`FitLayout` entity: `ship_motion_system` never moves it (immobile), and the
-    /// flat `collision_detect_system` path applies damage on a hit. An optional [`Faction`] tags its
-    /// side (the asteroid is neutral). Returns the entity (Phase 3/4 attach mining + turrets).
+    /// Spawn one stationary `Health`-based scenario structure (asteroid / outpost / transport) from
+    /// its [`StructureSpec`]. A non-`Ship`, non-`FitLayout` entity: `ship_motion_system` never moves
+    /// it (immobile), and the flat `collision_detect_system` path applies damage on a hit. Carries a
+    /// [`RenderScale`] (the authored render size) so the client scales its unit mesh. An optional
+    /// [`Faction`] tags its side (the asteroid is neutral). Returns the entity.
     fn spawn_structure(
         &mut self,
         kind: TargetKind,
         pos: Vec2,
-        radius: f32,
-        health: f32,
+        spec: &StructureSpec,
         faction: Option<Faction>,
     ) -> Entity {
+        let (rx, ry, rz) = spec.render_size;
         let mut e = self.world.spawn((
             Target,
             kind,
             Position(pos),
             Velocity(Vec2::ZERO),
             Heading(0.0),
-            CollisionRadius(radius),
-            Health(health),
+            CollisionRadius(spec.collision_radius),
+            Health(spec.health),
+            RenderScale(Vec3::new(rx, ry, rz)),
         ));
         if let Some(f) = faction {
             e.insert(f);

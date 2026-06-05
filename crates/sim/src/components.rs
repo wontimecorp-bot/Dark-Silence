@@ -18,7 +18,7 @@
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::prelude::Resource;
-use glam::Vec2;
+use glam::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
 /// World-space position of an entity on the 2D gameplay plane, in sim units.
@@ -76,6 +76,13 @@ pub struct AngularVelocity(pub f32);
 /// Remaining hit points; an entity is destroyed at or below zero.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Health(pub f32);
+
+/// **Render-only** per-entity mesh scale (x,y,z), in sim units — a render hint, NOT read by any sim
+/// system (so it's determinism-neutral). The windowed client emits it via `RenderEntity.scale` and
+/// scales a UNIT mesh by it, so a structure's on-screen size comes from data (the mining scenario's
+/// `assets/content/scenario.ron`) rather than a hardcoded mesh. Entities without it render at `ONE`.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RenderScale(pub Vec3);
 
 /// Phase E — the ship's **energy capacitor** (a dynamic, drainable power pool). Firing a weapon
 /// drains `current`; it recharges from the reactor at `regen`/s toward `max` while you hold fire.
