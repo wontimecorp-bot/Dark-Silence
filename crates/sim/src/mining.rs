@@ -18,7 +18,13 @@ use bevy_ecs::prelude::*;
 use glam::Vec2;
 
 use crate::clock::FixedDt;
-use crate::components::{Faction, Position, Velocity};
+use crate::components::{Faction, Heading, Position, Velocity};
+
+/// Velocity damping per second applied while a transport is parked (Loading/Unloading) — it eases to
+/// a stop instead of snapping to zero.
+const PARK_BRAKE: f32 = 4.0;
+/// Below this speed the transport holds its heading (no facing update on a near-stopped body).
+const NAV_HEADING_EPS: f32 = 0.5;
 
 /// The mining transport's loop phase.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -57,6 +63,13 @@ pub struct MiningTransport {
     pub unload_rate: f32,
     /// Cruise speed (sim units/s) while navigating.
     pub nav_speed: f32,
+    /// Max acceleration (units/s²) the transport STEERS its velocity toward the desired — the
+    /// momentum that makes starts/stops/turns smooth + slightly curved (not an instant rail snap).
+    pub accel: f32,
+    /// Distance within which it begins decelerating into the target (the "arrive" slowdown).
+    pub slow_radius: f32,
+    /// Heading slew rate (rad/s) — how fast the transport turns to FACE its travel direction.
+    pub turn_rate: f32,
     /// Distance at which the transport counts as "arrived" at a target.
     pub arrive_radius: f32,
 }
@@ -81,6 +94,7 @@ pub fn mining_transport_system(
     mut transports: Query<(
         &Position,
         &mut Velocity,
+        &mut Heading,
         &mut Cargo,
         &mut MiningState,
         &MiningTransport,
@@ -88,27 +102,43 @@ pub fn mining_transport_system(
     )>,
 ) {
     let dt = dt.0;
-    for (pos, mut vel, mut cargo, mut state, mt, faction) in &mut transports {
+    for (pos, mut vel, mut heading, mut cargo, mut state, mt, faction) in &mut transports {
         match *state {
             MiningState::ToAsteroid => {
-                if nav_toward(mt.mine_node, pos.0, &positions, mt, dt, &mut vel) {
+                if nav_toward(
+                    mt.mine_node,
+                    pos.0,
+                    &positions,
+                    mt,
+                    dt,
+                    &mut vel,
+                    &mut heading,
+                ) {
                     *state = MiningState::Loading;
                 }
             }
             MiningState::Loading => {
-                vel.0 = Vec2::ZERO;
+                brake(&mut vel, dt);
                 cargo.current = (cargo.current + mt.load_rate * dt).min(cargo.capacity);
                 if cargo.current >= cargo.capacity {
                     *state = MiningState::ToOutpost;
                 }
             }
             MiningState::ToOutpost => {
-                if nav_toward(mt.home_outpost, pos.0, &positions, mt, dt, &mut vel) {
+                if nav_toward(
+                    mt.home_outpost,
+                    pos.0,
+                    &positions,
+                    mt,
+                    dt,
+                    &mut vel,
+                    &mut heading,
+                ) {
                     *state = MiningState::Unloading;
                 }
             }
             MiningState::Unloading => {
-                vel.0 = Vec2::ZERO;
+                brake(&mut vel, dt);
                 let amount = (mt.unload_rate * dt).min(cargo.current);
                 cargo.current -= amount;
                 match faction {
@@ -123,9 +153,13 @@ pub fn mining_transport_system(
     }
 }
 
-/// Steer `vel` toward `target_entity`'s position at the transport's cruise speed, clamped so the
-/// integrated move (`vel·dt`) never overshoots; returns `true` once within `arrive_radius`. If the
-/// target entity is gone (e.g. a destroyed outpost), the transport idles in place.
+/// **Momentum "arrive" steering** toward `target_entity` (replaces the old instant `vel = dir·speed`
+/// rail snap): the desired speed is full cruise far out, scaling down within `slow_radius` so the
+/// transport DECELERATES into the target; the velocity is STEERED toward that desired with a limited
+/// `accel·dt` per tick (so it has inertia — smooth, slightly-curved starts/stops/turns). The
+/// transport's `Heading` slews toward its actual travel direction so the box visibly turns to face
+/// where it's going. Returns `true` once within `arrive_radius`. A missing target → it brakes in
+/// place. (`seek_system` integrates the resulting `vel → pos`, since the transport is a `Target`.)
 fn nav_toward(
     target_entity: Entity,
     pos: Vec2,
@@ -133,18 +167,42 @@ fn nav_toward(
     mt: &MiningTransport,
     dt: f32,
     vel: &mut Velocity,
+    heading: &mut Heading,
 ) -> bool {
     let Ok(target) = positions.get(target_entity) else {
-        vel.0 = Vec2::ZERO;
+        brake(vel, dt);
         return false;
     };
     let to = target.0 - pos;
     let dist = to.length();
-    if dist < mt.arrive_radius {
-        vel.0 = Vec2::ZERO;
-        return true;
+    let desired_speed = if dist < mt.arrive_radius {
+        0.0
+    } else {
+        mt.nav_speed * (dist / mt.slow_radius.max(f32::MIN_POSITIVE)).min(1.0)
+    };
+    let desired_vel = to.normalize_or_zero() * desired_speed;
+    // Steer the current velocity toward the desired with bounded accel — the momentum that makes it
+    // ease in/out + curve rather than snap.
+    vel.0 += (desired_vel - vel.0).clamp_length_max(mt.accel * dt);
+    face_travel(heading, vel.0, mt.turn_rate * dt);
+    dist < mt.arrive_radius
+}
+
+/// Ease a parked transport's velocity toward zero (a smooth stop, not an instant snap).
+fn brake(vel: &mut Velocity, dt: f32) {
+    vel.0 *= (1.0 - PARK_BRAKE * dt).max(0.0);
+}
+
+/// Slew `heading` toward the travel direction by at most `max_step` rad (held when nearly stopped).
+fn face_travel(heading: &mut Heading, vel: Vec2, max_step: f32) {
+    if vel.length() > NAV_HEADING_EPS {
+        let diff = wrap_angle(vel.to_angle() - heading.0);
+        heading.0 = wrap_angle(heading.0 + diff.clamp(-max_step, max_step));
     }
-    let speed = mt.nav_speed.min(dist / dt.max(f32::MIN_POSITIVE));
-    vel.0 = to.normalize_or_zero() * speed;
-    false
+}
+
+/// Wrap an angle to `(-π, π]`.
+fn wrap_angle(a: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    (a + PI).rem_euclid(TAU) - PI
 }

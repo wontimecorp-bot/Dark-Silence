@@ -1329,7 +1329,12 @@ impl ServerApp {
                     (
                         EntityKind::Target,
                         kind_flag,
-                        0.0,
+                        // Emit the entity's actual heading so a moving structure (the mining
+                        // transport, which slews its `Heading` to face travel) visibly turns. Among
+                        // plain targets only the transport has a non-zero heading; the asteroid /
+                        // outpost stay `Heading(0)`, and Sandbox dummies/asteroids/seekers carry no
+                        // `Heading` → still 0. Render-only.
+                        heading,
                         0.0,
                         0.0,
                         Vec2::ZERO,

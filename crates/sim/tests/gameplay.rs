@@ -221,6 +221,7 @@ fn mining_transport_runs_the_loop_and_grows_the_score() {
             TargetKind::Transport,
             Position(Vec2::new(20.0, 0.0)),
             Velocity(Vec2::ZERO),
+            Heading(0.0),
             CollisionRadius(1.6),
             Health(200.0),
             Faction::Red,
@@ -230,6 +231,9 @@ fn mining_transport_runs_the_loop_and_grows_the_score() {
                 load_rate: 25.0,
                 unload_rate: 50.0,
                 nav_speed: 30.0,
+                accel: 60.0,
+                slow_radius: 15.0,
+                turn_rate: 2.0,
                 arrive_radius: 7.0,
             },
             Cargo {

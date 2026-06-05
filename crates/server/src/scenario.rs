@@ -23,28 +23,34 @@ use crate::ServerApp;
 /// origin (where unfitted client ships spawn until Phase 5's faction spawn), so the arena is in
 /// clear view. Red is the left flank, Blue the right; each faction's transport sits between its
 /// outpost and the shared asteroid.
-const ARENA_Y: f32 = 25.0;
-const MINE_NODE_POS: Vec2 = Vec2::new(0.0, ARENA_Y);
-const RED_OUTPOST_POS: Vec2 = Vec2::new(-34.0, ARENA_Y);
-const BLUE_OUTPOST_POS: Vec2 = Vec2::new(34.0, ARENA_Y);
-const RED_TRANSPORT_POS: Vec2 = Vec2::new(-22.0, ARENA_Y);
-const BLUE_TRANSPORT_POS: Vec2 = Vec2::new(22.0, ARENA_Y);
-// Player spawn points (Phase 5): in open space just outside each faction's home outpost, facing the
-// contested asteroid.
-const RED_SPAWN_POS: Vec2 = Vec2::new(-34.0, 16.0);
-const BLUE_SPAWN_POS: Vec2 = Vec2::new(34.0, 16.0);
-// Role sizes / toughness (HP). The asteroid is effectively permanent; the outpost is far beefier
-// than the transport (but not a "battle outpost").
-const MINE_NODE_RADIUS: f32 = 5.0;
+// MASSIVE arena on the x-axis (Refinement 1): the central asteroid at the origin, each faction's
+// outpost ±1200 out (~2400-wide theatre). The transports START at their home base, so the player
+// escorts the full ~20 s run to the contested asteroid and back.
+const HALF_WIDTH: f32 = 1200.0;
+const MINE_NODE_POS: Vec2 = Vec2::new(0.0, 0.0);
+const RED_OUTPOST_POS: Vec2 = Vec2::new(-HALF_WIDTH, 0.0);
+const BLUE_OUTPOST_POS: Vec2 = Vec2::new(HALF_WIDTH, 0.0);
+const RED_TRANSPORT_POS: Vec2 = Vec2::new(-HALF_WIDTH + 50.0, 0.0);
+const BLUE_TRANSPORT_POS: Vec2 = Vec2::new(HALF_WIDTH - 50.0, 0.0);
+// Player spawn points (Phase 5): in open space just outside each faction's home outpost.
+const RED_SPAWN_POS: Vec2 = Vec2::new(-HALF_WIDTH, -60.0);
+const BLUE_SPAWN_POS: Vec2 = Vec2::new(HALF_WIDTH, -60.0);
+// Role sizes / toughness (HP). The asteroid is a big, effectively-permanent landmark; the outpost is
+// far beefier than the transport (but not a "battle outpost").
+const MINE_NODE_RADIUS: f32 = 30.0;
 const MINE_NODE_HEALTH: f32 = 1_000_000.0;
 const OUTPOST_RADIUS: f32 = 3.0;
 const OUTPOST_HEALTH: f32 = 800.0;
 const TRANSPORT_RADIUS: f32 = 1.6;
 const TRANSPORT_HEALTH: f32 = 200.0;
-// Mining-loop tunables (Phase 3): cruise speed, arrival tolerance (clears the asteroid/outpost
-// radius + the transport's own), cargo capacity, and load/unload rates (~4 s to fill / 2 s to empty).
-const TRANSPORT_NAV_SPEED: f32 = 18.0;
-const TRANSPORT_ARRIVE_RADIUS: f32 = 7.0;
+// Mining-loop tunables (Phase 3 + Refinement 1): cruise speed (so the ±1200 haul is ~20 s one-way),
+// momentum (`accel`/`slow_radius` give natural ease-in/out instead of a rail snap), `turn_rate` (the
+// box turns to face travel), arrival tolerance (clears the 30-radius asteroid), cargo + rates.
+const TRANSPORT_NAV_SPEED: f32 = 60.0;
+const TRANSPORT_ACCEL: f32 = 30.0;
+const TRANSPORT_SLOW_RADIUS: f32 = 90.0;
+const TRANSPORT_TURN_RATE: f32 = 1.5;
+const TRANSPORT_ARRIVE_RADIUS: f32 = 40.0;
 const CARGO_CAPACITY: f32 = 100.0;
 const LOAD_RATE: f32 = 25.0;
 const UNLOAD_RATE: f32 = 50.0;
@@ -179,6 +185,9 @@ impl ServerApp {
                 load_rate: LOAD_RATE,
                 unload_rate: UNLOAD_RATE,
                 nav_speed: TRANSPORT_NAV_SPEED,
+                accel: TRANSPORT_ACCEL,
+                slow_radius: TRANSPORT_SLOW_RADIUS,
+                turn_rate: TRANSPORT_TURN_RATE,
                 arrive_radius: TRANSPORT_ARRIVE_RADIUS,
             },
             Cargo {

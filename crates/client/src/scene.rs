@@ -1050,7 +1050,7 @@ pub fn setup_scene(
     let outpost_material = materials.add(Color::srgb(0.46, 0.47, 0.53));
     let transport_mesh = meshes.add(Cuboid::new(3.4, 1.9, 1.2)); // industrial mining transport
     let transport_material = materials.add(Color::srgb(0.55, 0.52, 0.46));
-    let minenode_mesh = meshes.add(Sphere::new(5.0)); // the central mining asteroid
+    let minenode_mesh = meshes.add(Sphere::new(30.0)); // the big central mining asteroid (landmark)
     let minenode_material = materials.add(Color::srgb(0.50, 0.46, 0.40));
     // Phase 2 faction tint materials (saturated team colours, slightly emissive so they read as
     // team identity under the top-down light).
