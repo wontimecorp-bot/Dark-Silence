@@ -1,0 +1,26 @@
+# Research — E004 Persistence Layer
+
+Context: persistence layer for a Rust authoritative game server (shared `bevy_ecs` `sim` crate, serde-derived entities). Decided stack (ADR-0007/SAD): `sqlx`/PostgreSQL (durable truth) + Redis (hot ephemeral) + tokio + tracing, new `crates/persistence`. Critical tension: the headless server is a synchronous 30 Hz deterministic fixed-tick loop with NO async runtime yet; persistence IO must not block or perturb the tick. Replaces the E003 `StubTokenIssuer` with account-backed `renet_netcode` connect tokens.
+
+## 1. sqlx + PostgreSQL
+`query!`/`query_as!` validate SQL against a live DB at compile time; `cargo sqlx prepare` caches metadata into a checked-in `.sqlx/` dir so `SQLX_OFFLINE=true` builds without a DB. `migrate!` embeds versioned migrations into the binary. Use `PgPool` + `Transaction` for atomicity; an async runtime feature is mandatory. Recommended: compile-time macros for static queries, runtime `query()` only for dynamic SQL; check in `.sqlx/` and gate CI with `cargo sqlx prepare --check`; wrap multi-step repo ops in transactions. Avoid: default pool config in prod; stale `.sqlx`; leaking the async-runtime feature into the deterministic `sim` crate.
+Sources: launchbadge/sqlx sqlx-cli README; docs.rs/sqlx.
+
+## 2. Async IO from the synchronous tick
+Tokio's bridging pattern runs a `current_thread` runtime on a dedicated `std::thread` driven by an `mpsc` channel — an actor: the sync side hands work over and reads results back via a channel. The tick thread must never block on IO; `spawn_blocking` isolates blocking work. Recommended: a persistence actor thread owns the runtime + pool; the tick sends commands and `try_recv`s results (never blocking recv) so the 30 Hz step is untouched; load/save at session boundaries (connect/disconnect) + periodic checkpoints, with durable writes on a bounded async queue. Avoid: `block_on`/blocking recv on the tick thread; any IO inside fixed-step systems (breaks determinism + tick budget); unbounded queues.
+Sources: tokio.rs/tokio/topics/bridging; docs.rs/tokio runtime.
+
+## 3. Redis hot-layer + degradation
+Cache-aside (read Redis → miss → load PG → backfill with TTL; on write, update PG then invalidate the key) stays correct when Redis is down — only performance degrades. Write-through favors consistency at write-throughput cost; write-behind risks loss if Redis dies pre-persist. TTL bounds staleness. Recommended: cache-aside for presence/ephemeral hot state with TTLs; on PG-down, serve reads from Redis, queue durable writes for replay, and refuse risky state-mutating actions (the SAD degradation rule); treat Redis as a cache, never sole truth. Avoid: Redis as a durable store; unbounded write-behind without a durable replay log; serving stale economy/inventory mutations during degradation.
+Sources: redis.io cache-aside (rust); c-sharpcorner Redis cache-pattern trade-offs.
+
+## 4. Credential storage + connect tokens
+OWASP (2024+) recommends Argon2id as default (min 19 MiB memory, 2 iterations, parallelism 1); bcrypt cost ≥12 is legacy-only. The Rust `argon2` crate auto-salts and encodes params in the PHC hash string. renet `ConnectToken::generate()` needs the same private key + protocol id as the server, carries user data, and must travel over TLS (the key is in the clear otherwise). Recommended: store only Argon2id PHC hashes (per-user salt, never plaintext); replace `StubTokenIssuer` with an issuer that verifies credentials THEN mints a `ConnectToken` (client_id from the account, server private key) delivered over TLS. Avoid: bcrypt for new code; plaintext/unsalted/reused-salt creds; issuing tokens before auth; shipping the netcode private key insecurely.
+Sources: OWASP Password Storage Cheat Sheet; docs.rs/renetcode ConnectToken.
+
+## 5. Testing the persistence layer
+`testcontainers-rs` + `testcontainers-modules` spin up disposable real Postgres/Redis in Docker for `cargo test`, then auto-clean; connect with `PgPool`, run `migrate!` per container for true isolation. Testing real DBs catches SQL/constraint/transaction bugs mocks miss. Recommended: per-test (or per-suite) ephemeral PG + Redis; integration tests per repository; migration round-trip (apply then down/up) tests; and entity serialize→store→load round-trip asserting equality against the serde-derived `sim` types and the versioned persisted format. Avoid: mock-only DB tests; a shared mutable test DB (cross-test bleed); skipping migration-rollback and format-version round-trips (silent-corruption risk).
+Sources: testcontainers/testcontainers-rs; docs.rs/testcontainers-modules.
+
+## Summary
+Run all DB IO on an off-thread tokio actor reached by channels so the deterministic 30 Hz tick never blocks; load/save at session boundaries and write-behind a bounded durable queue mid-session. PostgreSQL is the checked truth via compile-time `sqlx` macros + embedded `migrate!` migrations; Redis is a cache-aside hot layer whose loss degrades only performance, with PG-down falling back to serve-from-Redis + queue-writes + refuse-risky-mutations. Secure accounts with Argon2id hashes and gate `renet` connect-token issuance behind verified auth; validate with testcontainers-backed integration, migration-rollback, and serialize→store→load round-trip tests.
