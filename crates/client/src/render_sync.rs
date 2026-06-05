@@ -20,6 +20,8 @@
 //! The E002 gunsight pip and follow camera continue to read the local ship's
 //! rendered `Transform`, so their feel is unchanged.
 
+use std::collections::BTreeMap;
+
 use bevy::prelude::*;
 use protocol::{EntityId, EntityKind};
 use sim::components::{Energy, Heading, Heat, Position, Projectile, Ship};
@@ -107,8 +109,26 @@ pub struct ShieldBubble;
 /// `voxelized` records the current LOD state so the capture system switches cleanly when
 /// the ship crosses the distance threshold (near → build the hull-mesh child + drop the
 /// parent's box mesh; far → despawn the child + free its mesh + restore the box mesh).
+/// One spatial TILE of a BIG structure's **chunked** hull (the chunked-mesh optimization): the hull
+/// is split into `HULL_TILE`-cell squares so a carve rebuilds only the tile(s) it touched, not the
+/// whole ~8k-cell hull. Keyed in [`ShipHull::tiles`] by `(col / HULL_TILE, row / HULL_TILE)`.
+#[derive(Default)]
+pub struct HullTile {
+    /// Order-independent hash of this tile's present `(col, row, kind)` cells — the per-tile rebuild
+    /// trigger.
+    pub hash: u64,
+    /// This tile's mesh handle (freed from `Assets<Mesh>` on rebuild/despawn — no leak).
+    pub mesh: Option<Handle<Mesh>>,
+    /// This tile's child entity under the parent (despawned on rebuild / when the tile empties / far).
+    pub child: Option<Entity>,
+}
+
 #[derive(Component, Default)]
 pub struct ShipHull {
+    /// Per-tile chunked hull meshes for a BIG structure (empty for a ship / a small hull). A carve
+    /// rebuilds only the affected tile, not the whole hull. Mutually exclusive with the single
+    /// `child`/`mesh` below — a big structure uses `tiles`; a ship uses the single child.
+    pub tiles: BTreeMap<(u16, u16), HullTile>,
     /// The single hull-surface child entity (`None` until first built / while far).
     pub child: Option<Entity>,
     /// The hull mesh's handle, kept so it can be removed from [`Assets<Mesh>`] when the

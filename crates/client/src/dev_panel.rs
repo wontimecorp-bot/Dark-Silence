@@ -592,9 +592,41 @@ fn toggle_dev_panel(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<DevPanelS
     }
 }
 
-/// f32 slider row.
+/// A usable drag increment for an editable range field, scaled to the range span so the
+/// `DragValue` feels right whether the range is tiny (`0.1..=10`) or large (`0..=120`).
+fn drag_speed(lo: f32, hi: f32) -> f64 {
+    ((hi - lo).abs().max(1.0) as f64) * 0.01
+}
+
+/// f32 slider row with **editable min/max range fields** (Refinement 9). The slider's range
+/// endpoints are exposed as small `DragValue` number fields flanking the slider, so a value
+/// can be pushed past its built-in cap (e.g. raise the thrust max above 120 and drag past
+/// it). The per-slider `(min, max)` override is stored in egui's temp memory keyed by
+/// `label`, so it persists for the session AND every existing caller keeps its signature
+/// unchanged (the passed `range` is just the default). The range is always widened to
+/// contain the live value so opening the panel never silently clamps a value down; min is
+/// kept ≤ max.
 fn slider(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>) {
-    ui.add(egui::Slider::new(v, range).text(label));
+    let id = ui.make_persistent_id(("dev_slider_limits", label));
+    let (mut lo, mut hi) = ui
+        .data_mut(|d| d.get_temp::<(f32, f32)>(id))
+        .unwrap_or((*range.start(), *range.end()));
+    // Never let the slider clamp the current value down (the value may already exceed the
+    // default cap, or a prior edit raised it) — widen the range to include it.
+    lo = lo.min(*v);
+    hi = hi.max(*v);
+    let speed = drag_speed(lo, hi);
+    ui.horizontal(|ui| {
+        // Editable lower bound, the value slider over the live range, then the editable upper
+        // bound — all on one line.
+        ui.add_sized([56.0, 18.0], egui::DragValue::new(&mut lo).speed(speed));
+        ui.add(egui::Slider::new(v, lo..=hi).text(label));
+        ui.add_sized([56.0, 18.0], egui::DragValue::new(&mut hi).speed(speed));
+    });
+    if hi < lo {
+        hi = lo;
+    }
+    ui.data_mut(|d| d.insert_temp(id, (lo, hi)));
 }
 
 /// One read-only stat row (Phase M6c-fix): the label left-padded in a fixed-width **monospace**

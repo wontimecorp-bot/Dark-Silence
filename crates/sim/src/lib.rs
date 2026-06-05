@@ -163,7 +163,20 @@ pub fn add_fixed_step_systems(schedule: &mut Schedule) {
             // is a carve target from here on. Gated on `ScenarioActive` → a no-op everywhere else.
             voxelize::voxelize_pending_system.run_if(resource_exists::<scenario::ScenarioActive>),
             collision::fitted_damage_system,
-            collision::ram_collision_system,
+            // Ram (asteroid, elastic) then the solid-structure wall, grouped into one chained
+            // sub-tuple so the outer system tuple stays within Bevy's chained-tuple arity limit
+            // (20). The inner `.chain()` keeps ram before the structure push-out; the outer chain
+            // keeps the whole group between `fitted_damage_system` and `shield_regen_system`.
+            (
+                collision::ram_collision_system,
+                // Mining skirmish: the outpost/transport is a SOLID wall the player ship can't fly
+                // through — push the ship out + cancel its inward velocity. Gated on
+                // `ScenarioActive` (only ever touches `Outpost`/`Transport`) → a no-op in every
+                // headless world.
+                collision::structure_collision_system
+                    .run_if(resource_exists::<scenario::ScenarioActive>),
+            )
+                .chain(),
             // E007 powered shield regen/decay — gated so an unfitted world (no
             // ShieldConfig) skips it without panicking (graceful degradation).
             damage::shield_regen_system.run_if(resource_exists::<damage::ShieldConfig>),

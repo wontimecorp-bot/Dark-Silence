@@ -388,6 +388,39 @@ pub fn first_cell_hit(layout: &FitLayout, p0: Vec2, p1: Vec2) -> Option<(Cell, f
     best.map(|(toi, _, cell)| (cell, toi))
 }
 
+/// Clamp the cell-space carve entry `point` to the hull's OUTER surface along the shot line
+/// `dir`. The common case — a shot meeting the silhouette from OUTSIDE — returns `point`
+/// UNCHANGED (its forward entry cell already IS the outer surface, so the carve is
+/// byte-identical to a direct entry). When `point` landed INSIDE the silhouette — an
+/// off-axis shot whose broad-phase contact crossed the (inscribed) `CollisionRadius` circle
+/// at a point already within the solid hull — it returns the position where the shot LINE
+/// first enters the hull from outside, so the carve channels IN from the surface instead of
+/// starting at an interior cell.
+///
+/// `fwd_cell` is the forward-scan entry the caller already computed
+/// (`first_cell_hit(layout, point, point + dir·REACH)`) — today's entry; reused to tell the
+/// surface case (the back-extended scan finds the SAME first cell → unchanged) from the
+/// buried case (it finds an OUTER cell → enter there). `back` must exceed the hull's interior
+/// depth so the back-extended scan starts outside the cells (e.g. `grid.max_dim · 1.5`).
+/// Pure; reads only its arguments.
+pub fn surface_entry(
+    layout: &FitLayout,
+    point: Vec2,
+    dir: Vec2,
+    back: f32,
+    fwd_cell: Cell,
+) -> Vec2 {
+    let p0 = point - dir * back;
+    let p1 = point + dir * REACH;
+    match first_cell_hit(layout, p0, p1) {
+        // The outer-surface cell differs from today's forward entry → the contact was buried
+        // inside the hull; enter at the surface crossing along the same shot line.
+        Some((surf_cell, toi)) if surf_cell != fwd_cell => p0 + (p1 - p0) * toi,
+        // Already meeting the surface from outside (or no present cell) → unchanged.
+        _ => point,
+    }
+}
+
 /// Walk the present cells of `layout` the ray `p0 → p1` passes through, in the
 /// deterministic order the shot would carve them ([`carve_order`]: ascending
 /// time-of-impact, ties outer-before-inner by occlusion `depth`, then by [`Cell`]

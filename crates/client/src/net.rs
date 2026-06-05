@@ -67,7 +67,8 @@ use sim::{FactionSpawns, FixedDt, HitFeedback, ShipIntent};
 
 use crate::input::{build_client_input, InputSequencer};
 use crate::render_sync::{
-    interpolate_transforms, RemoteEntity, RenderInterp, ShieldBubble, ShieldChild, ShipHull,
+    interpolate_transforms, HullTile, RemoteEntity, RenderInterp, ShieldBubble, ShieldChild,
+    ShipHull,
 };
 use crate::scene::{
     build_hull_mesh, build_hull_mesh_contour, build_module_overlay_mesh, RenderAssets, CELL_SIZE,
@@ -828,6 +829,11 @@ fn sync_ship_hull(
     let center = hull_mesh_center(e);
 
     let near = e.pos.distance(lod_origin) <= SHIP_VOXEL_LOD_DIST;
+    // A big STRUCTURE (its hull footprint exceeds the ship range) renders its near hull as a CHUNKED
+    // mesh — split into tiles so a carve rebuilds only the touched tile, not its whole ~8k-cell hull.
+    // Ships + wreck chunks keep the single merged-mesh path below.
+    let footprint = e.grid_dims.0.max(e.grid_dims.1) as f32 * CELL_SIZE;
+    let big_structure = !is_wreck && footprint > STRUCTURE_LOD_FOOTPRINT;
 
     // Resolve (or initialize) this parent's hull tracking. A freshly-spawned parent has no
     // `ShipHull` yet (commands are deferred), so seed a default and attach it at the end.
@@ -841,10 +847,6 @@ fn sync_ship_hull(
     };
 
     if near {
-        // Cheap order-independent hash of the present `(col, row, kind)` set — the
-        // rebuild trigger.
-        let hash = cells_hash(e);
-
         if !current.voxelized() {
             // Far→near switch: stop drawing the parent's coarse box so only the hull
             // surface shows (the parent keeps its transform + markers).
@@ -854,90 +856,117 @@ fn sync_ship_hull(
             current.set_voxelized(true);
         }
 
-        // Build on first sight, REBUILD when the cell set changed (Phase-2 erosion), when the
-        // render-style toggle flipped (voxel ↔ contour), OR when the module-color toggle flipped
-        // (same cells, new look) — all "same parent, new mesh" cases.
-        let needs_build = current.child().is_none()
-            || current.cells_hash() != hash
-            || current.built_contour() != contour
-            || current.built_module_color() != module_color;
-        if needs_build {
-            // Free the previous mesh + child (rebuild path) so meshes/entities don't leak.
-            if let Some(old) = current.take_mesh() {
-                meshes.remove(&old);
-            }
-            if let Some(old_child) = current.take_child() {
-                if let Ok(mut ec) = commands.get_entity(old_child) {
-                    ec.despawn();
-                }
-            }
-            // The contour module-marker overlay is rebuilt with the hull (its inputs — cells,
-            // style, color — are exactly the rebuild triggers), so always tear the old one down.
-            if let Some(old) = current.take_module_overlay_mesh() {
-                meshes.remove(&old);
-            }
-            if let Some(old_child) = current.take_module_overlay_child() {
-                if let Ok(mut ec) = commands.get_entity(old_child) {
-                    ec.despawn();
-                }
-            }
-
-            // Merge the present cells into ONE seamless hull surface + add it to the mesh store,
-            // centred on `center` (grid centre for a ship, cell-COM for a wreck) so the cells sit
-            // around the parent `Position`.
-            let cell_tuples: Vec<(u16, u16, u8)> =
-                e.cells.iter().map(|c| (c.col, c.row, c.kind)).collect();
-            // The runtime toggles pick the look: smoothed rounded contour (Fix #11 M2) vs the
-            // blocky per-cell voxel mesh. Both share the same `center`-relative local frame, so
-            // the child sits identically under the parent transform either way. In the voxel look,
-            // `module_color` paints per-cell vertex colors (shown by the white-base material above).
-            let raw_mesh = if contour {
-                build_hull_mesh_contour(&cell_tuples, CELL_SIZE, center)
-            } else {
-                build_hull_mesh(&cell_tuples, CELL_SIZE, center, module_color)
+        if big_structure {
+            // Chunked path: rebuild only the tiles a carve touched. Structures are all-structural →
+            // always the plain faction-tinted voxel look (no module-colour / contour variants).
+            let struct_mat = match e.faction {
+                1 => assets.faction_red_hull_material.clone(),
+                2 => assets.faction_blue_hull_material.clone(),
+                _ => assets.hull_material.clone(),
             };
-            let mesh = meshes.add(raw_mesh);
+            chunked_hull_update(
+                commands,
+                meshes,
+                parent,
+                e,
+                center,
+                &struct_mat,
+                current.tiles_mut(),
+            );
+        } else {
+            // --- ship / wreck single-merged-mesh path (unchanged) ---
+            // Cheap order-independent hash of the present `(col, row, kind)` set — the rebuild trigger.
+            let hash = cells_hash(e);
 
-            let child = commands
-                .spawn((
-                    Mesh3d(mesh.clone()),
-                    MeshMaterial3d(hull_mat.clone()),
-                    Transform::IDENTITY,
-                ))
-                .id();
-            if let Ok(mut ec) = commands.get_entity(parent) {
-                ec.add_child(child);
-            }
-            current.set_child(Some(child));
-            current.set_mesh(Some(mesh));
-            current.set_cells_hash(hash);
-            current.set_built_contour(contour);
-            current.set_built_module_color(module_color);
-
-            // Module-color OVERLAY (the "second layer", contour look only): thin colored markers
-            // on module cells over the smooth hull. `None` when the chunk has no module cells.
-            if contour && module_color {
-                if let Some(overlay_raw) =
-                    build_module_overlay_mesh(&cell_tuples, CELL_SIZE, center)
-                {
-                    let overlay_mesh = meshes.add(overlay_raw);
-                    let overlay_child = commands
-                        .spawn((
-                            Mesh3d(overlay_mesh.clone()),
-                            MeshMaterial3d(assets.module_overlay_material.clone()),
-                            Transform::IDENTITY,
-                        ))
-                        .id();
-                    if let Ok(mut ec) = commands.get_entity(parent) {
-                        ec.add_child(overlay_child);
+            // Build on first sight, REBUILD when the cell set changed (Phase-2 erosion), when the
+            // render-style toggle flipped (voxel ↔ contour), OR when the module-color toggle flipped
+            // (same cells, new look) — all "same parent, new mesh" cases.
+            let needs_build = current.child().is_none()
+                || current.cells_hash() != hash
+                || current.built_contour() != contour
+                || current.built_module_color() != module_color;
+            if needs_build {
+                // Free the previous mesh + child (rebuild path) so meshes/entities don't leak.
+                if let Some(old) = current.take_mesh() {
+                    meshes.remove(&old);
+                }
+                if let Some(old_child) = current.take_child() {
+                    if let Ok(mut ec) = commands.get_entity(old_child) {
+                        ec.despawn();
                     }
-                    current.set_module_overlay_child(Some(overlay_child));
-                    current.set_module_overlay_mesh(Some(overlay_mesh));
+                }
+                // The contour module-marker overlay is rebuilt with the hull (its inputs — cells,
+                // style, color — are exactly the rebuild triggers), so always tear the old one down.
+                if let Some(old) = current.take_module_overlay_mesh() {
+                    meshes.remove(&old);
+                }
+                if let Some(old_child) = current.take_module_overlay_child() {
+                    if let Ok(mut ec) = commands.get_entity(old_child) {
+                        ec.despawn();
+                    }
+                }
+
+                // Merge the present cells into ONE seamless hull surface + add it to the mesh store,
+                // centred on `center` (grid centre for a ship, cell-COM for a wreck) so the cells sit
+                // around the parent `Position`.
+                let cell_tuples: Vec<(u16, u16, u8)> =
+                    e.cells.iter().map(|c| (c.col, c.row, c.kind)).collect();
+                // The runtime toggles pick the look: smoothed rounded contour (Fix #11 M2) vs the
+                // blocky per-cell voxel mesh. Both share the same `center`-relative local frame, so
+                // the child sits identically under the parent transform either way. In the voxel look,
+                // `module_color` paints per-cell vertex colors (shown by the white-base material above).
+                let raw_mesh = if contour {
+                    build_hull_mesh_contour(&cell_tuples, CELL_SIZE, center)
+                } else {
+                    build_hull_mesh(&cell_tuples, CELL_SIZE, center, module_color)
+                };
+                let mesh = meshes.add(raw_mesh);
+
+                let child = commands
+                    .spawn((
+                        Mesh3d(mesh.clone()),
+                        MeshMaterial3d(hull_mat.clone()),
+                        Transform::IDENTITY,
+                    ))
+                    .id();
+                if let Ok(mut ec) = commands.get_entity(parent) {
+                    ec.add_child(child);
+                }
+                current.set_child(Some(child));
+                current.set_mesh(Some(mesh));
+                current.set_cells_hash(hash);
+                current.set_built_contour(contour);
+                current.set_built_module_color(module_color);
+
+                // Module-color OVERLAY (the "second layer", contour look only): thin colored markers
+                // on module cells over the smooth hull. `None` when the chunk has no module cells.
+                if contour && module_color {
+                    if let Some(overlay_raw) =
+                        build_module_overlay_mesh(&cell_tuples, CELL_SIZE, center)
+                    {
+                        let overlay_mesh = meshes.add(overlay_raw);
+                        let overlay_child = commands
+                            .spawn((
+                                Mesh3d(overlay_mesh.clone()),
+                                MeshMaterial3d(assets.module_overlay_material.clone()),
+                                Transform::IDENTITY,
+                            ))
+                            .id();
+                        if let Ok(mut ec) = commands.get_entity(parent) {
+                            ec.add_child(overlay_child);
+                        }
+                        current.set_module_overlay_child(Some(overlay_child));
+                        current.set_module_overlay_mesh(Some(overlay_mesh));
+                    }
                 }
             }
         }
     } else if current.voxelized() {
-        // Near→far switch: despawn the hull child + overlay, free their meshes, restore the box.
+        // Near→far switch (or a big structure that went far): despawn the hull child(ren) + overlay +
+        // any chunk tiles, free their meshes, restore the coarse placeholder box.
+        for (_, tile) in std::mem::take(current.tiles_mut()) {
+            free_hull_tile(commands, meshes, tile);
+        }
         if let Some(old) = current.take_mesh() {
             meshes.remove(&old);
         }
@@ -1035,11 +1064,109 @@ fn hull_mesh_center(e: &RenderEntity) -> Vec2 {
 fn cells_hash(e: &RenderEntity) -> u64 {
     let mut acc: u64 = e.cells.len() as u64;
     for c in &e.cells {
-        // Pack (col, row, kind) and scramble; XOR-fold so order does not matter.
-        let key = ((c.col as u64) << 24) ^ ((c.row as u64) << 8) ^ (c.kind as u64);
-        acc ^= key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        acc ^= hash_one_cell(c.col, c.row, c.kind);
     }
     acc
+}
+
+/// Scramble one `(col, row, kind)` cell key — XOR-folded by the callers so cell order doesn't matter.
+fn hash_one_cell(col: u16, row: u16, kind: u8) -> u64 {
+    let key = ((col as u64) << 24) ^ ((row as u64) << 8) ^ (kind as u64);
+    key.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// Order-independent hash of a `(col, row, kind)` tuple slice (one chunk tile's cells).
+fn tile_cells_hash(cells: &[(u16, u16, u8)]) -> u64 {
+    let mut acc: u64 = cells.len() as u64;
+    for &(col, row, kind) in cells {
+        acc ^= hash_one_cell(col, row, kind);
+    }
+    acc
+}
+
+/// Chunked-mesh tile edge, in cells. A big structure's hull is split into `HULL_TILE × HULL_TILE`
+/// tiles so a carve rebuilds only the tile(s) it touched (≤ `HULL_TILE²` cells), not the whole hull.
+const HULL_TILE: u16 = 16;
+
+/// Free a chunk tile's mesh handle + despawn its child entity (no leak).
+fn free_hull_tile(commands: &mut Commands, meshes: &mut Assets<Mesh>, tile: HullTile) {
+    if let Some(mesh) = tile.mesh {
+        meshes.remove(&mesh);
+    }
+    if let Some(child) = tile.child {
+        if let Ok(mut ec) = commands.get_entity(child) {
+            ec.despawn();
+        }
+    }
+}
+
+/// **Chunked hull rebuild** (the chunked-mesh optimization, for a big STRUCTURE only): split the
+/// present cells into `HULL_TILE`-cell tiles and rebuild ONLY the tiles whose cell set changed since
+/// last tick (plus drop tiles fully carved away), instead of rebuilding the whole ~8k-cell hull every
+/// carve. Each tile is one [`build_hull_mesh`] child under `parent` at `Transform::IDENTITY` (so it
+/// inherits the parent pose), sharing `center` so the tiles line up into the seamless hull. Material
+/// is the structure's faction tint (structures are all-structural → no module-colour/contour look).
+fn chunked_hull_update(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    parent: Entity,
+    e: &RenderEntity,
+    center: Vec2,
+    material: &Handle<StandardMaterial>,
+    tiles: &mut std::collections::BTreeMap<(u16, u16), HullTile>,
+) {
+    // Group the present cells into tiles.
+    let mut by_tile: std::collections::BTreeMap<(u16, u16), Vec<(u16, u16, u8)>> =
+        std::collections::BTreeMap::new();
+    for c in &e.cells {
+        by_tile
+            .entry((c.col / HULL_TILE, c.row / HULL_TILE))
+            .or_default()
+            .push((c.col, c.row, c.kind));
+    }
+    // Drop tiles that no longer have any cells (fully carved away).
+    let stale: Vec<(u16, u16)> = tiles
+        .keys()
+        .copied()
+        .filter(|k| !by_tile.contains_key(k))
+        .collect();
+    for key in stale {
+        if let Some(tile) = tiles.remove(&key) {
+            free_hull_tile(commands, meshes, tile);
+        }
+    }
+    // Build/rebuild only the tiles whose cell set changed (or are new).
+    for (key, cells) in by_tile {
+        let hash = tile_cells_hash(&cells);
+        if tiles
+            .get(&key)
+            .is_some_and(|t| t.hash == hash && t.child.is_some())
+        {
+            continue; // unchanged — keep the existing tile mesh
+        }
+        if let Some(old) = tiles.remove(&key) {
+            free_hull_tile(commands, meshes, old);
+        }
+        let mesh = meshes.add(build_hull_mesh(&cells, CELL_SIZE, center, false));
+        let child = commands
+            .spawn((
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(material.clone()),
+                Transform::IDENTITY,
+            ))
+            .id();
+        if let Ok(mut ec) = commands.get_entity(parent) {
+            ec.add_child(child);
+        }
+        tiles.insert(
+            key,
+            HullTile {
+                hash,
+                mesh: Some(mesh),
+                child: Some(child),
+            },
+        );
+    }
 }
 
 /// Holds either the live `&mut ShipHull` from the query or a freshly-built one for a parent
@@ -1079,6 +1206,13 @@ impl HullView<'_> {
         match self {
             HullView::Existing(c) => c.child.take(),
             HullView::New(c) => c.child.take(),
+        }
+    }
+    /// The per-tile chunked-hull map (big structures only; empty for ships).
+    fn tiles_mut(&mut self) -> &mut std::collections::BTreeMap<(u16, u16), HullTile> {
+        match self {
+            HullView::Existing(c) => &mut c.tiles,
+            HullView::New(c) => &mut c.tiles,
         }
     }
     fn set_mesh(&mut self, v: Option<Handle<Mesh>>) {

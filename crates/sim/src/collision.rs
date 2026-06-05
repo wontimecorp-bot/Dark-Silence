@@ -16,7 +16,8 @@ use crate::components::{
     ProjectileMass, ProjectileOwner, ShieldHitFlash, Ship, Target, TargetKind, Velocity,
 };
 use crate::damage::{
-    apply_damage, core_cell, first_cell_hit, on_cells_carved, DamageEvent, HitKind, Wreck, REACH,
+    apply_damage, core_cell, first_cell_hit, on_cells_carved, surface_entry, DamageEvent, HitKind,
+    Wreck, REACH,
 };
 use crate::fitting::{
     center_or_anchor, layout_inertia_with, layout_mass_with, FitLayout, HullCatalog, ModuleCatalog,
@@ -524,7 +525,8 @@ pub fn fitted_damage_system(world: &mut World) {
             let (point, dir_cell) = hull_local_entry_ray(vel.0, hit.point, *tpos, *heading, center);
             // Narrow-phase: does the cell-space segment actually cross one of THIS target's
             // present cells? If not, the projectile passes this target (not a hit).
-            let Some((_, cell_toi)) = first_cell_hit(layout, point, point + dir_cell * REACH)
+            let Some((fwd_cell, cell_toi)) =
+                first_cell_hit(layout, point, point + dir_cell * REACH)
             else {
                 continue;
             };
@@ -534,7 +536,17 @@ pub fn fitted_damage_system(world: &mut World) {
                 Some((_, best_toi, _, _, _, _)) => cell_toi < best_toi,
             };
             if take {
-                best = Some((*target, cell_toi, *tpos, hit.point, point, dir_cell));
+                // Carve-from-surface: if the broad-phase contact landed INSIDE the solid
+                // silhouette — an off-axis shot whose path crossed the inscribed
+                // `CollisionRadius` circle at a point already within the hull (common on a big
+                // square structure, where the circle inscribes the corners) — back the entry
+                // up along the shot line to the OUTER surface cell so the carve channels IN
+                // from the surface, not an interior cube. A no-op (byte-identical) when the
+                // contact already meets the surface from outside (`fwd_cell` IS the surface).
+                let (cols, rows) = hull_dims.get(target).copied().unwrap_or((0, 0));
+                let back = (cols.max(rows) as f32) * 1.5;
+                let entry = surface_entry(layout, point, dir_cell, back, fwd_cell);
+                best = Some((*target, cell_toi, *tpos, hit.point, entry, dir_cell));
             }
         }
         if let Some((target, cell_toi, tpos, world_impact, point, dir_cell)) = best {
@@ -769,6 +781,48 @@ pub fn ram_collision_system(
             avel.0 = new_ast;
             if is_lethal_ram(closing, tuning.lethal_ram_speed) {
                 ship_health.0 = 0.0;
+            }
+        }
+    }
+}
+
+/// Mining-skirmish: make the refinery **outpost / transport** a SOLID obstacle the player
+/// ship cannot fly through (Refinement 9). Unlike [`ram_collision_system`]'s elastic
+/// asteroid (which drifts + can lethally ram), a structure is treated as an **immovable
+/// wall**: on overlap the ship is pushed back out along the contact normal and the inward
+/// component of its velocity is removed (it scrapes/stops along the surface rather than
+/// bouncing or phasing through). The structure neither moves nor takes ram damage — carving
+/// stays projectile-only.
+///
+/// Gated on `ScenarioActive` (see `add_fixed_step_systems`); it only ever inspects
+/// `Outpost`/`Transport` targets, which exist solely in the windowed mining scenario, so it
+/// is a no-op (byte-identical) in every headless / determinism / botkit / demo world. The
+/// `With<Ship>` / `Without<Ship>` split keeps the two queries disjoint. Works on a structure
+/// both before AND after lazy voxelization (the swap keeps `CollisionRadius`/`Target`).
+/// Deterministic (stable query order; no RNG); pure f32 over [`circle_contact`].
+pub fn structure_collision_system(
+    mut ship_q: Query<(&mut Position, &mut Velocity, &CollisionRadius), With<Ship>>,
+    structures: Query<(&Position, &CollisionRadius, &TargetKind), (With<Target>, Without<Ship>)>,
+) {
+    let Some((mut ship_pos, mut ship_vel, ship_radius)) = ship_q.iter_mut().next() else {
+        return;
+    };
+    let ship_radius = ship_radius.0;
+    for (spos, sradius, kind) in &structures {
+        if !matches!(*kind, TargetKind::Outpost | TargetKind::Transport) {
+            continue;
+        }
+        // `circle_contact(a, .., b, ..)` returns the normal pointing from `b` (the structure)
+        // toward `a` (the ship) = the push-out direction, plus the penetration depth.
+        if let Some(contact) = circle_contact(ship_pos.0, ship_radius, spos.0, sradius.0) {
+            // Eject the ship to the surface (the structure is immovable → it does not move).
+            ship_pos.0 += contact.normal * contact.depth;
+            // Cancel only the INWARD velocity (`into < 0` = heading into the structure) so the
+            // ship slides along the wall instead of bouncing or punching through; leave an
+            // already-outward velocity alone so it can depart.
+            let into = ship_vel.0.dot(contact.normal);
+            if into < 0.0 {
+                ship_vel.0 -= contact.normal * into;
             }
         }
     }

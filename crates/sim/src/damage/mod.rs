@@ -79,8 +79,9 @@ pub use content::{
 pub use destruction::{on_cells_carved, on_section_destroyed, shatter_ship};
 pub use event::{Channel, DamageEvent};
 pub use layers::{
-    apply_damage, first_cell_hit, resolve_entry_point, route_behind, ArmorFacet, DamageContext,
-    DamageOutcome, HitKind, HullStructure, SectionArmor, SectionHealth, Shields, REACH,
+    apply_damage, first_cell_hit, resolve_entry_point, route_behind, surface_entry, ArmorFacet,
+    DamageContext, DamageOutcome, HitKind, HullStructure, SectionArmor, SectionHealth, Shields,
+    REACH,
 };
 pub use penetration::{resolve_penetration, PenetrationResult};
 pub use resist::{layer_resist, DefenseLayer, ResistanceMatrix};
