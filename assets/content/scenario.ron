@@ -20,18 +20,16 @@
         collision_radius: 30.0,
         health: 1000000.0,
     ),
-    // Refinery outpost — a carveable voxel station (Refinement 5). grid · 0.32 ≈ world size:
-    // 94 · 0.32 ≈ 30 u. A thin `plating` makes a mostly-hollow plated frame (~1k cells, not ~8.8k
-    // solid); carving a channel to the centre core destroys it. Cheap flat box until first hit.
+    // Refinery outpost — a carveable SOLID voxel station (Refinement 7). grid · 0.32 ≈ world size:
+    // 94 · 0.32 ≈ 30 u → a solid 94×94 block (~8.8k fine cells). Cheap flat box until first hit;
+    // carving a channel to the centre core destroys it.
     outpost: (
         grid: (94, 94),
-        plating: 3,
         cell_hp: 5.0,
     ),
-    // Mining transport — a carveable voxel hull. 32 · 0.32 ≈ 10 u long; thicker plating = mostly solid.
+    // Mining transport — a carveable SOLID voxel hull. 32 · 0.32 ≈ 10 u long (~580 fine cells).
     transport: (
         grid: (32, 18),
-        plating: 4,
         cell_hp: 5.0,
     ),
     // Transport Newtonian movement + economy (the live MiningTuning resource; also tweakable in the

@@ -164,6 +164,12 @@ fn shield_radius_for(grid_dims: (u16, u16)) -> f32 {
 /// exists + switches cleanly when a ship crosses the threshold. Tunable for feel.
 pub const SHIP_VOXEL_LOD_DIST: f32 = 60.0;
 
+/// Refinement 6: a fitted entity whose hull footprint (`max(grid_dims) · CELL_SIZE`) exceeds this is
+/// a big STRUCTURE, not a ship. Its far-LOD placeholder is the unit [`RenderAssets::lod_box_mesh`]
+/// scaled to the footprint (so it reads at the right size), where a ship just uses `ship_mesh` at
+/// scale ONE. ~7.0 sits between the corvette's ~4.8 u and the transport's ~10.2 u.
+pub const STRUCTURE_LOD_FOOTPRINT: f32 = 7.0;
+
 /// Runtime hull-render style toggle (Fix #11 M2), flipped in-game by
 /// [`crate::input::toggle_hull_render`] (the `V` key). `false` (default) = the blocky per-cell
 /// voxel mesh ([`build_hull_mesh`]); `true` = the smoothed rounded contour
@@ -516,15 +522,32 @@ fn capture_render_state(
                     vel.0 = e.vel;
                 }
             }
-            // Refinement 5: keep the rendered scale in sync with the authoritative `RenderEntity.scale`
-            // each tick (not just at spawn). A structure that lazily voxelizes drops from its box
-            // `RenderScale` to ONE, so its newly-attached hull child (`Transform::IDENTITY`, which
-            // INHERITS the parent transform) renders at the natural cell size instead of the stale box
-            // scale. Skip `Debris` — a fragment sets its own per-chunk Transform scale at spawn.
-            // `bubble_q` is the existing `&mut Transform` query (reused to avoid a second one).
+            // Refinement 5/6: keep the rendered parent scale right each tick, LOD-aware. The parent
+            // transform is shared by the coarse far-LOD placeholder mesh AND (when near) the hull
+            // child (`Transform::IDENTITY`, which inherits it), so the correct scale differs by state:
+            //   * intact (no cells) → its `RenderScale` box (`e.scale`).
+            //   * fitted + NEAR → ONE, so the hull child renders at natural cell size.
+            //   * fitted + FAR + big footprint (a STRUCTURE) → the hull footprint, so the unit
+            //     placeholder box (restored by `sync_ship_hull` / the original unit structure mesh)
+            //     reads at the right ~30-u size instead of a tiny 1-u cube.
+            //   * fitted + FAR + small (a ship) → ONE (its `ship_mesh` placeholder is already sized).
+            // Skip `Debris` — a fragment owns its per-chunk Transform scale (set at spawn).
             if e.kind != EntityKind::Debris {
                 if let Ok((_, mut tf)) = bubble_q.get_mut(bevy_entity) {
-                    tf.scale = e.scale;
+                    let footprint =
+                        e.grid_dims.0.max(e.grid_dims.1) as f32 * crate::scene::CELL_SIZE;
+                    let near = e.pos.distance(lod_origin) <= SHIP_VOXEL_LOD_DIST;
+                    tf.scale = if e.cells.is_empty() {
+                        e.scale
+                    } else if !near && footprint > STRUCTURE_LOD_FOOTPRINT {
+                        Vec3::new(
+                            e.grid_dims.0 as f32 * crate::scene::CELL_SIZE,
+                            e.grid_dims.1 as f32 * crate::scene::CELL_SIZE,
+                            2.0,
+                        )
+                    } else {
+                        Vec3::ONE
+                    };
                 }
             }
             // Revise-B: seamless hull-surface LOD for a fitted ship (non-empty cell payload).
@@ -932,12 +955,21 @@ fn sync_ship_hull(
             }
         }
         if let Ok(mut ec) = commands.get_entity(parent) {
-            // Restore the coarse far-LOD mesh: a wreck → the tinted debris box, a ship →
-            // the coarse ship box. (The demo keeps combatants near, so this path is rare.)
+            // Restore the coarse far-LOD placeholder: a wreck → the tinted debris box; a big STRUCTURE
+            // → the UNIT `lod_box_mesh` (the parent transform scales it to the hull footprint, so it
+            // reads at the right ~30-u size — Refinement 6) wearing the faction-tinted hull material;
+            // a ship → its coarse `ship_mesh` (already ship-sized at scale ONE). (Rarely hit — the
+            // demo keeps combatants near.)
+            let footprint = e.grid_dims.0.max(e.grid_dims.1) as f32 * CELL_SIZE;
             if is_wreck {
                 ec.insert((
                     Mesh3d(assets.debris_mesh.clone()),
                     MeshMaterial3d(assets.debris_material.clone()),
+                ));
+            } else if footprint > STRUCTURE_LOD_FOOTPRINT {
+                ec.insert((
+                    Mesh3d(assets.lod_box_mesh.clone()),
+                    MeshMaterial3d(hull_mat.clone()),
                 ));
             } else {
                 ec.insert((

@@ -357,7 +357,7 @@ fn voxelize_on_hit_converts_a_structure_to_a_carve_hull() {
     let mut hulls = HullCatalog::default();
     hulls
         .hulls
-        .insert(hull_id, station_hull(hull_id, "TestStation", 7, 7, 2));
+        .insert(hull_id, station_hull(hull_id, "TestStation", 7, 7));
     w.insert_resource(hulls);
 
     let radius = sim::fitting::hull_collision_radius((7, 7));

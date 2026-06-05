@@ -66,11 +66,10 @@ struct StructureSpec {
 /// cell hull (size = `grid · CELL_WORLD_SIZE`, so render + collision derive from the grid).
 #[derive(Debug, Clone, Deserialize)]
 struct VoxelStructureSpec {
-    /// Hull grid `(cols, rows)` — world size is `grid · CELL_WORLD_SIZE` (≈0.32 u/cell).
+    /// Hull grid `(cols, rows)` — world size is `grid · CELL_WORLD_SIZE` (≈0.32 u/cell). The hull is a
+    /// solid filled block of this grid (Refinement 7).
     grid: (u16, u16),
-    /// Perimeter-shell + strut thickness in cells (larger → more filled / tougher).
-    plating: u16,
-    /// HP per structural cell (toughness of carving; cells × this ≈ the old flat HP).
+    /// HP per structural cell (toughness of carving; deeper carve to the centre core = destroyed).
     cell_hp: f32,
 }
 
@@ -172,14 +171,8 @@ impl ServerApp {
         {
             let (tc, tr) = content.transport.grid;
             let (oc, or) = content.outpost.grid;
-            let t_hull = station_hull(
-                HULL_TRANSPORT,
-                "Transport",
-                tc,
-                tr,
-                content.transport.plating,
-            );
-            let o_hull = station_hull(HULL_OUTPOST, "Outpost", oc, or, content.outpost.plating);
+            let t_hull = station_hull(HULL_TRANSPORT, "Transport", tc, tr);
+            let o_hull = station_hull(HULL_OUTPOST, "Outpost", oc, or);
             if let Some(mut hulls) = self.world.get_resource_mut::<HullCatalog>() {
                 hulls.hulls.insert(HULL_TRANSPORT, t_hull);
                 hulls.hulls.insert(HULL_OUTPOST, o_hull);

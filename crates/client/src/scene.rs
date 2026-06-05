@@ -34,6 +34,10 @@ pub struct RenderAssets {
     /// player-ship look so any rendered ship reads identically to the local one.
     pub ship_mesh: Handle<Mesh>,
     pub ship_material: Handle<StandardMaterial>,
+    /// Unit-cube far-LOD placeholder (Refinement 6): a voxelized STRUCTURE that's beyond the voxel
+    /// LOD distance draws this scaled to its hull footprint (by the parent `Transform.scale`) as a
+    /// cheap one-draw stand-in, instead of the `ship_mesh` (which is ship-shaped, not a unit cube).
+    pub lod_box_mesh: Handle<Mesh>,
     /// Per-`TargetKind` looks, picked by the server render entity's `flags` in
     /// [`crate::net::capture_render_state`] (the wire `EntityKind` only says
     /// "Target"): reddish dummy cube, grey asteroid sphere, green seeker dart —
@@ -1039,6 +1043,9 @@ pub fn setup_scene(
     // Ship look (dart-shaped cuboid long along +X, blue) — used for both the
     // local ship spawned below and any remote ship spawned by `net_update`.
     let ship_mesh = meshes.add(Cuboid::new(1.6, 0.6, 0.3));
+    // Unit cube — the far-LOD placeholder for a voxelized structure, scaled to its footprint by the
+    // parent transform (Refinement 6).
+    let lod_box_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
     let ship_material = materials.add(Color::srgb(0.30, 0.65, 1.0));
 
     // Per-kind remote target looks (dummies/asteroids/seeker now arrive over the
@@ -1183,6 +1190,7 @@ pub fn setup_scene(
         projectile_material,
         ship_mesh: ship_mesh.clone(),
         ship_material: ship_material.clone(),
+        lod_box_mesh,
         dummy_mesh,
         dummy_material,
         asteroid_mesh,
