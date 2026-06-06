@@ -33,7 +33,21 @@ use sim::{MiningTuning, SimTuning, Tuning};
 
 use crate::hud_bars::HudLayout;
 use crate::net::{LoopbackHost, NetClientState};
-use crate::starfield::StarfieldTuning;
+use crate::starfield::{StarfieldTuning, MAX_LAYERS};
+use crate::tuning_io;
+
+// Refinement 28: shared hover-tooltip text for the render-tuning sliders whose labels repeat across
+// bars/layers (so the same explanation isn't duplicated per call).
+const TIP_BAR_X: &str = "Camera-local X (cross-axis) of this HUD bar — lower = left, higher = right. Bars stay a fixed on-screen size at any zoom.";
+const TIP_BAR_Y: &str =
+    "Camera-local Y (baseline) of this HUD bar — lower = toward the bottom of the screen.";
+const TIP_BAR_EXTENT: &str = "Bar size along its main axis — length for the EHA row bars, height for the SAH stacks. Bigger = longer/taller.";
+const TIP_LAYER_PARALLAX: &str = "This layer's depth/parallax: 0 ≈ screen-locked / infinitely far (barely moves), toward 1 = world-anchored / drifts fast as you fly. Spread layers across 0..~0.5 for depth.";
+const TIP_LAYER_FREQUENCY: &str = "This layer's cell frequency (cells per world unit) = star SPACING. Higher = denser/closer-packed stars. (Star pixel SIZE is the 'size' knob.)";
+const TIP_LAYER_DENSITY: &str = "This layer's star density (0..1) = fraction of candidate cells that host a star. Final = this × 'density (all)' × the clustering map.";
+const TIP_LAYER_BRIGHTNESS: &str = "This layer's brightness factor. Final = this × 'brightness (all)'. Brighter stars bloom more (HDR).";
+const TIP_LAYER_TWINKLE: &str = "This layer's twinkle factor. Final = this × 'twinkle (all)'. Higher = more scintillation on this layer.";
+const TIP_LAYER_SIZE: &str = "This layer's star pixel-radius factor (hard points, ~1px min). Bigger = chunkier stars. (Star SPACING is the 'frequency' knob.)";
 
 /// Phase M6e — the single source of truth for every stat/knob the panel shows. A section refers to
 /// a [`StatId`] instead of hand-writing its label/order/format, so a rename or reorder is a
@@ -396,6 +410,192 @@ impl StatId {
             unit,
         }
     }
+
+    /// Every variant, for the label→desc reverse lookup in [`desc_for_label`] (R28). Keep in sync
+    /// with the enum — a missing entry only drops that stat's slider auto-tooltip (read-only rows
+    /// look up `desc()` directly, so they're unaffected).
+    const ALL: &'static [StatId] = {
+        use StatId::*;
+        &[
+            Mass,
+            Thrust,
+            Reverse,
+            Strafe,
+            Torque,
+            TopSpeed,
+            TurnRate,
+            AngularInertia,
+            LinearDrag,
+            AngularDrag,
+            TurnShare,
+            PowerGen,
+            PowerDraw,
+            Cpu,
+            Hp,
+            ShieldHp,
+            ShieldRegen,
+            Armor,
+            Dmg,
+            Rof,
+            Muzzle,
+            Slug,
+            LethalRam,
+            RicochetAngle,
+            OvermatchRatio,
+            EffectiveArmorCap,
+            PenTierFull,
+            PenTierOver,
+            PenTierNon,
+            ShieldRegenDefault,
+            UnpoweredDecay,
+            StatHealthFloor,
+            IntactFraction,
+            ScrapFloor,
+            ScrapPerMass,
+            StructCellHp,
+            StructCellMass,
+            CarveFalloff,
+            CarvePenCost,
+            CarveMinCellCost,
+            RicochetMinNeighbors,
+            SmoothNormalRadius,
+            ProjMass,
+            ProjDamage,
+            ProjLifetime,
+            PenPerDamage,
+            PenSize,
+            WreckLifetime,
+            ShipRamMass,
+            AsteroidRamMass,
+            EnergyCapacitySecs,
+            WeaponEnergyPerDamage,
+            HeatCapacity,
+            HeatDissipation,
+            ThrustEnergyPerInput,
+            AfterburnerCapacity,
+            AfterburnerDrainRate,
+            AfterburnerRegenRate,
+            AfterburnerBoostFactor,
+            SlowRadius,
+            ArriveRadius,
+            DockSpeed,
+            LoadRate,
+            UnloadRate,
+            CargoCapacity,
+            BaseMass,
+            PowerCap,
+            CpuCap,
+            MassCap,
+            GridDims,
+            Speed,
+            Heading,
+            Health,
+            HullStruct,
+            ShieldsState,
+            ArmorState,
+            Energy,
+            Heat,
+            AfterburnerState,
+            Cells,
+        ]
+    };
+
+    /// Rich hover-tooltip text for this stat (Refinement 28) — what it is, how it works, and how it
+    /// differs from related knobs. Shown on hover for both the tuning slider and the read-only row.
+    fn desc(self) -> &'static str {
+        use StatId::*;
+        match self {
+            // --- Ship locomotion / power ---
+            Mass => "Total ship mass (hull + modules). Higher mass = more inertia: slower acceleration and turning for the same thrust/torque, and harder to shove in collisions. It's the divisor in accel = force / mass.",
+            Thrust => "Forward thrust force. Acceleration = thrust / mass; emergent top speed ≈ thrust / linear-drag. Raise for snappier, faster flight.",
+            Reverse => "Reverse thrust force (braking / backing up) — usually weaker than forward thrust.",
+            Strafe => "Lateral thrust force for sliding sideways without turning.",
+            Torque => "Turn torque. Angular accel = torque / angular-inertia; steady turn rate ≈ torque / angular-drag. Higher = sharper turning.",
+            TopSpeed => "Read-only: emergent top speed (≈ thrust / linear-drag). Not set directly — change thrust or linear drag.",
+            TurnRate => "Read-only: max steady turn rate (≈ torque / angular-drag), in rad/s.",
+            AngularInertia => "Rotational inertia — resistance to changing spin. Higher = slower to start/stop a turn (heavier feel); the steady turn rate is unchanged (that's torque vs angular-drag).",
+            LinearDrag => "Linear drag. Velocity decays toward thrust/drag, so higher drag = lower top speed AND a faster stop.",
+            AngularDrag => "Angular drag. Spin decays toward torque/drag, so higher = lower top turn rate AND a quicker settle.",
+            TurnShare => "Share of the control budget given to turning vs forward thrust (0..1).",
+            PowerGen => "Power generated by working, core-connected reactor cells (health-scaled). Drives runtime energy regen and the shield 'powered' threshold; 0 if no working reactor.",
+            PowerDraw => "Continuous power draw of active modules. If draw exceeds generation, energy drains and shields lose power.",
+            Cpu => "CPU load of the fitted modules (compared against the hull's CPU capacity — a fitting budget).",
+            // --- Durability / weapon ---
+            Hp => "Flat health max for UNFITTED bodies. Fitted ships ignore this and use the cell / armor / shield layers instead.",
+            ShieldHp => "Shield capacity from the shield generator (health-scaled). 0 with no working generator.",
+            ShieldRegen => "Shield regeneration per second — only while the ship is powered (generation ≥ draw).",
+            Armor => "Armor-HP from armor modules. Soaks hits before the hull carves; a single hit larger than the remaining armor spills its excess into the carve.",
+            Dmg => "Damage per projectile hit.",
+            Rof => "Weapon rate of fire (shots per second).",
+            Muzzle => "Projectile muzzle speed. Higher = flatter trajectory, less lead needed, and less render lag.",
+            Slug => "Projectile mass — affects momentum / knockback and penetration.",
+            LethalRam => "Closing speed at or above which a ram is a one-shot kill (scenario ram tuning).",
+            // --- Defense / penetration ---
+            RicochetAngle => "Glancing-hit threshold (degrees): shots striking the surface steeper than this bounce off instead of penetrating.",
+            OvermatchRatio => "Damage-to-armor ratio above which a hit overmatches the armor and defeats it outright.",
+            EffectiveArmorCap => "Cap on the effective armor thickness any single hit can be stopped by (limits how much armor one shot 'sees').",
+            PenTierFull => "Penetration-vs-resistance threshold for a FULL penetration (the shot punches in and carves cells).",
+            PenTierOver => "Threshold for an OVER-penetration (the shot passes through with reduced effect).",
+            PenTierNon => "Threshold below which a hit is a NON-penetration (no carve — absorbed or ricocheted).",
+            ShieldRegenDefault => "Fallback shield regen for ships that don't specify a generator regen value.",
+            UnpoweredDecay => "Rate at which shields decay while the ship is unpowered (generation < draw).",
+            StatHealthFloor => "Minimum health-scale a damaged module keeps, so a nearly-destroyed module still contributes a little to derived stats.",
+            IntactFraction => "Live-cell fraction above which a hull still counts as 'intact' (vs visibly damaged) for stat/visual purposes.",
+            ScrapFloor => "Minimum scrap/salvage a wreck yields regardless of its mass.",
+            ScrapPerMass => "Scrap/salvage yielded per unit of wreck mass.",
+            // --- Carve / structural / projectile / wreck / ram ---
+            StructCellHp => "Per-cell hit points of voxelized structures (asteroid / outpost / transport). Higher = tougher to dig through.",
+            StructCellMass => "Per-cell mass of voxelized structures — feeds momentum and ram force.",
+            CarveFalloff => "How quickly carve damage falls off along a shot's channel (higher = shallower craters).",
+            CarvePenCost => "Penetration spent to carve each cell along the channel (higher = shots stop sooner / dig less deep).",
+            CarveMinCellCost => "Floor on the per-cell penetration cost, so each carved cell always costs at least this much.",
+            RicochetMinNeighbors => "Minimum solid neighbours a surface cell needs for a glancing hit to ricochet off it (rather than bite in).",
+            SmoothNormalRadius => "Cell radius sampled to estimate a smoothed surface normal for the ricochet-angle test.",
+            ProjMass => "Default projectile mass (the unfitted-weapon path).",
+            ProjDamage => "Default projectile damage (the unfitted-weapon path).",
+            ProjLifetime => "Seconds a projectile lives before despawning (effective range ≈ lifetime × muzzle speed).",
+            PenPerDamage => "Penetration gained per point of damage — how deep a shot carves for its damage.",
+            PenSize => "Projectile size factor used in the penetration calculation.",
+            WreckLifetime => "Seconds a wreck / debris chunk drifts before it fades and despawns.",
+            ShipRamMass => "Effective ram mass of ships — governs collision / ram momentum (who shoves whom).",
+            AsteroidRamMass => "Effective ram mass of asteroids / structures — how hard they shove (and resist being shoved).",
+            // --- Energy / heat ---
+            EnergyCapacitySecs => "Energy capacitor size, expressed as seconds of full draw it can sustain.",
+            WeaponEnergyPerDamage => "Energy consumed per point of weapon damage fired.",
+            HeatCapacity => "Heat the ship can hold before overheating (firing adds heat).",
+            HeatDissipation => "Heat shed per second (cooling rate).",
+            // --- Afterburner / thrust energy ---
+            ThrustEnergyPerInput => "Energy drained per unit of thrust input — flying itself costs energy.",
+            AfterburnerCapacity => "Size of the afterburner / boost pool.",
+            AfterburnerDrainRate => "Boost pool drained per second while boosting.",
+            AfterburnerRegenRate => "Boost pool refilled per second when not boosting.",
+            AfterburnerBoostFactor => "Thrust multiplier while boosting (e.g. 1.5 = +50% thrust).",
+            // --- Mining transport ---
+            SlowRadius => "Distance from its dock where the transport starts throttling down to arrive smoothly.",
+            ArriveRadius => "Distance within which the transport counts as 'arrived' at a dock.",
+            DockSpeed => "Speed below which (inside the arrive radius) the transport counts as docked and begins loading/unloading.",
+            LoadRate => "Cargo loaded per second at the asteroid.",
+            UnloadRate => "Cargo unloaded per second at the outpost — this is what grows the faction's refined-resources total.",
+            CargoCapacity => "Maximum cargo the transport carries per run.",
+            // --- Hull capacities (fitting budgets) ---
+            BaseMass => "The hull's own base mass, before any modules.",
+            PowerCap => "Hull power capacity — the fitting budget for module power draw.",
+            CpuCap => "Hull CPU capacity — the fitting budget for module CPU load.",
+            MassCap => "Hull mass capacity — the fitting budget for total module mass.",
+            GridDims => "Hull grid dimensions (cols × rows) — the fitting / voxel footprint.",
+            // --- Runtime telemetry (read-only) ---
+            Speed => "Read-only: current speed (velocity magnitude).",
+            Heading => "Read-only: current facing, in degrees.",
+            Health => "Read-only: flat health (unfitted bodies); shows '—' for fitted ships, which use the cell/armor/shield layers.",
+            HullStruct => "Read-only: hull structure pool (current / max).",
+            ShieldsState => "Read-only: live shields (current / max).",
+            ArmorState => "Read-only: live armor-HP (current / max).",
+            Energy => "Read-only: live energy capacitor (current / max).",
+            Heat => "Read-only: live heat (current / max); full = overheated.",
+            AfterburnerState => "Read-only: live afterburner / boost pool (current / max).",
+            Cells => "Read-only: live structural cell count — drops as the hull is carved apart.",
+        }
+    }
 }
 
 /// The displayed (short) label for a stat — the single naming reference (Phase M6e).
@@ -415,7 +615,8 @@ fn fmt(id: StatId, v: f32) -> String {
 fn render_rows(ui: &mut egui::Ui, mut rows: Vec<(StatId, String)>) {
     rows.sort_by_key(|(id, _)| *id as usize);
     for (id, v) in &rows {
-        stat(ui, label(*id), v);
+        // R28: each read-only readout gets the same hover tooltip as its slider.
+        stat(ui, label(*id), v).on_hover_text(id.desc());
     }
 }
 
@@ -559,6 +760,8 @@ fn build_equipment(fit: &Fit, catalog: Option<&ModuleCatalog>) -> (Vec<Equipment
 pub struct DevPanelState {
     pub tuning_open: bool,
     pub stats_open: bool,
+    /// Refinement 27: last result of the "Save tuning → RON" button (shown by the button).
+    pub save_status: String,
 }
 
 impl Default for DevPanelState {
@@ -566,6 +769,7 @@ impl Default for DevPanelState {
         Self {
             tuning_open: true,
             stats_open: true,
+            save_status: String::new(),
         }
     }
 }
@@ -608,7 +812,12 @@ fn drag_speed(lo: f32, hi: f32) -> f64 {
 /// unchanged (the passed `range` is just the default). The range is always widened to
 /// contain the live value so opening the panel never silently clamps a value down; min is
 /// kept ≤ max.
-fn slider(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>) {
+fn slider(
+    ui: &mut egui::Ui,
+    label: &str,
+    v: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> egui::Response {
     let id = ui.make_persistent_id(("dev_slider_limits", label));
     let (mut lo, mut hi) = ui
         .data_mut(|d| d.get_temp::<(f32, f32)>(id))
@@ -618,24 +827,48 @@ fn slider(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInc
     lo = lo.min(*v);
     hi = hi.max(*v);
     let speed = drag_speed(lo, hi);
+    // R28b: capture the SLIDER WIDGET's response (not the `horizontal` row) — egui only shows a
+    // hover tooltip when THAT response is `hovered()`, and hovering the slider marks the slider
+    // widget, not the row. The slider senses drag (incl. hover), so the tooltip fires correctly;
+    // callers chaining `.on_hover_text(...)` land on the same widget.
+    let mut slider_resp = None;
     ui.horizontal(|ui| {
         // Editable lower bound, the value slider over the live range, then the editable upper
         // bound — all on one line.
         ui.add_sized([56.0, 18.0], egui::DragValue::new(&mut lo).speed(speed));
-        ui.add(egui::Slider::new(v, lo..=hi).text(label));
+        slider_resp = Some(ui.add(egui::Slider::new(v, lo..=hi).text(label)));
         ui.add_sized([56.0, 18.0], egui::DragValue::new(&mut hi).speed(speed));
     });
+    let resp = slider_resp.expect("the slider widget was added in the horizontal layout");
     if hi < lo {
         hi = lo;
     }
     ui.data_mut(|d| d.insert_temp(id, (lo, hi)));
+    // R28: auto-attach the hover tooltip when the label is exactly a StatId short (covers the StatId
+    // tuning sliders with no call-site change). Decorated / ad-hoc callers chain `.on_hover_text(...)`.
+    let tip = desc_for_label(label);
+    if tip.is_empty() {
+        resp
+    } else {
+        resp.on_hover_text(tip)
+    }
+}
+
+/// Reverse-lookup a slider's hover tooltip from its label: if `label` is exactly a [`StatId`]'s short
+/// name, return that stat's [`StatId::desc`]; else `""` (R28). Used by [`slider`] for auto-tooltips.
+fn desc_for_label(label: &str) -> &'static str {
+    StatId::ALL
+        .iter()
+        .copied()
+        .find(|id| id.meta().short == label)
+        .map_or("", |id| id.desc())
 }
 
 /// One read-only stat row (Phase M6c-fix): the label left-padded in a fixed-width **monospace**
 /// column, then the value — so every stats group lines up in the same columns regardless of label
 /// length. Egui's default font is proportional, so the alignment relies on the monospace style.
-fn stat(ui: &mut egui::Ui, label: &str, value: impl std::fmt::Display) {
-    ui.label(egui::RichText::new(format!("{label:<16}{value}")).monospace());
+fn stat(ui: &mut egui::Ui, label: &str, value: impl std::fmt::Display) -> egui::Response {
+    ui.label(egui::RichText::new(format!("{label:<16}{value}")).monospace())
 }
 
 /// Render the read-only **Ship Stats** window body. Three groups, every one in the SAME canonical
@@ -671,7 +904,8 @@ fn render_ship_stats(ui: &mut egui::Ui, r: &ShipReadout) {
     }
     render_rows(ui, applied);
     if s.weapon.is_none() {
-        stat(ui, "weapon", format!("none (can_fire {})", s.can_fire));
+        stat(ui, "weapon", format!("none (can_fire {})", s.can_fire))
+            .on_hover_text("Read-only: this ship's weapon summary — 'none' = no fitted weapon; can_fire reflects the power/heat/cooldown gate.");
     }
 
     ui.separator();
@@ -742,7 +976,8 @@ fn render_ship_stats(ui: &mut egui::Ui, r: &ShipReadout) {
     ui.separator();
     let t = &r.totals;
     ui.label(egui::RichText::new("Equipment totals (nominal: full-health catalog sums)").strong());
-    stat(ui, "modules", format!("{}", t.count));
+    stat(ui, "modules", format!("{}", t.count))
+        .on_hover_text("Read-only: number of installed modules in this equipment group.");
     render_rows(
         ui,
         vec![
@@ -993,7 +1228,8 @@ fn dev_panel_ui(
                             ui,
                             "cruise≈",
                             format!("{:.0}", mining.thrust_force / mining.linear_drag.max(1e-3)),
-                        );
+                        )
+                        .on_hover_text("Read-only: emergent cruise speed (thrust / linear-drag) — the speed the loaded transport settles at.");
                         // Arrive / dock geometry.
                         slider(
                             ui,
@@ -1044,13 +1280,15 @@ fn dev_panel_ui(
                         &format!("{} ⟳", label(StatId::StructCellHp)),
                         &mut sim.struct_cell_hp,
                         0.5..=40.0,
-                    );
+                    )
+                    .on_hover_text(StatId::StructCellHp.desc());
                     slider(
                         ui,
                         &format!("{} ⟳", label(StatId::StructCellMass)),
                         &mut sim.struct_cell_mass,
                         0.01..=2.0,
-                    );
+                    )
+                    .on_hover_text(StatId::StructCellMass.desc());
                     slider(
                         ui,
                         label(StatId::CarveFalloff),
@@ -1072,23 +1310,27 @@ fn dev_panel_ui(
                     ui.add(
                         egui::Slider::new(&mut sim.ricochet_min_neighbors, 0..=8)
                             .text(label(StatId::RicochetMinNeighbors)),
-                    );
+                    )
+                    .on_hover_text(StatId::RicochetMinNeighbors.desc());
                     ui.add(
                         egui::Slider::new(&mut sim.smooth_normal_radius, 0..=5)
                             .text(label(StatId::SmoothNormalRadius)),
-                    );
+                    )
+                    .on_hover_text(StatId::SmoothNormalRadius.desc());
                     slider(
                         ui,
                         &format!("{} (unfitted)", label(StatId::ProjMass)),
                         &mut sim.projectile_mass,
                         0.001..=1.0,
-                    );
+                    )
+                    .on_hover_text(StatId::ProjMass.desc());
                     slider(
                         ui,
                         &format!("{} (unfitted)", label(StatId::ProjDamage)),
                         &mut sim.projectile_damage,
                         1.0..=100.0,
-                    );
+                    )
+                    .on_hover_text(StatId::ProjDamage.desc());
                     slider(
                         ui,
                         label(StatId::ProjLifetime),
@@ -1186,6 +1428,7 @@ fn dev_panel_ui(
                             egui::Slider::new(&mut deg, 0.0..=90.0)
                                 .text(format!("{} (deg)", label(StatId::RicochetAngle))),
                         )
+                        .on_hover_text(StatId::RicochetAngle.desc())
                         .changed()
                     {
                         pen.ricochet_angle = deg.to_radians();
@@ -1370,13 +1613,15 @@ fn dev_panel_ui(
                                         "{} {:?} (read-only)",
                                         label(StatId::GridDims),
                                         h.grid_dims
-                                    ));
+                                    ))
+                                    .on_hover_text(StatId::GridDims.desc());
                                     slider(
                                         ui,
                                         &format!("{} (budget axis)", label(StatId::BaseMass)),
                                         &mut h.hull_base_mass,
                                         0.1..=120.0,
-                                    );
+                                    )
+                                    .on_hover_text(StatId::BaseMass.desc());
                                     slider(
                                         ui,
                                         label(StatId::PowerCap),
@@ -1405,89 +1650,79 @@ fn dev_panel_ui(
                 // Energy readout next frame — no Apply needed (drag and watch it move).
                 egui::CollapsingHeader::new("HUD layout (client, live)").show(ui, |ui| {
                     ui.label("Bars: camera-local units (x / y / extent).");
-                    slider(ui, "Energy x", &mut hud_layout.energy.x_center, -8.0..=8.0);
-                    slider(ui, "Energy y", &mut hud_layout.energy.y_base, -8.0..=8.0);
-                    slider(
-                        ui,
-                        "Energy extent",
-                        &mut hud_layout.energy.extent,
-                        0.5..=8.0,
-                    );
-                    slider(ui, "Heat x", &mut hud_layout.heat.x_center, -8.0..=8.0);
-                    slider(ui, "Heat y", &mut hud_layout.heat.y_base, -8.0..=8.0);
-                    slider(ui, "Heat extent", &mut hud_layout.heat.extent, 0.5..=8.0);
-                    slider(
-                        ui,
-                        "Afterburner x",
-                        &mut hud_layout.afterburner.x_center,
-                        -8.0..=8.0,
-                    );
-                    slider(
-                        ui,
-                        "Afterburner y",
-                        &mut hud_layout.afterburner.y_base,
-                        -8.0..=8.0,
-                    );
-                    slider(
-                        ui,
-                        "Afterburner extent",
-                        &mut hud_layout.afterburner.extent,
-                        0.5..=8.0,
-                    );
-                    slider(ui, "Shield x", &mut hud_layout.shield.x_center, -8.0..=8.0);
-                    slider(ui, "Shield y", &mut hud_layout.shield.y_base, -8.0..=8.0);
-                    slider(
-                        ui,
-                        "Shield extent",
-                        &mut hud_layout.shield.extent,
-                        0.5..=8.0,
-                    );
-                    slider(ui, "Armor x", &mut hud_layout.armor.x_center, -8.0..=8.0);
-                    slider(ui, "Armor y", &mut hud_layout.armor.y_base, -8.0..=8.0);
-                    slider(ui, "Armor extent", &mut hud_layout.armor.extent, 0.5..=8.0);
-                    slider(ui, "Hull x", &mut hud_layout.hull.x_center, -8.0..=8.0);
-                    slider(ui, "Hull y", &mut hud_layout.hull.y_base, -8.0..=8.0);
-                    slider(ui, "Hull extent", &mut hud_layout.hull.extent, 0.5..=8.0);
+                    let bar = |ui: &mut egui::Ui, name: &str, p: &mut crate::hud_bars::BarPos| {
+                        slider(ui, &format!("{name} x"), &mut p.x_center, -8.0..=8.0)
+                            .on_hover_text(TIP_BAR_X);
+                        slider(ui, &format!("{name} y"), &mut p.y_base, -8.0..=8.0)
+                            .on_hover_text(TIP_BAR_Y);
+                        slider(ui, &format!("{name} extent"), &mut p.extent, 0.5..=8.0)
+                            .on_hover_text(TIP_BAR_EXTENT);
+                    };
+                    bar(ui, "Energy", &mut hud_layout.energy);
+                    bar(ui, "Heat", &mut hud_layout.heat);
+                    bar(ui, "Afterburner", &mut hud_layout.afterburner);
+                    bar(ui, "Shield", &mut hud_layout.shield);
+                    bar(ui, "Armor", &mut hud_layout.armor);
+                    bar(ui, "Hull", &mut hud_layout.hull);
                     ui.separator();
                     ui.label("Energy readout (viewport % / px).");
-                    slider(
-                        ui,
-                        "readout left %",
-                        &mut hud_layout.readout_left_pct,
-                        0.0..=100.0,
-                    );
-                    slider(
-                        ui,
-                        "readout width %",
-                        &mut hud_layout.readout_width_pct,
-                        0.0..=100.0,
-                    );
-                    slider(
-                        ui,
-                        "readout bottom px",
-                        &mut hud_layout.readout_bottom_px,
-                        0.0..=400.0,
-                    );
+                    slider(ui, "readout left %", &mut hud_layout.readout_left_pct, 0.0..=100.0)
+                        .on_hover_text("Energy numeric readout: left edge as % of the viewport width — line it up with the Energy bar's left edge.");
+                    slider(ui, "readout width %", &mut hud_layout.readout_width_pct, 0.0..=100.0)
+                        .on_hover_text("Energy readout row width as % of the viewport. With SpaceBetween, this sets how far right the rate sits vs the ENRG number — tune to span the bar.");
+                    slider(ui, "readout bottom px", &mut hud_layout.readout_bottom_px, 0.0..=400.0)
+                        .on_hover_text("Energy readout distance from the bottom of the screen, in pixels.");
                 });
 
                 // Refinement 25: live starfield + bloom (client-side). Editing mutates the
                 // `StarfieldTuning` ResMut directly → `update_starfield` applies it next frame.
                 egui::CollapsingHeader::new("Starfield / Bloom (client, live)").show(ui, |ui| {
-                    slider(
-                        ui,
-                        "bloom intensity",
-                        &mut starfield.bloom_intensity,
-                        0.0..=1.0,
-                    );
-                    slider(
-                        ui,
-                        "star brightness",
-                        &mut starfield.star_brightness,
-                        0.0..=4.0,
-                    );
-                    slider(ui, "star density", &mut starfield.star_density, 0.0..=1.0);
-                    slider(ui, "twinkle", &mut starfield.twinkle_amount, 0.0..=2.0);
-                    slider(ui, "layers (4-16)", &mut starfield.layer_count, 4.0..=16.0);
+                    // Global knobs. The "(all)" sliders are MASTER multipliers: final = per-layer × all.
+                    slider(ui, "bloom intensity", &mut starfield.bloom_intensity, 0.0..=1.0)
+                        .on_hover_text("Camera bloom strength — the glow on bright pixels (bright stars + emissive). Higher = more glow; keep modest so ships stay readable against the field.");
+                    slider(ui, "brightness (all)", &mut starfield.star_brightness, 0.0..=4.0)
+                        .on_hover_text("MASTER star brightness — multiplies EVERY layer (final = per-layer brightness × this). Quick whole-field dim/boost; no priority over per-layer, they multiply.");
+                    slider(ui, "density (all)", &mut starfield.star_density, 0.0..=1.0)
+                        .on_hover_text("MASTER star density — multiplies EVERY layer's density (final = per-layer density × this × clustering map). Set to 0 and the whole field empties regardless of per-layer.");
+                    slider(ui, "twinkle (all)", &mut starfield.twinkle_amount, 0.0..=2.0)
+                        .on_hover_text("MASTER twinkle — multiplies EVERY layer's twinkle (final = per-layer twinkle × this). 0 = steady (no scintillation).");
+                    slider(ui, "layers (4-16)", &mut starfield.layer_count, 4.0..=16.0)
+                        .on_hover_text("How many parallax star layers to draw (4–16). More = deeper field, slightly more GPU. The 'Layer N' rows below appear/disappear with this.");
+                    ui.separator();
+                    // Refinement 26: per-layer rows (depth/spacing/density/brightness/twinkle/size).
+                    let count = (starfield.layer_count.round() as usize).clamp(1, MAX_LAYERS);
+                    for i in 0..count {
+                        let l = &mut starfield.layers[i];
+                        egui::CollapsingHeader::new(format!("Layer {i}")).show(ui, |ui| {
+                            slider(ui, &format!("L{i} parallax"), &mut l.parallax, 0.0..=1.0)
+                                .on_hover_text(TIP_LAYER_PARALLAX);
+                            slider(ui, &format!("L{i} frequency"), &mut l.frequency, 0.05..=4.0)
+                                .on_hover_text(TIP_LAYER_FREQUENCY);
+                            slider(ui, &format!("L{i} density"), &mut l.density, 0.0..=1.0)
+                                .on_hover_text(TIP_LAYER_DENSITY);
+                            slider(ui, &format!("L{i} brightness"), &mut l.brightness, 0.0..=3.0)
+                                .on_hover_text(TIP_LAYER_BRIGHTNESS);
+                            slider(ui, &format!("L{i} twinkle"), &mut l.twinkle, 0.0..=2.0)
+                                .on_hover_text(TIP_LAYER_TWINKLE);
+                            slider(ui, &format!("L{i} size"), &mut l.size, 0.3..=4.0)
+                                .on_hover_text(TIP_LAYER_SIZE);
+                            // R29-fix: live estimate of the on-screen star radius for this `size`.
+                            // Shader: radius = max(mix(1.0,2.2,tn)*size, 1.0) px; tn=0 cool .. 1 hot,
+                            // floored at 1px. Zoom-independent.
+                            stat(
+                                ui,
+                                "  ↳ px radius",
+                                format!(
+                                    "≈ {:.1} (cool) … {:.1} (hot)",
+                                    l.size.max(1.0),
+                                    (2.2 * l.size).max(1.0)
+                                ),
+                            )
+                            .on_hover_text(
+                                "Estimated on-screen star RADIUS in pixels for this layer's size. Most stars are cool (≈ the first number); rare hot stars reach the second. Hard floor of 1px (a hard point can't be smaller), so size below ~0.45 stops shrinking them. Zoom-independent.",
+                            );
+                        });
+                    }
                 });
             });
 
@@ -1502,6 +1737,16 @@ fn dev_panel_ui(
             }
             if ui.button("Reset ALL to defaults").clicked() {
                 reset = true;
+            }
+            // Refinement 27: persist the client HUD + starfield tuning to `render_tuning.ron`.
+            if ui.button("Save HUD + Starfield → RON").clicked() {
+                state.save_status = match tuning_io::save_render_tuning(&starfield, &hud_layout) {
+                    Ok(msg) => msg,
+                    Err(e) => format!("save failed: {e}"),
+                };
+            }
+            if !state.save_status.is_empty() {
+                ui.label(&state.save_status);
             }
         });
 

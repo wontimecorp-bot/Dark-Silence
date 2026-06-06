@@ -16,6 +16,7 @@ use bevy::reflect::TypePath;
 use bevy::render::render_resource::{AsBindGroup, ShaderType};
 use bevy::shader::ShaderRef;
 use bevy::window::PrimaryWindow;
+use serde::{Deserialize, Serialize};
 
 use crate::camera::MainCamera;
 
@@ -23,7 +24,39 @@ use crate::camera::MainCamera;
 const STARFIELD_SHADER: &str = "shaders/starfield.wgsl";
 
 /// Hard cap on shader star layers — MUST match `MAX_LAYERS` in `starfield.wgsl`.
-pub const MAX_LAYERS: u32 = 16;
+pub const MAX_LAYERS: usize = 16;
+
+/// Linear interpolation helper (used for the per-layer "character" defaults: density/brightness/size).
+fn mix(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// Geometric (exponential) interpolation `a·(b/a)^t` — used for the per-layer DISTANCE SCALES
+/// (parallax + frequency) so the layers are spaced **exponentially** (each a multiplicative step in
+/// scale), per the starfield spec.
+fn geomix(a: f32, b: f32, t: f32) -> f32 {
+    a * (b / a).powf(t)
+}
+
+/// One layer's GPU parameters (Refinement 26). 8×`f32` = 32 bytes so the std140 uniform array stride
+/// is unambiguous. Field order + types MUST match `StarLayer` in the WGSL.
+#[derive(ShaderType, Clone, Copy, Default)]
+pub struct StarLayer {
+    /// Parallax factor (0 = screen-locked / infinite, →1 = world-anchored / fast).
+    pub parallax: f32,
+    /// Cell frequency (cells per world unit — spacing/density).
+    pub frequency: f32,
+    /// Fraction of candidate cells that host a star (0..1).
+    pub density: f32,
+    /// Per-layer brightness factor.
+    pub brightness: f32,
+    /// Per-layer twinkle factor.
+    pub twinkle: f32,
+    /// Per-layer star size (pixel-radius) factor.
+    pub size: f32,
+    pub _pad0: f32,
+    pub _pad1: f32,
+}
 
 /// GPU uniforms for the starfield shader. Field order + types MUST match `StarfieldParams` in the
 /// WGSL (std140-ish layout via `ShaderType`).
@@ -39,11 +72,17 @@ pub struct StarfieldParams {
     pub resolution: Vec2,
     /// Seconds since start (twinkle).
     pub time: f32,
-    /// Live tunables (see [`StarfieldTuning`]).
+    /// GLOBAL multipliers applied on top of every layer (see [`StarfieldTuning`]).
     pub star_brightness: f32,
     pub star_density: f32,
     pub twinkle_amount: f32,
+    /// How many of `layers` to draw.
     pub layer_count: u32,
+    /// Pad so `layers` starts at a 16-byte-aligned offset (44 → 48). `ShaderType` requires array
+    /// fields to be 16-aligned and does NOT auto-insert this; the WGSL auto-aligns the array to match.
+    pub _pad0: f32,
+    /// Per-layer parameters (Refinement 26); the shader reads `layers[0..layer_count]`.
+    pub layers: [StarLayer; MAX_LAYERS],
 }
 
 /// The starfield background material (one uniform block at binding 0).
@@ -62,31 +101,62 @@ impl Material for StarfieldMaterial {
     }
 }
 
+/// One layer's tunable parameters (Refinement 26) — the clean CPU-side form the dev panel edits
+/// (no GPU padding). Packed into a [`StarLayer`] for the uniform each frame.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct LayerTuning {
+    pub parallax: f32,
+    pub frequency: f32,
+    pub density: f32,
+    pub brightness: f32,
+    pub twinkle: f32,
+    pub size: f32,
+}
+
 /// Live, dev-panel-tunable starfield + bloom knobs (client-only; NOT behind the `dev_panel` feature
 /// so the apply path always compiles). `Default` = a dim backdrop + low bloom so lit ships clearly
-/// out-read the background.
-#[derive(Resource, Clone, Copy)]
+/// out-read the background, with the per-layer defaults reproducing R25's exponential 8-layer look.
+#[derive(Resource, Clone, Copy, Serialize, Deserialize)]
 pub struct StarfieldTuning {
     /// Camera bloom strength (applied to the `Bloom` component).
     pub bloom_intensity: f32,
-    /// Overall star brightness multiplier.
+    /// GLOBAL star brightness multiplier (scales every layer).
     pub star_brightness: f32,
-    /// Star density (0..1, fraction of candidate cells that host a star).
+    /// GLOBAL star density multiplier (scales every layer).
     pub star_density: f32,
-    /// Twinkle amount (0 = steady).
+    /// GLOBAL twinkle multiplier (scales every layer; 0 = steady).
     pub twinkle_amount: f32,
-    /// Parallax layer count (stored as f32 for the slider; rounded + clamped to [`MAX_LAYERS`]).
+    /// Layer count to draw (stored as f32 for the slider; rounded + clamped to [`MAX_LAYERS`]).
     pub layer_count: f32,
+    /// Per-layer parameters (depth / spacing / density / brightness / twinkle / size).
+    pub layers: [LayerTuning; MAX_LAYERS],
 }
 
 impl Default for StarfieldTuning {
     fn default() -> Self {
+        // Per-layer defaults reproduce R25's exponential formula at `fi = (i/7).min(1)`, so layers
+        // 0..7 match the current 8-layer look; 8..15 clamp to the nearest, ready to tune.
+        let layers = std::array::from_fn(|i| {
+            let fi = (i as f32 / 7.0).min(1.0);
+            LayerTuning {
+                // Distance scales spaced EXPONENTIALLY (geometric steps) — far layers nearly
+                // screen-locked + dense, near layers parallaxing + sparse.
+                parallax: geomix(0.015, 0.45, fi),
+                frequency: geomix(2.5, 0.35, fi),
+                // Per-layer character (not "spacing") — linear is fine.
+                density: mix(0.40, 0.22, fi),
+                brightness: mix(0.6, 1.0, fi),
+                twinkle: 1.0,
+                size: mix(0.9, 1.3, fi),
+            }
+        });
         Self {
             bloom_intensity: 0.15,
             star_brightness: 1.0,
             star_density: 1.0,
             twinkle_amount: 1.0,
             layer_count: 8.0,
+            layers,
         }
     }
 }
@@ -149,6 +219,20 @@ pub fn update_starfield(
         _ => std::f32::consts::FRAC_PI_4,
     };
     if let Some(mat) = materials.get_mut(&handle.0) {
+        // Pack the clean per-layer tuning into the padded GPU array (the shader reads 0..layer_count).
+        let layers = std::array::from_fn(|i| {
+            let l = tuning.layers[i];
+            StarLayer {
+                parallax: l.parallax,
+                frequency: l.frequency,
+                density: l.density,
+                brightness: l.brightness,
+                twinkle: l.twinkle,
+                size: l.size,
+                _pad0: 0.0,
+                _pad1: 0.0,
+            }
+        });
         mat.params = StarfieldParams {
             cam_pos: tf.translation.truncate(),
             height: cam.height,
@@ -158,7 +242,9 @@ pub fn update_starfield(
             star_brightness: tuning.star_brightness,
             star_density: tuning.star_density,
             twinkle_amount: tuning.twinkle_amount,
-            layer_count: (tuning.layer_count.round() as u32).clamp(1, MAX_LAYERS),
+            layer_count: (tuning.layer_count.round() as u32).clamp(1, MAX_LAYERS as u32),
+            _pad0: 0.0,
+            layers,
         };
     }
 }

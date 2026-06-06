@@ -225,7 +225,7 @@ fn seg_placement(layout: &BarLayout, i: usize) -> (f32, f32, f32, f32) {
 /// One HUD bar's tunable PLACEMENT (camera-local units at [`HUD_DEPTH`]). The bar's `shape`
 /// (segment heights / taper / count) stays fixed in [`BARS`]; only `x_center`/`y_base`/`extent` are
 /// live-editable.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct BarPos {
     pub x_center: f32,
     pub y_base: f32,
@@ -237,7 +237,7 @@ pub struct BarPos {
 /// readout). [`Default`] mirrors the hardcoded [`BARS`] + the Energy-readout defaults, so with the
 /// `dev_panel` feature compiled out (the resource never changes) the HUD sits exactly where it always
 /// did — determinism/behaviour unchanged.
-#[derive(Resource, Clone, Copy)]
+#[derive(Resource, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct HudLayout {
     pub energy: BarPos,
     pub heat: BarPos,

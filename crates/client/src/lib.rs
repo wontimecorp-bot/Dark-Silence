@@ -41,6 +41,7 @@ pub mod radar;
 pub mod render_sync;
 pub mod scene;
 pub mod starfield;
+pub mod tuning_io;
 
 use bevy::prelude::*;
 use fitting_ui::{FittingScreenState, FittingUiPlugin};
@@ -89,6 +90,10 @@ pub fn run() -> AppExit {
         );
     }
 
+    // Refinement 27: load the persisted Starfield + HUD tuning from `render_tuning.ron` (code
+    // defaults if absent/unparseable) and insert both resources below.
+    let render_tuning = tuning_io::load_render_tuning();
+
     let mut app = App::new();
     app.add_plugins(DefaultPlugins)
         // Refinement 25: the procedural starfield background material (custom WGSL shader).
@@ -108,9 +113,10 @@ pub fn run() -> AppExit {
         .init_resource::<net::ModuleColorMode>()
         // Refinement 24: live-tunable HUD bar/readout layout (the dev panel edits it; default = the
         // hardcoded positions). Present even without the dev panel → the HUD sits at its defaults.
-        .init_resource::<hud_bars::HudLayout>()
-        // Refinement 25: live starfield + bloom tuning (dev panel edits it; applied each frame).
-        .init_resource::<starfield::StarfieldTuning>()
+        // Refinement 24/25/27: the live HUD + starfield tuning, loaded from `render_tuning.ron`
+        // (the dev panel edits them; its Save button writes them back). Code defaults if no file.
+        .insert_resource(render_tuning.hud)
+        .insert_resource(render_tuning.starfield)
         // Refinement 21/22: load the shared HUD fonts (label + mono) + icon images into
         // `FontAssets`/`IconAssets` BEFORE the Startup HUD setups, which clone the handles.
         .add_systems(PreStartup, fonts::load_hud_assets)

@@ -10,6 +10,19 @@
 
 #import bevy_pbr::forward_io::VertexOutput
 
+// One layer's parameters (Refinement 26). Order/types MUST match `StarLayer` in starfield.rs
+// (8 floats = 32-byte uniform array stride).
+struct StarLayer {
+    parallax: f32,
+    frequency: f32,
+    density: f32,
+    brightness: f32,
+    twinkle: f32,
+    size: f32,
+    pad0: f32,
+    pad1: f32,
+}
+
 struct StarfieldParams {
     cam_pos: vec2<f32>,
     height: f32,
@@ -20,6 +33,10 @@ struct StarfieldParams {
     star_density: f32,
     twinkle_amount: f32,
     layer_count: u32,
+    // Pad so `layers` is 16-aligned (offset 44 → 48), matching the Rust `_pad0`. WGSL/naga does not
+    // auto-pad before a uniform array field.
+    pad0: f32,
+    layers: array<StarLayer, 16>,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> params: StarfieldParams;
@@ -40,47 +57,63 @@ fn hash22(p: vec2<f32>) -> vec2<f32> {
     return fract((p3.xx + p3.yz) * p3.zy);
 }
 
-// Smooth value noise — the low-frequency density map (galactic bands / voids).
-fn vnoise(p: vec2<f32>) -> f32 {
-    let i = floor(p);
+// Worley / cellular F1 noise: distance (≈0..1) to the nearest of one jittered feature point per
+// cell. Used as the star DENSITY MAP — cellular clustering (clumps near features, voids between).
+fn worley(p: vec2<f32>) -> f32 {
+    let cell = floor(p);
     let f = fract(p);
-    let u = f * f * (3.0 - 2.0 * f);
-    let a = hash21(i);
-    let b = hash21(i + vec2<f32>(1.0, 0.0));
-    let c = hash21(i + vec2<f32>(0.0, 1.0));
-    let d = hash21(i + vec2<f32>(1.0, 1.0));
-    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-}
-
-// Blackbody-ish color across the stellar sequence: t=0 -> M (cool red), t=1 -> O (hot blue).
-fn star_color(t: f32) -> vec3<f32> {
-    let cool = vec3<f32>(1.0, 0.55, 0.35); // M / K  (red-orange)
-    let mid = vec3<f32>(1.0, 0.96, 0.88);  // G / F  (white)
-    let hot = vec3<f32>(0.70, 0.80, 1.0);  // B / O  (blue)
-    if (t < 0.5) {
-        return mix(cool, mid, t * 2.0);
+    var d = 1.0;
+    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+        for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+            let g = vec2<f32>(f32(dx), f32(dy));
+            let feat = g + hash22(cell + g);
+            d = min(d, length(f - feat));
+        }
     }
-    return mix(mid, hot, (t - 0.5) * 2.0);
+    return d;
 }
 
-// One layer's accumulated star color.
+// Blackbody temperature (Kelvin) → linear-ish RGB (Tanner-Helland piecewise, /255-normalized; valid
+// ~1000–40000K). Gives the real stellar-class colors: ~3000K red (M) → ~30000K blue (O).
+fn blackbody(kelvin: f32) -> vec3<f32> {
+    let t = clamp(kelvin, 1000.0, 40000.0) / 100.0;
+    var r: f32;
+    var g: f32;
+    var b: f32;
+    if (t <= 66.0) {
+        r = 1.0;
+        g = clamp(0.39008157876902 * log(t) - 0.63184144378961, 0.0, 1.0);
+    } else {
+        r = clamp(1.29293618606274 * pow(t - 60.0, -0.1332047592), 0.0, 1.0);
+        g = clamp(1.12989086089529 * pow(t - 60.0, -0.0755148492), 0.0, 1.0);
+    }
+    if (t >= 66.0) {
+        b = 1.0;
+    } else if (t <= 19.0) {
+        b = 0.0;
+    } else {
+        b = clamp(0.54320678911019 * log(t - 10.0) - 1.19625408914, 0.0, 1.0);
+    }
+    return vec3<f32>(r, g, b);
+}
+
+// One layer's accumulated star color. Per-layer parameters come from `layer` (Refinement 26).
 fn star_layer(
     world: vec2<f32>,
     cam: vec2<f32>,
-    pf: f32,
-    freq: f32,
+    layer: StarLayer,
     px_per_world: f32,
-    fi: f32,
-    layer_bright: f32,
     seed: f32,
     dmap: f32,
 ) -> vec3<f32> {
+    let pf = layer.parallax;
+    let freq = layer.frequency;
     // Parallax sample coordinate: far layers (pf~0) are screen-locked; near layers world-anchored.
     let s = world - cam * (1.0 - pf);
     let q = s * freq + vec2<f32>(seed, seed * 1.7);
     let cell = floor(q);
-    // Fraction of candidate cells that host a star (far layers denser), modulated by the density map.
-    let dens = mix(0.40, 0.22, fi) * params.star_density * dmap;
+    // Fraction of candidate cells that host a star, modulated by the global density + the density map.
+    let dens = layer.density * params.star_density * dmap;
 
     var col = vec3<f32>(0.0);
     for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
@@ -96,10 +129,12 @@ fn star_layer(
             let d_cells = length(q - star_q);
             let px = d_cells / freq * px_per_world; // distance to the star in PIXELS
 
-            // Temperature weighted toward cool (M most common, O rarest).
+            // Stellar class, weighted toward cool (M most common, O rarest): `tn` 0..1, then the
+            // real blackbody temperature M≈3000K (red) → O≈30000K (blue).
             let th = hash21(cid * 4.13 + seed + 9.1);
-            let temp = pow(th, 3.0);
-            let radius = max(mix(1.0, 2.2, temp) * mix(0.9, 1.3, fi), 1.0); // pixels
+            let tn = pow(th, 3.0);
+            let temp_k = mix(3000.0, 30000.0, tn);
+            let radius = max(mix(1.0, 2.2, tn) * layer.size, 1.0); // pixels
             // HARD point: lit iff within radius_px (no smoothstep / no AA).
             if (step(px, radius) < 0.5) {
                 continue;
@@ -111,11 +146,11 @@ fn star_layer(
             let raw = 0.5 * sin(t * 1.3 + phase)
                 + 0.3 * sin(t * 2.1 + phase * 1.7)
                 + 0.2 * sin(t * 3.7 + phase * 2.3);
-            let amp = mix(1.0, 0.4, temp); // cool/dim stars scintillate more, hot/bright steadier
-            let tw = clamp(0.6 + 0.4 * raw * params.twinkle_amount * amp, 0.0, 1.6);
+            let amp = mix(1.0, 0.4, tn); // cool/dim stars scintillate more, hot/bright steadier
+            let tw = clamp(0.6 + 0.4 * raw * params.twinkle_amount * layer.twinkle * amp, 0.0, 1.6);
 
-            let bright = mix(0.5, 2.2, temp) * layer_bright; // hot brighter; >1 => HDR bloom
-            col = col + star_color(temp) * bright * tw;
+            let bright = mix(0.5, 2.2, tn) * layer.brightness; // hot brighter; >1 => HDR bloom
+            col = col + blackbody(temp_k) * bright * tw;
         }
     }
     return col;
@@ -136,19 +171,16 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let world = params.cam_pos + vec2<f32>(ndc.x * half_w, -ndc.y * half_h);
     let px_per_world = res.y / (2.0 * half_h);
 
-    // Low-frequency clustering field (never fully empty).
-    let dmap = 0.35 + 0.65 * vnoise(world * 0.02);
+    // Cellular (Worley) density map: high near cell feature points → star clumps, low in voids
+    // (kept off zero so voids aren't fully empty).
+    let dmap = 0.30 + 0.70 * (1.0 - worley(world * 0.03));
 
     let n = clamp(params.layer_count, 1u, MAX_LAYERS);
-    let denom = f32(max(n - 1u, 1u));
     var col = vec3<f32>(0.0);
     for (var i: u32 = 0u; i < n; i = i + 1u) {
-        let fi = f32(i) / denom;            // 0 (farthest) .. 1 (nearest)
-        let pf = mix(0.015, 0.45, fi);      // parallax factor (far ~ screen-locked)
-        let freq = mix(2.5, 0.35, fi);      // cells/world (far denser/smaller spacing)
-        let lb = mix(0.6, 1.0, fi);         // near layers a touch brighter
         let seed = f32(i) * 13.7;
-        col = col + star_layer(world, params.cam_pos, pf, freq, px_per_world, fi, lb, seed, dmap);
+        let layer = params.layers[i]; // per-layer depth/spacing/density/brightness/twinkle/size
+        col = col + star_layer(world, params.cam_pos, layer, px_per_world, seed, dmap);
     }
 
     col = col * params.star_brightness;

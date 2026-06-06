@@ -24,6 +24,10 @@ server = { path = "../server" }
 glam = { workspace = true }
 earcutr = "0.5.0"
 bevy_egui = { version = "0.39.1", optional = true }
+# Refinement 27: persist the client render tuning (Starfield + HUD) to a hand-editable RON file
+# (load at startup + a dev-panel Save button), mirroring the sim content-RON pattern.
+serde = { workspace = true }
+ron = { workspace = true }
 
 [features]
 # Default-ON for the solo windowed client: the live dev tuning panel (Phase M6).
