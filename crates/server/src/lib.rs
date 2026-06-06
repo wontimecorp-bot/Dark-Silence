@@ -41,8 +41,8 @@ use protocol::{
 };
 use sim::components::{
     AngularVelocity, CollisionRadius, CombatRules, DamageFlash, Destructible, Faction,
-    FlightAssist, Heading, Health, LastShieldHit, MeshAnchor, Position, Projectile, RenderScale,
-    ShieldHitFlash, Ship, Target, TargetKind, Velocity, Weapon,
+    FlightAssist, Heading, Health, LastShieldHit, MeshAnchor, Position, PrevPosition, Projectile,
+    ProjectileOwner, RenderScale, ShieldHitFlash, Ship, Target, TargetKind, Velocity, Weapon,
 };
 use sim::damage::{
     default_resistance_matrix, seed_defense_layers, PenetrationConfig, SalvageConfig, ShieldConfig,
@@ -286,6 +286,12 @@ pub struct RenderEntity {
     /// size is data-driven (`assets/content/scenario.ron`). `ONE` for every other entity. Never on
     /// the wire.
     pub scale: Vec3,
+    /// Refinement 19 (**client-only / in-process**): for a PROJECTILE, the velocity it inherited
+    /// from its shooter (looked up via [`ProjectileOwner`] → the owner's `Velocity`). The client
+    /// uses it to lag-match the bullet's FIRST rendered frame to the (interpolated, one-tick-lagging)
+    /// ship, so the shot emerges glued to the gun instead of sliding sideways at spawn. `Vec2::ZERO`
+    /// for every non-projectile entity (and a projectile whose owner is gone). Never on the wire.
+    pub inherited_vel: Vec2,
 }
 
 /// The [`RenderEntity::shield_frac`] of an optional [`Shields`]: `current / max`
@@ -1221,18 +1227,43 @@ impl ServerApp {
                 mesh_anchor: None,
                 faction: factions.get(&entity).copied().unwrap_or(0),
                 scale: render_scales.get(&entity).copied().unwrap_or(Vec3::ONE),
+                // Ships are interpolated normally; only projectiles use the inherited-velocity seed.
+                inherited_vel: Vec2::ZERO,
             });
         }
 
         // Projectiles (heading derived from velocity direction) — no shield, no flash.
-        let mut projectiles = self
-            .world
-            .query_filtered::<(Entity, &Position, &Velocity), With<Projectile>>();
-        let proj_rows: Vec<(Entity, Vec2, Vec2)> = projectiles
+        let mut projectiles = self.world.query_filtered::<(
+            Entity,
+            &PrevPosition,
+            &Velocity,
+            Option<&ProjectileOwner>,
+        ), With<Projectile>>();
+        // Refinement 17: render a projectile at the TAIL of its current swept segment
+        // (`PrevPosition` = `Position − Velocity·dt`, and exactly the muzzle on the spawn
+        // tick) rather than its leading `Position`. `weapon_fire_system` runs before
+        // `projectile_step_system` in the same chained tick, so a fresh projectile's
+        // `Position` is already one tick AHEAD of the muzzle; rendering that leading edge
+        // puts the bullet one interpolation tick ahead of the (interpolated, lagging) ship,
+        // which shows up as a constant drift-direction sideways offset at the muzzle.
+        // Rendering the tail puts it in the SAME interpolation phase as the ship → it leaves
+        // from the centre and carries the inherited drift straight downrange. Render-only
+        // (this is the client render readout, off the wire — `full_records` still uses
+        // `Position`), so determinism/snapshots are unaffected.
+        let proj_rows: Vec<(Entity, Vec2, Vec2, Option<Entity>)> = projectiles
             .iter(&self.world)
-            .map(|(e, p, v)| (e, p.0, v.0))
+            .map(|(e, prev, v, owner)| (e, prev.0, v.0, owner.map(|o| o.0)))
             .collect();
-        for (entity, pos, vel) in proj_rows {
+        for (entity, pos, vel, owner) in proj_rows {
+            // Refinement 19: the velocity the shot inherited from its shooter ≈ the owner's current
+            // velocity (it was just fired). The client lag-matches the bullet's FIRST rendered frame
+            // to the (interpolated, one-tick-lagging) ship with it, so the shot emerges glued to the
+            // gun instead of sliding `drift·dt` sideways at spawn. `ZERO` if the owner is gone (or a
+            // turret with no `Velocity`) → the client falls back to the small static-seed jog.
+            let inherited_vel = owner
+                .and_then(|o| self.world.get::<Velocity>(o))
+                .map(|v| v.0)
+                .unwrap_or(Vec2::ZERO);
             out.push(RenderEntity {
                 id: self.entity_ids.id_for(entity),
                 kind: EntityKind::Projectile,
@@ -1250,6 +1281,7 @@ impl ServerApp {
                 mesh_anchor: None,
                 faction: factions.get(&entity).copied().unwrap_or(0),
                 scale: render_scales.get(&entity).copied().unwrap_or(Vec3::ONE),
+                inherited_vel,
             });
         }
 
@@ -1379,6 +1411,7 @@ impl ServerApp {
                 mesh_anchor: None,
                 faction: factions.get(&entity).copied().unwrap_or(0),
                 scale: render_scales.get(&entity).copied().unwrap_or(Vec3::ONE),
+                inherited_vel: Vec2::ZERO,
             });
         }
 
@@ -1467,6 +1500,7 @@ impl ServerApp {
                 // Wreckage keeps its faction tint (a destroyed outpost/transport stays its colour).
                 faction: factions.get(&entity).copied().unwrap_or(0),
                 scale: render_scales.get(&entity).copied().unwrap_or(Vec3::ONE),
+                inherited_vel: Vec2::ZERO,
             });
         }
 

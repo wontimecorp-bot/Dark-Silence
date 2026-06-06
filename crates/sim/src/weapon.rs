@@ -249,10 +249,15 @@ pub fn weapon_fire_system(
             // velocity, so a moving ship's shots carry its motion (a true Newtonian gun).
             let muzzle = Vec2::from_angle(heading.0) * profile.muzzle_speed;
             let vel = muzzle + ship_vel.0;
+            // Refinement 18: spawn at the installed gun's world position — the body-frame
+            // `muzzle_offset` (derived from the weapon's grid cell) rotated by the ship's heading —
+            // so the shot leaves from the actual weapon cell, not the ship centre. The velocity
+            // (muzzle direction + inherited ship velocity) and recoil are unchanged.
+            let spawn = pos.0 + Vec2::from_angle(heading.0).rotate(profile.muzzle_offset);
             commands.spawn((
                 Projectile,
-                Position(pos.0),
-                PrevPosition(pos.0),
+                Position(spawn),
+                PrevPosition(spawn),
                 Velocity(vel),
                 Damage(profile.damage),
                 // Phase M5: the per-weapon slug mass, carried to the hit for the impulse.

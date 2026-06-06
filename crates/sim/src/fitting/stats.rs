@@ -27,11 +27,12 @@
 //! semantics so a round-trip compares equal.
 
 use bevy_ecs::component::Component;
+use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
 use super::content::{ModuleCatalog, STRUCT_CELL_MASS};
 use super::fit::Fit;
-use super::hull::Hull;
+use super::hull::{Hull, CELL_WORLD_SIZE};
 use super::layout::{layout_mass_with, CellOccupant, FitLayout};
 use super::module::{Module, ModuleKind, ModuleSpecifics};
 use crate::damage::{Channel, StatScalingConfig, DEFAULT_SHIELD_HP, DEFAULT_SHIELD_REGEN};
@@ -79,6 +80,12 @@ pub struct WeaponProfile {
     /// ship's [`Heat`](crate::components::Heat) pool when firing; not health-scaled (a physical
     /// property, like `projectile_mass`).
     pub heat: f32,
+    /// Refinement 18 — the firing weapon cell's BODY-FRAME muzzle offset from the hull grid
+    /// centre (row → forward `+x`, col → lateral `+y`, × [`CELL_WORLD_SIZE`]), so the shot spawns
+    /// at the actual installed-gun location (rotated by the ship's `Heading`) instead of the ship
+    /// centre. `Vec2::ZERO` for a centred/legacy weapon. Render/feel only — does not change the
+    /// shot's velocity or damage.
+    pub muzzle_offset: Vec2,
 }
 
 /// The fit-derived effective stats for a ship — the per-entity flight + weapon
@@ -363,6 +370,23 @@ pub fn derive_ship_stats_with(
                 projectile_mass,
                 .. // `class`/`ammo`/`secondary_damage_type` are not consumed by derivation yet.
             } if module.kind == ModuleKind::Weapon && weapon.is_none() && hf > 0.0 => {
+                // Refinement 18 — the firing weapon's grid cell → BODY-FRAME muzzle offset so the
+                // shot spawns at the installed gun, not the ship centre. Convention matches the
+                // client hull mesh: row → forward (`+x`), col → lateral (`+y`), measured from the
+                // grid centre `(cols·0.5, rows·0.5)`. The cell is the alive layout cell carrying
+                // this weapon slot (the same one `hf` was read from).
+                let muzzle_offset = layout
+                    .cells
+                    .iter()
+                    .find(|(_, o)| o.slot == *slot_id && o.module.is_some())
+                    .map(|(cell, _)| {
+                        let (cols, rows) = hull.grid_dims;
+                        Vec2::new(
+                            ((cell.1 as f32 + 0.5) - rows as f32 * 0.5) * CELL_WORLD_SIZE,
+                            ((cell.0 as f32 + 0.5) - cols as f32 * 0.5) * CELL_WORLD_SIZE,
+                        )
+                    })
+                    .unwrap_or(Vec2::ZERO);
                 weapon = Some(WeaponProfile {
                     channel: damage_type,
                     muzzle_speed,
@@ -371,6 +395,7 @@ pub fn derive_ship_stats_with(
                     // The slug's mass + per-shot heat are physical properties — NOT health-scaled.
                     projectile_mass,
                     heat: module.heat,
+                    muzzle_offset,
                 });
             }
             // Armor plates contribute their nominal `armor_value` to the depleting ArmorHp pool's

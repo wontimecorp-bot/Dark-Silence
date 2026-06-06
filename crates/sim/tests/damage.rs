@@ -2477,7 +2477,13 @@ fn spawn_fitted_player_aimed(w: &mut World, pos: Vec2, aim_at: Vec2) -> Entity {
 
     // Heading points from the player toward the target, so the fixed forward weapon
     // (which fires along `Vec2::from_angle(heading)`) sends rounds straight at it.
-    let heading = (aim_at - pos).to_angle();
+    // R18 spawns the shot at the GUN (the weapon cell, offset from the ship centre), so aim the
+    // GUN — not the centre — at the target; a centre-aimed burst would ride parallel to and miss
+    // the core. One correction step converges (the muzzle offset ≪ the firing range).
+    let muzzle_off = stats.weapon.map(|p| p.muzzle_offset).unwrap_or(Vec2::ZERO);
+    let h0 = (aim_at - pos).to_angle();
+    let gun = pos + Vec2::from_angle(h0).rotate(muzzle_off);
+    let heading = (aim_at - gun).to_angle();
 
     w.spawn((
         Ship,

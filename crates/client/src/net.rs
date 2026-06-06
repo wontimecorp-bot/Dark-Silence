@@ -739,9 +739,19 @@ fn spawn_render_entity(
                 kind: e.kind,
             },
             RenderInterp {
-                // `prev` one tick back (the muzzle for a fresh projectile) so the
-                // first rendered frame interpolates out from the ship.
-                prev_pos: e.pos - e.vel * dt,
+                // A fresh PROJECTILE is captured at its swept-segment tail (`PrevPosition` = the gun
+                // muzzle on the spawn tick, R17). Seed its `prev` one tick of the SHOOTER'S velocity
+                // behind the muzzle (`inherited_vel`, R19) so its first overstep LAG-MATCHES the
+                // (interpolated, one-tick-lagging) ship: it stays glued to the gun for that frame
+                // (`bullet − ship_centre = gun_offset`, constant) and then launches straight forward,
+                // with no perpendicular "L" slide at speed. (Seeding plain `e.pos` left a `drift·dt`
+                // sideways jog; `e.pos − e.vel·dt` drew a phantom a full muzzle-tick behind.) Other
+                // kinds keep the one-tick back-seed so a newly-seen mover eases in.
+                prev_pos: if e.kind == EntityKind::Projectile {
+                    e.pos - e.inherited_vel * dt
+                } else {
+                    e.pos - e.vel * dt
+                },
                 curr_pos: e.pos,
                 prev_heading: e.heading,
                 curr_heading: e.heading,
