@@ -11,13 +11,18 @@ use sim::components::{Energy, FlightAssist, Ship, Velocity};
 use sim::damage::HitKind;
 use sim::{HitFeedback, RefinedResources};
 
-use crate::fonts::FontAssets;
+use crate::fonts::{FontAssets, IconAssets};
+use crate::hud_bars::HudLayout;
 use crate::net::{LoopbackHost, NetClientState};
 
 /// Shared HUD text tint (the SPD line + the Energy readouts).
 const HUD_BLUE: Color = Color::srgb(0.80, 0.90, 1.0);
 /// The mining-skirmish score line tint.
 const SCORE_WHITE: Color = Color::srgb(0.92, 0.92, 0.96);
+/// Energy net-rate trend colours (the arrow icon + number): green charging / red draining / dim steady.
+const RATE_GREEN: Color = Color::srgb(0.30, 0.90, 0.35);
+const RATE_RED: Color = Color::srgb(0.95, 0.35, 0.25);
+const RATE_DIM: Color = Color::srgb(0.60, 0.60, 0.65);
 
 /// Marker for the readout text node.
 #[derive(Component)]
@@ -113,11 +118,19 @@ pub fn update_score_hud(
 #[derive(Component)]
 pub struct BarLabel;
 
-/// The Energy net-rate readout next to the ENRG number (Phase F): an ASCII direction glyph (`^`
-/// charging / `v` draining / `~` ≈0 — the default font has no triangle glyphs) + the signed
-/// per-second rate, coloured green (charging) / red (draining) / dim (≈0).
+/// The Energy numeric readout row (the whole `ENRG …  ▲ +N` line). Repositioned from [`HudLayout`]
+/// by [`apply_readout_layout`]; `ENRG` pins to its left edge, the rate group to its right.
 #[derive(Component)]
-pub struct BarRate;
+pub struct EnergyReadoutRow;
+
+/// The Energy net-rate ARROW icon (Refinement 24): an up-triangle image, tinted green (charging) /
+/// red (draining), flipped (`flip_y`) to point down for draining, hidden when steady.
+#[derive(Component)]
+pub struct RateIcon;
+
+/// The Energy net-rate signed NUMBER beside [`RateIcon`] (mono; green/red/dim with the trend).
+#[derive(Component)]
+pub struct RateNumber;
 
 /// An unlit segment's colour (dim, so the lit portion reads as the level). Shared with the
 /// Phase F trapezoid bars ([`crate::hud_bars`]).
@@ -192,19 +205,30 @@ pub fn setup_hud(mut commands: Commands, fonts: Res<FontAssets>) {
 /// Spawn the **Energy numeric + net-rate** text readout (the Energy BAR itself is a camera-anchored
 /// trapezoid mesh in [`crate::hud_bars`]). A compact row anchored at the bottom, left-of-centre so it
 /// floats just above the Energy bar in the bottom EHA row. (Position is a first-pass guess — tunable.)
-pub fn setup_energy_bars(mut commands: Commands, fonts: Res<FontAssets>) {
+pub fn setup_energy_bars(
+    mut commands: Commands,
+    fonts: Res<FontAssets>,
+    icons: Res<IconAssets>,
+    layout: Res<HudLayout>,
+) {
+    // The row SPANS the bar (`SpaceBetween`): `ENRG cur/max` pins to the left edge, the rate group to
+    // the right. Position comes from the live `HudLayout` (kept in sync by `apply_readout_layout`).
     commands
-        .spawn(Node {
-            position_type: PositionType::Absolute,
-            bottom: Val::Px(46.0),
-            left: Val::Percent(24.0),
-            flex_direction: FlexDirection::Row,
-            align_items: AlignItems::Center,
-            column_gap: Val::Px(8.0),
-            ..default()
-        })
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                bottom: Val::Px(layout.readout_bottom_px),
+                left: Val::Percent(layout.readout_left_pct),
+                width: Val::Percent(layout.readout_width_pct),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::SpaceBetween,
+                ..default()
+            },
+            EnergyReadoutRow,
+        ))
         .with_children(|row| {
-            // ENRG: "ENRG "(label) <cur>(mono) "/"(label) <max>(mono).
+            // ENRG (LEFT): "ENRG "(label) <cur>(mono) "/"(label) <max>(mono).
             row.spawn((
                 Text::new("ENRG "),
                 TextFont {
@@ -244,26 +268,39 @@ pub fn setup_energy_bars(mut commands: Commands, fonts: Res<FontAssets>) {
                     TextColor(HUD_BLUE),
                 ));
             });
-            // Rate: "{glyph} "(label) <rate>(mono), tinted green/red/dim each frame.
-            row.spawn((
-                Text::new("~ "),
-                TextFont {
-                    font: fonts.label.clone(),
-                    font_size: 13.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(0.6, 0.6, 0.65)),
-                BarRate,
-            ))
-            .with_children(|p| {
-                p.spawn((
-                    TextSpan::new(String::new()),
+            // Rate (RIGHT): an up/down arrow ICON + the signed number (mono), driven each frame by
+            // `update_energy_hud` (green charging / red draining, flipped down for draining, hidden +
+            // dim "0" when steady).
+            row.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(4.0),
+                ..default()
+            })
+            .with_children(|rate| {
+                rate.spawn((
+                    ImageNode {
+                        image: icons.rate_arrow.clone(),
+                        color: RATE_DIM,
+                        ..default()
+                    },
+                    Node {
+                        width: Val::Px(12.0),
+                        height: Val::Px(12.0),
+                        ..default()
+                    },
+                    Visibility::Hidden,
+                    RateIcon,
+                ));
+                rate.spawn((
+                    Text::new("0"),
                     TextFont {
                         font: fonts.mono.clone(),
                         font_size: 13.0,
                         ..default()
                     },
-                    TextColor(Color::srgb(0.6, 0.6, 0.65)),
+                    TextColor(RATE_DIM),
+                    RateNumber,
                 ));
             });
         });
@@ -276,7 +313,8 @@ pub fn update_energy_hud(
     host: Option<NonSend<LoopbackHost>>,
     net: Option<NonSend<NetClientState>>,
     label_root: Query<Entity, With<BarLabel>>,
-    rate_root: Query<Entity, With<BarRate>>,
+    num_root: Query<Entity, With<RateNumber>>,
+    mut rate_icon: Query<(&mut Visibility, &mut ImageNode), With<RateIcon>>,
     mut writer: TextUiWriter,
 ) {
     // Resolve the local ship's Energy pool (None until it exists / is fitted).
@@ -311,20 +349,40 @@ pub fn update_energy_hud(
         }
     }
 
-    // Energy net-rate readout: an ASCII direction glyph (label) + the signed rate (mono), tinted
-    // green (charging) / red (draining) / dim (≈0) on BOTH spans so the trend reads at a glance.
-    // ASCII `^`/`v`/`~` because no triangle glyphs are guaranteed across faces.
-    if let Ok(e) = rate_root.single() {
-        let (glyph, col, num) = match erate {
-            Some(r) if r > 1.0 => ("^", Color::srgb(0.30, 0.90, 0.35), format!("+{r:.0}")),
-            Some(r) if r < -1.0 => ("v", Color::srgb(0.95, 0.35, 0.25), format!("{r:.0}")),
-            Some(r) => ("~", Color::srgb(0.60, 0.60, 0.65), format!("{r:+.0}")),
-            None => ("~", Color::srgb(0.60, 0.60, 0.65), String::new()),
-        };
-        *writer.text(e, 0) = format!("{glyph} ");
-        *writer.text(e, 1) = num;
+    // Energy net-rate trend (Refinement 24): an up/down ARROW icon + the signed rate (mono). Green
+    // pointing up while charging, red flipped down while draining; HIDDEN when steady (≈0), leaving a
+    // dim "0".
+    let (vis, flip, col, num) = match erate {
+        Some(r) if r > 1.0 => (Visibility::Visible, false, RATE_GREEN, format!("+{r:.0}")),
+        Some(r) if r < -1.0 => (Visibility::Visible, true, RATE_RED, format!("{r:.0}")),
+        Some(_) => (Visibility::Hidden, false, RATE_DIM, "0".to_string()),
+        None => (Visibility::Hidden, false, RATE_DIM, String::new()),
+    };
+    if let Ok((mut v, mut img)) = rate_icon.single_mut() {
+        *v = vis;
+        img.flip_y = flip;
+        img.color = col;
+    }
+    if let Ok(e) = num_root.single() {
+        *writer.text(e, 0) = num;
         *writer.color(e, 0) = TextColor(col);
-        *writer.color(e, 1) = TextColor(col);
+    }
+}
+
+/// Keep the Energy numeric readout row positioned from the live [`HudLayout`] (the dev panel edits
+/// it). Runs only when `HudLayout` changed (the initial [`setup_energy_bars`] already used the
+/// defaults). See also [`crate::hud_bars::apply_bar_layout`] for the mesh bars.
+pub fn apply_readout_layout(
+    layout: Res<HudLayout>,
+    mut row: Query<&mut Node, With<EnergyReadoutRow>>,
+) {
+    if !layout.is_changed() {
+        return;
+    }
+    if let Ok(mut node) = row.single_mut() {
+        node.left = Val::Percent(layout.readout_left_pct);
+        node.width = Val::Percent(layout.readout_width_pct);
+        node.bottom = Val::Px(layout.readout_bottom_px);
     }
 }
 

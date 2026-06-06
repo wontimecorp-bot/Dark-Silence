@@ -68,6 +68,7 @@ pub struct TrapSegment {
 }
 
 /// The geometry of a bar's segments.
+#[derive(Clone, Copy)]
 enum Shape {
     /// Horizontal row whose segment HEIGHTS ramp short→tall along `+x`. `double` = the heat
     /// double-ramp (resets to `min_h` at the midpoint, an obvious 50% landmark).
@@ -218,6 +219,123 @@ fn seg_placement(layout: &BarLayout, i: usize) -> (f32, f32, f32, f32) {
             let y = layout.y_base + i as f32 * spacing;
             (layout.x_center, y, width, spacing * SEG_FILL)
         }
+    }
+}
+
+/// One HUD bar's tunable PLACEMENT (camera-local units at [`HUD_DEPTH`]). The bar's `shape`
+/// (segment heights / taper / count) stays fixed in [`BARS`]; only `x_center`/`y_base`/`extent` are
+/// live-editable.
+#[derive(Clone, Copy)]
+pub struct BarPos {
+    pub x_center: f32,
+    pub y_base: f32,
+    pub extent: f32,
+}
+
+/// Live-tunable HUD layout (Refinement 24, client-only). Edited in the dev panel, applied each frame
+/// by [`apply_bar_layout`] (the bars) + [`crate::hud::apply_readout_layout`] (the Energy numeric
+/// readout). [`Default`] mirrors the hardcoded [`BARS`] + the Energy-readout defaults, so with the
+/// `dev_panel` feature compiled out (the resource never changes) the HUD sits exactly where it always
+/// did — determinism/behaviour unchanged.
+#[derive(Resource, Clone, Copy)]
+pub struct HudLayout {
+    pub energy: BarPos,
+    pub heat: BarPos,
+    pub afterburner: BarPos,
+    pub shield: BarPos,
+    pub armor: BarPos,
+    pub hull: BarPos,
+    /// Energy numeric readout row (screen-space): left edge + width as % of the viewport, bottom px.
+    pub readout_left_pct: f32,
+    pub readout_width_pct: f32,
+    pub readout_bottom_px: f32,
+}
+
+impl Default for HudLayout {
+    fn default() -> Self {
+        // Mirrors `BARS` (the EHA row + the SAH stacks) and the Energy readout's split placement.
+        let y_base = -4.6;
+        Self {
+            energy: BarPos {
+                x_center: -3.4,
+                y_base,
+                extent: 3.0,
+            },
+            heat: BarPos {
+                x_center: 0.4,
+                y_base,
+                extent: 3.6,
+            },
+            afterburner: BarPos {
+                x_center: 4.4,
+                y_base,
+                extent: 3.2,
+            },
+            shield: BarPos {
+                x_center: -6.3,
+                y_base,
+                extent: 2.5,
+            },
+            armor: BarPos {
+                x_center: -5.8,
+                y_base,
+                extent: 2.5,
+            },
+            hull: BarPos {
+                x_center: -5.3,
+                y_base,
+                extent: 2.5,
+            },
+            readout_left_pct: 24.0,
+            readout_width_pct: 14.0,
+            readout_bottom_px: 46.0,
+        }
+    }
+}
+
+impl HudLayout {
+    /// The live placement for `bar`.
+    pub fn bar(&self, bar: TrapBar) -> BarPos {
+        match bar {
+            TrapBar::Energy => self.energy,
+            TrapBar::Heat => self.heat,
+            TrapBar::Afterburner => self.afterburner,
+            TrapBar::Shield => self.shield,
+            TrapBar::Armor => self.armor,
+            TrapBar::Hull => self.hull,
+        }
+    }
+}
+
+/// The static [`BARS`] entry for `bar` (its `shape`/`count`, which stay fixed while placement tunes).
+fn bar_layout_for(bar: TrapBar) -> &'static BarLayout {
+    BARS.iter()
+        .find(|l| l.bar == bar)
+        .expect("every TrapBar has a BARS entry")
+}
+
+/// Reposition every trapezoid segment from the live [`HudLayout`] (the dev panel edits it). Keeps
+/// each bar's `shape`/`count` from [`BARS`] and overrides only the placement. Sets only `Transform`
+/// (the colour-only [`update_trapezoid_bars`] is disjoint). Runs only when `HudLayout` changed — the
+/// initial [`setup_trapezoid_bars`] already places segments at the defaults.
+pub fn apply_bar_layout(hud: Res<HudLayout>, mut segs: Query<(&TrapSegment, &mut Transform)>) {
+    if !hud.is_changed() {
+        return;
+    }
+    for (seg, mut tf) in &mut segs {
+        let base = bar_layout_for(seg.bar);
+        let pos = hud.bar(seg.bar);
+        let layout = BarLayout {
+            bar: base.bar,
+            count: base.count,
+            x_center: pos.x_center,
+            y_base: pos.y_base,
+            extent: pos.extent,
+            shape: base.shape,
+        };
+        let (x, y, w, h) = seg_placement(&layout, seg.index);
+        tf.translation = Vec3::new(x, y, -HUD_DEPTH);
+        tf.scale = Vec3::new(w, h, 1.0);
     }
 }
 

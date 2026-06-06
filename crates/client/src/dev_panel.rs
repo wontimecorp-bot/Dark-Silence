@@ -31,6 +31,7 @@ use sim::fitting::{
 };
 use sim::{MiningTuning, SimTuning, Tuning};
 
+use crate::hud_bars::HudLayout;
 use crate::net::{LoopbackHost, NetClientState};
 
 /// Phase M6e — the single source of truth for every stat/knob the panel shows. A section refers to
@@ -768,6 +769,9 @@ fn dev_panel_ui(
     // The local player's wire id → resolve the ship in the server world (M6b readout).
     net: Option<NonSend<NetClientState>>,
     mut state: ResMut<DevPanelState>,
+    // Refinement 24: the CLIENT-side live HUD layout (edited here, applied by the HUD apply systems).
+    // A direct resource param — NOT in the embedded server world.
+    mut hud_layout: ResMut<HudLayout>,
 ) {
     if !state.tuning_open && !state.stats_open {
         return;
@@ -1393,17 +1397,89 @@ fn dev_panel_ui(
                     });
                 }
 
-                ui.separator();
-                if ui
-                    .button("Apply / Re-derive ships (repairs to full health)")
-                    .clicked()
-                {
-                    rederive = true;
-                }
-                if ui.button("Reset ALL to defaults").clicked() {
-                    reset = true;
-                }
+                // Refinement 24: live HUD layout (client-side). These sliders mutate the `HudLayout`
+                // ResMut directly, so `apply_bar_layout` / `apply_readout_layout` reposition the bars +
+                // Energy readout next frame — no Apply needed (drag and watch it move).
+                egui::CollapsingHeader::new("HUD layout (client, live)").show(ui, |ui| {
+                    ui.label("Bars: camera-local units (x / y / extent).");
+                    slider(ui, "Energy x", &mut hud_layout.energy.x_center, -8.0..=8.0);
+                    slider(ui, "Energy y", &mut hud_layout.energy.y_base, -8.0..=8.0);
+                    slider(
+                        ui,
+                        "Energy extent",
+                        &mut hud_layout.energy.extent,
+                        0.5..=8.0,
+                    );
+                    slider(ui, "Heat x", &mut hud_layout.heat.x_center, -8.0..=8.0);
+                    slider(ui, "Heat y", &mut hud_layout.heat.y_base, -8.0..=8.0);
+                    slider(ui, "Heat extent", &mut hud_layout.heat.extent, 0.5..=8.0);
+                    slider(
+                        ui,
+                        "Afterburner x",
+                        &mut hud_layout.afterburner.x_center,
+                        -8.0..=8.0,
+                    );
+                    slider(
+                        ui,
+                        "Afterburner y",
+                        &mut hud_layout.afterburner.y_base,
+                        -8.0..=8.0,
+                    );
+                    slider(
+                        ui,
+                        "Afterburner extent",
+                        &mut hud_layout.afterburner.extent,
+                        0.5..=8.0,
+                    );
+                    slider(ui, "Shield x", &mut hud_layout.shield.x_center, -8.0..=8.0);
+                    slider(ui, "Shield y", &mut hud_layout.shield.y_base, -8.0..=8.0);
+                    slider(
+                        ui,
+                        "Shield extent",
+                        &mut hud_layout.shield.extent,
+                        0.5..=8.0,
+                    );
+                    slider(ui, "Armor x", &mut hud_layout.armor.x_center, -8.0..=8.0);
+                    slider(ui, "Armor y", &mut hud_layout.armor.y_base, -8.0..=8.0);
+                    slider(ui, "Armor extent", &mut hud_layout.armor.extent, 0.5..=8.0);
+                    slider(ui, "Hull x", &mut hud_layout.hull.x_center, -8.0..=8.0);
+                    slider(ui, "Hull y", &mut hud_layout.hull.y_base, -8.0..=8.0);
+                    slider(ui, "Hull extent", &mut hud_layout.hull.extent, 0.5..=8.0);
+                    ui.separator();
+                    ui.label("Energy readout (viewport % / px).");
+                    slider(
+                        ui,
+                        "readout left %",
+                        &mut hud_layout.readout_left_pct,
+                        0.0..=100.0,
+                    );
+                    slider(
+                        ui,
+                        "readout width %",
+                        &mut hud_layout.readout_width_pct,
+                        0.0..=100.0,
+                    );
+                    slider(
+                        ui,
+                        "readout bottom px",
+                        &mut hud_layout.readout_bottom_px,
+                        0.0..=400.0,
+                    );
+                });
             });
+
+            // Refinement 24: Apply/Reset PINNED below the scroll area (outside the `ScrollArea`
+            // closure) so they stay visible while the sliders scroll.
+            ui.separator();
+            if ui
+                .button("Apply / Re-derive ships (repairs to full health)")
+                .clicked()
+            {
+                rederive = true;
+            }
+            if ui.button("Reset ALL to defaults").clicked() {
+                reset = true;
+            }
         });
 
     // --- write back (mutable borrow) ----------------------------------------------
@@ -1420,6 +1496,8 @@ fn dev_panel_ui(
         let (m, h) = seed_catalogs();
         world.insert_resource(m);
         world.insert_resource(h);
+        // Refinement 24: "Reset ALL" also restores the HUD layout to its default positions.
+        *hud_layout = HudLayout::default();
         rederive = true;
     } else {
         world.insert_resource(tuning);

@@ -103,6 +103,9 @@ pub fn run() -> AppExit {
         // Module-color toggle (Fix #11 M3): default off; `C` tints cells by module
         // type (voxel = per-cell vertex colors, contour = a marker overlay). Cosmetic.
         .init_resource::<net::ModuleColorMode>()
+        // Refinement 24: live-tunable HUD bar/readout layout (the dev panel edits it; default = the
+        // hardcoded positions). Present even without the dev panel → the HUD sits at its defaults.
+        .init_resource::<hud_bars::HudLayout>()
         // Refinement 21/22: load the shared HUD fonts (label + mono) + icon images into
         // `FontAssets`/`IconAssets` BEFORE the Startup HUD setups, which clone the handles.
         .add_systems(PreStartup, fonts::load_hud_assets)
@@ -161,6 +164,9 @@ pub fn run() -> AppExit {
                 hud_bars::update_trapezoid_bars,
                 module_bars::update_module_bars,
                 radar::update_radar,
+                // Refinement 24: apply the live HUD layout (dev panel) to the bars + the readout.
+                hud_bars::apply_bar_layout,
+                hud::apply_readout_layout,
             ),
         );
 

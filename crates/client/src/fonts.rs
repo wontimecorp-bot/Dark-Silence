@@ -27,6 +27,11 @@ pub const MONO_FONT: &str = "fonts/ShareTechMono-Regular.ttf";
 /// red + pulsed in-game (see `module_bars`).
 pub const ICON_MODULE_DESTROYED_PNG: &str = "icons/module-destroyed.png";
 
+/// Path (under `assets/`) of the Energy net-rate arrow — a white-on-transparent triangle pointing
+/// UP. Tinted green (charging) / red (draining) and flipped (`flip_y`) to point down for draining;
+/// hidden when steady (see `hud::update_energy_hud`).
+pub const ICON_RATE_ARROW_PNG: &str = "icons/rate-arrow.png";
+
 /// Shared HUD TEXT fonts (Refinement 22). Loaded once by [`load_hud_assets`] at `PreStartup`; HUD
 /// `TextFont`s clone [`label`](FontAssets::label) for labels and [`mono`](FontAssets::mono) for the
 /// changing-number text spans. (Future title/faction/brand faces: add fields here.)
@@ -44,6 +49,8 @@ pub struct FontAssets {
 pub struct IconAssets {
     /// The "module destroyed" alarm icon.
     pub module_destroyed: Handle<Image>,
+    /// The Energy net-rate arrow (up by default; flipped for draining).
+    pub rate_arrow: Handle<Image>,
 }
 
 /// `PreStartup`: load the HUD text fonts + icon images and insert [`FontAssets`] + [`IconAssets`] so
@@ -56,5 +63,6 @@ pub fn load_hud_assets(mut commands: Commands, assets: Res<AssetServer>) {
     });
     commands.insert_resource(IconAssets {
         module_destroyed: assets.load(ICON_MODULE_DESTROYED_PNG),
+        rate_arrow: assets.load(ICON_RATE_ARROW_PNG),
     });
 }
