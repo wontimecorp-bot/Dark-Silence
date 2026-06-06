@@ -33,6 +33,7 @@ use sim::{MiningTuning, SimTuning, Tuning};
 
 use crate::hud_bars::HudLayout;
 use crate::net::{LoopbackHost, NetClientState};
+use crate::starfield::StarfieldTuning;
 
 /// Phase M6e — the single source of truth for every stat/knob the panel shows. A section refers to
 /// a [`StatId`] instead of hand-writing its label/order/format, so a rename or reorder is a
@@ -772,6 +773,8 @@ fn dev_panel_ui(
     // Refinement 24: the CLIENT-side live HUD layout (edited here, applied by the HUD apply systems).
     // A direct resource param — NOT in the embedded server world.
     mut hud_layout: ResMut<HudLayout>,
+    // Refinement 25: CLIENT-side live starfield + bloom tuning (applied by `update_starfield`).
+    mut starfield: ResMut<StarfieldTuning>,
 ) {
     if !state.tuning_open && !state.stats_open {
         return;
@@ -1466,6 +1469,26 @@ fn dev_panel_ui(
                         0.0..=400.0,
                     );
                 });
+
+                // Refinement 25: live starfield + bloom (client-side). Editing mutates the
+                // `StarfieldTuning` ResMut directly → `update_starfield` applies it next frame.
+                egui::CollapsingHeader::new("Starfield / Bloom (client, live)").show(ui, |ui| {
+                    slider(
+                        ui,
+                        "bloom intensity",
+                        &mut starfield.bloom_intensity,
+                        0.0..=1.0,
+                    );
+                    slider(
+                        ui,
+                        "star brightness",
+                        &mut starfield.star_brightness,
+                        0.0..=4.0,
+                    );
+                    slider(ui, "star density", &mut starfield.star_density, 0.0..=1.0);
+                    slider(ui, "twinkle", &mut starfield.twinkle_amount, 0.0..=2.0);
+                    slider(ui, "layers (4-16)", &mut starfield.layer_count, 4.0..=16.0);
+                });
             });
 
             // Refinement 24: Apply/Reset PINNED below the scroll area (outside the `ScrollArea`
@@ -1496,8 +1519,9 @@ fn dev_panel_ui(
         let (m, h) = seed_catalogs();
         world.insert_resource(m);
         world.insert_resource(h);
-        // Refinement 24: "Reset ALL" also restores the HUD layout to its default positions.
+        // Refinement 24/25: "Reset ALL" also restores the HUD layout + starfield/bloom defaults.
         *hud_layout = HudLayout::default();
+        *starfield = StarfieldTuning::default();
         rederive = true;
     } else {
         world.insert_resource(tuning);

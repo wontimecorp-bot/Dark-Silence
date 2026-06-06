@@ -40,6 +40,7 @@ pub mod prediction;
 pub mod radar;
 pub mod render_sync;
 pub mod scene;
+pub mod starfield;
 
 use bevy::prelude::*;
 use fitting_ui::{FittingScreenState, FittingUiPlugin};
@@ -90,6 +91,8 @@ pub fn run() -> AppExit {
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins)
+        // Refinement 25: the procedural starfield background material (custom WGSL shader).
+        .add_plugins(MaterialPlugin::<starfield::StarfieldMaterial>::default())
         // Fixed-step clock the embedded-server lifecycle runs on, and the matching
         // dt the shared sim reads (the embedded server uses its announced rate).
         .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
@@ -106,6 +109,8 @@ pub fn run() -> AppExit {
         // Refinement 24: live-tunable HUD bar/readout layout (the dev panel edits it; default = the
         // hardcoded positions). Present even without the dev panel → the HUD sits at its defaults.
         .init_resource::<hud_bars::HudLayout>()
+        // Refinement 25: live starfield + bloom tuning (dev panel edits it; applied each frame).
+        .init_resource::<starfield::StarfieldTuning>()
         // Refinement 21/22: load the shared HUD fonts (label + mono) + icon images into
         // `FontAssets`/`IconAssets` BEFORE the Startup HUD setups, which clone the handles.
         .add_systems(PreStartup, fonts::load_hud_assets)
@@ -125,6 +130,8 @@ pub fn run() -> AppExit {
                 hud_bars::setup_trapezoid_bars.after(camera::setup_camera),
                 // Camera-anchored ranged sensor radar (top-right) — also a camera child.
                 radar::setup_radar.after(camera::setup_camera),
+                // Refinement 25: the starfield background quad — a camera child, so the camera first.
+                starfield::setup_starfield.after(camera::setup_camera),
             ),
         )
         // Input runs before the fixed step so intents apply the same frame; the
@@ -167,6 +174,8 @@ pub fn run() -> AppExit {
                 // Refinement 24: apply the live HUD layout (dev panel) to the bars + the readout.
                 hud_bars::apply_bar_layout,
                 hud::apply_readout_layout,
+                // Refinement 25: feed camera uniforms + live tuning to the starfield + bloom.
+                starfield::update_starfield.after(camera::follow_camera),
             ),
         );
 

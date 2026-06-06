@@ -1,6 +1,8 @@
 //! Top-down follow camera with zoom (FR-001): renders the 2D gameplay plane
 //! (sim X/Y) in 3D, viewed straight down the +Z axis.
 
+use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use sim::components::Ship;
 
@@ -26,6 +28,15 @@ pub fn setup_camera(mut commands: Commands) {
             color: Color::WHITE,
             brightness: 350.0,
             ..default()
+        },
+        // Refinement 25: HDR + Bloom so the starfield's bright stars (and emissive ship accents
+        // later) glow. `Bloom` is `#[require(Hdr)]`, so this also switches the camera to HDR +
+        // tonemapping — which changes how ALL camera-pass meshes (ships, HUD bars, radar) render.
+        // `intensity` is then driven live by `StarfieldTuning` (dev panel); keep it modest.
+        Tonemapping::TonyMcMapface,
+        Bloom {
+            intensity: 0.15,
+            ..Bloom::NATURAL
         },
     ));
 }
