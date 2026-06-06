@@ -29,6 +29,7 @@ pub mod camera;
 #[cfg(feature = "dev_panel")]
 pub mod dev_panel;
 pub mod fitting_ui;
+pub mod fonts;
 pub mod hud;
 pub mod hud_bars;
 pub mod input;
@@ -73,6 +74,20 @@ pub const TICK_HZ: f64 = 30.0;
 /// `protocol`/`server` netcode) are unchanged and remain the path real *remote*
 /// multiplayer uses.
 pub fn run() -> AppExit {
+    // Bevy resolves `assets/` relative to CARGO_MANIFEST_DIR (= crates/client) under `cargo run`,
+    // or the exe's directory for a directly-launched binary — but Dark Silence keeps its assets at
+    // the WORKSPACE ROOT (alongside the content RON). Without this, the HUD fonts + icons (the
+    // project's first + only AssetServer loads) fail with `AssetNotFound` and render blank. Point
+    // Bevy's asset root at the workspace root so they load regardless of how the game is launched;
+    // an explicit `BEVY_ASSET_ROOT` (e.g. a packaged build) still wins. `env!("CARGO_MANIFEST_DIR")`
+    // is the compile-time crate dir, so `/../..` is the workspace root.
+    if std::env::var_os("BEVY_ASSET_ROOT").is_none() {
+        std::env::set_var(
+            "BEVY_ASSET_ROOT",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../.."),
+        );
+    }
+
     let mut app = App::new();
     app.add_plugins(DefaultPlugins)
         // Fixed-step clock the embedded-server lifecycle runs on, and the matching
@@ -88,6 +103,9 @@ pub fn run() -> AppExit {
         // Module-color toggle (Fix #11 M3): default off; `C` tints cells by module
         // type (voxel = per-cell vertex colors, contour = a marker overlay). Cosmetic.
         .init_resource::<net::ModuleColorMode>()
+        // Refinement 21/22: load the shared HUD fonts (label + mono) + icon images into
+        // `FontAssets`/`IconAssets` BEFORE the Startup HUD setups, which clone the handles.
+        .add_systems(PreStartup, fonts::load_hud_assets)
         .add_systems(
             Startup,
             (

@@ -13,7 +13,8 @@
 use bevy::prelude::*;
 use sim::fitting::{module_conditions, Fit, FitLayout, ModuleCatalog, ModuleCondition, ModuleKind};
 
-use crate::hud::{grade, seg_dim};
+use crate::fonts::{FontAssets, IconAssets};
+use crate::hud::{grade, scale_rgb, seg_dim};
 use crate::net::{LoopbackHost, NetClientState};
 
 /// The module types shown, in order (the major ones a pilot cares about).
@@ -46,7 +47,9 @@ fn short_name(k: ModuleKind) -> &'static str {
 /// green→amber→red ramp (full = green).
 fn seg_color(f: f32) -> Color {
     if f <= 0.0 {
-        Color::srgb(0.22, 0.04, 0.05) // destroyed
+        // Refinement 21: a destroyed module's segment reads EMPTY (the bright broken-icon centred in
+        // it marks the kill), instead of a dark-red fill.
+        seg_dim()
     } else {
         grade(1.0 - f.clamp(0.0, 1.0))
     }
@@ -54,6 +57,8 @@ fn seg_color(f: f32) -> Color {
 
 const LABEL_OK: Color = Color::srgb(0.78, 0.82, 0.90);
 const LABEL_HURT: Color = Color::srgb(0.96, 0.42, 0.36);
+/// The bright "destroyed" icon colour (alarm red-orange) for the broken-segment glyph (Refinement 21).
+const ICON_DESTROYED_COLOR: Color = Color::srgb(0.98, 0.30, 0.22);
 
 /// Root of the module-bar panel (toggled hidden when there is no fitted player ship).
 #[derive(Component)]
@@ -66,6 +71,13 @@ pub struct ModuleBarRow {
 /// One segment = one installed module of `kind` (segment `index` in its row).
 #[derive(Component)]
 pub struct ModuleSeg {
+    kind: ModuleKind,
+    index: usize,
+}
+/// The centred "destroyed" icon glyph child of segment (`kind`, `index`) — shown (via `Visibility`)
+/// only when that module is destroyed (Refinement 21).
+#[derive(Component)]
+pub struct ModuleSegIcon {
     kind: ModuleKind,
     index: usize,
 }
@@ -83,12 +95,12 @@ pub struct ModuleBarCount {
 /// Spawn the right-anchored panel of per-type rows (one row per [`ROWS`] kind, each with a label, a
 /// segmented bar of `MAX_SEG` pre-spawned segments, and a count text). Pre-spawn + show/hide each
 /// frame — no per-frame spawn/despawn.
-pub fn setup_module_bars(mut commands: Commands) {
+pub fn setup_module_bars(mut commands: Commands, fonts: Res<FontAssets>, icons: Res<IconAssets>) {
     commands
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
-                top: Val::Px(64.0),
+                bottom: Val::Px(64.0),
                 right: Val::Px(12.0),
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(4.0),
@@ -112,6 +124,7 @@ pub fn setup_module_bars(mut commands: Commands) {
                         row.spawn((
                             Text::new(short_name(kind)),
                             TextFont {
+                                font: fonts.label.clone(),
                                 font_size: 13.0,
                                 ..default()
                             },
@@ -135,16 +148,41 @@ pub fn setup_module_bars(mut commands: Commands) {
                                     Node {
                                         flex_grow: 1.0,
                                         height: Val::Percent(100.0),
+                                        // Centre the destroyed-icon child (Refinement 21).
+                                        justify_content: JustifyContent::Center,
+                                        align_items: AlignItems::Center,
                                         ..default()
                                     },
                                     BackgroundColor(seg_dim()),
                                     ModuleSeg { kind, index },
-                                ));
+                                ))
+                                .with_children(|seg| {
+                                    // Centred "destroyed" icon IMAGE (game-icons PNG, R22), hidden
+                                    // until this module breaks; `update_module_bars` toggles its
+                                    // `Visibility` + pulses its tint. Fixed 10px box so the source
+                                    // PNG scales down into the segment.
+                                    seg.spawn((
+                                        ImageNode {
+                                            image: icons.module_destroyed.clone(),
+                                            color: ICON_DESTROYED_COLOR,
+                                            ..default()
+                                        },
+                                        Node {
+                                            width: Val::Px(10.0),
+                                            height: Val::Px(10.0),
+                                            ..default()
+                                        },
+                                        Visibility::Hidden,
+                                        ModuleSegIcon { kind, index },
+                                    ));
+                                });
                             }
                         });
+                        // `d/N down` count — multi-font: numbers (mono) + "/"/" down" (label).
                         row.spawn((
-                            Text::new(String::new()),
+                            Text::new(String::new()), // span 0: destroyed count (mono)
                             TextFont {
+                                font: fonts.mono.clone(),
                                 font_size: 12.0,
                                 ..default()
                             },
@@ -154,7 +192,36 @@ pub fn setup_module_bars(mut commands: Commands) {
                                 ..default()
                             },
                             ModuleBarCount { kind },
-                        ));
+                        ))
+                        .with_children(|p| {
+                            p.spawn((
+                                TextSpan::new(String::new()), // 1: "/" label
+                                TextFont {
+                                    font: fonts.label.clone(),
+                                    font_size: 12.0,
+                                    ..default()
+                                },
+                                TextColor(LABEL_HURT),
+                            ));
+                            p.spawn((
+                                TextSpan::new(String::new()), // 2: total count (mono)
+                                TextFont {
+                                    font: fonts.mono.clone(),
+                                    font_size: 12.0,
+                                    ..default()
+                                },
+                                TextColor(LABEL_HURT),
+                            ));
+                            p.spawn((
+                                TextSpan::new(String::new()), // 3: " down" label
+                                TextFont {
+                                    font: fonts.label.clone(),
+                                    font_size: 12.0,
+                                    ..default()
+                                },
+                                TextColor(LABEL_HURT),
+                            ));
+                        });
                     });
             }
         });
@@ -163,13 +230,17 @@ pub fn setup_module_bars(mut commands: Commands) {
 /// Refresh the segments/labels/counts each frame from the player ship's live `FitLayout`. Reads the
 /// embedded server world read-only (same access as the trapezoid pool bars). Hides every row when
 /// there is no fitted player ship (Sandbox / pre-spawn).
+#[allow(clippy::too_many_arguments)] // Bevy system: many disjoint HUD queries + the text writer.
 pub fn update_module_bars(
     host: Option<NonSend<LoopbackHost>>,
     net: Option<NonSend<NetClientState>>,
+    time: Res<Time>,
     mut rows: Query<(&ModuleBarRow, &mut Node), Without<ModuleSeg>>,
     mut segs: Query<(&ModuleSeg, &mut Node, &mut BackgroundColor), Without<ModuleBarRow>>,
-    mut labels: Query<(&ModuleBarLabel, &mut TextColor)>,
-    mut counts: Query<(&ModuleBarCount, &mut Text)>,
+    mut icons: Query<(&ModuleSegIcon, &mut Visibility, &mut ImageNode)>,
+    labels: Query<(Entity, &ModuleBarLabel)>,
+    counts: Query<(Entity, &ModuleBarCount)>,
+    mut writer: TextUiWriter,
 ) {
     // Per-kind conditions for the local fitted ship (empty if none → all rows hide).
     let conditions: Vec<ModuleCondition> = (|| -> Option<Vec<ModuleCondition>> {
@@ -207,20 +278,47 @@ pub fn update_module_bars(
             _ => node.display = Display::None,
         }
     }
-    // Label tint when any of that type are down.
-    for (lbl, mut color) in &mut labels {
-        color.0 = if destroyed(lbl.kind) > 0 {
+    // The "destroyed" icon image on a broken segment (Refinement 22): visible only when that module
+    // is installed (index < count) AND destroyed (condition <= 0); when shown, its red tint PULSES
+    // (motion = the strongest peripheral cue). Hidden otherwise (alive / spare).
+    let pulse = 0.55 + 0.45 * (time.elapsed_secs() * 9.0).sin().abs();
+    for (icon, mut vis, mut img) in &mut icons {
+        let show = matches!(
+            find(icon.kind),
+            Some(c) if icon.index < c.modules.len() && c.modules[icon.index] <= 0.0
+        );
+        if show {
+            *vis = Visibility::Visible;
+            img.color = scale_rgb(ICON_DESTROYED_COLOR, pulse);
+        } else {
+            *vis = Visibility::Hidden;
+        }
+    }
+    // Label tint (span 0) when any of that type are down — written via the text writer so it does not
+    // contend with the icon/count component access.
+    for (e, lbl) in &labels {
+        let tint = if destroyed(lbl.kind) > 0 {
             LABEL_HURT
         } else {
             LABEL_OK
         };
+        *writer.color(e, 0) = TextColor(tint);
     }
-    // `d/N down` count (blank when none down).
-    for (cnt, mut text) in &mut counts {
+    // `d/N down` count spans (blank when none down): [0 dest mono][1 "/"][2 total mono][3 " down"].
+    for (e, cnt) in &counts {
         let d = destroyed(cnt.kind);
-        text.0 = match find(cnt.kind) {
-            Some(c) if d > 0 => format!("{}/{} down", d, c.modules.len()),
-            _ => String::new(),
-        };
+        match find(cnt.kind) {
+            Some(c) if d > 0 => {
+                *writer.text(e, 0) = format!("{d}");
+                *writer.text(e, 1) = "/".to_string();
+                *writer.text(e, 2) = format!("{}", c.modules.len());
+                *writer.text(e, 3) = " down".to_string();
+            }
+            _ => {
+                for i in 0..4 {
+                    *writer.text(e, i) = String::new();
+                }
+            }
+        }
     }
 }

@@ -11,7 +11,13 @@ use sim::components::{Energy, FlightAssist, Ship, Velocity};
 use sim::damage::HitKind;
 use sim::{HitFeedback, RefinedResources};
 
+use crate::fonts::FontAssets;
 use crate::net::{LoopbackHost, NetClientState};
+
+/// Shared HUD text tint (the SPD line + the Energy readouts).
+const HUD_BLUE: Color = Color::srgb(0.80, 0.90, 1.0);
+/// The mining-skirmish score line tint.
+const SCORE_WHITE: Color = Color::srgb(0.92, 0.92, 0.96);
 
 /// Marker for the readout text node.
 #[derive(Component)]
@@ -24,40 +30,82 @@ pub struct ScoreText;
 /// Spawn the mining-skirmish score readout (top-centre): `RED <n>   BLUE <n>`, the per-faction
 /// refined-resources tally read from the embedded server world each frame. Hidden (blank) in any
 /// world without the [`RefinedResources`] resource (e.g. the Sandbox before anything refines).
-pub fn setup_score_hud(mut commands: Commands) {
-    commands.spawn((
-        Text::new(String::new()),
-        TextFont {
-            font_size: 20.0,
-            ..default()
-        },
-        TextColor(Color::srgb(0.92, 0.92, 0.96)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(10.0),
-            left: Val::Percent(38.0),
-            ..default()
-        },
-        ScoreText,
-    ));
+pub fn setup_score_hud(mut commands: Commands, fonts: Res<FontAssets>) {
+    // Multi-font line (Refinement 22): "RED "(label) <red>(mono) "    BLUE "(label) <blue>(mono).
+    commands
+        .spawn((
+            Text::new(String::new()), // span 0: "RED " label
+            TextFont {
+                font: fonts.label.clone(),
+                font_size: 20.0,
+                ..default()
+            },
+            TextColor(SCORE_WHITE),
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(10.0),
+                left: Val::Percent(38.0),
+                ..default()
+            },
+            ScoreText,
+        ))
+        .with_children(|p| {
+            p.spawn((
+                TextSpan::new(String::new()), // 1: red number (mono)
+                TextFont {
+                    font: fonts.mono.clone(),
+                    font_size: 20.0,
+                    ..default()
+                },
+                TextColor(SCORE_WHITE),
+            ));
+            p.spawn((
+                TextSpan::new(String::new()), // 2: "    BLUE " label
+                TextFont {
+                    font: fonts.label.clone(),
+                    font_size: 20.0,
+                    ..default()
+                },
+                TextColor(SCORE_WHITE),
+            ));
+            p.spawn((
+                TextSpan::new(String::new()), // 3: blue number (mono)
+                TextFont {
+                    font: fonts.mono.clone(),
+                    font_size: 20.0,
+                    ..default()
+                },
+                TextColor(SCORE_WHITE),
+            ));
+        });
 }
 
 /// Refresh the score line from the embedded server world's [`RefinedResources`] (like the energy
 /// readout reads the server world). Blank when the resource is absent.
 pub fn update_score_hud(
     host: Option<NonSend<LoopbackHost>>,
-    mut q: Query<&mut Text, With<ScoreText>>,
+    roots: Query<Entity, With<ScoreText>>,
+    mut writer: TextUiWriter,
 ) {
-    let Ok(mut text) = q.single_mut() else {
+    let Ok(e) = roots.single() else {
         return;
     };
-    text.0 = match host
+    match host
         .as_ref()
         .and_then(|h| h.server.world().get_resource::<RefinedResources>())
     {
-        Some(r) => format!("RED {:.0}    BLUE {:.0}", r.red, r.blue),
-        None => String::new(),
-    };
+        Some(r) => {
+            *writer.text(e, 0) = "RED ".to_string();
+            *writer.text(e, 1) = format!("{:.0}", r.red);
+            *writer.text(e, 2) = "    BLUE ".to_string();
+            *writer.text(e, 3) = format!("{:.0}", r.blue);
+        }
+        None => {
+            for i in 0..4 {
+                *writer.text(e, i) = String::new();
+            }
+        }
+    }
 }
 
 /// The numeric Energy readout (`ENRG 72/120`) — the detail-on-focus layer beside the Energy mesh
@@ -100,28 +148,51 @@ pub(crate) fn scale_rgb(c: Color, k: f32) -> Color {
 /// Spawn the readout line (top-left). The aiming reticle is a world-space
 /// gunsight pip ahead of the nose (see `render_sync::AimPip`), not a screen
 /// overlay — the weapon fires along the heading, not at screen centre.
-pub fn setup_hud(mut commands: Commands) {
-    commands.spawn((
-        Text::new("SPD   0.0   FLIGHT"),
-        TextFont {
-            font_size: 18.0,
-            ..default()
-        },
-        TextColor(Color::srgb(0.80, 0.90, 1.0)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(10.0),
-            left: Val::Px(10.0),
-            ..default()
-        },
-        HudText,
-    ));
+pub fn setup_hud(mut commands: Commands, fonts: Res<FontAssets>) {
+    // Multi-font line (Refinement 22): "SPD "(label) <speed>(mono) "   {mode}{flash}"(label).
+    commands
+        .spawn((
+            Text::new("SPD "), // span 0: label
+            TextFont {
+                font: fonts.label.clone(),
+                font_size: 18.0,
+                ..default()
+            },
+            TextColor(HUD_BLUE),
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(10.0),
+                left: Val::Px(10.0),
+                ..default()
+            },
+            HudText,
+        ))
+        .with_children(|p| {
+            p.spawn((
+                TextSpan::new("  0.0"), // 1: speed value (mono, tabular)
+                TextFont {
+                    font: fonts.mono.clone(),
+                    font_size: 18.0,
+                    ..default()
+                },
+                TextColor(HUD_BLUE),
+            ));
+            p.spawn((
+                TextSpan::new("   FLIGHT"), // 2: mode + transient flash (label)
+                TextFont {
+                    font: fonts.label.clone(),
+                    font_size: 18.0,
+                    ..default()
+                },
+                TextColor(HUD_BLUE),
+            ));
+        });
 }
 
 /// Spawn the **Energy numeric + net-rate** text readout (the Energy BAR itself is a camera-anchored
 /// trapezoid mesh in [`crate::hud_bars`]). A compact row anchored at the bottom, left-of-centre so it
 /// floats just above the Energy bar in the bottom EHA row. (Position is a first-pass guess — tunable.)
-pub fn setup_energy_bars(mut commands: Commands) {
+pub fn setup_energy_bars(mut commands: Commands, fonts: Res<FontAssets>) {
     commands
         .spawn(Node {
             position_type: PositionType::Absolute,
@@ -133,24 +204,68 @@ pub fn setup_energy_bars(mut commands: Commands) {
             ..default()
         })
         .with_children(|row| {
+            // ENRG: "ENRG "(label) <cur>(mono) "/"(label) <max>(mono).
             row.spawn((
-                Text::new("ENRG  --".to_string()),
+                Text::new("ENRG "),
                 TextFont {
+                    font: fonts.label.clone(),
                     font_size: 13.0,
                     ..default()
                 },
-                TextColor(Color::srgb(0.80, 0.90, 1.0)),
+                TextColor(HUD_BLUE),
                 BarLabel,
-            ));
+            ))
+            .with_children(|p| {
+                p.spawn((
+                    TextSpan::new(" --"),
+                    TextFont {
+                        font: fonts.mono.clone(),
+                        font_size: 13.0,
+                        ..default()
+                    },
+                    TextColor(HUD_BLUE),
+                ));
+                p.spawn((
+                    TextSpan::new(String::new()),
+                    TextFont {
+                        font: fonts.label.clone(),
+                        font_size: 13.0,
+                        ..default()
+                    },
+                    TextColor(HUD_BLUE),
+                ));
+                p.spawn((
+                    TextSpan::new(String::new()),
+                    TextFont {
+                        font: fonts.mono.clone(),
+                        font_size: 13.0,
+                        ..default()
+                    },
+                    TextColor(HUD_BLUE),
+                ));
+            });
+            // Rate: "{glyph} "(label) <rate>(mono), tinted green/red/dim each frame.
             row.spawn((
-                Text::new("~".to_string()),
+                Text::new("~ "),
                 TextFont {
+                    font: fonts.label.clone(),
                     font_size: 13.0,
                     ..default()
                 },
                 TextColor(Color::srgb(0.6, 0.6, 0.65)),
                 BarRate,
-            ));
+            ))
+            .with_children(|p| {
+                p.spawn((
+                    TextSpan::new(String::new()),
+                    TextFont {
+                        font: fonts.mono.clone(),
+                        font_size: 13.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.6, 0.6, 0.65)),
+                ));
+            });
         });
 }
 
@@ -160,8 +275,9 @@ pub fn setup_energy_bars(mut commands: Commands) {
 pub fn update_energy_hud(
     host: Option<NonSend<LoopbackHost>>,
     net: Option<NonSend<NetClientState>>,
-    mut labels: Query<&mut Text, (With<BarLabel>, Without<HudText>, Without<BarRate>)>,
-    mut rate_q: Query<(&mut Text, &mut TextColor), (With<BarRate>, Without<HudText>)>,
+    label_root: Query<Entity, With<BarLabel>>,
+    rate_root: Query<Entity, With<BarRate>>,
+    mut writer: TextUiWriter,
 ) {
     // Resolve the local ship's Energy pool (None until it exists / is fitted).
     let (energy, erate) = match (host.as_ref(), net.as_ref()) {
@@ -178,25 +294,37 @@ pub fn update_energy_hud(
         _ => (None, None),
     };
 
-    for mut text in &mut labels {
-        text.0 = match energy {
-            Some((c, m)) => format!("ENRG {c:>3.0}/{m:<3.0}"),
-            None => "ENRG  --".to_string(),
-        };
+    if let Ok(e) = label_root.single() {
+        match energy {
+            Some((c, m)) => {
+                *writer.text(e, 0) = "ENRG ".to_string();
+                *writer.text(e, 1) = format!("{c:>3.0}");
+                *writer.text(e, 2) = "/".to_string();
+                *writer.text(e, 3) = format!("{m:<3.0}");
+            }
+            None => {
+                *writer.text(e, 0) = "ENRG  --".to_string();
+                *writer.text(e, 1) = String::new();
+                *writer.text(e, 2) = String::new();
+                *writer.text(e, 3) = String::new();
+            }
+        }
     }
 
-    // Energy net-rate readout: an ASCII direction glyph + the signed rate, coloured green (charging)
-    // / red (draining) / dim (≈0) so the trend reads at a glance. ASCII `^`/`v`/`~` because the
-    // default font has no triangle glyphs (the old `▲`/`▼` rendered as blank squares).
-    if let Ok((mut text, mut color)) = rate_q.single_mut() {
-        let (glyph, c, num) = match erate {
+    // Energy net-rate readout: an ASCII direction glyph (label) + the signed rate (mono), tinted
+    // green (charging) / red (draining) / dim (≈0) on BOTH spans so the trend reads at a glance.
+    // ASCII `^`/`v`/`~` because no triangle glyphs are guaranteed across faces.
+    if let Ok(e) = rate_root.single() {
+        let (glyph, col, num) = match erate {
             Some(r) if r > 1.0 => ("^", Color::srgb(0.30, 0.90, 0.35), format!("+{r:.0}")),
             Some(r) if r < -1.0 => ("v", Color::srgb(0.95, 0.35, 0.25), format!("{r:.0}")),
             Some(r) => ("~", Color::srgb(0.60, 0.60, 0.65), format!("{r:+.0}")),
             None => ("~", Color::srgb(0.60, 0.60, 0.65), String::new()),
         };
-        text.0 = format!("{glyph} {num}");
-        color.0 = c;
+        *writer.text(e, 0) = format!("{glyph} ");
+        *writer.text(e, 1) = num;
+        *writer.color(e, 0) = TextColor(col);
+        *writer.color(e, 1) = TextColor(col);
     }
 }
 
@@ -221,13 +349,17 @@ pub fn hit_cue_label(kind: HitKind) -> &'static str {
 pub fn update_hud(
     ship_q: Query<(&Velocity, &FlightAssist), With<Ship>>,
     feedback: Res<HitFeedback>,
-    mut text_q: Query<&mut Text, With<HudText>>,
+    roots: Query<Entity, With<HudText>>,
+    mut writer: TextUiWriter,
 ) {
-    let Ok(mut text) = text_q.single_mut() else {
+    let Ok(e) = roots.single() else {
         return;
     };
     let Ok((vel, assist)) = ship_q.single() else {
-        text.0 = "-- SHIP DESTROYED --".to_string();
+        // No live ship: collapse to a single label span.
+        *writer.text(e, 0) = "-- SHIP DESTROYED --".to_string();
+        *writer.text(e, 1) = String::new();
+        *writer.text(e, 2) = String::new();
         return;
     };
     let speed = vel.0.length();
@@ -248,7 +380,9 @@ pub fn update_hud(
     } else {
         String::new()
     };
-    text.0 = format!("SPD {speed:>5.1}   {mode}{flash}");
+    *writer.text(e, 0) = "SPD ".to_string();
+    *writer.text(e, 1) = format!("{speed:>5.1}"); // mono / tabular
+    *writer.text(e, 2) = format!("   {mode}{flash}");
 }
 
 #[cfg(test)]
