@@ -7,7 +7,7 @@
 //! embedded server world like the dev panel.
 
 use bevy::prelude::*;
-use sim::components::{Energy, FlightAssist, Health, Ship, Velocity};
+use sim::components::{Energy, FlightAssist, Ship, Velocity};
 use sim::damage::HitKind;
 use sim::{HitFeedback, RefinedResources};
 
@@ -102,7 +102,7 @@ pub(crate) fn scale_rgb(c: Color, k: f32) -> Color {
 /// overlay — the weapon fires along the heading, not at screen centre.
 pub fn setup_hud(mut commands: Commands) {
     commands.spawn((
-        Text::new("SPD   0.0   FLIGHT   HP 100"),
+        Text::new("SPD   0.0   FLIGHT"),
         TextFont {
             font_size: 18.0,
             ..default()
@@ -219,14 +219,14 @@ pub fn hit_cue_label(kind: HitKind) -> &'static str {
 
 /// Refresh the readout each frame from the ship state + transient hit feedback.
 pub fn update_hud(
-    ship_q: Query<(&Velocity, &FlightAssist, &Health), With<Ship>>,
+    ship_q: Query<(&Velocity, &FlightAssist), With<Ship>>,
     feedback: Res<HitFeedback>,
     mut text_q: Query<&mut Text, With<HudText>>,
 ) {
     let Ok(mut text) = text_q.single_mut() else {
         return;
     };
-    let Ok((vel, assist, health)) = ship_q.single() else {
+    let Ok((vel, assist)) = ship_q.single() else {
         text.0 = "-- SHIP DESTROYED --".to_string();
         return;
     };
@@ -248,7 +248,7 @@ pub fn update_hud(
     } else {
         String::new()
     };
-    text.0 = format!("SPD {speed:>5.1}   {mode}   HP {:>3.0}{flash}", health.0);
+    text.0 = format!("SPD {speed:>5.1}   {mode}{flash}");
 }
 
 #[cfg(test)]

@@ -11,14 +11,14 @@ use crate::clock::FixedDt;
 use crate::combat::{self, HitFeedback};
 use crate::components::AngularVelocity;
 use crate::components::{
-    hostile, BoxCollider, CollisionRadius, CombatRules, Damage, DamageFlash, Destructible, Faction,
-    Heading, Health, LastShieldHit, MeshAnchor, Movable, Position, PrevPosition, Projectile,
-    ProjectileFaction, ProjectileMass, ProjectileOwner, RamMass, ShieldHitFlash, Ship, Target,
-    TargetKind, Velocity,
+    hostile, ArmorHp, BoxCollider, CollisionRadius, CombatRules, Damage, DamageFlash, Destructible,
+    Faction, Heading, Health, LastShieldHit, MeshAnchor, Movable, Position, PrevPosition,
+    Projectile, ProjectileFaction, ProjectileMass, ProjectileOwner, RamMass, ShieldHitFlash, Ship,
+    Target, TargetKind, Velocity,
 };
 use crate::damage::{
-    apply_damage, core_cell, first_cell_hit, on_cells_carved, surface_entry, Channel, DamageEvent,
-    HitKind, Wreck, REACH,
+    apply_damage, core_cell, first_cell_hit, on_cells_carved, shield_absorb, surface_entry,
+    Channel, DamageEvent, HitKind, ResistanceMatrix, Shields, Wreck, REACH,
 };
 use crate::fitting::{
     center_or_anchor, layout_inertia_with, layout_mass_with, FitLayout, HullCatalog, ModuleCatalog,
@@ -48,6 +48,10 @@ const RAM_CARVE_K: f32 = 0.3;
 /// Minimum closing speed for a ship↔structure contact to carve at all — below this it is purely a
 /// wall bounce (so easing/resting against a station does not grind the hull). Tunable.
 const RAM_MIN_CLOSING_SPEED: f32 = 8.0;
+/// Refinement 15 — ram crater AREA per unit of surviving (post-shield/armor) damage: the crater
+/// radius is `(surviving · RAM_CRATER_K).sqrt()` cells, clamped to the hull's max grid dim. So a fast
+/// slam clamps to the whole hull (obliterated) while a glancing one bites a small gash. Tunable.
+const RAM_CRATER_K: f32 = 0.03;
 /// Linear drag (per second) a shoved [`Movable`] structure settles under, so a ram-imparted drift
 /// eases to rest instead of coasting forever.
 const STRUCTURE_DRAG: f32 = 0.8;
@@ -863,15 +867,16 @@ pub fn structure_motion_system(
     }
 }
 
-/// Route ONE ram impact through the carve pipeline (Refinement 11) — map the world contact into the
-/// `target`'s cell-space (the SAME [`hull_local_entry_ray`] + [`surface_entry`] projectiles use),
-/// build a Kinetic [`DamageEvent`], and [`apply_damage`] (shields → armor → carve) + [`on_cells_carved`]
-/// on death. Reads the target's CURRENT `FitLayout`/hull/anchor fresh from the world, so it is correct
-/// for either body (the fitted ship OR a voxelized structure) and after a prior carve this tick.
-/// `world_impact`/`world_dir` are world-space: the contact point on the target's surface + the inward
-/// carve direction. No-op if the target has no `FitLayout` (not carveable / not yet voxelized).
+/// Route ONE ram impact into an **AREA CRATER** (Refinement 15) — a ram is a BROAD impact, so instead
+/// of boring a single 1-cell-wide channel (a projectile) it craters a region: it is soaked by shields
+/// → armor first (the R13 spill), then the SURVIVING budget sizes a radius and every present cell
+/// within it is removed, and [`on_cells_carved`] severs/destroys via the SAME path projectiles use.
+/// Maps the world contact into the `target`'s cell-space (the SAME [`hull_local_entry_ray`] +
+/// [`surface_entry`]/[`first_cell_hit`] projectiles use). No-op if the target has no `FitLayout` (not
+/// yet carveable) or if shields/armor fully soak the hit (`m <= 0`). `world_impact`/`world_dir` are
+/// world-space: the contact point on the target's surface + the inward direction.
 #[allow(clippy::too_many_arguments)]
-fn ram_carve(
+fn ram_crater(
     world: &mut World,
     target: Entity,
     target_pos: Vec2,
@@ -879,9 +884,9 @@ fn ram_carve(
     world_impact: Vec2,
     world_dir: Vec2,
     magnitude: f32,
-    sim: &SimTuning,
+    _sim: &SimTuning,
 ) {
-    let Some(layout) = world.get::<FitLayout>(target).cloned() else {
+    let Some(mut layout) = world.get::<FitLayout>(target).cloned() else {
         return;
     };
     let Some(grid_dims) = world
@@ -891,30 +896,77 @@ fn ram_carve(
     else {
         return;
     };
+    let pre_core = core_cell(&layout);
     let is_wreck = world.get::<Wreck>(target).is_some();
     let anchor = world.get::<MeshAnchor>(target).map(|a| a.0);
     let center = center_or_anchor(anchor, &layout, grid_dims, is_wreck);
     let (point, dir_cell) =
         hull_local_entry_ray(world_dir, world_impact, target_pos, heading, center);
-    let Some((fwd_cell, _)) = first_cell_hit(&layout, point, point + dir_cell * REACH) else {
+    // The surface cell the ram meets (back-extended scan) = the crater CENTRE.
+    let back = (grid_dims.0.max(grid_dims.1) as f32) * 1.5;
+    let Some((contact_cell, _)) =
+        first_cell_hit(&layout, point - dir_cell * back, point + dir_cell * REACH)
+    else {
         return;
     };
-    let back = (grid_dims.0.max(grid_dims.1) as f32) * 1.5;
-    let entry = surface_entry(&layout, point, dir_cell, back, fwd_cell);
-    let ev = DamageEvent {
-        channel: Channel::Kinetic,
-        magnitude,
-        penetration: magnitude * sim.pen_per_damage,
-        pen_size: sim.pen_size,
-        point: entry,
-        dir: dir_cell.normalize_or_zero(),
-        source: None,
-    };
-    let pre_core = world.get::<FitLayout>(target).and_then(core_cell);
-    let outcome = apply_damage(world, target, ev);
-    if outcome.destroyed {
-        on_cells_carved(world, target, pre_core);
+    let contact = Vec2::new(contact_cell.0 as f32 + 0.5, contact_cell.1 as f32 + 0.5);
+
+    // Soak shields → armor (the R13 spill); only the SURVIVING budget craters the hull.
+    let mut m = magnitude.max(0.0);
+    if let Some(matrix) = world.get_resource::<ResistanceMatrix>().copied() {
+        if let Some(mut shields) = world.get::<Shields>(target).copied() {
+            let ev = DamageEvent {
+                channel: Channel::Kinetic,
+                magnitude: m,
+                penetration: 0.0,
+                pen_size: 0.0,
+                point: contact,
+                dir: dir_cell.normalize_or_zero(),
+                source: None,
+            };
+            let (surviving, _) = shield_absorb(&mut shields, &ev, &matrix);
+            m = surviving;
+            world.entity_mut(target).insert(shields);
+        }
     }
+    if let Some(mut armor) = world.get::<ArmorHp>(target).copied() {
+        if armor.current > 0.0 {
+            let absorbed = armor.current.min(m);
+            armor.current = (armor.current - m).max(0.0);
+            world.entity_mut(target).insert(armor);
+            m = (m - absorbed).max(0.0);
+        }
+    }
+    if m <= 0.0 {
+        return; // shields/armor held — the ram bounces but does not crater the hull
+    }
+
+    // Crater: remove every present cell within a budget-scaled radius of the contact. A big budget
+    // (a fast slam) clamps to the whole hull → obliterated; a small one bites a gash.
+    let radius = (m * RAM_CRATER_K)
+        .sqrt()
+        .min(grid_dims.0.max(grid_dims.1) as f32);
+    let to_remove = crater_cells(&layout, contact, radius);
+    if to_remove.is_empty() {
+        return;
+    }
+    for c in to_remove {
+        layout.cells.remove(&c);
+    }
+    world.entity_mut(target).insert(layout);
+    on_cells_carved(world, target, pre_core);
+}
+
+/// The present cells of `layout` whose centres lie within `radius` (cell units) of the cell-space
+/// `centre` — the **disc** footprint a ram crater removes (Refinement 15): an AREA, not a 1-cell line.
+/// Pure.
+fn crater_cells(layout: &FitLayout, centre: Vec2, radius: f32) -> Vec<(u16, u16)> {
+    layout
+        .cells
+        .keys()
+        .copied()
+        .filter(|c| (Vec2::new(c.0 as f32 + 0.5, c.1 as f32 + 0.5) - centre).length() <= radius)
+        .collect()
 }
 
 /// Refinement 10/11 — ship↔structure **RAM**: a craft that flies into the refinery outpost /
@@ -1087,9 +1139,9 @@ pub fn structure_ram_system(world: &mut World) {
         }
     }
 
-    // 5. Apply the carves (ship + any voxelized body), then tag the not-yet-voxelized bodies.
+    // 5. Crater the ship + any voxelized body, then tag the not-yet-voxelized bodies.
     for (target, target_pos, heading, world_impact, world_dir, magnitude) in carves {
-        ram_carve(
+        ram_crater(
             world,
             target,
             target_pos,
@@ -1164,6 +1216,39 @@ mod tests {
         assert_eq!(
             circle_contact(Vec2::ZERO, 1.0, Vec2::new(3.0, 0.0), 1.0),
             None
+        );
+    }
+
+    #[test]
+    fn ram_crater_removes_a_disc_area_not_a_line() {
+        // Refinement 15: a ram craters an AREA (a disc of cells), not a 1-cell-wide line. On a solid
+        // 11×11 station hull, a radius-3 crater removes ≈ π·3² ≈ 28 cells — far more than a line of
+        // length 2·3 = 6 — and a tiny radius bites only a couple of cells.
+        use crate::fitting::{build_layout, seed_catalogs, station_hull, Fit, HullId};
+        let (modules, _) = seed_catalogs();
+        let hull = station_hull(HullId(9999), "Test", 11, 11);
+        let layout = build_layout(&hull, &Fit::new(hull.id), &modules);
+        assert_eq!(layout.cells.len(), 121, "solid 11×11 hull");
+
+        let centre = Vec2::new(5.5, 5.5); // grid centre
+        let disc = crater_cells(&layout, centre, 3.0);
+        assert!(
+            (20..=40).contains(&disc.len()),
+            "a radius-3 crater removes a disc (~28 cells), not a line (~6); got {}",
+            disc.len()
+        );
+        // A through-line of the same length would only touch ~6 cells — the crater is much broader.
+        assert!(
+            disc.len() > 6 * 2,
+            "the crater area dwarfs a 1-cell channel"
+        );
+
+        // A gentle (small-radius) ram bites only a couple of cells.
+        let nibble = crater_cells(&layout, centre, 0.8);
+        assert!(
+            (1..=4).contains(&nibble.len()),
+            "a small crater bites a cell or two; got {}",
+            nibble.len()
         );
     }
 

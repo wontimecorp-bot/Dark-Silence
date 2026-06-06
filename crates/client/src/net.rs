@@ -803,10 +803,14 @@ fn sync_ship_hull(
     module_color: bool,
 ) {
     // Only a fitted ship OR a severed chunk / dead hulk carries a cell payload; everything
-    // else (projectiles, plain targets, a layout-less wreck) keeps its single mesh.
-    if e.cells.is_empty() {
-        return;
-    }
+    // else (projectiles, plain targets) keeps its single mesh and is handled by the
+    // empty-cells bail below (after the hull-state is resolved). A FITTED entity carved to
+    // ZERO cells — a hard ram obliterates the whole hull, so `destroy_ship` keeps an empty
+    // residual `FitLayout` and `render_state` re-emits it as `Debris` with no cells — is NOT
+    // bailed here: it still has a built voxel hull child that must be TORN DOWN so the
+    // destruction actually renders (otherwise the last intact mesh stays frozen on screen,
+    // the R16 bug). The `!has_cells && !voxelized` bail below skips only the never-built case.
+    let has_cells = !e.cells.is_empty();
 
     // A `Debris` entity with cells is WRECKAGE (a severed chunk or a destroyed-ship hulk):
     // render its real cells with the darkened "dead metal" wreck tint and centre the cells
@@ -853,7 +857,19 @@ fn sync_ship_hull(
         }
     };
 
-    if near {
+    // Nothing to draw AND nothing built to tear down (a projectile / plain target / a fresh
+    // fitted entity that never voxelized) — bail exactly as the old top-of-fn early-return
+    // did. The synthesized `new_state` (if any) is dropped, never attached, so a cell-less
+    // entity never gains a `ShipHull` (byte-identical to before).
+    if !has_cells && !current.voxelized() {
+        return;
+    }
+
+    // A fitted entity with cells (and near) builds/rebuilds its hull. An OBLITERATED one
+    // (empty cells but a previously-built voxel hull) skips this and falls through to the
+    // `else if current.voxelized()` teardown branch below — so its destruction renders (the
+    // frozen hull child is despawned + the wreck box restored) instead of freezing intact.
+    if near && has_cells {
         if !current.voxelized() {
             // Far→near switch: stop drawing the parent's coarse box so only the hull
             // surface shows (the parent keeps its transform + markers).
