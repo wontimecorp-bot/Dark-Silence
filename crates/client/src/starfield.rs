@@ -78,9 +78,10 @@ pub struct StarfieldParams {
     pub twinkle_amount: f32,
     /// How many of `layers` to draw.
     pub layer_count: u32,
-    /// Pad so `layers` starts at a 16-byte-aligned offset (44 → 48). `ShaderType` requires array
-    /// fields to be 16-aligned and does NOT auto-insert this; the WGSL auto-aligns the array to match.
-    pub _pad0: f32,
+    /// Analytic-coverage edge softness in pixels (Refinement 30): 0 = hard points (shimmer on
+    /// motion), ~0.75 = smooth/stable. Reuses the 16-align pad slot (offset 44 → `layers` at 48), so
+    /// the layout is unchanged; the WGSL field must match.
+    pub edge_softness: f32,
     /// Per-layer parameters (Refinement 26); the shader reads `layers[0..layer_count]`.
     pub layers: [StarLayer; MAX_LAYERS],
 }
@@ -128,8 +129,19 @@ pub struct StarfieldTuning {
     pub twinkle_amount: f32,
     /// Layer count to draw (stored as f32 for the slider; rounded + clamped to [`MAX_LAYERS`]).
     pub layer_count: f32,
+    /// Star-edge AA softness in px (Refinement 30): 0 = pure hard points (shimmer on motion), ~0.75 =
+    /// smooth/stable (twinkle fully controllable). `#[serde(default)]` so `render_tuning.ron` files
+    /// saved before this field still load.
+    #[serde(default = "default_edge_softness")]
+    pub edge_softness: f32,
     /// Per-layer parameters (depth / spacing / density / brightness / twinkle / size).
     pub layers: [LayerTuning; MAX_LAYERS],
+}
+
+/// Default star-edge softness (px) — stable by default so the field doesn't shimmer; also the value
+/// substituted for `render_tuning.ron` files saved before `edge_softness` existed.
+fn default_edge_softness() -> f32 {
+    0.75
 }
 
 impl Default for StarfieldTuning {
@@ -156,6 +168,7 @@ impl Default for StarfieldTuning {
             star_density: 1.0,
             twinkle_amount: 1.0,
             layer_count: 8.0,
+            edge_softness: default_edge_softness(),
             layers,
         }
     }
@@ -243,7 +256,7 @@ pub fn update_starfield(
             star_density: tuning.star_density,
             twinkle_amount: tuning.twinkle_amount,
             layer_count: (tuning.layer_count.round() as u32).clamp(1, MAX_LAYERS as u32),
-            _pad0: 0.0,
+            edge_softness: tuning.edge_softness,
             layers,
         };
     }

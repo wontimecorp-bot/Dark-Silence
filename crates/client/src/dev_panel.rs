@@ -1688,6 +1688,8 @@ fn dev_panel_ui(
                         .on_hover_text("MASTER twinkle — multiplies EVERY layer's twinkle (final = per-layer twinkle × this). 0 = steady (no scintillation).");
                     slider(ui, "layers (4-16)", &mut starfield.layer_count, 4.0..=16.0)
                         .on_hover_text("How many parallax star layers to draw (4–16). More = deeper field, slightly more GPU. The 'Layer N' rows below appear/disappear with this.");
+                    slider(ui, "edge softness (AA)", &mut starfield.edge_softness, 0.0..=1.5)
+                        .on_hover_text("Star-edge anti-aliasing width in pixels. 0 = pure hard points (crispest, but they SHIMMER as the camera moves — twinkle can't be fully turned off). ~0.75 = smooth analytic coverage: stars stay crisp (~1px, NOT blurred) but stop popping, so twinkle becomes fully controllable. Also energy-conserving: sub-pixel stars dim instead of clamping to 1px.");
                     ui.separator();
                     // Refinement 26: per-layer rows (depth/spacing/density/brightness/twinkle/size).
                     let count = (starfield.layer_count.round() as usize).clamp(1, MAX_LAYERS);

@@ -33,9 +33,9 @@ struct StarfieldParams {
     star_density: f32,
     twinkle_amount: f32,
     layer_count: u32,
-    // Pad so `layers` is 16-aligned (offset 44 → 48), matching the Rust `_pad0`. WGSL/naga does not
-    // auto-pad before a uniform array field.
-    pad0: f32,
+    // Analytic-coverage edge softness in px (R30); reuses the 16-align slot (offset 44 → layers 48),
+    // so the layout still matches the Rust `StarfieldParams`.
+    edge_softness: f32,
     layers: array<StarLayer, 16>,
 }
 
@@ -104,7 +104,6 @@ fn star_layer(
     layer: StarLayer,
     px_per_world: f32,
     seed: f32,
-    dmap: f32,
 ) -> vec3<f32> {
     let pf = layer.parallax;
     let freq = layer.frequency;
@@ -112,6 +111,10 @@ fn star_layer(
     let s = world - cam * (1.0 - pf);
     let q = s * freq + vec2<f32>(seed, seed * 1.7);
     let cell = floor(q);
+    // R31: density map sampled in THIS layer's parallax frame `s` (NOT raw world) — so the star grid
+    // and the density field move together → each star's density value is invariant under camera
+    // translation → no twinkle as you fly (at parallax 0, `s` = screen offset → density screen-locked).
+    let dmap = 0.30 + 0.70 * (1.0 - worley(s * 0.03 + vec2<f32>(seed, seed)));
     // Fraction of candidate cells that host a star, modulated by the global density + the density map.
     let dens = layer.density * params.star_density * dmap;
 
@@ -134,11 +137,16 @@ fn star_layer(
             let th = hash21(cid * 4.13 + seed + 9.1);
             let tn = pow(th, 3.0);
             let temp_k = mix(3000.0, 30000.0, tn);
-            let radius = max(mix(1.0, 2.2, tn) * layer.size, 1.0); // pixels
-            // HARD point: lit iff within radius_px (no smoothstep / no AA).
-            if (step(px, radius) < 0.5) {
-                continue;
+            // R30: analytic sub-pixel COVERAGE instead of a hard step → temporally stable (kills the
+            // motion shimmer) + twinkle-controllable. No 1px floor; energy-conserving so sub-pixel
+            // stars get fainter (by radius) rather than clamping to a full-bright 1px dot.
+            let r = mix(1.0, 2.2, tn) * layer.size; // pixel radius (may be < 1)
+            let aa = max(params.edge_softness, 0.001); // 0 (tiny) ⇒ effectively a hard step
+            if (px > r + aa) {
+                continue; // beyond the AA'd edge — contributes nothing
             }
+            let cov = 1.0 - smoothstep(r - aa, r + aa, px); // soft coverage at this fragment
+            let fill = clamp(r, 0.0, 1.0); // energy-conserving: sub-pixel stars dimmer
 
             // Desynchronised twinkle: per-star phase + summed incommensurate sines.
             let phase = hash21(cid * 5.7 + seed) * TAU;
@@ -150,7 +158,12 @@ fn star_layer(
             let tw = clamp(0.6 + 0.4 * raw * params.twinkle_amount * layer.twinkle * amp, 0.0, 1.6);
 
             let bright = mix(0.5, 2.2, tn) * layer.brightness; // hot brighter; >1 => HDR bloom
-            col = col + blackbody(temp_k) * bright * tw;
+            // R30b: SOFT density gate — fade stars in/out near the threshold instead of a hard pop, so
+            // they don't twinkle as the world-space density map (dmap) sweeps past while you fly. Only
+            // the marginal (upper-half-of-threshold) stars fade; core stars (present < 0.5·dens) stay
+            // fully on.
+            let gate = 1.0 - smoothstep(dens * 0.5, dens, present);
+            col = col + blackbody(temp_k) * bright * tw * cov * fill * gate;
         }
     }
     return col;
@@ -171,16 +184,12 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let world = params.cam_pos + vec2<f32>(ndc.x * half_w, -ndc.y * half_h);
     let px_per_world = res.y / (2.0 * half_h);
 
-    // Cellular (Worley) density map: high near cell feature points → star clumps, low in voids
-    // (kept off zero so voids aren't fully empty).
-    let dmap = 0.30 + 0.70 * (1.0 - worley(world * 0.03));
-
     let n = clamp(params.layer_count, 1u, MAX_LAYERS);
     var col = vec3<f32>(0.0);
     for (var i: u32 = 0u; i < n; i = i + 1u) {
         let seed = f32(i) * 13.7;
         let layer = params.layers[i]; // per-layer depth/spacing/density/brightness/twinkle/size
-        col = col + star_layer(world, params.cam_pos, layer, px_per_world, seed, dmap);
+        col = col + star_layer(world, params.cam_pos, layer, px_per_world, seed);
     }
 
     col = col * params.star_brightness;
