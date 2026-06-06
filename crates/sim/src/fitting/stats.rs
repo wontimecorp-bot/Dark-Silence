@@ -118,7 +118,9 @@ pub struct ShipStats {
     pub angular_inertia: f32,
     /// Fraction of translational thrust diverted at full turn input (`0..=1`).
     pub turn_power_share: f32,
-    /// Power supplied to the budget: `hull.power_capacity + Σ reactor.power_gen`.
+    /// RUNTIME power generation: `Σ reactor.power_gen` (health-scaled, working core-connected
+    /// reactor cells only — no hull base). Feeds `energy_system` recharge + the shield "powered"
+    /// gate. (The fitting-INSTALL budget in `validate.rs` is separate and still adds the hull base.)
     pub power_supply: f32,
     /// Power consumed by the fit: `Σ module.power_draw` (`>= 0`).
     pub power_draw: f32,
@@ -234,7 +236,8 @@ fn health_factor(occupant: &CellOccupant, module: &Module, cfg: &StatScalingConf
 /// - `linear_drag` / `angular_drag` / `angular_inertia` / `turn_power_share` are
 ///   the base constants from [`Tuning::default`] (the demoted-but-not-deleted
 ///   flight-feel source) so denominators are always `> 0`;
-/// - `power_supply = hull.power_capacity + Σ reactor.power_gen`,
+/// - `power_supply = Σ reactor.power_gen` (runtime generation, reactor cells only — no hull base;
+///   the separate fitting-install budget in `validate.rs` still adds `hull.power_capacity`),
 ///   `power_draw = Σ module.power_draw`, `cpu_draw = Σ module.cpu_draw`;
 /// - `can_fire` is `true` iff ≥1 **weapon** module is installed, and `weapon` is
 ///   that module's [`WeaponProfile`] (the first by deterministic `SlotId` order
@@ -446,7 +449,13 @@ pub fn derive_ship_stats_with(
         angular_drag: base.angular_drag,
         angular_inertia: base.angular_inertia,
         turn_power_share: base.turn_power_share,
-        power_supply: hull.power_capacity + power_gen,
+        // Refinement 20: RUNTIME power generation comes ONLY from the working, core-connected
+        // reactor cells (`power_gen`, already health-scaled + dropped for any reactor cell carved
+        // away or severed off the layout). The hull contributes NO free base here — a ship with no
+        // working reactor generates 0, so `energy_system` drains its pool and the shield "powered"
+        // gate goes false. (`hull.power_capacity` is unchanged and still feeds the SEPARATE
+        // fitting-install budget in `validate.rs`; this is runtime generation only.)
+        power_supply: power_gen,
         power_draw,
         cpu_draw,
         continuous_draw,

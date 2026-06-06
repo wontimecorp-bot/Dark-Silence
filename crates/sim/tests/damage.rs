@@ -815,8 +815,8 @@ fn damaged_thruster_lowers_thrust_and_accel_floored() {
 
 /// A **destroyed weapon** (cell health 0) drops `can_fire` and the weapon profile
 /// (FR-013), and a **destroyed reactor** (cell health 0) contributes `0` `power_gen`
-/// — collapsing `power_supply` to `hull.power_capacity` alone — which un-powers a
-/// `power_linked` shield via the `power_supply < power_draw` gate, so it decays
+/// — collapsing runtime `power_supply` to `0` (Refinement 20: runtime generation is reactor-only)
+/// — which un-powers a `power_linked` shield via the `power_supply < power_draw` gate, so it decays
 /// (INV-D14/FR-013).
 #[test]
 fn destroyed_weapon_disarms_and_destroyed_reactor_unpowers_shields() {
@@ -827,8 +827,8 @@ fn destroyed_weapon_disarms_and_destroyed_reactor_unpowers_shields() {
     // (slots 1+2), and a power-hungry shield (raw-installed; drives power_draw the
     // reactor must cover). Raw installs so the derivation reads the intended loadout
     // regardless of budget — the power-starve only emerges when the reactor dies.
-    // Draws: 2×thruster(3) + cannon(3) + shield(6) = 15 > hull.power_capacity (10),
-    // so without the reactor's 20 the ship is power-starved.
+    // Draws: 2×thruster(3) + cannon(3) + shield(6) = 15; runtime power is reactor-only,
+    // so without the reactor's 20 the ship generates 0 and is power-starved.
     let mut fit = Fit::new(HULL_FIGHTER);
     fit.install_raw(SlotId(0), MODULE_REACTOR_BASIC); // power_gen 20, draw 0
     fit.install_raw(SlotId(1), MODULE_THRUSTER_BASIC); // draw 3
@@ -843,8 +843,8 @@ fn destroyed_weapon_disarms_and_destroyed_reactor_unpowers_shields() {
     assert!(healthy.weapon.is_some());
     let reactor_gen = modules.get(MODULE_REACTOR_BASIC).unwrap().power_gen; // 20
     assert!(
-        (healthy.power_supply - (hull.power_capacity + reactor_gen)).abs() < 1e-4,
-        "power_supply = hull.power_capacity + reactor power_gen at full health"
+        (healthy.power_supply - reactor_gen).abs() < 1e-4,
+        "runtime power_supply = reactor power_gen at full health (no hull base, Refinement 20)"
     );
 
     // --- FR-013: a destroyed WEAPON drops can_fire + the profile -----------------
@@ -865,8 +865,8 @@ fn destroyed_weapon_disarms_and_destroyed_reactor_unpowers_shields() {
     damage_slot(&mut no_reactor, SlotId(0), 0.0); // reactor destroyed
     let unpowered = derive_ship_stats(&hull, &fit, &modules, &no_reactor);
     assert!(
-        (unpowered.power_supply - hull.power_capacity).abs() < 1e-4,
-        "a destroyed reactor contributes 0 power_gen ⇒ power_supply = hull.power_capacity alone (FR-013)"
+        unpowered.power_supply.abs() < 1e-4,
+        "a destroyed reactor contributes 0 power_gen ⇒ runtime power_supply = 0 (Refinement 20)"
     );
     assert!(
         unpowered.power_supply < unpowered.power_draw,
@@ -2049,9 +2049,9 @@ fn carving_disconnects_a_region_and_severs_it_while_the_ship_lives() {
 
 /// A focused slice of the same chain isolating the **emergent stat drop** (SC-002):
 /// a hit that destroys the reactor, followed by the re-derive, collapses the ship's
-/// `power_supply` to the hull capacity alone (the reactor contributes 0). Driven
-/// without the whole-ship destruction so the live degraded `ShipStats` is readable
-/// on a surviving ship.
+/// runtime `power_supply` to 0 (Refinement 20: generation is reactor-only, the destroyed
+/// reactor contributes nothing). Driven without the whole-ship destruction so the live
+/// degraded `ShipStats` is readable on a surviving ship.
 #[test]
 fn fitted_damage_drops_emergent_ship_stats_after_rederive() {
     let mut w = World::new();
@@ -2103,8 +2103,8 @@ fn fitted_damage_drops_emergent_ship_stats_after_rederive() {
         "a destroyed reactor collapses the emergent power_supply ({powered_after} < {powered_before}, SC-002)"
     );
     assert!(
-        (powered_after - hull.power_capacity).abs() < 1e-4,
-        "the destroyed reactor contributes 0 power_gen ⇒ power_supply = hull capacity alone"
+        powered_after.abs() < 1e-4,
+        "the destroyed reactor contributes 0 power_gen ⇒ runtime power_supply = 0 (Refinement 20)"
     );
 }
 

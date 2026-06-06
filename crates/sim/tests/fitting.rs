@@ -1093,9 +1093,10 @@ mod layout_phase5 {
             Some(MODULE_REACTOR_BASIC),
             "the layout rebuilt with the newly installed reactor"
         );
-        // ShipStats was re-derived on the same trigger (power supply rose).
+        // ShipStats was re-derived on the same trigger: installing a reactor raises runtime
+        // generation above 0 (Refinement 20: runtime power_supply is reactor-only, no hull base).
         let new_stats = w.get::<ShipStats>(ship).unwrap();
-        assert!(new_stats.power_supply > hull.power_capacity);
+        assert!(new_stats.power_supply > 0.0);
     }
 }
 
