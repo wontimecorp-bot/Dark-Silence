@@ -839,14 +839,17 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
         }
     };
 
-    // --- 4b. Armor-HP layer (Phase F): a depleting HP buffer between the shield and the
-    // hull carve. A PENETRATING hit (a Ricochet already returned above, so armor is never
-    // touched on a bounce) is SOAKED whole by the armor while it holds (`current > 0`): the
-    // post-armor magnitude `m` (the would-be carve budget) drains the pool and the hull does
-    // NOT carve. There is no spill — a shot that over-depletes still carves nothing; the NEXT
-    // shot finds `current <= 0` and carves. Only once armor is gone (`<= 0`) — or the
-    // component is ABSENT (every determinism/test ship carries none) — does the shot carve the
-    // hull as today, so the headless path stays byte-identical. Armor does not regenerate.
+    // --- 4b. Armor-HP layer (Phase F + Refinement 13): a depleting HP buffer between the shield
+    // and the hull carve. A PENETRATING hit (a Ricochet already returned above, so armor is never
+    // touched on a bounce) is soaked by the armor while it holds (`current > 0`): the post-armor
+    // magnitude `m` (the would-be carve budget) drains the pool. A hit `<= current` is fully
+    // soaked → the hull does NOT carve (a normal shot is « remaining armor, so it always takes this
+    // path — armor is a buffer you strip over many shots). Refinement 13: a hit LARGER than the
+    // remaining armor drains it to 0 and **spills the excess** to the carve, so a single
+    // over-the-top hit (a hard ram) punches through. When the component is ABSENT (every
+    // determinism/test ship carries none) the block is skipped → the headless path stays
+    // byte-identical, and a test ship that does carry it is only hit by sub-armor shots (fully
+    // soaked) → still byte-identical. Armor does not regenerate.
     if let Some(mut armor) = world.get::<ArmorHp>(target).copied() {
         if armor.current > 0.0 {
             let absorbed = armor.current.min(m.max(0.0));
@@ -854,21 +857,31 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
             if let Some(mut comp) = world.get_mut::<ArmorHp>(target) {
                 *comp = armor;
             }
-            // Hull protected: write back the (uncarved) layout/shields and stop. HUD
-            // attribution is the entry cell's module if it is one (else `None`).
-            let struck = layout
-                .cells
-                .get(&entry_cell)
-                .and_then(|occ| occ.module.map(|mid| ModuleRef::new(occ.slot, mid)));
-            write_back(world, target, layout, shields, hull_structure);
-            return DamageOutcome {
-                struck,
-                applied: absorbed,
-                layer_reached: DefenseLayer::Armor,
-                result,
-                destroyed: false,
-                destroyed_cells: Vec::new(),
-            };
+            // Refinement 13: armor SPILLS. Subtract what the plate soaked; only the EXCESS — a
+            // single hit bigger than the remaining armor (a hard RAM, or a future heavy weapon) —
+            // spills past to carve the hull. A normal autocannon shot is « the remaining armor, so
+            // it is still fully soaked (the `m <= 0` branch below returns with no carve), preserving
+            // the 2-stage armor feel for shots AND the byte-identical headless path (test ships
+            // carry no `ArmorHp`; any that do are only ever hit by sub-armor shots).
+            m = (m - absorbed).max(0.0);
+            if m <= 0.0 {
+                // Fully soaked: hull protected — write back the (uncarved) layout/shields and stop.
+                // HUD attribution is the entry cell's module if it is one (else `None`).
+                let struck = layout
+                    .cells
+                    .get(&entry_cell)
+                    .and_then(|occ| occ.module.map(|mid| ModuleRef::new(occ.slot, mid)));
+                write_back(world, target, layout, shields, hull_structure);
+                return DamageOutcome {
+                    struck,
+                    applied: absorbed,
+                    layer_reached: DefenseLayer::Armor,
+                    result,
+                    destroyed: false,
+                    destroyed_cells: Vec::new(),
+                };
+            }
+            // else: the over-the-top excess `m` continues to the carve below.
         }
     }
 

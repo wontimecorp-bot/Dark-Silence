@@ -1003,10 +1003,17 @@ fn sync_ship_hull(
                     MeshMaterial3d(assets.debris_material.clone()),
                 ));
             } else if footprint > STRUCTURE_LOD_FOOTPRINT {
-                ec.insert((
-                    Mesh3d(assets.lod_box_mesh.clone()),
-                    MeshMaterial3d(hull_mat.clone()),
-                ));
+                // Refinement 12: the ROUND rock uses its sphere placeholder (the parent transform
+                // scales it to a flat ~60-u disc ≈ the near voxel hull) so it stays round at any
+                // zoom; the square outpost/transport keep the box. Same colour (`hull_mat`) either
+                // way, so the near↔far swap is seamless.
+                let placeholder =
+                    if matches!(TargetKind::from_u8(e.flags), Some(TargetKind::MineNode)) {
+                        assets.minenode_mesh.clone()
+                    } else {
+                        assets.lod_box_mesh.clone()
+                    };
+                ec.insert((Mesh3d(placeholder), MeshMaterial3d(hull_mat.clone())));
             } else {
                 ec.insert((
                     Mesh3d(assets.ship_mesh.clone()),

@@ -433,6 +433,79 @@ pub fn derive_ship_stats_with(
     }
 }
 
+/// One module TYPE's aggregate condition for the HUD (Refinement 14): the live condition of every
+/// installed module of this [`ModuleKind`], in deterministic slot order. `modules[i]` is module i's
+/// condition fraction `(health / health_max).clamp(0,1)` — `0.0` = destroyed (or carved away);
+/// `sum_health / sum_health_max` is the aggregate %. `modules.len()` is the authored count; the
+/// destroyed count is `modules.iter().filter(|&&f| f <= 0.0).count()`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModuleCondition {
+    /// The module type this row aggregates.
+    pub kind: ModuleKind,
+    /// Each installed module's condition fraction (`0.0` destroyed … `1.0` full), slot order.
+    pub modules: Vec<f32>,
+    /// Σ live health across this type's modules.
+    pub sum_health: f32,
+    /// Σ max health across this type's modules (the aggregate denominator).
+    pub sum_health_max: f32,
+}
+
+/// A `ModuleKind`'s fixed display/bucket order so the HUD rows are stable (Refinement 14).
+fn kind_order(k: ModuleKind) -> usize {
+    match k {
+        ModuleKind::Reactor => 0,
+        ModuleKind::Thruster => 1,
+        ModuleKind::Weapon => 2,
+        ModuleKind::Shield => 3,
+        ModuleKind::Armor => 4,
+        ModuleKind::Sensor => 5,
+        ModuleKind::Utility => 6,
+    }
+}
+
+/// Per-module-TYPE condition for a fitted ship (Refinement 14) — for each [`ModuleKind`] present in
+/// the fit, the live condition of every installed module of that type, plus the summed live/max
+/// health for the aggregate bar. Reuses the SAME per-cell health lookup as [`derive_ship_stats`]
+/// (iterate `fit.assignments`, find the module's live cell in `layout`, a carved-away cell = `0` =
+/// destroyed), so the HUD bars always agree with the emergent stat degrade. Returns one entry per
+/// PRESENT kind in [`kind_order`] order. **Pure** — reads only its arguments; no system / no
+/// schedule / no RNG, so it is determinism-neutral.
+pub fn module_conditions(
+    fit: &Fit,
+    layout: &FitLayout,
+    catalog: &ModuleCatalog,
+) -> Vec<ModuleCondition> {
+    let mut buckets: [Option<ModuleCondition>; 7] = Default::default();
+    for (slot_id, module_id) in fit.assignments.iter() {
+        let Some(module) = catalog.get(*module_id) else {
+            continue; // dangling id (validate_fit rejects) — no contribution
+        };
+        // Live health of this module's cell; a carved-away / severed cell is gone from the layout →
+        // destroyed (0), exactly as `derive_ship_stats` treats it.
+        let health = layout
+            .cells
+            .values()
+            .find(|o| o.slot == *slot_id && o.module.is_some())
+            .map(|o| o.health.max(0.0))
+            .unwrap_or(0.0);
+        let frac = if module.health_max > 0.0 {
+            (health / module.health_max).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let entry = buckets[kind_order(module.kind)].get_or_insert_with(|| ModuleCondition {
+            kind: module.kind,
+            modules: Vec::new(),
+            sum_health: 0.0,
+            sum_health_max: 0.0,
+        });
+        entry.modules.push(frac);
+        entry.sum_health += health;
+        entry.sum_health_max += module.health_max;
+    }
+    buckets.into_iter().flatten().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,6 +591,62 @@ mod tests {
             "a carved-off generator gives no shields"
         );
         assert_eq!(carved.shield_regen, 0.0);
+    }
+
+    #[test]
+    fn module_conditions_aggregate_per_kind_and_count_destroyed() {
+        // Refinement 14: per-module-type condition — a carved module reads 0 (destroyed) and drops
+        // its kind's aggregate, while the slot count stays (so "1 of 2 destroyed" is legible).
+        use crate::fitting::content::{HULL_FIGHTER, MODULE_THRUSTER_BASIC};
+        use crate::fitting::SlotId;
+        let (modules, hulls) = seed_catalogs();
+        let hull = hulls.get(HULL_FIGHTER).unwrap().clone();
+        // The fighter has TWO thruster hardpoints (slots 1 + 2) — fit both.
+        let mut fit = Fit::new(hull.id);
+        fit.install_module(SlotId(1), MODULE_THRUSTER_BASIC, &hull, &modules)
+            .unwrap();
+        fit.install_module(SlotId(2), MODULE_THRUSTER_BASIC, &hull, &modules)
+            .unwrap();
+        let mut layout = build_layout(&hull, &fit, &modules);
+
+        // Full health: the Thruster row has two full modules → aggregate 1.0.
+        let full = module_conditions(&fit, &layout, &modules);
+        let thr = full
+            .iter()
+            .find(|c| matches!(c.kind, ModuleKind::Thruster))
+            .expect("a thruster row");
+        assert_eq!(thr.modules.len(), 2, "two thrusters fitted");
+        assert!(thr.modules.iter().all(|&f| (f - 1.0).abs() < 1e-4));
+        assert!((thr.sum_health / thr.sum_health_max - 1.0).abs() < 1e-4);
+
+        // Carve ONE thruster cell away → it reads 0 (destroyed); the row stays count 2, aggregate 0.5.
+        let thruster_cell = *layout
+            .cells
+            .iter()
+            .find(|(_, o)| o.slot == SlotId(2) && o.module == Some(MODULE_THRUSTER_BASIC))
+            .map(|(c, _)| c)
+            .expect("the 2nd thruster has a cell");
+        layout.cells.remove(&thruster_cell);
+        let carved = module_conditions(&fit, &layout, &modules);
+        let thr2 = carved
+            .iter()
+            .find(|c| matches!(c.kind, ModuleKind::Thruster))
+            .expect("a thruster row");
+        assert_eq!(
+            thr2.modules.len(),
+            2,
+            "the destroyed thruster's slot still counts"
+        );
+        assert_eq!(
+            thr2.modules.iter().filter(|&&f| f <= 0.0).count(),
+            1,
+            "exactly one thruster is destroyed"
+        );
+        assert!(
+            (thr2.sum_health / thr2.sum_health_max - 0.5).abs() < 1e-4,
+            "the aggregate halves to 50% (got {})",
+            thr2.sum_health / thr2.sum_health_max
+        );
     }
 
     #[test]

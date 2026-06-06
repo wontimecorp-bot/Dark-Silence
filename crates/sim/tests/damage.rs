@@ -611,20 +611,23 @@ fn clean_penetration_carves_a_channel_to_the_module_behind() {
     );
 }
 
-/// Phase F — the depleting **armor-HP layer**: while `ArmorHp.current > 0`, a penetrating shot is
-/// SOAKED by the armor (the pool drains, the hull is NOT carved); once armor is gone the shot carves
-/// the hull as before. A target WITHOUT `ArmorHp` carves exactly as today (the `Option`-gated path
-/// every determinism/test ship takes) — proven by `clean_penetration_*` above and re-asserted here.
+/// Phase F + Refinement 13 — the depleting **armor-HP layer**: a penetrating hit the armor can fully
+/// absorb (`m <= current`) is SOAKED (the pool drains, the hull is NOT carved); a hit BIGGER than the
+/// remaining armor **spills** — drains it to 0 and carves the excess (so a hard ram punches through
+/// instead of being soaked whole). Once armor is gone the shot carves the hull as before. A target
+/// WITHOUT `ArmorHp` carves exactly as today (the `Option`-gated path every determinism/test ship
+/// takes) — proven by `clean_penetration_*` above and re-asserted here.
 #[test]
-fn armor_hp_soaks_penetrating_hits_until_depleted_then_the_hull_carves() {
+fn armor_hp_soaks_absorbable_hits_but_spills_an_overwhelming_one() {
     use sim::components::ArmorHp;
 
     // No shield (reach the armor gate directly), thin facet (the shot penetrates the plate angle).
     let (mut w, ship) = fitted_world(None, thin_entry_facet);
-    // Give the ship a partial armor-HP pool (50 of 80) so a hit both depletes AND leaves some.
+    // A DEEP armor pool (100k) that can fully absorb even the strong shot's post-armor budget — so
+    // it soaks the hit (no carve), demonstrating armor protects against a hit it CAN absorb.
     w.entity_mut(ship).insert(ArmorHp {
-        current: 50.0,
-        max: 80.0,
+        current: 100_000.0,
+        max: 100_000.0,
     });
 
     // The cell set before any shot — to prove armor protects the hull (no cells removed).
@@ -649,11 +652,33 @@ fn armor_hp_soaks_penetrating_hits_until_depleted_then_the_hull_carves() {
         cells_before,
         "the hull is protected while armor holds (no cells removed)"
     );
-    // The armor pool drained.
+    // The armor pool drained (but is not depleted — it absorbed the whole hit).
     let after = w.get::<ArmorHp>(ship).unwrap().current;
     assert!(
-        after < 50.0,
-        "the penetrating hit depleted ArmorHp (got {after})"
+        after < 100_000.0 && after > 0.0,
+        "the hit drained (but did not deplete) the deep ArmorHp pool (got {after})"
+    );
+
+    // Refinement 13 — a hit BIGGER than the remaining armor SPILLS: it drains the pool to 0 AND
+    // carves the excess into the hull (a hard ram punches through instead of being soaked whole).
+    let (mut ws, ships) = fitted_world(None, thin_entry_facet);
+    ws.entity_mut(ships).insert(ArmorHp {
+        current: 50.0,
+        max: 80.0,
+    });
+    let spill = apply_damage(
+        &mut ws,
+        ships,
+        downward_shot(Channel::Em, 4000.0, 1000.0, 0.0),
+    );
+    assert!(
+        spill.destroyed,
+        "a hit far larger than the remaining armor spills past it and carves to the core"
+    );
+    assert_eq!(
+        ws.get::<ArmorHp>(ships).unwrap().current,
+        0.0,
+        "the spilling hit drains the armor pool to 0"
     );
 
     // Deplete the rest of the armor and fire again → the carve RESUMES on the bare hull.

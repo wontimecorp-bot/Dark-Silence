@@ -38,10 +38,13 @@ pub(crate) const SHIP_MASS: f32 = 2.0;
 /// Asteroid inertial mass for ram impulses.
 pub(crate) const ASTEROID_MASS: f32 = 8.0;
 
-/// Refinement 10 — ship↔structure ram carve magnitude per unit of closing speed (world u/s). The
-/// impact runs the full `apply_damage` pipeline (shields → armor → carve), so a gentle bump just
-/// dings shields while a fast slam blows through and carves the craft apart. Tunable.
-const RAM_CARVE_PER_SPEED: f32 = 3.0;
+/// Refinement 10/12 — ship↔structure ram carve magnitude coefficient. The magnitude is **quadratic
+/// in closing speed** (`RAM_CARVE_K · closing²`) — i.e. ∝ the impact's KINETIC ENERGY — so a fast
+/// slam is dramatically more lethal than a gentle bump. The impact runs the full `apply_damage`
+/// pipeline (shields → armor → carve), and shields RESIST Kinetic heavily (~0.85), so the quadratic
+/// growth is what lets a high-speed ram overwhelm the shield + carve the craft apart while a slow
+/// nudge stays harmless. Tunable.
+const RAM_CARVE_K: f32 = 0.3;
 /// Minimum closing speed for a ship↔structure contact to carve at all — below this it is purely a
 /// wall bounce (so easing/resting against a station does not grind the hull). Tunable.
 const RAM_MIN_CLOSING_SPEED: f32 = 8.0;
@@ -1039,7 +1042,9 @@ pub fn structure_ram_system(world: &mut World) {
             // The contact point on the touching surfaces (the ship's surface toward the body ≈ the
             // body's surface toward the ship).
             let contact_point = ship_pos - contact.normal * ship_radius;
-            let mag_ship = RAM_CARVE_PER_SPEED * closing;
+            // Quadratic in closing speed (∝ kinetic energy) so a fast slam overwhelms the
+            // kinetic-resistant shield while a gentle bump barely registers (Refinement 12).
+            let mag_ship = RAM_CARVE_K * closing * closing;
             // Craft takes the brunt (carve INTO the ship along +normal).
             carves.push((
                 ship,

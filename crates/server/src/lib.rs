@@ -1332,7 +1332,12 @@ impl ServerApp {
                 if fitted {
                     (
                         EntityKind::Ship,
-                        0,
+                        // Refinement 13: keep the entity's `TargetKind` (not 0) so the client can
+                        // still tell a voxelized structure's sub-kind apart — e.g. the round rock
+                        // (`MineNode`) picks a sphere far-LOD placeholder instead of the square box.
+                        // Render-only (off the wire); `kind == Ship` ignores `flags` on the spawn
+                        // path, so this only feeds the LOD-placeholder pick.
+                        kind_flag,
                         heading,
                         shield_frac,
                         shield_flash,

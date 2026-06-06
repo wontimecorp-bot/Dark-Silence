@@ -64,7 +64,10 @@ pub use module::{
     AmmoType, Axis, HardpointType, Module, ModuleId, ModuleKind, ModuleSpecifics, PropulsionType,
     SensorType, SlotSize, Violation, WeaponClass,
 };
-pub use stats::{derive_ship_stats, derive_ship_stats_with, ShipStats, WeaponProfile};
+pub use stats::{
+    derive_ship_stats, derive_ship_stats_with, module_conditions, ModuleCondition, ShipStats,
+    WeaponProfile,
+};
 pub use validate::{
     budget_usage, check_slot_fit, validate_fit, AxisUsage, BudgetUsage, FitValidation,
 };

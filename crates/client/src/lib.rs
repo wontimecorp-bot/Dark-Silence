@@ -33,6 +33,7 @@ pub mod hud;
 pub mod hud_bars;
 pub mod input;
 pub mod interpolation;
+pub mod module_bars;
 pub mod net;
 pub mod prediction;
 pub mod radar;
@@ -95,6 +96,9 @@ pub fn run() -> AppExit {
                 hud::setup_hud,
                 hud::setup_energy_bars,
                 hud::setup_score_hud,
+                // Refinement 14: segmented per-module-type condition bars (right side) — plain Bevy
+                // UI nodes, no camera dependency.
+                module_bars::setup_module_bars,
                 // Camera-anchored trapezoid bars (afterburner ramp + heat double-ramp) —
                 // parented to the camera, so it must exist first.
                 hud_bars::setup_trapezoid_bars.after(camera::setup_camera),
@@ -137,6 +141,7 @@ pub fn run() -> AppExit {
                 hud::update_energy_hud,
                 hud::update_score_hud,
                 hud_bars::update_trapezoid_bars,
+                module_bars::update_module_bars,
                 radar::update_radar,
             ),
         );
