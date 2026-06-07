@@ -46,8 +46,13 @@ const TIP_LAYER_PARALLAX: &str = "This layer's depth/parallax: 0 ≈ screen-lock
 const TIP_LAYER_FREQUENCY: &str = "This layer's cell frequency (cells per world unit) = star SPACING. Higher = denser/closer-packed stars. (Star pixel SIZE is the 'size' knob.)";
 const TIP_LAYER_DENSITY: &str = "This layer's star density (0..1) = fraction of candidate cells that host a star. Final = this × 'density (all)' × the clustering map.";
 const TIP_LAYER_BRIGHTNESS: &str = "This layer's brightness factor. Final = this × 'brightness (all)'. Brighter stars bloom more (HDR).";
-const TIP_LAYER_TWINKLE: &str = "This layer's twinkle factor. Final = this × 'twinkle (all)'. Higher = more scintillation on this layer.";
+const TIP_LAYER_TWINKLE: &str = "This layer's twinkle DEPTH — how FAR its stars pulse. 0 = steady at full brightness; higher = deeper scintillation. (Pulse RATE is 'twinkle speed' just below.)";
 const TIP_LAYER_SIZE: &str = "This layer's star pixel-radius factor (hard points, ~1px min). Bigger = chunkier stars. (Star SPACING is the 'frequency' knob.)";
+const TIP_LAYER_TEMP_MIN: &str = "This layer's COOL-end stellar temperature (Kelvin). Most stars sit near here (cool-weighted), so this sets the layer's dominant color: ≈3000K red (M) … ≈6000K yellow (G) … ≈10000K white (A). The layer becomes a distinct stellar class at a distance.";
+const TIP_LAYER_TEMP_MAX: &str = "This layer's HOT-end stellar temperature (Kelvin) — the rare hottest stars reach this: ≈10000K white (A) … ≈30000K blue (O). Set temp min = max for a single-class monochrome layer; spread them for variety.";
+const TIP_LAYER_TINT: &str = "This layer's flat color TINT hue — blended on top of the blackbody color by 'tint strength' below (which is 0/off by default, so this swatch does nothing until you raise it). Pushes the layer toward a hue (e.g. nebula-ish teal/violet) regardless of temperature.";
+const TIP_LAYER_TINT_STRENGTH: &str = "How strongly the layer 'tint' applies — a SECONDARY effect. 0 = off (pure stellar/blackbody color, the default); partial = a subtle hue push that keeps the temperature variation; 1 = full tint multiply (a saturated hue overrides the temperature). For overall dimming use 'brightness', not this.";
+const TIP_TWINKLE_SPEED: &str = "This layer's twinkle SPEED — how FAST its stars pulse (scales the pulse rate). Separate from 'twinkle depth' (how FAR they pulse). 1.0 = default rate; 0 = frozen phase.";
 
 /// Phase M6e — the single source of truth for every stat/knob the panel shows. A section refers to
 /// a [`StatId`] instead of hand-writing its label/order/format, so a rename or reorder is a
@@ -1674,18 +1679,18 @@ fn dev_panel_ui(
                         .on_hover_text("Energy readout distance from the bottom of the screen, in pixels.");
                 });
 
-                // Refinement 25: live starfield + bloom (client-side). Editing mutates the
-                // `StarfieldTuning` ResMut directly → `update_starfield` applies it next frame.
-                egui::CollapsingHeader::new("Starfield / Bloom (client, live)").show(ui, |ui| {
-                    // Global knobs. The "(all)" sliders are MASTER multipliers: final = per-layer × all.
+                // Refinement 34: bloom is a CAMERA post-process (the whole rendered image), NOT a
+                // starfield knob — give it its own section. Editing mutates `StarfieldTuning` →
+                // `update_starfield` applies `bloom_intensity` to the camera's `Bloom` next frame.
+                egui::CollapsingHeader::new("Camera / Post-processing (client, live)").show(ui, |ui| {
                     slider(ui, "bloom intensity", &mut starfield.bloom_intensity, 0.0..=1.0)
-                        .on_hover_text("Camera bloom strength — the glow on bright pixels (bright stars + emissive). Higher = more glow; keep modest so ships stay readable against the field.");
-                    slider(ui, "brightness (all)", &mut starfield.star_brightness, 0.0..=4.0)
-                        .on_hover_text("MASTER star brightness — multiplies EVERY layer (final = per-layer brightness × this). Quick whole-field dim/boost; no priority over per-layer, they multiply.");
-                    slider(ui, "density (all)", &mut starfield.star_density, 0.0..=1.0)
-                        .on_hover_text("MASTER star density — multiplies EVERY layer's density (final = per-layer density × this × clustering map). Set to 0 and the whole field empties regardless of per-layer.");
-                    slider(ui, "twinkle (all)", &mut starfield.twinkle_amount, 0.0..=2.0)
-                        .on_hover_text("MASTER twinkle — multiplies EVERY layer's twinkle (final = per-layer twinkle × this). 0 = steady (no scintillation).");
+                        .on_hover_text("Camera bloom strength — the glow on bright pixels across the WHOLE image (bright stars, emissive, ships). Higher = more glow; keep modest so ships stay readable against the field.");
+                });
+
+                // Refinement 25/34: live starfield (client-side). All LOOK knobs are PER-LAYER (the
+                // old global brightness/density/twinkle masters were removed); only the structural
+                // `layers` count + the global `edge softness` quality knob live here.
+                egui::CollapsingHeader::new("Starfield (client, live)").show(ui, |ui| {
                     slider(ui, "layers (4-16)", &mut starfield.layer_count, 4.0..=16.0)
                         .on_hover_text("How many parallax star layers to draw (4–16). More = deeper field, slightly more GPU. The 'Layer N' rows below appear/disappear with this.");
                     slider(ui, "edge softness (AA)", &mut starfield.edge_softness, 0.0..=1.5)
@@ -1704,8 +1709,10 @@ fn dev_panel_ui(
                                 .on_hover_text(TIP_LAYER_DENSITY);
                             slider(ui, &format!("L{i} brightness"), &mut l.brightness, 0.0..=3.0)
                                 .on_hover_text(TIP_LAYER_BRIGHTNESS);
-                            slider(ui, &format!("L{i} twinkle"), &mut l.twinkle, 0.0..=2.0)
+                            slider(ui, &format!("L{i} twinkle depth"), &mut l.twinkle, 0.0..=2.0)
                                 .on_hover_text(TIP_LAYER_TWINKLE);
+                            slider(ui, &format!("L{i} twinkle speed"), &mut l.twinkle_speed, 0.0..=5.0)
+                                .on_hover_text(TIP_TWINKLE_SPEED);
                             slider(ui, &format!("L{i} size"), &mut l.size, 0.3..=4.0)
                                 .on_hover_text(TIP_LAYER_SIZE);
                             // R29-fix: live estimate of the on-screen star radius for this `size`.
@@ -1723,6 +1730,34 @@ fn dev_panel_ui(
                             .on_hover_text(
                                 "Estimated on-screen star RADIUS in pixels for this layer's size. Most stars are cool (≈ the first number); rare hot stars reach the second. Hard floor of 1px (a hard point can't be smaller), so size below ~0.45 stops shrinking them. Zoom-independent.",
                             );
+                            // R32: this layer's stellar-class temperature RANGE (→ blackbody color)
+                            // + an optional flat color TINT multiplier on top.
+                            slider(
+                                ui,
+                                &format!("L{i} temp min (K)"),
+                                &mut l.temp_min,
+                                1000.0..=40000.0,
+                            )
+                            .on_hover_text(TIP_LAYER_TEMP_MIN);
+                            slider(
+                                ui,
+                                &format!("L{i} temp max (K)"),
+                                &mut l.temp_max,
+                                1000.0..=40000.0,
+                            )
+                            .on_hover_text(TIP_LAYER_TEMP_MAX);
+                            ui.horizontal(|ui| {
+                                ui.label("layer tint").on_hover_text(TIP_LAYER_TINT);
+                                ui.color_edit_button_rgb(&mut l.tint)
+                                    .on_hover_text(TIP_LAYER_TINT);
+                            });
+                            slider(
+                                ui,
+                                &format!("L{i} tint strength"),
+                                &mut l.tint_strength,
+                                0.0..=1.0,
+                            )
+                            .on_hover_text(TIP_LAYER_TINT_STRENGTH);
                         });
                     }
                 });

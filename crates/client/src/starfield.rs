@@ -38,8 +38,8 @@ fn geomix(a: f32, b: f32, t: f32) -> f32 {
     a * (b / a).powf(t)
 }
 
-/// One layer's GPU parameters (Refinement 26). 8×`f32` = 32 bytes so the std140 uniform array stride
-/// is unambiguous. Field order + types MUST match `StarLayer` in the WGSL.
+/// One layer's GPU parameters (Refinement 26/32). 12×`f32` = 48 bytes so the std140 uniform array
+/// stride is unambiguous (a 16-byte multiple). Field order + types MUST match `StarLayer` in the WGSL.
 #[derive(ShaderType, Clone, Copy, Default)]
 pub struct StarLayer {
     /// Parallax factor (0 = screen-locked / infinite, →1 = world-anchored / fast).
@@ -54,8 +54,19 @@ pub struct StarLayer {
     pub twinkle: f32,
     /// Per-layer star size (pixel-radius) factor.
     pub size: f32,
-    pub _pad0: f32,
-    pub _pad1: f32,
+    /// Stellar-class temperature RANGE in Kelvin feeding the blackbody color (Refinement 32):
+    /// `temp_min` = the common cool end, `temp_max` = the rare hot end (per-star `tn` mixes between
+    /// them). Repurposes the old `_pad0`/`_pad1` slots — no size change for these two.
+    pub temp_min: f32,
+    pub temp_max: f32,
+    /// Per-layer flat color TINT multiplier (Refinement 32; white = no change).
+    pub tint_r: f32,
+    pub tint_g: f32,
+    pub tint_b: f32,
+    /// Per-layer twinkle SPEED (Refinement 34) — the pulse RATE for this layer (vs `twinkle` = the
+    /// DEPTH). Reuses the old trailing pad slot, so `StarLayer` stays 12 f32 / 48 bytes (identical
+    /// uniform array stride).
+    pub twinkle_speed: f32,
 }
 
 /// GPU uniforms for the starfield shader. Field order + types MUST match `StarfieldParams` in the
@@ -72,10 +83,13 @@ pub struct StarfieldParams {
     pub resolution: Vec2,
     /// Seconds since start (twinkle).
     pub time: f32,
-    /// GLOBAL multipliers applied on top of every layer (see [`StarfieldTuning`]).
-    pub star_brightness: f32,
-    pub star_density: f32,
-    pub twinkle_amount: f32,
+    /// Refinement 34: the old GLOBAL `star_brightness`/`star_density`/`twinkle_amount` master
+    /// multipliers were removed (everything is per-layer now). Kept as PADS so the uniform byte
+    /// layout is byte-identical to R32/R33 (offsets unchanged → no alignment recompute); the shader
+    /// no longer reads them.
+    pub _pad_a: f32,
+    pub _pad_b: f32,
+    pub _pad_c: f32,
     /// How many of `layers` to draw.
     pub layer_count: u32,
     /// Analytic-coverage edge softness in pixels (Refinement 30): 0 = hard points (shimmer on
@@ -84,6 +98,9 @@ pub struct StarfieldParams {
     pub edge_softness: f32,
     /// Per-layer parameters (Refinement 26); the shader reads `layers[0..layer_count]`.
     pub layers: [StarLayer; MAX_LAYERS],
+    /// Refinement 34: the global `twinkle_speed` moved to per-layer (`StarLayer.twinkle_speed`); this
+    /// trailing slot is kept as a PAD so the layout is unchanged. Not read by the shader.
+    pub _pad_d: f32,
 }
 
 /// The starfield background material (one uniform block at binding 0).
@@ -112,6 +129,26 @@ pub struct LayerTuning {
     pub brightness: f32,
     pub twinkle: f32,
     pub size: f32,
+    /// Stellar-class temperature RANGE (Kelvin) for this layer's blackbody color (Refinement 32).
+    /// `#[serde(default)]` so `render_tuning.ron` files saved before these fields existed still load.
+    #[serde(default = "default_temp_min")]
+    pub temp_min: f32,
+    #[serde(default = "default_temp_max")]
+    pub temp_max: f32,
+    /// Per-layer flat color TINT (Refinement 32; the picked hue). Applied as a SECONDARY effect via
+    /// `tint_strength` (R33) — the swatch only matters when strength > 0.
+    #[serde(default = "default_tint")]
+    pub tint: [f32; 3],
+    /// Per-layer tint STRENGTH (Refinement 33), 0 = off (pure stellar color) … 1 = full `tint`
+    /// multiply. The effective GPU tint = `lerp(white, tint, strength)` (computed CPU-side), so this
+    /// is a real off-by-default secondary control. `#[serde(default)]` so older RONs load.
+    #[serde(default = "default_tint_strength")]
+    pub tint_strength: f32,
+    /// Per-layer twinkle SPEED (Refinement 34) — the pulse RATE for this layer (vs `twinkle` = the
+    /// DEPTH). 1.0 = the original rate. `#[serde(default)]` so older RONs load (replaces the removed
+    /// global `twinkle_speed`).
+    #[serde(default = "default_twinkle_speed")]
+    pub twinkle_speed: f32,
 }
 
 /// Live, dev-panel-tunable starfield + bloom knobs (client-only; NOT behind the `dev_panel` feature
@@ -119,14 +156,9 @@ pub struct LayerTuning {
 /// out-read the background, with the per-layer defaults reproducing R25's exponential 8-layer look.
 #[derive(Resource, Clone, Copy, Serialize, Deserialize)]
 pub struct StarfieldTuning {
-    /// Camera bloom strength (applied to the `Bloom` component).
+    /// Camera bloom strength (applied to the `Bloom` component). Lives in the dev panel's
+    /// "Camera / Post-processing" section (R34) — it's a camera post-process, not a starfield knob.
     pub bloom_intensity: f32,
-    /// GLOBAL star brightness multiplier (scales every layer).
-    pub star_brightness: f32,
-    /// GLOBAL star density multiplier (scales every layer).
-    pub star_density: f32,
-    /// GLOBAL twinkle multiplier (scales every layer; 0 = steady).
-    pub twinkle_amount: f32,
     /// Layer count to draw (stored as f32 for the slider; rounded + clamped to [`MAX_LAYERS`]).
     pub layer_count: f32,
     /// Star-edge AA softness in px (Refinement 30): 0 = pure hard points (shimmer on motion), ~0.75 =
@@ -134,7 +166,9 @@ pub struct StarfieldTuning {
     /// saved before this field still load.
     #[serde(default = "default_edge_softness")]
     pub edge_softness: f32,
-    /// Per-layer parameters (depth / spacing / density / brightness / twinkle / size).
+    /// Per-layer parameters (R34: ALL look knobs are per-layer — the old global `star_brightness` /
+    /// `star_density` / `twinkle_amount` / `twinkle_speed` masters were removed; serde ignores them
+    /// in older `render_tuning.ron` files).
     pub layers: [LayerTuning; MAX_LAYERS],
 }
 
@@ -142,6 +176,33 @@ pub struct StarfieldTuning {
 /// substituted for `render_tuning.ron` files saved before `edge_softness` existed.
 fn default_edge_softness() -> f32 {
     0.75
+}
+
+/// Default per-layer cool-end temperature (Kelvin) — R25's global default, now per-layer (R32); also
+/// substituted for `render_tuning.ron` layers saved before `temp_min` existed.
+fn default_temp_min() -> f32 {
+    3000.0
+}
+
+/// Default per-layer hot-end temperature (Kelvin) — see [`default_temp_min`].
+fn default_temp_max() -> f32 {
+    30000.0
+}
+
+/// Default per-layer color tint — white (no change).
+fn default_tint() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
+}
+
+/// Default per-layer tint strength (R33) — 0.0 = off (the tint is a secondary effect, off until
+/// dialed up); also substituted for `render_tuning.ron` layers saved before `tint_strength` existed.
+fn default_tint_strength() -> f32 {
+    0.0
+}
+
+/// Default global twinkle SPEED multiplier (R32) — 1.0 = the original hardcoded pulse rate.
+fn default_twinkle_speed() -> f32 {
+    1.0
 }
 
 impl Default for StarfieldTuning {
@@ -160,13 +221,18 @@ impl Default for StarfieldTuning {
                 brightness: mix(0.6, 1.0, fi),
                 twinkle: 1.0,
                 size: mix(0.9, 1.3, fi),
+                // R32: per-layer stellar-class range + tint default to R25's global range / no tint,
+                // so the default render is unchanged until the user tunes a layer.
+                temp_min: default_temp_min(),
+                temp_max: default_temp_max(),
+                tint: default_tint(),
+                tint_strength: default_tint_strength(),
+                // R34: per-layer twinkle speed (was a global); 1.0 = the original pulse rate.
+                twinkle_speed: default_twinkle_speed(),
             }
         });
         Self {
             bloom_intensity: 0.15,
-            star_brightness: 1.0,
-            star_density: 1.0,
-            twinkle_amount: 1.0,
             layer_count: 8.0,
             edge_softness: default_edge_softness(),
             layers,
@@ -242,8 +308,16 @@ pub fn update_starfield(
                 brightness: l.brightness,
                 twinkle: l.twinkle,
                 size: l.size,
-                _pad0: 0.0,
-                _pad1: 0.0,
+                temp_min: l.temp_min,
+                temp_max: l.temp_max,
+                // R33: tint is a SECONDARY effect via `tint_strength` — the effective GPU tint is
+                // `lerp(white, tint, strength)` so the WGSL stays a plain `blackbody·tint` multiply
+                // (no shader/struct change), and strength 0 ⇒ white ⇒ exact no-op.
+                tint_r: mix(1.0, l.tint[0], l.tint_strength),
+                tint_g: mix(1.0, l.tint[1], l.tint_strength),
+                tint_b: mix(1.0, l.tint[2], l.tint_strength),
+                // R34: per-layer twinkle SPEED (was a global multiplier).
+                twinkle_speed: l.twinkle_speed,
             }
         });
         mat.params = StarfieldParams {
@@ -252,12 +326,14 @@ pub fn update_starfield(
             fov,
             resolution: Vec2::new(window.width(), window.height()),
             time: time.elapsed_secs(),
-            star_brightness: tuning.star_brightness,
-            star_density: tuning.star_density,
-            twinkle_amount: tuning.twinkle_amount,
+            // R34: removed global multipliers — kept as zeroed pads (layout unchanged; shader ignores).
+            _pad_a: 0.0,
+            _pad_b: 0.0,
+            _pad_c: 0.0,
             layer_count: (tuning.layer_count.round() as u32).clamp(1, MAX_LAYERS as u32),
             edge_softness: tuning.edge_softness,
             layers,
+            _pad_d: 0.0,
         };
     }
 }

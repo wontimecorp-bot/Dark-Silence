@@ -10,8 +10,8 @@
 
 #import bevy_pbr::forward_io::VertexOutput
 
-// One layer's parameters (Refinement 26). Order/types MUST match `StarLayer` in starfield.rs
-// (8 floats = 32-byte uniform array stride).
+// One layer's parameters (Refinement 26/32/34). Order/types MUST match `StarLayer` in starfield.rs
+// (12 floats = 48-byte uniform array stride). R34: the old trailing `pad0` is now `twinkle_speed`.
 struct StarLayer {
     parallax: f32,
     frequency: f32,
@@ -19,8 +19,12 @@ struct StarLayer {
     brightness: f32,
     twinkle: f32,
     size: f32,
-    pad0: f32,
-    pad1: f32,
+    temp_min: f32,
+    temp_max: f32,
+    tint_r: f32,
+    tint_g: f32,
+    tint_b: f32,
+    twinkle_speed: f32,
 }
 
 struct StarfieldParams {
@@ -29,14 +33,18 @@ struct StarfieldParams {
     fov: f32,
     resolution: vec2<f32>,
     time: f32,
-    star_brightness: f32,
-    star_density: f32,
-    twinkle_amount: f32,
+    // R34: the old global star_brightness/star_density/twinkle_amount masters were removed (all
+    // per-layer now) — kept as PADS so the byte layout still matches the Rust `StarfieldParams`.
+    pad_a: f32,
+    pad_b: f32,
+    pad_c: f32,
     layer_count: u32,
     // Analytic-coverage edge softness in px (R30); reuses the 16-align slot (offset 44 → layers 48),
     // so the layout still matches the Rust `StarfieldParams`.
     edge_softness: f32,
     layers: array<StarLayer, 16>,
+    // R34: the global twinkle_speed moved to per-layer; this trailing slot is now a PAD.
+    pad_d: f32,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> params: StarfieldParams;
@@ -115,8 +123,9 @@ fn star_layer(
     // and the density field move together → each star's density value is invariant under camera
     // translation → no twinkle as you fly (at parallax 0, `s` = screen offset → density screen-locked).
     let dmap = 0.30 + 0.70 * (1.0 - worley(s * 0.03 + vec2<f32>(seed, seed)));
-    // Fraction of candidate cells that host a star, modulated by the global density + the density map.
-    let dens = layer.density * params.star_density * dmap;
+    // Fraction of candidate cells that host a star, modulated by the density map (R34: per-layer
+    // density only — the global `star_density` master was removed).
+    let dens = layer.density * dmap;
 
     var col = vec3<f32>(0.0);
     for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
@@ -132,11 +141,12 @@ fn star_layer(
             let d_cells = length(q - star_q);
             let px = d_cells / freq * px_per_world; // distance to the star in PIXELS
 
-            // Stellar class, weighted toward cool (M most common, O rarest): `tn` 0..1, then the
-            // real blackbody temperature M≈3000K (red) → O≈30000K (blue).
+            // Stellar class, weighted toward cool (`tn` cool-biased via pow(.,3)): the layer's own
+            // R32 temperature RANGE — `temp_min` (common cool end) → `temp_max` (rare hot end) — so
+            // each layer reads as a distinct stellar class, with real per-star blackbody variation.
             let th = hash21(cid * 4.13 + seed + 9.1);
             let tn = pow(th, 3.0);
-            let temp_k = mix(3000.0, 30000.0, tn);
+            let temp_k = mix(layer.temp_min, layer.temp_max, tn);
             // R30: analytic sub-pixel COVERAGE instead of a hard step → temporally stable (kills the
             // motion shimmer) + twinkle-controllable. No 1px floor; energy-conserving so sub-pixel
             // stars get fainter (by radius) rather than clamping to a full-bright 1px dot.
@@ -148,14 +158,19 @@ fn star_layer(
             let cov = 1.0 - smoothstep(r - aa, r + aa, px); // soft coverage at this fragment
             let fill = clamp(r, 0.0, 1.0); // energy-conserving: sub-pixel stars dimmer
 
-            // Desynchronised twinkle: per-star phase + summed incommensurate sines.
+            // Desynchronised twinkle: per-star phase + summed incommensurate sines. R34: the sine
+            // frequencies scale by THIS LAYER's twinkle SPEED (`layer.twinkle_speed`) — the pulse RATE,
+            // distinct from `layer.twinkle` (the DEPTH). Both are per-layer now.
             let phase = hash21(cid * 5.7 + seed) * TAU;
             let t = params.time;
-            let raw = 0.5 * sin(t * 1.3 + phase)
-                + 0.3 * sin(t * 2.1 + phase * 1.7)
-                + 0.2 * sin(t * 3.7 + phase * 2.3);
+            let sp = layer.twinkle_speed;
+            let raw = 0.5 * sin(t * 1.3 * sp + phase)
+                + 0.3 * sin(t * 2.1 * sp + phase * 1.7)
+                + 0.2 * sin(t * 3.7 * sp + phase * 2.3);
             let amp = mix(1.0, 0.4, tn); // cool/dim stars scintillate more, hot/bright steadier
-            let tw = clamp(0.6 + 0.4 * raw * params.twinkle_amount * layer.twinkle * amp, 0.0, 1.6);
+            // R32: base 1.0 (not 0.6) so twinkle=0 ⇒ tw=1.0 (steady, FULL brightness); twinkle>0
+            // dips + flares around full. R34: per-layer twinkle depth only (global master removed).
+            let tw = clamp(1.0 + 0.4 * raw * layer.twinkle * amp, 0.0, 1.6);
 
             let bright = mix(0.5, 2.2, tn) * layer.brightness; // hot brighter; >1 => HDR bloom
             // R30b: SOFT density gate — fade stars in/out near the threshold instead of a hard pop, so
@@ -163,7 +178,10 @@ fn star_layer(
             // the marginal (upper-half-of-threshold) stars fade; core stars (present < 0.5·dens) stay
             // fully on.
             let gate = 1.0 - smoothstep(dens * 0.5, dens, present);
-            col = col + blackbody(temp_k) * bright * tw * cov * fill * gate;
+            // R32: per-layer flat color TINT multiplier on top of the blackbody color (white = no
+            // change).
+            let tint = vec3<f32>(layer.tint_r, layer.tint_g, layer.tint_b);
+            col = col + blackbody(temp_k) * tint * bright * tw * cov * fill * gate;
         }
     }
     return col;
@@ -192,6 +210,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         col = col + star_layer(world, params.cam_pos, layer, px_per_world, seed);
     }
 
-    col = col * params.star_brightness;
+    // R34: no global brightness master — each layer's `brightness` is applied inside `star_layer`.
     return vec4<f32>(col, 1.0);
 }
