@@ -238,6 +238,10 @@ pub struct BarPos {
 /// `dev_panel` feature compiled out (the resource never changes) the HUD sits exactly where it always
 /// did — determinism/behaviour unchanged.
 #[derive(Resource, Clone, Copy, serde::Serialize, serde::Deserialize)]
+// R40: `#[serde(default)]` so an older `render_tuning.ron` whose `hud` block predates a field still
+// deserializes (missing fields fall back to `HudLayout::default()`), instead of failing the whole
+// `DevSettings` parse.
+#[serde(default)]
 pub struct HudLayout {
     pub energy: BarPos,
     pub heat: BarPos,
@@ -249,6 +253,12 @@ pub struct HudLayout {
     pub readout_left_pct: f32,
     pub readout_width_pct: f32,
     pub readout_bottom_px: f32,
+    /// Refinement 40: the bottom-right module-condition bar panel (`module_bars.rs`), screen-space px:
+    /// distance from the right/bottom edges + each per-type bar track's width/height.
+    pub module_right_px: f32,
+    pub module_bottom_px: f32,
+    pub module_bar_width_px: f32,
+    pub module_bar_height_px: f32,
 }
 
 impl Default for HudLayout {
@@ -289,6 +299,11 @@ impl Default for HudLayout {
             readout_left_pct: 24.0,
             readout_width_pct: 14.0,
             readout_bottom_px: 46.0,
+            // R40: mirror the hardcoded `setup_module_bars` panel layout (bottom-right, 120×12 tracks).
+            module_right_px: 12.0,
+            module_bottom_px: 64.0,
+            module_bar_width_px: 120.0,
+            module_bar_height_px: 12.0,
         }
     }
 }

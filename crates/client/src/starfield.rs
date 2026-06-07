@@ -152,10 +152,12 @@ pub struct StarfieldParams {
     pub glare_spike_len: f32,
     pub glare_spike_count: f32,
     pub glare_spike_intensity: f32,
+    /// R38: zoom size compensation (0 = fixed pixel, 1 = fixed apparent size). Takes one of the three
+    /// pad slots, so `layers` still starts at offset 144 (no offset shift).
+    pub zoom_compensation: f32,
     /// Explicit pad so `layers` (array, 16-byte align) starts on a 16-byte boundary (offset 144).
     pub _pad0: f32,
     pub _pad1: f32,
-    pub _pad2: f32,
     /// Per-layer depth parameters; the shader reads `layers[0..layer_count]`.
     pub layers: [StarLayer; MAX_LAYERS],
     /// Per-spectral-class parameters (Refinement 35); `NUM_CLASSES` used.
@@ -245,6 +247,11 @@ impl Default for ClassTuning {
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GalaxyTuning {
+    /// Zoom size compensation (Refinement 38), 0..1: 0 = fixed-pixel stars (brightness changes with
+    /// zoom), 1 = fixed apparent size (brightness ~constant across zoom). Scales star + glare size by
+    /// `(REF_HEIGHT / camera.height)^this`.
+    #[serde(default = "default_zoom_comp")]
+    pub zoom_compensation: f32,
     // Galactic band (the Milky Way lane).
     pub band_angle: f32,
     pub band_width: f32,
@@ -403,6 +410,7 @@ impl Default for GalaxyTuning {
             ),
         ];
         Self {
+            zoom_compensation: default_zoom_comp(),
             band_angle: 0.35,
             band_width: 0.4,
             band_offset: 0.0,
@@ -462,6 +470,12 @@ fn default_tint() -> [f32; 3] {
 /// off-by-default effect); also substituted for older `render_tuning.ron` layers without the field.
 fn default_tint_strength() -> f32 {
     0.0
+}
+
+/// Default zoom size compensation (R38) — 1.0 = fixed apparent size (brightness ~constant across
+/// zoom). Also substituted for older `render_tuning.ron` files without the field.
+fn default_zoom_comp() -> f32 {
+    1.0
 }
 
 impl Default for StarfieldTuning {
@@ -665,9 +679,9 @@ pub fn update_starfield(
             glare_spike_len: g.glare_spike_len,
             glare_spike_count: g.glare_spike_count,
             glare_spike_intensity: g.glare_spike_intensity,
+            zoom_compensation: g.zoom_compensation,
             _pad0: 0.0,
             _pad1: 0.0,
-            _pad2: 0.0,
             layers,
             classes,
         };

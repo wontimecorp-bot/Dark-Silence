@@ -90,9 +90,11 @@ pub fn run() -> AppExit {
         );
     }
 
-    // Refinement 27: load the persisted Starfield + HUD tuning from `render_tuning.ron` (code
-    // defaults if absent/unparseable) and insert both resources below.
-    let render_tuning = tuning_io::load_render_tuning();
+    // Refinement 27/39: load the persisted dev settings from `render_tuning.ron` (code defaults if
+    // absent/unparseable). Here we take only the CLIENT render resources (HUD + starfield); the sim
+    // tuning part is loaded + applied to the embedded server WINDOWED-ONLY in `net::setup_loopback_host`
+    // (never in `ServerApp::new`, so headless determinism is untouched).
+    let dev = tuning_io::load_dev_settings();
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins)
@@ -113,10 +115,10 @@ pub fn run() -> AppExit {
         .init_resource::<net::ModuleColorMode>()
         // Refinement 24: live-tunable HUD bar/readout layout (the dev panel edits it; default = the
         // hardcoded positions). Present even without the dev panel → the HUD sits at its defaults.
-        // Refinement 24/25/27: the live HUD + starfield tuning, loaded from `render_tuning.ron`
+        // Refinement 24/25/27/39: the live HUD + starfield tuning, loaded from `render_tuning.ron`
         // (the dev panel edits them; its Save button writes them back). Code defaults if no file.
-        .insert_resource(render_tuning.hud)
-        .insert_resource(render_tuning.starfield)
+        .insert_resource(dev.hud)
+        .insert_resource(dev.starfield)
         // Refinement 21/22: load the shared HUD fonts (label + mono) + icon images into
         // `FontAssets`/`IconAssets` BEFORE the Startup HUD setups, which clone the handles.
         .add_systems(PreStartup, fonts::load_hud_assets)
@@ -180,6 +182,8 @@ pub fn run() -> AppExit {
                 // Refinement 24: apply the live HUD layout (dev panel) to the bars + the readout.
                 hud_bars::apply_bar_layout,
                 hud::apply_readout_layout,
+                // Refinement 40: apply the live module-condition-bar layout (position + track size).
+                module_bars::apply_module_bar_layout,
                 // Refinement 25: feed camera uniforms + live tuning to the starfield + bloom.
                 starfield::update_starfield.after(camera::follow_camera),
             ),

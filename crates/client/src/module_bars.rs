@@ -15,6 +15,7 @@ use sim::fitting::{module_conditions, Fit, FitLayout, ModuleCatalog, ModuleCondi
 
 use crate::fonts::{FontAssets, IconAssets};
 use crate::hud::{grade, scale_rgb, seg_dim};
+use crate::hud_bars::HudLayout;
 use crate::net::{LoopbackHost, NetClientState};
 
 /// The module types shown, in order (the major ones a pilot cares about).
@@ -63,6 +64,13 @@ const ICON_DESTROYED_COLOR: Color = Color::srgb(0.98, 0.30, 0.22);
 /// Root of the module-bar panel (toggled hidden when there is no fitted player ship).
 #[derive(Component)]
 pub struct ModuleBarPanel;
+/// Refinement 40: a row's segmented-bar TRACK container — its width/height are dev-panel-tunable
+/// (`apply_module_bar_layout`); the segments inside flex-grow to fill it.
+#[derive(Component)]
+pub struct ModuleBarTrack {
+    #[allow(dead_code)] // kind isn't read by the apply system, but mirrors the other row markers.
+    kind: ModuleKind,
+}
 /// One module-type row container (hidden when the ship has no module of that kind).
 #[derive(Component)]
 pub struct ModuleBarRow {
@@ -135,13 +143,16 @@ pub fn setup_module_bars(mut commands: Commands, fonts: Res<FontAssets>, icons: 
                             },
                             ModuleBarLabel { kind },
                         ));
-                        row.spawn(Node {
-                            width: Val::Px(120.0),
-                            height: Val::Px(12.0),
-                            flex_direction: FlexDirection::Row,
-                            column_gap: Val::Px(2.0),
-                            ..default()
-                        })
+                        row.spawn((
+                            Node {
+                                width: Val::Px(120.0),
+                                height: Val::Px(12.0),
+                                flex_direction: FlexDirection::Row,
+                                column_gap: Val::Px(2.0),
+                                ..default()
+                            },
+                            ModuleBarTrack { kind },
+                        ))
                         .with_children(|bar| {
                             for index in 0..MAX_SEG {
                                 bar.spawn((
@@ -225,6 +236,28 @@ pub fn setup_module_bars(mut commands: Commands, fonts: Res<FontAssets>, icons: 
                     });
             }
         });
+}
+
+/// Refinement 40: apply the dev-panel-tunable module-bar layout — position the panel (distance from
+/// the right/bottom edges) and size each per-type bar track (width/height) from [`HudLayout`]. Runs
+/// only when the layout changed (the initial spawn already uses the same defaults). Disjoint `&mut
+/// Node` queries via mutually-exclusive `With`/`Without` markers. Windowed-client HUD only.
+pub fn apply_module_bar_layout(
+    layout: Res<HudLayout>,
+    mut panel_q: Query<&mut Node, (With<ModuleBarPanel>, Without<ModuleBarTrack>)>,
+    mut track_q: Query<&mut Node, (With<ModuleBarTrack>, Without<ModuleBarPanel>)>,
+) {
+    if !layout.is_changed() {
+        return;
+    }
+    for mut n in &mut panel_q {
+        n.right = Val::Px(layout.module_right_px);
+        n.bottom = Val::Px(layout.module_bottom_px);
+    }
+    for mut n in &mut track_q {
+        n.width = Val::Px(layout.module_bar_width_px);
+        n.height = Val::Px(layout.module_bar_height_px);
+    }
 }
 
 /// Refresh the segments/labels/counts each frame from the player ship's live `FitLayout`. Reads the

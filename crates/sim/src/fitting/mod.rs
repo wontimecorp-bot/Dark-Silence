@@ -172,3 +172,15 @@ pub fn force_rederive_all(world: &mut World) {
         fit.set_changed();
     }
 }
+
+/// Re-derive every fitted ship's [`ShipStats`] from the live catalog/tuning **without repairing**
+/// (Refinement 39 — the dev panel's live "edit a module DESIGN and see all ships update"). Marks each
+/// [`FitLayout`] changed (NOT [`Fit`]), so [`recompute_ship_stats_system`] takes the no-rebuild branch
+/// (`fit.is_changed()` is false → the layout + its per-cell health are preserved) and only re-derives
+/// the stats. Unlike [`force_rederive_all`] this keeps live battle damage. Solo / dev only.
+pub fn force_rederive_keep_health(world: &mut World) {
+    let mut q = world.query::<&mut FitLayout>();
+    for mut layout in q.iter_mut(world) {
+        layout.set_changed();
+    }
+}

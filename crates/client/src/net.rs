@@ -238,6 +238,26 @@ const SELECTED_SCENARIO: Scenario = Scenario::MiningSkirmish;
 
 fn setup_loopback_host(world: &mut World) {
     let (mut server, mut transport) = ServerApp::loopback();
+
+    // Refinement 39/41: apply the WINDOWED-ONLY sim-tuning override (the dev panel's saved
+    // `render_tuning.ron`) to the embedded server BEFORE spawning, so spawns build at the dev tuning
+    // (e.g. struct-cell HP/mass) and every tick reads the dev flight/damage configs. This is loaded
+    // here — NOT in `ServerApp::new` — so the headless determinism/botkit/demo worlds (which never run
+    // this windowed setup) keep their `Default` tuning and stay bit-identical. Module/hull DESIGNS are
+    // NOT overridden here: R41 writes design edits back to the canonical `modules.ron`/`ships.ron`,
+    // which `ServerApp::loopback()` → `load_content_or_default` already loaded into the catalog.
+    let dev = crate::tuning_io::load_dev_settings();
+    {
+        let w = server.world_mut();
+        w.insert_resource(dev.tuning);
+        w.insert_resource(dev.sim_tuning);
+        w.insert_resource(dev.penetration);
+        w.insert_resource(dev.shield);
+        w.insert_resource(dev.salvage);
+        w.insert_resource(dev.stat_scaling);
+        w.insert_resource(dev.resistance);
+    }
+
     // Populate the authoritative world with the selected scenario BEFORE the handshake
     // tick below, so its entities exist the first time `capture_render_state` reads the
     // server world. `Scenario::Sandbox` reproduces the original demo (practice dummies +
@@ -245,6 +265,9 @@ fn setup_loopback_host(world: &mut World) {
     // new game mode. The headless tests never call `spawn_scenario`, so `spawn_demo_world`
     // + the test entity sets are untouched.
     server.spawn_scenario(SELECTED_SCENARIO);
+    // `spawn_scenario(MiningSkirmish)` inserts `MiningTuning` from `scenario.ron`, so apply the dev
+    // override AFTERWARDS (else it would be clobbered). Sandbox also inserts a default MiningTuning.
+    server.world_mut().insert_resource(dev.mining);
     let conn = NetTransport::connect(&mut transport, loopback_addr());
 
     // Handshake: send Connect, tick the server once so it accepts + replies, then

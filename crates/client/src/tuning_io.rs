@@ -10,70 +10,201 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use sim::damage::{
+    default_resistance_matrix, PenetrationConfig, ResistanceMatrix, SalvageConfig, ShieldConfig,
+    StatScalingConfig,
+};
+use sim::fitting::{HullCatalog, ModuleCatalog};
+use sim::{MiningTuning, SimTuning, Tuning};
+
 use crate::hud_bars::HudLayout;
 use crate::starfield::StarfieldTuning;
 
-/// File name (under the content dir) holding the persisted render tuning.
+/// File name (under the content dir) holding the windowed dev override (R39: sim tuning + HUD +
+/// starfield). Kept as `render_tuning.ron` so older files (which held only `starfield`+`hud`) still
+/// load — the name is now a slight misnomer.
 const RENDER_TUNING_RON: &str = "render_tuning.ron";
 
-/// The on-disk wrapper: both render-tuning resources in one RON. `Default` = the code defaults of
-/// both (the fallback when no file is present).
-#[derive(Default, Serialize, Deserialize)]
-pub struct RenderTuning {
-    pub starfield: StarfieldTuning,
-    pub hud: HudLayout,
-}
-
 /// The content dir (`$DARK_SILENCE_CONTENT` if set, else `assets/content/` relative to the CWD —
-/// mirrors `server::load_content_or_default`) joined with [`RENDER_TUNING_RON`].
-fn render_tuning_path() -> PathBuf {
-    let dir = std::env::var_os("DARK_SILENCE_CONTENT")
+/// mirrors `server::load_content_or_default`). Shared by the dev override, the module/hull content
+/// RONs, and the starfield-preset library.
+fn content_dir() -> PathBuf {
+    std::env::var_os("DARK_SILENCE_CONTENT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("assets/content"));
-    dir.join(RENDER_TUNING_RON)
+        .unwrap_or_else(|| PathBuf::from("assets/content"))
 }
 
-/// Load the render tuning from `render_tuning.ron`; fall back to the code `Default`s if the file is
-/// absent or unparseable (logging a note on a parse error). Called once at startup.
-pub fn load_render_tuning() -> RenderTuning {
-    let path = render_tuning_path();
+/// Refinement 39/41 — the windowed-client dev override: ALL the dev-panel-tuned **sim tuning**
+/// (loaded into the embedded server world WINDOWED-ONLY — never `ServerApp::new`, so headless
+/// determinism is untouched) + the client HUD + starfield.
+///
+/// Module/hull **DESIGN** edits are NOT stored here — R41 writes them back to the canonical
+/// `modules.ron`/`ships.ron` via [`save_catalogs`] (the user's chosen persistence), which the existing
+/// `load_content_or_default` then loads for both headless and windowed. `#[serde(default)]`
+/// (container) so an old `render_tuning.ron` still loads (and any stale `modules`/`hulls` keys a
+/// previous build wrote are silently ignored — serde skips unknown fields).
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+pub struct DevSettings {
+    pub tuning: Tuning,
+    pub sim_tuning: SimTuning,
+    pub penetration: PenetrationConfig,
+    pub shield: ShieldConfig,
+    pub salvage: SalvageConfig,
+    pub stat_scaling: StatScalingConfig,
+    pub resistance: ResistanceMatrix,
+    pub mining: MiningTuning,
+    pub hud: HudLayout,
+    pub starfield: StarfieldTuning,
+}
+
+impl Default for DevSettings {
+    fn default() -> Self {
+        Self {
+            tuning: Tuning::default(),
+            sim_tuning: SimTuning::default(),
+            penetration: PenetrationConfig::default(),
+            shield: ShieldConfig::default(),
+            salvage: SalvageConfig::default(),
+            stat_scaling: StatScalingConfig::default(),
+            resistance: default_resistance_matrix(),
+            mining: MiningTuning::default(),
+            hud: HudLayout::default(),
+            starfield: StarfieldTuning::default(),
+        }
+    }
+}
+
+/// Load the dev override from `render_tuning.ron`; fall back to the code `Default`s if absent or
+/// unparseable (logging a note on a parse error). Called once at startup. An old file (only
+/// `starfield`+`hud`) loads fine — the sim fields fall back to defaults.
+pub fn load_dev_settings() -> DevSettings {
+    let path = content_dir().join(RENDER_TUNING_RON);
     match std::fs::read_to_string(&path) {
-        Ok(s) => match ron::from_str::<RenderTuning>(&s) {
-            Ok(rt) => rt,
+        Ok(s) => match ron::from_str::<DevSettings>(&s) {
+            Ok(d) => d,
             Err(e) => {
                 eprintln!(
                     "render_tuning.ron parse error ({e}) — using defaults: {}",
                     path.display()
                 );
-                RenderTuning::default()
+                DevSettings::default()
             }
         },
-        // Absent file → silently use defaults (first run / not yet saved).
-        Err(_) => RenderTuning::default(),
+        Err(_) => DevSettings::default(),
     }
 }
 
-/// Save the current render tuning to `render_tuning.ron` (the dev-panel Save button). Returns a short
-/// status string (Ok or Err) for the panel to display.
-pub fn save_render_tuning(starfield: &StarfieldTuning, hud: &HudLayout) -> Result<String, String> {
-    let path = render_tuning_path();
-    let rt = RenderTuning {
-        starfield: *starfield,
-        hud: *hud,
-    };
-    let s = ron::ser::to_string_pretty(&rt, ron::ser::PrettyConfig::default())
+/// Save the dev override to `render_tuning.ron` (the dev-panel Save). Returns a status string.
+pub fn save_dev_settings(dev: &DevSettings) -> Result<String, String> {
+    let path = content_dir().join(RENDER_TUNING_RON);
+    let s = ron::ser::to_string_pretty(dev, ron::ser::PrettyConfig::default())
         .map_err(|e| format!("serialize: {e}"))?;
     std::fs::write(&path, s).map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(format!("saved {}", path.display()))
 }
 
+/// Refinement 39/41 — filter the live catalogs to **canonical seed ids only**, so runtime-injected
+/// scenario hulls (Transport/Outpost/MineNode — procedural + huge) are excluded. Used by
+/// [`save_catalogs`] before write-back, so a Save can never pollute `ships.ron` with scenario hulls
+/// (the bug that earlier produced a 186k-line file + broke the seed-catalog test).
+pub fn canonical_design_override(
+    modules: &ModuleCatalog,
+    hulls: &HullCatalog,
+) -> (ModuleCatalog, HullCatalog) {
+    let (seed_m, seed_h) = sim::fitting::seed_catalogs();
+    let m = ModuleCatalog {
+        modules: modules
+            .modules
+            .iter()
+            .filter(|(id, _)| seed_m.modules.contains_key(id))
+            .map(|(id, m)| (*id, m.clone()))
+            .collect(),
+    };
+    let h = HullCatalog {
+        hulls: hulls
+            .hulls
+            .iter()
+            .filter(|(id, _)| seed_h.hulls.contains_key(id))
+            .map(|(id, h)| (*id, h.clone()))
+            .collect(),
+    };
+    (m, h)
+}
+
+/// Refinement 41 — write the dev-edited module/hull **DESIGNS** back to the canonical
+/// `modules.ron`/`ships.ron` (the user's chosen persistence — these become the real defaults that
+/// `load_content_or_default` loads for both headless and windowed). The live catalogs are FILTERED to
+/// canonical seed ids (via [`canonical_design_override`]) so the runtime scenario hulls never pollute
+/// `ships.ron`.
+///
+/// A file is rewritten **only when its parsed catalog differs** from the filtered live one (or is
+/// absent/unparseable). A no-edit Save therefore leaves the files — and their hand-authored comments —
+/// untouched. RON has no comment-preserving writer, so a *real* rewrite strips comments + reorders
+/// entries to id order (the accepted cost of write-back). Returns a short status for the dev panel.
+pub fn save_catalogs(
+    modules: Option<&ModuleCatalog>,
+    hulls: Option<&HullCatalog>,
+) -> Result<String, String> {
+    let (Some(modules), Some(hulls)) = (modules, hulls) else {
+        return Ok("no catalog loaded — nothing to save".to_string());
+    };
+    let (m, h) = canonical_design_override(modules, hulls);
+    let dir = content_dir();
+    let mut written: Vec<&str> = Vec::new();
+    let mut unchanged: Vec<&str> = Vec::new();
+
+    // modules.ron — a serialized `ModuleCatalog` (matches `parse_catalogs`).
+    let m_path = dir.join("modules.ron");
+    let m_changed = match std::fs::read_to_string(&m_path) {
+        Ok(s) => ron::from_str::<ModuleCatalog>(&s)
+            .map(|on_disk| on_disk != m)
+            .unwrap_or(true),
+        Err(_) => true,
+    };
+    if m_changed {
+        let body = ron::ser::to_string_pretty(&m, ron::ser::PrettyConfig::default())
+            .map_err(|e| format!("serialize modules: {e}"))?;
+        std::fs::write(&m_path, body).map_err(|e| format!("write {}: {e}", m_path.display()))?;
+        written.push("modules.ron");
+    } else {
+        unchanged.push("modules.ron");
+    }
+
+    // ships.ron — a serialized `HullCatalog` (matches `parse_catalogs`).
+    let h_path = dir.join("ships.ron");
+    let h_changed = match std::fs::read_to_string(&h_path) {
+        Ok(s) => ron::from_str::<HullCatalog>(&s)
+            .map(|on_disk| on_disk != h)
+            .unwrap_or(true),
+        Err(_) => true,
+    };
+    if h_changed {
+        let body = ron::ser::to_string_pretty(&h, ron::ser::PrettyConfig::default())
+            .map_err(|e| format!("serialize ships: {e}"))?;
+        std::fs::write(&h_path, body).map_err(|e| format!("write {}: {e}", h_path.display()))?;
+        written.push("ships.ron");
+    } else {
+        unchanged.push("ships.ron");
+    }
+
+    if written.is_empty() {
+        Ok("designs unchanged — files left intact".to_string())
+    } else if unchanged.is_empty() {
+        Ok(format!("wrote {}", written.join(" + ")))
+    } else {
+        Ok(format!(
+            "wrote {} (unchanged: {})",
+            written.join(" + "),
+            unchanged.join(" + ")
+        ))
+    }
+}
+
 /// Refinement 36 — drop-in starfield presets. The directory of `*.ron` presets, beside
 /// `render_tuning.ron` (under `$DARK_SILENCE_CONTENT` / `assets/content`).
 fn starfield_presets_dir() -> PathBuf {
-    let dir = std::env::var_os("DARK_SILENCE_CONTENT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("assets/content"));
-    dir.join("starfield_presets")
+    content_dir().join("starfield_presets")
 }
 
 /// List the available `*.ron` starfield presets as `(display_name, path)`, sorted by name. Empty if

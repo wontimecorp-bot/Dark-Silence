@@ -85,9 +85,9 @@ struct StarfieldParams {
     glare_spike_len: f32,
     glare_spike_count: f32,
     glare_spike_intensity: f32,
+    zoom_compensation: f32,
     pad0: f32,
     pad1: f32,
-    pad2: f32,
     layers: array<StarLayer, 16>,
     classes: array<SpectralClass, 8>,
 }
@@ -99,6 +99,9 @@ const NUM_CLASSES: u32 = 7u;
 const TAU: f32 = 6.2831853;
 // World units the galactic band/haze/core coordinates are normalised by (sets the galaxy's scale).
 const GALAXY_SCALE: f32 = 400.0;
+// R38: reference camera altitude for zoom size compensation (= camera.rs default height) — at this
+// zoom the size factor is 1.0 regardless of `zoom_compensation`, so the calibration is unchanged.
+const REF_HEIGHT: f32 = 45.0;
 
 // --- hashing (deterministic, render-only) -----------------------------------------------------
 fn hash21(p: vec2<f32>) -> f32 {
@@ -211,6 +214,9 @@ fn star_layer(
     let core_w = core_weight(g_layer);
     // R36: OPTIONAL per-layer tint overlay (effective tint packed CPU-side; white = no-op).
     let layer_tint = vec3<f32>(layer.tint_r, layer.tint_g, layer.tint_b);
+    // R38: zoom size compensation. zf = 1 at the reference zoom; comp 0 → always 1 (fixed pixel),
+    // comp 1 → REF_HEIGHT/height (fixed apparent size → ~constant field brightness across zoom).
+    let zf = pow(max(REF_HEIGHT / params.height, 0.001), params.zoom_compensation);
     let dens = layer.density * dmap * (1.0 + params.core_density_boost * core_w); // denser near the core
 
     var col = vec3<f32>(0.0);
@@ -252,7 +258,7 @@ fn star_layer(
             let mh = hash21(cid * 11.1 + seed + 5.7);
             let mag = pow(mh, mix(1.0, 4.0, clamp(cls.mag_spread, 0.0, 1.0)));
             let bright = cls.brightness * mag * layer.brightness;
-            let r = cls.size * layer.size;
+            let r = cls.size * layer.size * zf; // R38: size scales with zoom (apparent-size comp)
             let aa = max(cls.softness, 0.001);
             let phase = hash21(cid * 5.7 + seed) * TAU;
             let t = params.time;
@@ -267,15 +273,22 @@ fn star_layer(
             if (glare_eligible) {
                 let ax = abs(off_px.x);
                 let ay = abs(off_px.y);
-                let slen = max(params.glare_spike_len, 1.0);
-                let halo = params.glare_halo_intensity * exp(-px / max(params.glare_halo_size, 0.5));
+                // R38: glare scales with zoom too (zf), so it stays proportional to the stars.
+                let slen = max(params.glare_spike_len * zf, 1.0);
+                let halo = params.glare_halo_intensity * exp(-px / max(params.glare_halo_size * zf, 0.5));
                 var spikes = exp(-ay / 1.5) * exp(-ax / slen) + exp(-ax / 1.5) * exp(-ay / slen);
                 if (params.glare_spike_count > 5.0) {
                     let d1 = abs(off_px.x + off_px.y) * 0.70710678;
                     let d2 = abs(off_px.x - off_px.y) * 0.70710678;
                     spikes = spikes + exp(-d2 / 1.5) * exp(-d1 / slen) + exp(-d1 / 1.5) * exp(-d2 / slen);
                 }
-                let glow = halo + spikes * params.glare_spike_intensity;
+                // R37: smoothly fade the glare to zero BEFORE the 3×3 cell-search boundary, so it
+                // never gets hard-cut into a square. `reach` stays inside the ±1.5-cell box; near/big
+                // layers (cell ≫ glare) are untouched, far/dense layers just fade instead of squaring.
+                let cell_px = px_per_world / freq;
+                let reach = 1.35 * cell_px;
+                let win = 1.0 - smoothstep(reach * 0.6, reach, px);
+                let glow = (halo + spikes * params.glare_spike_intensity) * win;
                 col = col + color * bright * tw * glow * gate;
             }
 

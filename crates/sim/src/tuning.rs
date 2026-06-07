@@ -31,7 +31,7 @@ use crate::weapon::{
 /// Global gameplay tuning. One instance is inserted by the client at startup
 /// and read by the `sim` systems. All magnitudes are positive (INV-10);
 /// `turn_power_share` is a `0..=1` fraction.
-#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+#[derive(Resource, Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Tuning {
     /// Main-drive thrust force (sim units·mass/s²).
     pub thrust_force: f32,
@@ -120,7 +120,7 @@ impl Tuning {
 /// helpers), so the resource and the consts can never silently diverge — the consts remain the
 /// single source of truth. Editing a field is **solo / server-authoritative only** (a networked
 /// client has no authority over server tuning, and divergent tuning would break reconciliation).
-#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+#[derive(Resource, Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SimTuning {
     /// Structural (filler-plating) cell hit points — hull erosion rate (`STRUCT_CELL_HP`).
     pub struct_cell_hp: f32,

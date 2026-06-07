@@ -37,6 +37,8 @@ use sim::fitting::{
     MODULE_THRUSTER_BASIC, MODULE_UTILITY_BASIC,
 };
 
+use crate::net::LoopbackHost;
+
 /// The client app-state toggling the flying view and the interactive fitting
 /// screen (FR-012). `main.rs` registers it ([`bevy::app::App::init_state`]) and
 /// binds a key that flips `Flying ⇄ Fitting`; the screen's UI + interaction
@@ -227,7 +229,23 @@ const BAR_WIDTH: f32 = 240.0;
 /// node/text pattern). One root panel anchored top-right holds the three budget
 /// bars (each a track + a coloured fill), the budget numeric line, the preview /
 /// delta line, the status line, and a static controls legend.
-fn build_fitting_screen(mut commands: Commands) {
+fn build_fitting_screen(
+    mut commands: Commands,
+    mut session: ResMut<FittingSession>,
+    host: Option<NonSend<LoopbackHost>>,
+) {
+    // R39: refresh the fitting palette/preview catalog from the LIVE embedded-server catalog (which
+    // reflects dev-panel design edits + the on-disk modules.ron/ships.ron) instead of the stale seed
+    // clone, so previews here match what ships actually fly.
+    if let Some(host) = host {
+        let w = host.server.world();
+        if let Some(m) = w.get_resource::<ModuleCatalog>() {
+            session.modules = m.clone();
+        }
+        if let Some(h) = w.get_resource::<HullCatalog>() {
+            session.hulls = h.clone();
+        }
+    }
     commands
         .spawn((
             FittingScreenRoot,

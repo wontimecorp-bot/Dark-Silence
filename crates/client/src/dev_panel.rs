@@ -22,12 +22,12 @@ use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 
 use sim::components::{Afterburner, ArmorHp, Energy, Heading, Health, Heat, Velocity};
 use sim::damage::{
-    default_resistance_matrix, HullStructure, PenetrationConfig, SalvageConfig, ShieldConfig,
-    Shields, StatScalingConfig,
+    default_resistance_matrix, HullStructure, PenetrationConfig, ResistanceMatrix, SalvageConfig,
+    ShieldConfig, Shields, StatScalingConfig,
 };
 use sim::fitting::{
-    force_rederive_all, seed_catalogs, Fit, FitLayout, HullCatalog, ModuleCatalog, ModuleSpecifics,
-    ShipStats,
+    force_rederive_all, force_rederive_keep_health, seed_catalogs, Fit, FitLayout, HullCatalog,
+    ModuleCatalog, ModuleId, ModuleKind, ModuleSpecifics, ShipStats,
 };
 use sim::{MiningTuning, SimTuning, Tuning};
 
@@ -1183,6 +1183,12 @@ fn dev_panel_ui(
         .get_resource::<MiningTuning>()
         .copied()
         .unwrap_or_default();
+    // R39: read the current resistance matrix so the dev-settings save round-trips it (the panel has
+    // no resistance editor yet, so this is normally the default — harmless to persist + reapply).
+    let resistance = world
+        .get_resource::<ResistanceMatrix>()
+        .copied()
+        .unwrap_or_else(default_resistance_matrix);
 
     // M6b: snapshot the LOCAL player ship's derived stats + live state (read-only). Resolve the
     // server entity from the client's wire `local_id`; gather into an owned struct so the egui
@@ -1646,90 +1652,88 @@ fn dev_panel_ui(
                 });
 
                 if let Some(modules) = modules.as_mut() {
-                    egui::CollapsingHeader::new("Module catalog ⟳").show(ui, |ui| {
-                        for (id, m) in modules.modules.iter_mut() {
-                            egui::CollapsingHeader::new(format!("{:?} {:?}", m.kind, id))
-                                .id_salt(("mod", id.0))
+                    // R39: "Module Designs" — one entry per DESIGN (catalog template), grouped by kind
+                    // and labeled by name. Editing a design's stats applies to EVERY ship using it.
+                    egui::CollapsingHeader::new("Module Designs ⟳").show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "A DESIGN's stats apply to every ship that uses it (live; keeps damage). Save writes modules.ron.",
+                            )
+                            .weak(),
+                        );
+                        const KINDS: [ModuleKind; 7] = [
+                            ModuleKind::Reactor,
+                            ModuleKind::Thruster,
+                            ModuleKind::Weapon,
+                            ModuleKind::Shield,
+                            ModuleKind::Armor,
+                            ModuleKind::Utility,
+                            ModuleKind::Sensor,
+                        ];
+                        for (ki, kind) in KINDS.iter().enumerate() {
+                            let ids: Vec<ModuleId> = modules
+                                .modules
+                                .iter()
+                                .filter(|(_, m)| m.kind == *kind)
+                                .map(|(id, _)| *id)
+                                .collect();
+                            if ids.is_empty() {
+                                continue;
+                            }
+                            egui::CollapsingHeader::new(format!("{kind:?} ({})", ids.len()))
+                                .id_salt(("modkind", ki))
                                 .show(ui, |ui| {
-                                    // Same canonical order + short names as the read-only groups
-                                    // (Phase M6d): mass → [thruster thrust/strafe/torque] → power
-                                    // gen/draw → cpu → hp → [weapon | shield | armor].
-                                    slider(ui, label(StatId::Mass), &mut m.mass, 0.0..=80.0);
-                                    if let ModuleSpecifics::Thruster {
-                                        thrust_force,
-                                        turn_torque,
-                                        strafe_force,
-                                        .. // Phase C `propulsion` tag — not edited here.
-                                    } = &mut m.specifics
-                                    {
-                                        slider(ui, label(StatId::Thrust), thrust_force, 0.0..=60.0);
-                                        slider(ui, label(StatId::Strafe), strafe_force, 0.0..=40.0);
-                                        slider(ui, label(StatId::Torque), turn_torque, 0.0..=40.0);
-                                    }
-                                    slider(
-                                        ui,
-                                        label(StatId::PowerGen),
-                                        &mut m.power_gen,
-                                        0.0..=100.0,
-                                    );
-                                    slider(
-                                        ui,
-                                        label(StatId::PowerDraw),
-                                        &mut m.power_draw,
-                                        0.0..=50.0,
-                                    );
-                                    slider(ui, label(StatId::Cpu), &mut m.cpu_draw, 0.0..=50.0);
-                                    slider(ui, label(StatId::Hp), &mut m.health_max, 1.0..=200.0);
-                                    match &mut m.specifics {
-                                        ModuleSpecifics::Shield { shield_hp, regen } => {
-                                            slider(
-                                                ui,
-                                                label(StatId::ShieldHp),
-                                                shield_hp,
-                                                0.0..=300.0,
-                                            );
-                                            slider(
-                                                ui,
-                                                label(StatId::ShieldRegen),
-                                                regen,
-                                                0.0..=50.0,
-                                            );
-                                        }
-                                        ModuleSpecifics::Armor { armor_value } => {
-                                            slider(
-                                                ui,
-                                                label(StatId::Armor),
-                                                armor_value,
-                                                0.0..=300.0,
-                                            );
-                                        }
-                                        ModuleSpecifics::Weapon {
-                                            muzzle_speed,
-                                            fire_rate,
-                                            damage,
-                                            projectile_mass,
-                                            .. // Phase C class/ammo/damage_type/secondary not edited here yet.
-                                        } => {
-                                            slider(ui, label(StatId::Dmg), damage, 1.0..=100.0);
-                                            slider(ui, label(StatId::Rof), fire_rate, 0.5..=30.0);
-                                            slider(
-                                                ui,
-                                                label(StatId::Muzzle),
-                                                muzzle_speed,
-                                                20.0..=600.0,
-                                            );
-                                            slider(
-                                                ui,
-                                                label(StatId::Slug),
-                                                projectile_mass,
-                                                0.001..=2.0,
-                                            );
-                                        }
-                                        // Phase C: Sensor range/resolution have no slider yet (no StatId).
-                                        ModuleSpecifics::Thruster { .. }
-                                        | ModuleSpecifics::Reactor
-                                        | ModuleSpecifics::Utility
-                                        | ModuleSpecifics::Sensor { .. } => {}
+                                    for id in ids {
+                                        let Some(m) = modules.modules.get_mut(&id) else {
+                                            continue;
+                                        };
+                                        egui::CollapsingHeader::new(format!("{} [{:?}]", m.name, id))
+                                            .id_salt(("mod", id.0))
+                                            .show(ui, |ui| {
+                                                // Canonical order: mass → [thruster] → power gen/draw
+                                                // → cpu → hp → [weapon | shield | armor].
+                                                slider(ui, label(StatId::Mass), &mut m.mass, 0.0..=80.0);
+                                                if let ModuleSpecifics::Thruster {
+                                                    thrust_force,
+                                                    turn_torque,
+                                                    strafe_force,
+                                                    ..
+                                                } = &mut m.specifics
+                                                {
+                                                    slider(ui, label(StatId::Thrust), thrust_force, 0.0..=60.0);
+                                                    slider(ui, label(StatId::Strafe), strafe_force, 0.0..=40.0);
+                                                    slider(ui, label(StatId::Torque), turn_torque, 0.0..=40.0);
+                                                }
+                                                slider(ui, label(StatId::PowerGen), &mut m.power_gen, 0.0..=100.0);
+                                                slider(ui, label(StatId::PowerDraw), &mut m.power_draw, 0.0..=50.0);
+                                                slider(ui, label(StatId::Cpu), &mut m.cpu_draw, 0.0..=50.0);
+                                                slider(ui, label(StatId::Hp), &mut m.health_max, 1.0..=200.0);
+                                                match &mut m.specifics {
+                                                    ModuleSpecifics::Shield { shield_hp, regen } => {
+                                                        slider(ui, label(StatId::ShieldHp), shield_hp, 0.0..=300.0);
+                                                        slider(ui, label(StatId::ShieldRegen), regen, 0.0..=50.0);
+                                                    }
+                                                    ModuleSpecifics::Armor { armor_value } => {
+                                                        slider(ui, label(StatId::Armor), armor_value, 0.0..=300.0);
+                                                    }
+                                                    ModuleSpecifics::Weapon {
+                                                        muzzle_speed,
+                                                        fire_rate,
+                                                        damage,
+                                                        projectile_mass,
+                                                        ..
+                                                    } => {
+                                                        slider(ui, label(StatId::Dmg), damage, 1.0..=100.0);
+                                                        slider(ui, label(StatId::Rof), fire_rate, 0.5..=30.0);
+                                                        slider(ui, label(StatId::Muzzle), muzzle_speed, 20.0..=600.0);
+                                                        slider(ui, label(StatId::Slug), projectile_mass, 0.001..=2.0);
+                                                    }
+                                                    ModuleSpecifics::Thruster { .. }
+                                                    | ModuleSpecifics::Reactor
+                                                    | ModuleSpecifics::Utility
+                                                    | ModuleSpecifics::Sensor { .. } => {}
+                                                }
+                                            });
                                     }
                                 });
                         }
@@ -1737,9 +1741,15 @@ fn dev_panel_ui(
                 }
 
                 if let Some(hulls) = hulls.as_mut() {
-                    egui::CollapsingHeader::new("Hull catalog ⟳").show(ui, |ui| {
+                    egui::CollapsingHeader::new("Hull Designs ⟳").show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "A hull DESIGN's stats apply to every ship of that hull. Save writes ships.ron.",
+                            )
+                            .weak(),
+                        );
                         for (id, h) in hulls.hulls.iter_mut() {
-                            egui::CollapsingHeader::new(format!("{} {:?}", h.name, id))
+                            egui::CollapsingHeader::new(format!("{} [{:?}]", h.name, id))
                                 .id_salt(("hull", id.0))
                                 .show(ui, |ui| {
                                     ui.label(format!(
@@ -1805,6 +1815,17 @@ fn dev_panel_ui(
                         .on_hover_text("Energy readout row width as % of the viewport. With SpaceBetween, this sets how far right the rate sits vs the ENRG number — tune to span the bar.");
                     slider(ui, "readout bottom px", &mut hud_layout.readout_bottom_px, 0.0..=400.0)
                         .on_hover_text("Energy readout distance from the bottom of the screen, in pixels.");
+                    ui.separator();
+                    // R40: the bottom-right module-condition bar panel (Reactor/Thruster/Weapon/…).
+                    ui.label("Module-condition bars (bottom-right).");
+                    slider(ui, "module right px", &mut hud_layout.module_right_px, 0.0..=600.0)
+                        .on_hover_text("Module-bar panel distance from the RIGHT screen edge, in pixels.");
+                    slider(ui, "module bottom px", &mut hud_layout.module_bottom_px, 0.0..=600.0)
+                        .on_hover_text("Module-bar panel distance from the BOTTOM screen edge, in pixels.");
+                    slider(ui, "module bar width px", &mut hud_layout.module_bar_width_px, 30.0..=400.0)
+                        .on_hover_text("Width of each per-type segmented bar track, in pixels.");
+                    slider(ui, "module bar height px", &mut hud_layout.module_bar_height_px, 4.0..=40.0)
+                        .on_hover_text("Height (thickness) of each per-type segmented bar track, in pixels.");
                 });
 
                 // Refinement 34: bloom is a CAMERA post-process (the whole rendered image), NOT a
@@ -1869,6 +1890,13 @@ fn dev_panel_ui(
                     ui.separator();
                     slider(ui, "layers (4-16)", &mut starfield.layer_count, 4.0..=16.0)
                         .on_hover_text("How many parallax DEPTH layers to draw (4–16). More = deeper field, slightly more GPU. The 'Layer N' rows below appear/disappear with this.");
+                    slider(
+                        ui,
+                        "zoom size compensation",
+                        &mut starfield.galaxy.zoom_compensation,
+                        0.0..=1.0,
+                    )
+                    .on_hover_text("How star size tracks zoom. 0 = fixed PIXEL size (crisp, but the field gets brighter zoomed out / dimmer zoomed in). 1 = fixed APPARENT size (stars shrink/grow with zoom) so the overall brightness stays ~constant across zoom — zoom out = many tiny stars, zoom in = fewer bigger ones.");
                     ui.separator();
                     // Star CHARACTER: the spectral class table + the galaxy band/haze/dust/core/glare.
                     galaxy_controls(ui, &mut starfield.galaxy);
@@ -1920,12 +1948,43 @@ fn dev_panel_ui(
             if ui.button("Reset ALL to defaults").clicked() {
                 reset = true;
             }
-            // Refinement 27: persist the client HUD + starfield tuning to `render_tuning.ron`.
-            if ui.button("Save HUD + Starfield → RON").clicked() {
-                state.save_status = match tuning_io::save_render_tuning(&starfield, &hud_layout) {
-                    Ok(msg) => msg,
+            // Refinement 41: persist the dev-panel SIM TUNING + HUD + starfield to the windowed
+            // `render_tuning.ron` override (loaded windowed-only — never `ServerApp::new` — so headless
+            // determinism is untouched). Module/hull DESIGNS are NOT saved here; use the separate
+            // "Save designs" button below. (Starfield presets save separately, in their section.)
+            if ui.button("Save dev settings → RON").clicked() {
+                let dev = tuning_io::DevSettings {
+                    tuning,
+                    sim_tuning: sim,
+                    penetration: pen,
+                    shield,
+                    salvage,
+                    stat_scaling: scaling,
+                    resistance,
+                    mining,
+                    hud: *hud_layout,
+                    starfield: *starfield,
+                };
+                state.save_status = match tuning_io::save_dev_settings(&dev) {
+                    Ok(m) => m,
                     Err(e) => format!("save failed: {e}"),
                 };
+            }
+            // Refinement 41: write the edited module/hull DESIGNS back to the canonical
+            // `assets/content/{modules,ships}.ron` (filtered to seed ids → no scenario-hull pollution).
+            // Only rewrites a file when its design data actually changed, so a no-edit click leaves the
+            // files (and their hand-authored comments) intact. A real rewrite drops that file's comments
+            // + reorders to id order (RON has no comment-preserving writer) — these become the new
+            // defaults that both the windowed game and the headless tests load.
+            if ui
+                .button("Save designs → modules.ron/ships.ron")
+                .clicked()
+            {
+                state.save_status =
+                    match tuning_io::save_catalogs(modules.as_ref(), hulls.as_ref()) {
+                        Ok(m) => m,
+                        Err(e) => format!("design save failed: {e}"),
+                    };
             }
             if !state.save_status.is_empty() {
                 ui.label(&state.save_status);
@@ -1951,6 +2010,13 @@ fn dev_panel_ui(
         *starfield = StarfieldTuning::default();
         rederive = true;
     } else {
+        // R39: a module/hull DESIGN edit (or struct-cell mass) needs the cached ship stats to
+        // re-derive. Detect it BEFORE re-inserting (the world still holds the pre-edit values), then
+        // re-derive WITHOUT healing (preserve battle damage). Flight/damage tuning is read live per
+        // tick, so it needs no re-derive. Catalogs differing → live update for all ships.
+        let designs_changed = world.get_resource::<ModuleCatalog>() != modules.as_ref()
+            || world.get_resource::<HullCatalog>() != hulls.as_ref()
+            || world.get_resource::<SimTuning>() != Some(&sim);
         world.insert_resource(tuning);
         world.insert_resource(sim);
         world.insert_resource(pen);
@@ -1963,6 +2029,9 @@ fn dev_panel_ui(
         }
         if let Some(h) = hulls {
             world.insert_resource(h);
+        }
+        if designs_changed && !rederive {
+            force_rederive_keep_health(world);
         }
     }
     if rederive {
