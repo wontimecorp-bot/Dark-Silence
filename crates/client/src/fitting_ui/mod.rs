@@ -37,7 +37,7 @@ use sim::fitting::{
     MODULE_THRUSTER_BASIC, MODULE_UTILITY_BASIC,
 };
 
-use crate::net::LoopbackHost;
+use crate::net::{LoopbackHost, NetClientState};
 
 /// The client app-state toggling the flying view and the interactive fitting
 /// screen (FR-012). `main.rs` registers it ([`bevy::app::App::init_state`]) and
@@ -67,6 +67,8 @@ impl Plugin for FittingUiPlugin {
         app.init_state::<FittingScreenState>()
             .init_resource::<FittingSession>()
             .init_resource::<FittingPreview>()
+            // R43: the player's available modules ("cargo/inventory") the screen installs from.
+            .init_resource::<Inventory>()
             // Build the screen UI when entering Fitting; tear it down on exit so
             // the flying HUD is unobstructed.
             .add_systems(OnEnter(FittingScreenState::Fitting), build_fitting_screen)
@@ -75,13 +77,17 @@ impl Plugin for FittingUiPlugin {
             // the `sim` install/remove/preset fns; the readout systems re-run the
             // pure `sim` budget/preview fns and paint the bars + deltas. They chain
             // so a place/remove this frame is reflected in the same frame's bars.
+            // R43: `commit_fitting_to_ship` (Enter) writes the working fit to the live ship;
+            // `refresh_loadout` repaints the inventory + per-slot loadout text.
             .add_systems(
                 Update,
                 (
                     handle_fitting_input,
+                    commit_fitting_to_ship,
                     refresh_preview,
                     refresh_budget_bars,
                     refresh_status_text,
+                    refresh_loadout,
                 )
                     .chain()
                     .run_if(in_state(FittingScreenState::Fitting)),
@@ -197,11 +203,31 @@ pub struct FittingPreview {
     pub can_fire: bool,
 }
 
+/// Refinement 43 — the player's available modules ("cargo / inventory") the fitting screen can
+/// install. For now it holds EVERY catalog module (refreshed from the live catalog on enter); a real
+/// game will limit it to OWNED items. Installing is still gated by ship capabilities (hardpoint
+/// type/size + budget) via [`Fit::install_module`], so the inventory is "what you have" and the slots
+/// are "what fits".
+#[derive(Resource, Default)]
+pub struct Inventory {
+    /// Owned module ids in display order (sorted by id — `ModuleCatalog` is a `BTreeMap`).
+    pub available: Vec<ModuleId>,
+    /// Cursor into `available`; the highlighted (`▶`) row is the active module to install.
+    pub cursor: usize,
+}
+
 // --- UI marker components ----------------------------------------------------
 
 /// Root node of the fitting screen — despawned wholesale on exit.
 #[derive(Component)]
 struct FittingScreenRoot;
+
+/// R43 — the scrolling INVENTORY list text (all available modules; the active one marked `▶`).
+#[derive(Component)]
+struct InventoryText;
+/// R43 — the per-slot LOADOUT readout text (each slot + its installed module).
+#[derive(Component)]
+struct LoadoutText;
 
 /// The power-budget bar's fill node (width tracks `used / capacity`).
 #[derive(Component)]
@@ -232,11 +258,13 @@ const BAR_WIDTH: f32 = 240.0;
 fn build_fitting_screen(
     mut commands: Commands,
     mut session: ResMut<FittingSession>,
+    mut inventory: ResMut<Inventory>,
     host: Option<NonSend<LoopbackHost>>,
+    // R43: the local player's wire id → load the LIVE ship's current fit so you edit your real loadout.
+    state: Option<NonSend<NetClientState>>,
 ) {
-    // R39: refresh the fitting palette/preview catalog from the LIVE embedded-server catalog (which
-    // reflects dev-panel design edits + the on-disk modules.ron/ships.ron) instead of the stale seed
-    // clone, so previews here match what ships actually fly.
+    // R39/R43: refresh the catalog AND load the player's CURRENT loadout from the LIVE embedded server
+    // (so previews + the editable fit match what flies), instead of the stale seed clone + empty fit.
     if let Some(host) = host {
         let w = host.server.world();
         if let Some(m) = w.get_resource::<ModuleCatalog>() {
@@ -245,6 +273,25 @@ fn build_fitting_screen(
         if let Some(h) = w.get_resource::<HullCatalog>() {
             session.hulls = h.clone();
         }
+        // Load the live ship's fit → edit a copy; `applied_fit` is the baseline for preview deltas.
+        if let Some(ship) = state
+            .as_ref()
+            .and_then(|s| host.server.ship_entity_for(s.local_id))
+        {
+            if let Some(fit) = w.get::<Fit>(ship) {
+                session.working_fit = fit.clone();
+                session.applied_fit = fit.clone();
+            }
+        }
+    }
+    // R43: the inventory ("cargo") is every catalog module (sorted by id); clamp the cursor + set the
+    // active module from it.
+    inventory.available = session.modules.modules.keys().copied().collect();
+    if inventory.cursor >= inventory.available.len() {
+        inventory.cursor = 0;
+    }
+    if let Some(id) = inventory.available.get(inventory.cursor) {
+        session.active_module = *id;
     }
     commands
         .spawn((
@@ -294,12 +341,25 @@ fn build_fitting_screen(
             ));
             root.spawn((
                 Text::new(
-                    "MODULE: R reactor  T thruster  G gun  H shield  J armor  K util\n\
-                     SLOT 1-7 install active module   X+1-7 remove\n\
-                     P save preset   L load preset",
+                    "↑/↓ select module   1-7 install into slot   X+1-7 remove\n\
+                     ENTER apply to ship   P save preset   L load preset",
                 ),
                 text_font(11.0),
                 TextColor(Color::srgb(0.6, 0.68, 0.78)),
+            ));
+            // R43: per-slot loadout + the inventory ("cargo") list — filled each frame by
+            // `refresh_loadout`.
+            root.spawn((
+                Text::new(""),
+                text_font(11.0),
+                TextColor(Color::srgb(0.8, 0.9, 0.8)),
+                LoadoutText,
+            ));
+            root.spawn((
+                Text::new(""),
+                text_font(11.0),
+                TextColor(Color::srgb(0.78, 0.86, 0.95)),
+                InventoryText,
             ));
         });
 }
@@ -383,13 +443,30 @@ fn teardown_fitting_screen(mut commands: Commands, root_q: Query<Entity, With<Fi
 ///
 /// Every gameplay decision is the `sim` fn's — this only routes input and records
 /// the human-readable outcome.
-fn handle_fitting_input(keys: Res<ButtonInput<KeyCode>>, mut session: ResMut<FittingSession>) {
-    // Module selection: pick the active module to install.
-    for (key, module_id, name) in MODULE_KEYS {
+fn handle_fitting_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut session: ResMut<FittingSession>,
+    mut inventory: ResMut<Inventory>,
+) {
+    // R43: inventory selection — letter quick-jumps move the cursor to that module; ↑/↓ step it. The
+    // cursor row is the active module to install (the inventory list marks it `▶`).
+    for (key, module_id, _name) in MODULE_KEYS {
         if keys.just_pressed(key) {
-            session.active_module = module_id;
-            session.status = format!("Active module: {name}");
+            if let Some(i) = inventory.available.iter().position(|id| *id == module_id) {
+                inventory.cursor = i;
+            }
         }
+    }
+    if !inventory.available.is_empty() {
+        let n = inventory.available.len();
+        if keys.just_pressed(KeyCode::ArrowDown) {
+            inventory.cursor = (inventory.cursor + 1) % n;
+        }
+        if keys.just_pressed(KeyCode::ArrowUp) {
+            inventory.cursor = (inventory.cursor + n - 1) % n;
+        }
+        inventory.cursor = inventory.cursor.min(n - 1);
+        session.active_module = inventory.available[inventory.cursor];
     }
 
     let removing = keys.pressed(KeyCode::KeyX);
@@ -634,5 +711,79 @@ fn sign(delta: f32) -> &'static str {
         "-"
     } else {
         "+"
+    }
+}
+
+/// `Update` (while Fitting) — R43: on **Enter**, COMMIT the working fit to the live player ship so the
+/// edited loadout actually flies. Writes the `Fit` onto the embedded-server ship entity (which
+/// triggers [`sim::fitting::recompute_ship_stats_system`] → fresh layout + `ShipStats` next tick) and
+/// rebases the preview baseline. Windowed-only — the player ship exists only on this embedded path, so
+/// the headless/determinism worlds are untouched.
+fn commit_fitting_to_ship(
+    keys: Res<ButtonInput<KeyCode>>,
+    host: Option<NonSendMut<LoopbackHost>>,
+    state: Option<NonSend<NetClientState>>,
+    mut session: ResMut<FittingSession>,
+) {
+    if !keys.just_pressed(KeyCode::Enter) {
+        return;
+    }
+    let (Some(mut host), Some(state)) = (host, state) else {
+        session.status = "No embedded server to apply to".to_string();
+        return;
+    };
+    let Some(ship) = host.server.ship_entity_for(state.local_id) else {
+        session.status = "No player ship to apply to".to_string();
+        return;
+    };
+    let fit = session.working_fit.clone();
+    let world = host.server.world_mut();
+    if let Ok(mut entity) = world.get_entity_mut(ship) {
+        entity.insert(fit);
+        session.applied_fit = session.working_fit.clone();
+        session.status = "Applied to ship ✓".to_string();
+    } else {
+        session.status = "Player ship entity missing".to_string();
+    }
+}
+
+/// `Update` (while Fitting) — R43: repaint the per-slot LOADOUT line + the INVENTORY ("cargo") list
+/// from the working fit + inventory. Each slot shows its hardpoint type + the installed module (or
+/// `—`); the active inventory row is marked `▶`, with each module's kind / size / power-cpu-mass cost.
+fn refresh_loadout(
+    session: Res<FittingSession>,
+    inventory: Res<Inventory>,
+    mut load_q: Query<&mut Text, (With<LoadoutText>, Without<InventoryText>)>,
+    mut inv_q: Query<&mut Text, (With<InventoryText>, Without<LoadoutText>)>,
+) {
+    if let Ok(mut text) = load_q.single_mut() {
+        let mut s = String::from("— LOADOUT —\n");
+        if let Some(hull) = session.working_hull() {
+            for slot in &hull.slots {
+                let name = session
+                    .working_fit
+                    .assignments
+                    .get(&slot.id)
+                    .and_then(|mid| session.modules.get(*mid))
+                    .map(|m| m.name.as_str())
+                    .unwrap_or("—");
+                s.push_str(&format!("S{} {:?}: {}\n", slot.id.0, slot.slot_type, name));
+            }
+        }
+        text.0 = s;
+    }
+    if let Ok(mut text) = inv_q.single_mut() {
+        let mut s = String::from("— INVENTORY —\n");
+        for (i, id) in inventory.available.iter().enumerate() {
+            let Some(m) = session.modules.get(*id) else {
+                continue;
+            };
+            let cursor = if i == inventory.cursor { "▶ " } else { "  " };
+            s.push_str(&format!(
+                "{cursor}{}  [{:?}/{:?}]  p{:.0} c{:.0} m{:.0}\n",
+                m.name, m.kind, m.hardpoint_size, m.power_draw, m.cpu_draw, m.mass
+            ));
+        }
+        text.0 = s;
     }
 }

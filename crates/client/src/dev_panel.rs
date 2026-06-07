@@ -27,7 +27,7 @@ use sim::damage::{
 };
 use sim::fitting::{
     derive_weapon, force_rederive_all, force_rederive_keep_health, seed_catalogs, Fit, FitLayout,
-    HullCatalog, ModuleCatalog, ModuleId, ModuleKind, ModuleSpecifics, ShipStats,
+    HullCatalog, ModuleCatalog, ModuleId, ModuleKind, ModuleSpecifics, ShipStats, SlotId,
 };
 use sim::{MiningTuning, SimTuning, Tuning};
 
@@ -865,6 +865,8 @@ pub struct DevPanelState {
     pub stats_open: bool,
     /// Refinement 27: last result of the "Save tuning → RON" button (shown by the button).
     pub save_status: String,
+    /// Refinement 43: last result of the "Equip weapon → player ship" quick-swap (shown by it).
+    pub equip_status: String,
 }
 
 impl Default for DevPanelState {
@@ -873,6 +875,7 @@ impl Default for DevPanelState {
             tuning_open: true,
             stats_open: true,
             save_status: String::new(),
+            equip_status: String::new(),
         }
     }
 }
@@ -1336,6 +1339,13 @@ fn dev_panel_ui(
     let mut stats_open = state.stats_open;
     let mut rederive = false;
     let mut reset = false;
+    // R43: a quick weapon-equip request (a clicked weapon id) + the resolved player ship entity.
+    // The click is captured in the read/UI phase and applied in the write phase below (where the world
+    // is mutable). `equip_ship` is `None` until the player ship exists.
+    let mut equip_weapon: Option<ModuleId> = None;
+    let equip_ship = net
+        .as_ref()
+        .and_then(|n| host.server.ship_entity_for(n.local_id));
 
     // M6c — read-only Ship Stats in its OWN draggable window: derived stats + live state, then the
     // ship's installed equipment and its nominal summed contributions.
@@ -1779,6 +1789,32 @@ fn dev_panel_ui(
                     );
                 });
 
+                // R43: quick-equip a weapon onto the PLAYER ship's primary weapon slot (slot 3). The
+                // click is applied to the live embedded-server ship in the write phase below — instant
+                // test path: click a weapon, fly, fire. Validated (type/size/budget); rejections shown.
+                egui::CollapsingHeader::new("Equip weapon → player ship (live)").show(ui, |ui| {
+                    if equip_ship.is_none() {
+                        ui.label(egui::RichText::new("no player ship yet").weak());
+                    }
+                    if let Some(cat) = modules.as_ref() {
+                        ui.horizontal_wrapped(|ui| {
+                            for (id, m) in cat.modules.iter() {
+                                if m.kind == ModuleKind::Weapon
+                                    && ui
+                                        .button(&m.name)
+                                        .on_hover_text(format!("{id:?} → slot 3"))
+                                        .clicked()
+                                {
+                                    equip_weapon = Some(*id);
+                                }
+                            }
+                        });
+                    }
+                    if !state.equip_status.is_empty() {
+                        ui.label(&state.equip_status);
+                    }
+                });
+
                 if let Some(modules) = modules.as_mut() {
                     // R39: "Module Designs" — one entry per DESIGN (catalog template), grouped by kind
                     // and labeled by name. Editing a design's stats applies to EVERY ship using it.
@@ -2187,6 +2223,42 @@ fn dev_panel_ui(
     if rederive {
         force_rederive_all(world);
     }
+    // R43: apply a quick weapon-equip to the player ship's primary weapon slot (slot 3). Validated
+    // install against the live hull + catalog; writing the `Fit` triggers `recompute_ship_stats_system`
+    // (full re-derive next tick). Windowed-only — the player ship exists only on this embedded path.
+    if let (Some(weapon_id), Some(ship)) = (equip_weapon, equip_ship) {
+        state.equip_status = equip_module(world, ship, SlotId(3), weapon_id);
+    }
     state.tuning_open = tuning_open;
     state.stats_open = stats_open;
+}
+
+/// Refinement 43 — install `module_id` into `slot` on the live `ship`'s [`Fit`] (validated against the
+/// live hull + catalog: hardpoint type/size + budget) and write it back so
+/// [`recompute_ship_stats_system`](sim::fitting::recompute_ship_stats_system) re-derives next tick.
+/// Returns a short status string for the dev panel. Windowed-only (the embedded-server player ship).
+fn equip_module(world: &mut World, ship: Entity, slot: SlotId, module_id: ModuleId) -> String {
+    let Some(mut fit) = world.get::<Fit>(ship).cloned() else {
+        return "no Fit on player ship".to_string();
+    };
+    let Some(hulls) = world.get_resource::<HullCatalog>().cloned() else {
+        return "no hull catalog".to_string();
+    };
+    let Some(catalog) = world.get_resource::<ModuleCatalog>().cloned() else {
+        return "no module catalog".to_string();
+    };
+    let Some(hull) = hulls.get(fit.hull) else {
+        return "ship hull not in catalog".to_string();
+    };
+    match fit.install_module(slot, module_id, hull, &catalog) {
+        Ok(()) => {
+            let name = catalog
+                .get(module_id)
+                .map(|m| m.name.clone())
+                .unwrap_or_default();
+            world.entity_mut(ship).insert(fit);
+            format!("equipped {name} → slot {}", slot.0)
+        }
+        Err(rej) => format!("rejected: {rej:?}"),
+    }
 }

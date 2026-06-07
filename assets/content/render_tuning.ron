@@ -38,6 +38,11 @@
         afterburner_drain_rate: 40.0,
         afterburner_regen_rate: 20.0,
         afterburner_boost_factor: 0.6,
+        mm_to_world: 0.006666667,
+        velocity_scale: 0.2,
+        rpm_scale: 0.016666668,
+        projectile_density: 0.000001111111,
+        damage_per_joule: 0.0008,
     ),
     penetration: (
         ricochet_angle: 1.1780972,
@@ -93,17 +98,17 @@
             extent: 3.2,
         ),
         shield: (
-            x_center: -8.0,
+            x_center: -6.3,
             y_base: -4.6,
             extent: 2.5,
         ),
         armor: (
-            x_center: -7.7,
+            x_center: -5.8,
             y_base: -4.6,
             extent: 2.5,
         ),
         hull: (
-            x_center: -7.0,
+            x_center: -5.3,
             y_base: -4.6,
             extent: 2.5,
         ),

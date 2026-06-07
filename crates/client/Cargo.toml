@@ -23,7 +23,9 @@ protocol = { path = "../protocol" }
 server = { path = "../server" }
 glam = { workspace = true }
 earcutr = "0.5.0"
-bevy_egui = { version = "0.39.1", optional = true }
+# R44: egui is now always-on — the EVE-style fitting/inventory screen (`fitting_ui`) uses it, not just
+# the (feature-gated) dev panel. `EguiPlugin` is added once in `lib::run()`.
+bevy_egui = { version = "0.39.1" }
 # Refinement 27: persist the client render tuning (Starfield + HUD) to a hand-editable RON file
 # (load at startup + a dev-panel Save button), mirroring the sim content-RON pattern.
 serde = { workspace = true }

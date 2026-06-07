@@ -252,7 +252,7 @@
             heat: 5.0,
             health_max: 18.0,
             hardpoint_type: Weapon,
-            hardpoint_size: Medium,
+            hardpoint_size: Small,
             specifics: Weapon(
                 class: Ballistic,
                 ammo: Shell,
@@ -277,7 +277,7 @@
             heat: 2.0,
             health_max: 14.0,
             hardpoint_type: Weapon,
-            hardpoint_size: Medium,
+            hardpoint_size: Small,
             specifics: Weapon(
                 class: Missile,
                 ammo: Missile,
@@ -306,7 +306,7 @@
             heat: 6.0,
             health_max: 14.0,
             hardpoint_type: Weapon,
-            hardpoint_size: Medium,
+            hardpoint_size: Small,
             specifics: Weapon(
                 class: DirectedEnergy,
                 ammo: Plasma,
@@ -335,7 +335,7 @@
             heat: 3.0,
             health_max: 12.0,
             hardpoint_type: Weapon,
-            hardpoint_size: Medium,
+            hardpoint_size: Small,
             specifics: Weapon(
                 class: DirectedEnergy,
                 ammo: Particle,
@@ -414,7 +414,7 @@
             heat: 5.0,
             health_max: 16.0,
             hardpoint_type: Weapon,
-            hardpoint_size: Medium,
+            hardpoint_size: Small,
             specifics: Weapon(
                 class: Ballistic,
                 ammo: Shell,
