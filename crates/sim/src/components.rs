@@ -485,6 +485,16 @@ pub struct Weapon {
     pub fire_rate: f32,
     /// Projectile launch speed.
     pub muzzle_speed: f32,
+    /// R42 — rotary spool fraction `0..=1` (fraction of full RPM). The fitted fire path ramps this
+    /// toward `1` while firing a weapon whose `WeaponProfile.spin_up_time > 0` (decays when idle) and
+    /// gates firing until full; an instant (non-rotary) weapon sits at `1`. `#[serde(default)]` (0.0)
+    /// keeps any older serialized `Weapon` loading.
+    #[serde(default)]
+    pub spool: f32,
+    /// R42 — monotonic per-weapon shot counter, the deterministic seed for the dispersion noise
+    /// (`aim_noise(owner_bits, shot_counter)`). Wraps; sim-internal, no RNG.
+    #[serde(default)]
+    pub shot_counter: u32,
 }
 
 #[cfg(test)]

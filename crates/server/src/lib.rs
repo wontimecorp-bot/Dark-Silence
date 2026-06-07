@@ -1602,6 +1602,8 @@ impl ServerApp {
                     cooldown: 0.0,
                     fire_rate: tuning.fire_rate,
                     muzzle_speed: tuning.muzzle_speed,
+                    spool: 1.0,
+                    shot_counter: 0,
                 },
             ))
             .id()
@@ -1821,6 +1823,8 @@ impl ServerApp {
                     cooldown: 0.0,
                     fire_rate: tuning.fire_rate,
                     muzzle_speed: tuning.muzzle_speed,
+                    spool: 1.0,
+                    shot_counter: 0,
                 },
             ))
             .id()

@@ -190,7 +190,12 @@ pub enum ModuleSpecifics {
         /// Lateral (strafe) thrust contribution (`>= 0`).
         strafe_force: f32,
     },
-    /// Weapon: populates the `Weapon` component fire params (FR-016).
+    /// Weapon: populates the `Weapon` component fire params (FR-016). Refinement 42 — authored from
+    /// REAL ballistic specs (`caliber_mm` / `muzzle_velocity_ms` / `rpm`); the game DERIVES the
+    /// game-space `muzzle_speed`/`fire_rate`/`damage`/`projectile_mass` + projectile radius from those
+    /// via the global `SimTuning` weapon-physics scales (see `derive_weapon` in `stats.rs`). The four
+    /// cooked outputs are optional per-weapon OVERRIDES: `Some(x)` ⇒ honor it (bypass physics — for
+    /// energy/missile weapons that don't fit the caliber model); `None` ⇒ derive.
     Weapon {
         /// Delivery family (Phase C) — the axis the fire system branches on.
         class: WeaponClass,
@@ -201,18 +206,40 @@ pub enum ModuleSpecifics {
         damage_type: Channel,
         /// Optional secondary damage type (Phase C) — e.g. a shell is `Kinetic` + `Blast`.
         secondary_damage_type: Option<Channel>,
-        /// Projectile launch speed (`> 0`).
-        muzzle_speed: f32,
-        /// Shots per second (`> 0`).
-        fire_rate: f32,
-        /// Damage per shot (`> 0`).
-        damage: f32,
-        /// Phase M5 — the fired projectile's inertial **mass** (`> 0`), the per-weapon slug mass
-        /// that sets both the shot's knockback on a target and the shooter's recoil
-        /// (`momentum = projectile_mass · muzzle_velocity`). Small relative to ship mass; a heavier
-        /// gun (e.g. a railgun) hits + recoils harder. Distinct from the weapon module's own
-        /// install `mass` (the cost axis). Tunable for feel.
-        projectile_mass: f32,
+        /// R42 — bore diameter in real millimetres. Drives projectile RADIUS (visual + collision) and
+        /// the caliber³ slug-MASS model; with `muzzle_velocity_ms` it sets kinetic energy → damage.
+        #[serde(default)]
+        caliber_mm: f32,
+        /// R42 — real muzzle velocity (m/s). Scaled to game `muzzle_speed` by `velocity_scale`.
+        #[serde(default)]
+        muzzle_velocity_ms: f32,
+        /// R42 — rounds per minute. Scaled to game `fire_rate` (shots/s) by `rpm_scale`.
+        #[serde(default)]
+        rpm: f32,
+        /// R42 — rotary spool-up time (s) to reach full RPM while firing; `0` = instant (non-rotary).
+        #[serde(default)]
+        spin_up_time: f32,
+        /// R42 — shot dispersion half-angle (degrees); `0` = pinpoint. Applied as DETERMINISTIC
+        /// per-shot angular noise (splitmix64 of owner + shot counter — no RNG).
+        #[serde(default)]
+        dispersion_deg: f32,
+        /// R42 — max projectile travel in game units → `lifetime = range_units / muzzle_speed`.
+        #[serde(default = "default_range_units")]
+        range_units: f32,
+        /// R42 — optional OVERRIDE of the derived game launch speed (`None` ⇒ derive from velocity).
+        #[serde(default)]
+        muzzle_speed: Option<f32>,
+        /// R42 — optional OVERRIDE of the derived fire rate, shots/s (`None` ⇒ derive from rpm).
+        #[serde(default)]
+        fire_rate: Option<f32>,
+        /// R42 — optional OVERRIDE of the derived per-shot damage (`None` ⇒ derive from KE).
+        #[serde(default)]
+        damage: Option<f32>,
+        /// Phase M5 / R42 — the fired projectile's inertial **slug mass** that sets the shot's
+        /// knockback on a target and the shooter's recoil (`momentum = mass · muzzle`). Optional
+        /// OVERRIDE: `None` ⇒ derive from caliber³ density. Distinct from the module's install `mass`.
+        #[serde(default)]
+        projectile_mass: Option<f32>,
     },
     /// Shield: defense data consumed by E007 (not flight).
     Shield {
@@ -237,6 +264,12 @@ pub enum ModuleSpecifics {
     },
     /// Utility: generic seam; no flight/weapon contribution this epic.
     Utility,
+}
+
+/// R42 — serde default for a weapon's `range_units` when omitted (game units of projectile travel).
+/// Keeps an under-authored weapon firing a sane distance instead of a zero-lifetime dud.
+fn default_range_units() -> f32 {
+    1200.0
 }
 
 /// The uniform data-driven stat block — the atom of fitting (FR-001).

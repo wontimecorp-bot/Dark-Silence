@@ -10,8 +10,9 @@
 
 use crate::clock::FixedDt;
 use crate::components::{
-    Damage, Energy, Faction, Heading, Heat, Lifetime, Position, PrevPosition, Projectile,
-    ProjectileFaction, ProjectileMass, ProjectileOwner, Ship, Velocity, Weapon,
+    CollisionRadius, Damage, Energy, Faction, Heading, Heat, Lifetime, Position, PrevPosition,
+    Projectile, ProjectileFaction, ProjectileMass, ProjectileOwner, RenderScale, Ship, Velocity,
+    Weapon,
 };
 use crate::damage::{Channel, DamageEvent};
 use crate::fitting::ShipStats;
@@ -19,7 +20,7 @@ use crate::intent::ShipIntent;
 use crate::physics::SweptHit;
 use crate::tuning::{SimTuning, Tuning};
 use bevy_ecs::prelude::*;
-use glam::Vec2;
+use glam::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
 /// Default damage a projectile carries (Damage > 0, INV-04) — the unfitted-ship
@@ -36,6 +37,11 @@ pub(crate) const PROJECTILE_LIFETIME: f32 = 3.0;
 /// Small relative to ship mass so a shot nudges rather than flings; **tunable**. Sim-side → part
 /// of the determinism contract.
 pub const PROJECTILE_MASS: f32 = 0.03;
+/// R42 — the client's projectile mesh radius (`Sphere::new(0.2)` in `client/scene.rs`). A fitted
+/// weapon's caliber-derived world radius is emitted as a [`RenderScale`] of `radius / this` so the
+/// shared sphere renders at the real size. **Keep in sync with the client mesh.** Unfitted / turret
+/// shots carry no `RenderScale` and render at this base size (unchanged).
+const PROJECTILE_MESH_RADIUS: f32 = 0.2;
 
 // --- E007 damage-typing seam (T037) ---------------------------------------------
 
@@ -239,22 +245,51 @@ pub fn weapon_fire_system(
         if weapon.cooldown > 0.0 {
             weapon.cooldown -= dt;
         }
+        // R42 — rotary spool: a weapon with `spin_up_time > 0` (vulcan/gatling) ramps `spool` toward
+        // full RPM while firing and decays it when idle; firing is gated on full spool below. A weapon
+        // with `spin_up_time == 0` (every gun today) sits at `1.0` ⇒ no behavior change.
+        if profile.spin_up_time > 0.0 {
+            let step = dt / profile.spin_up_time;
+            weapon.spool = if intent.fire {
+                (weapon.spool + step).min(1.0)
+            } else {
+                (weapon.spool - step).max(0.0)
+            };
+        } else {
+            weapon.spool = 1.0;
+        }
         // Phase E: a shot costs Energy + builds Heat, and is gated on both (when the pools exist).
         // `is_none_or` ⇒ a ship without the pools (the headless/test path) fires exactly as before.
         let shot_cost = profile.damage * sim.weapon_energy_per_damage;
         let energy_ok = energy.as_ref().is_none_or(|e| e.current >= shot_cost);
         let heat_ok = heat.as_ref().is_none_or(|h| h.current < h.max);
-        if stats.can_fire && intent.fire && can_fire(weapon.cooldown) && energy_ok && heat_ok {
+        if stats.can_fire
+            && intent.fire
+            && weapon.spool >= 1.0
+            && can_fire(weapon.cooldown)
+            && energy_ok
+            && heat_ok
+        {
+            // R42 — dispersion: scatter the shot within the weapon's cone by a DETERMINISTIC per-shot
+            // angle (`aim_noise` = splitmix64 of the owner bits + shot counter — no RNG). `0` ⇒ the
+            // shot flies exactly on heading (byte-identical to today). The gun's muzzle POSITION stays
+            // on `heading` (the barrel doesn't move); only the round's launch direction scatters.
+            let aim = if profile.dispersion_rad > 0.0 {
+                heading.0
+                    + crate::turret::aim_noise(owner.to_bits(), weapon.shot_counter)
+                        * profile.dispersion_rad
+            } else {
+                heading.0
+            };
             // Phase M4: the muzzle velocity (the gun's contribution) plus the shooter's own
             // velocity, so a moving ship's shots carry its motion (a true Newtonian gun).
-            let muzzle = Vec2::from_angle(heading.0) * profile.muzzle_speed;
+            let muzzle = Vec2::from_angle(aim) * profile.muzzle_speed;
             let vel = muzzle + ship_vel.0;
             // Refinement 18: spawn at the installed gun's world position — the body-frame
             // `muzzle_offset` (derived from the weapon's grid cell) rotated by the ship's heading —
-            // so the shot leaves from the actual weapon cell, not the ship centre. The velocity
-            // (muzzle direction + inherited ship velocity) and recoil are unchanged.
+            // so the shot leaves from the actual weapon cell, not the ship centre.
             let spawn = pos.0 + Vec2::from_angle(heading.0).rotate(profile.muzzle_offset);
-            commands.spawn((
+            let mut shot = commands.spawn((
                 Projectile,
                 Position(spawn),
                 PrevPosition(spawn),
@@ -262,12 +297,11 @@ pub fn weapon_fire_system(
                 Damage(profile.damage),
                 // Phase M5: the per-weapon slug mass, carried to the hit for the impulse.
                 ProjectileMass(profile.projectile_mass),
-                Lifetime(sim.projectile_lifetime),
+                // R42: per-weapon range — `lifetime = range_units / muzzle_speed` (was the global TTL).
+                Lifetime(profile.lifetime),
                 ProjectileOwner(owner),
                 // E007 damage typing (T037) + Phase C: the shot carries the fitted weapon's own
-                // damage `Channel` (`profile.channel`) with penetration derived from the shot
-                // damage (M6: live `pen_per_damage`/`pen_size`). Seed autocannon = Kinetic →
-                // byte-identical to the old hardcoded path.
+                // damage `Channel` with penetration derived from the shot damage.
                 WeaponSource::from_damage_typed(
                     profile.channel,
                     profile.damage,
@@ -277,6 +311,17 @@ pub fn weapon_fire_system(
                 // Mining-skirmish friend/foe: the shot carries the shooter's team (None = neutral).
                 ProjectileFaction(faction.copied()),
             ));
+            // R42: a caliber-derived radius gives the shot its on-screen size (RenderScale on the
+            // shared 0.2 sphere) AND its hit radius (CollisionRadius, Minkowski-summed in collision).
+            // Absent (radius 0) ⇒ the legacy point shot at the default mesh size (unfitted/turret).
+            if profile.projectile_radius > 0.0 {
+                shot.insert((
+                    CollisionRadius(profile.projectile_radius),
+                    RenderScale(Vec3::splat(
+                        profile.projectile_radius / PROJECTILE_MESH_RADIUS,
+                    )),
+                ));
+            }
             // Phase M4/M5 recoil: conserve momentum against the MUZZLE component only (the inherited
             // part was already the ship's momentum), using the per-weapon slug mass.
             // Δv = −(projectile_mass·muzzle)/ship_mass.
@@ -289,6 +334,8 @@ pub fn weapon_fire_system(
             if let Some(h) = heat.as_mut() {
                 h.current += profile.heat;
             }
+            // R42: advance the dispersion seed each shot (unread by a pinpoint weapon).
+            weapon.shot_counter = weapon.shot_counter.wrapping_add(1);
             weapon.cooldown = cooldown_after_fire(profile.fire_rate);
         }
     }
@@ -454,6 +501,8 @@ mod tests {
                     cooldown: 0.0,
                     fire_rate: profile.fire_rate,
                     muzzle_speed: profile.muzzle_speed,
+                    spool: 1.0,
+                    shot_counter: 0,
                 },
                 Energy {
                     current: 100.0,

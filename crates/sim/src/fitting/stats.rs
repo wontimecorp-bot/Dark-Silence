@@ -30,13 +30,13 @@ use bevy_ecs::component::Component;
 use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
-use super::content::{ModuleCatalog, STRUCT_CELL_MASS};
+use super::content::ModuleCatalog;
 use super::fit::Fit;
 use super::hull::{Hull, CELL_WORLD_SIZE};
 use super::layout::{layout_mass_with, CellOccupant, FitLayout};
 use super::module::{Module, ModuleKind, ModuleSpecifics};
 use crate::damage::{Channel, StatScalingConfig, DEFAULT_SHIELD_HP, DEFAULT_SHIELD_REGEN};
-use crate::tuning::Tuning;
+use crate::tuning::{SimTuning, Tuning};
 
 /// Smallest thrust force a fit can derive to (FR-017): no thruster ⇒ this floor,
 /// never `0`, so the ship is near-immobile but `top_speed = floor / linear_drag`
@@ -86,6 +86,84 @@ pub struct WeaponProfile {
     /// centre. `Vec2::ZERO` for a centred/legacy weapon. Render/feel only — does not change the
     /// shot's velocity or damage.
     pub muzzle_offset: Vec2,
+    /// R42 — the fired projectile's RADIUS in world units (visual + collision), derived from
+    /// `caliber_mm · SimTuning.mm_to_world`. `0` ⇒ the legacy point projectile.
+    pub projectile_radius: f32,
+    /// R42 — rotary spool-up time (s) to reach full RPM; `0` = instant. The fire system ramps
+    /// `Weapon.spool` and gates firing until full (vulcan/gatling wind-up).
+    pub spin_up_time: f32,
+    /// R42 — shot dispersion half-angle in RADIANS (`dispersion_deg.to_radians()`); `0` = pinpoint.
+    /// Applied as deterministic per-shot angular noise (no RNG).
+    pub dispersion_rad: f32,
+    /// R42 — the projectile's time-to-live (s) = `range_units / muzzle_speed` (per-weapon range),
+    /// replacing the global `SimTuning.projectile_lifetime` for fitted shots.
+    pub lifetime: f32,
+}
+
+/// R42 — the game-space outputs of a weapon design, physics-DERIVED from its real specs
+/// (caliber/velocity/rpm) via the [`SimTuning`] scales, with any `Some(..)` per-field override
+/// honored. Built by [`derive_weapon`]; the dev panel shows these as read-only readouts and
+/// `derive_ship_stats` turns them into the runtime [`WeaponProfile`] (health-scaling `damage`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DerivedWeapon {
+    pub muzzle_speed: f32,
+    pub fire_rate: f32,
+    pub damage: f32,
+    pub projectile_mass: f32,
+    pub projectile_radius: f32,
+    pub dispersion_rad: f32,
+    pub spin_up_time: f32,
+    pub lifetime: f32,
+}
+
+/// R42 — derive a weapon design's game-space outputs from its authored real specs via the
+/// [`SimTuning`] physics scales, honoring per-field `Some(..)` overrides. Returns `None` for a
+/// non-weapon `ModuleSpecifics`. Pure + deterministic (no RNG). Reused by the dev-panel readouts.
+///
+/// - `muzzle_speed = muzzle_velocity_ms · velocity_scale`
+/// - `fire_rate    = rpm · rpm_scale`
+/// - `projectile_radius = caliber_mm · mm_to_world`
+/// - `projectile_mass = projectile_density · caliber_mm³`
+/// - `damage = ½ · mass · muzzle_velocity_ms² · damage_per_joule`
+/// - `lifetime = range_units / muzzle_speed`
+pub fn derive_weapon(spec: &ModuleSpecifics, sim: &SimTuning) -> Option<DerivedWeapon> {
+    let ModuleSpecifics::Weapon {
+        caliber_mm,
+        muzzle_velocity_ms,
+        rpm,
+        spin_up_time,
+        dispersion_deg,
+        range_units,
+        muzzle_speed,
+        fire_rate,
+        damage,
+        projectile_mass,
+        ..
+    } = *spec
+    else {
+        return None;
+    };
+    let projectile_radius = caliber_mm * sim.mm_to_world;
+    let mass = projectile_mass.unwrap_or(sim.projectile_density * caliber_mm.powi(3));
+    let speed = muzzle_speed.unwrap_or(muzzle_velocity_ms * sim.velocity_scale);
+    let rate = fire_rate.unwrap_or(rpm * sim.rpm_scale);
+    let dmg = damage
+        .unwrap_or(0.5 * mass * muzzle_velocity_ms * muzzle_velocity_ms * sim.damage_per_joule);
+    let lifetime = if speed > 0.0 {
+        range_units / speed
+    } else {
+        sim.projectile_lifetime
+    };
+    Some(DerivedWeapon {
+        muzzle_speed: speed,
+        fire_rate: rate,
+        damage: dmg,
+        projectile_mass: mass,
+        projectile_radius,
+        dispersion_rad: dispersion_deg.to_radians(),
+        spin_up_time,
+        lifetime,
+    })
 }
 
 /// The fit-derived effective stats for a ship — the per-entity flight + weapon
@@ -264,19 +342,20 @@ pub fn derive_ship_stats(
     catalog: &ModuleCatalog,
     layout: &FitLayout,
 ) -> ShipStats {
-    derive_ship_stats_with(hull, fit, catalog, layout, STRUCT_CELL_MASS)
+    derive_ship_stats_with(hull, fit, catalog, layout, &SimTuning::default())
 }
 
-/// [`derive_ship_stats`] with an explicit structural-cell mass (Phase M6 live tuning): the flight
-/// `total_mass` = [`layout_mass_with`] at `struct_cell_mass` instead of the compile-time
-/// [`STRUCT_CELL_MASS`]. The dev panel's re-derive passes the live `SimTuning.struct_cell_mass`.
+/// [`derive_ship_stats`] with the live [`SimTuning`] (Phase M6 / R42): the flight `total_mass` uses
+/// `sim.struct_cell_mass` instead of the compile-time default, and the weapon profile is physics-
+/// derived from the live weapon-physics scales (caliber → size/rate/damage via [`derive_weapon`]).
+/// The dev panel's re-derive passes the live resource so editing a scale updates every ship.
 #[allow(clippy::too_many_arguments)]
 pub fn derive_ship_stats_with(
     hull: &Hull,
     fit: &Fit,
     catalog: &ModuleCatalog,
     layout: &FitLayout,
-    struct_cell_mass: f32,
+    sim: &SimTuning,
 ) -> ShipStats {
     // Flight-feel constants the modules do not supply come from the demoted
     // `Tuning` baseline (HINT-002): the seed baseline fit reproduces these.
@@ -365,14 +444,9 @@ pub fn derive_ship_stats_with(
             // fire profile (FR-013/016): a destroyed weapon (hf == 0) is skipped so
             // `can_fire` stays false; the surviving profile's `damage` scales by hf
             // (at full health hf == 1.0 → identical, baseline-preserving).
-            ModuleSpecifics::Weapon {
-                damage_type,
-                muzzle_speed,
-                fire_rate,
-                damage,
-                projectile_mass,
-                .. // `class`/`ammo`/`secondary_damage_type` are not consumed by derivation yet.
-            } if module.kind == ModuleKind::Weapon && weapon.is_none() && hf > 0.0 => {
+            ModuleSpecifics::Weapon { damage_type, .. }
+                if module.kind == ModuleKind::Weapon && weapon.is_none() && hf > 0.0 =>
+            {
                 // Refinement 18 — the firing weapon's grid cell → BODY-FRAME muzzle offset so the
                 // shot spawns at the installed gun, not the ship centre. Convention matches the
                 // client hull mesh: row → forward (`+x`), col → lateral (`+y`), measured from the
@@ -390,15 +464,24 @@ pub fn derive_ship_stats_with(
                         )
                     })
                     .unwrap_or(Vec2::ZERO);
+                // R42 — physics-derive the game-space outputs (size/rate/damage/mass/spin/range) from
+                // the weapon's real specs via the live `SimTuning` scales; only `damage` is
+                // health-scaled (a battered gun hits softer); size/mass/spin/dispersion/range are
+                // physical properties, like the slug mass + per-shot heat below.
+                let d = derive_weapon(&module.specifics, sim)
+                    .expect("weapon-kind module has Weapon specifics");
                 weapon = Some(WeaponProfile {
                     channel: damage_type,
-                    muzzle_speed,
-                    fire_rate,
-                    damage: damage * hf,
-                    // The slug's mass + per-shot heat are physical properties — NOT health-scaled.
-                    projectile_mass,
+                    muzzle_speed: d.muzzle_speed,
+                    fire_rate: d.fire_rate,
+                    damage: d.damage * hf,
+                    projectile_mass: d.projectile_mass,
                     heat: module.heat,
                     muzzle_offset,
+                    projectile_radius: d.projectile_radius,
+                    spin_up_time: d.spin_up_time,
+                    dispersion_rad: d.dispersion_rad,
+                    lifetime: d.lifetime,
                 });
             }
             // Armor plates contribute their nominal `armor_value` to the depleting ArmorHp pool's
@@ -437,7 +520,7 @@ pub fn derive_ship_stats_with(
     // continuous as it erodes into a wreck. (The authored `hull.hull_base_mass` is no longer part
     // of the flight mass — it remains only the fitting-screen mass-**budget** axis.) Floored `> 0`
     // (INV-F14) — a no-cell layout never zeroes the flight denominator.
-    let total_mass = layout_mass_with(layout, catalog, struct_cell_mass).max(f32::MIN_POSITIVE);
+    let total_mass = layout_mass_with(layout, catalog, sim.struct_cell_mass).max(f32::MIN_POSITIVE);
 
     ShipStats {
         thrust_force,

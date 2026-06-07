@@ -26,8 +26,8 @@ use sim::damage::{
     ShieldConfig, Shields, StatScalingConfig,
 };
 use sim::fitting::{
-    force_rederive_all, force_rederive_keep_health, seed_catalogs, Fit, FitLayout, HullCatalog,
-    ModuleCatalog, ModuleId, ModuleKind, ModuleSpecifics, ShipStats,
+    derive_weapon, force_rederive_all, force_rederive_keep_health, seed_catalogs, Fit, FitLayout,
+    HullCatalog, ModuleCatalog, ModuleId, ModuleKind, ModuleSpecifics, ShipStats,
 };
 use sim::{MiningTuning, SimTuning, Tuning};
 
@@ -80,6 +80,14 @@ enum StatId {
     Rof,
     Muzzle,
     Slug,
+    // R42 — weapon real-spec authoring inputs + a derived projectile-radius readout.
+    CaliberMm,
+    MuzzleVelocityMs,
+    Rpm,
+    SpinUp,
+    DispersionDeg,
+    RangeUnits,
+    ProjRadius,
     LethalRam,
     // Defense / penetration tuning.
     RicochetAngle,
@@ -105,6 +113,12 @@ enum StatId {
     ProjMass,
     ProjDamage,
     ProjLifetime,
+    // R42 — global ballistic weapon-physics scales (real specs → game space).
+    MmToWorld,
+    VelocityScale,
+    RpmScale,
+    ProjDensity,
+    DamagePerJoule,
     PenPerDamage,
     PenSize,
     WreckLifetime,
@@ -198,8 +212,70 @@ impl StatId {
             Armor => ("armor", "Armor value", "armor_value", 0, ""),
             Dmg => ("dmg", "Weapon damage", "damage", 0, ""),
             Rof => ("rof", "Rate of fire", "fire_rate", 1, "/s"),
-            Muzzle => ("muzzle", "Muzzle speed", "muzzle_speed", 0, ""),
-            Slug => ("slug", "Projectile mass", "projectile_mass", 3, ""),
+            Muzzle => ("muzzle", "Muzzle speed (derived)", "muzzle_speed", 0, ""),
+            Slug => (
+                "slug",
+                "Projectile mass (derived)",
+                "projectile_mass",
+                4,
+                "",
+            ),
+            // R42 weapon real-spec authoring + derived readout.
+            CaliberMm => ("caliber", "Bore caliber", "caliber_mm", 2, " mm"),
+            MuzzleVelocityMs => (
+                "muzzle m/s",
+                "Muzzle velocity (real)",
+                "muzzle_velocity_ms",
+                0,
+                " m/s",
+            ),
+            Rpm => ("rpm", "Rounds per minute", "rpm", 0, " rpm"),
+            SpinUp => ("spin-up", "Rotary spool-up time", "spin_up_time", 2, " s"),
+            DispersionDeg => (
+                "dispersion",
+                "Shot dispersion half-angle",
+                "dispersion_deg",
+                2,
+                "°",
+            ),
+            RangeUnits => ("range", "Projectile travel range", "range_units", 0, " u"),
+            ProjRadius => (
+                "proj radius",
+                "Projectile radius (derived)",
+                "projectile_radius",
+                3,
+                "",
+            ),
+            // R42 global weapon-physics scales.
+            MmToWorld => (
+                "mm→world",
+                "Projectile radius per mm caliber",
+                "mm_to_world",
+                5,
+                "",
+            ),
+            VelocityScale => (
+                "vel scale",
+                "Real m/s → game speed",
+                "velocity_scale",
+                3,
+                "",
+            ),
+            RpmScale => ("rpm scale", "RPM → shots/s", "rpm_scale", 5, ""),
+            ProjDensity => (
+                "proj density",
+                "Slug mass per mm³ caliber",
+                "projectile_density",
+                8,
+                "",
+            ),
+            DamagePerJoule => (
+                "dmg/joule",
+                "Damage per joule of muzzle KE",
+                "damage_per_joule",
+                5,
+                "",
+            ),
             LethalRam => ("lethal ram", "Lethal ram speed", "lethal_ram_speed", 0, ""),
             RicochetAngle => ("ricochet_angle", "Ricochet angle", "ricochet_angle", 0, "°"),
             OvermatchRatio => (
@@ -440,6 +516,13 @@ impl StatId {
             Rof,
             Muzzle,
             Slug,
+            CaliberMm,
+            MuzzleVelocityMs,
+            Rpm,
+            SpinUp,
+            DispersionDeg,
+            RangeUnits,
+            ProjRadius,
             LethalRam,
             RicochetAngle,
             OvermatchRatio,
@@ -463,6 +546,11 @@ impl StatId {
             ProjMass,
             ProjDamage,
             ProjLifetime,
+            MmToWorld,
+            VelocityScale,
+            RpmScale,
+            ProjDensity,
+            DamagePerJoule,
             PenPerDamage,
             PenSize,
             WreckLifetime,
@@ -529,7 +617,14 @@ impl StatId {
             Dmg => "Damage per projectile hit.",
             Rof => "Weapon rate of fire (shots per second).",
             Muzzle => "Projectile muzzle speed. Higher = flatter trajectory, less lead needed, and less render lag.",
-            Slug => "Projectile mass — affects momentum / knockback and penetration.",
+            Slug => "Projectile mass (derived from caliber³) — affects momentum / knockback and recoil.",
+            CaliberMm => "R42: bore caliber (mm). Drives projectile size (visual + collision) and the caliber³ slug mass; with muzzle velocity it sets kinetic energy → damage.",
+            MuzzleVelocityMs => "R42: real muzzle velocity (m/s), scaled to game muzzle speed by the velocity-scale.",
+            Rpm => "R42: rounds per minute, scaled to shots/second by the rpm-scale (a rotary gun also spools up).",
+            SpinUp => "R42: rotary spool-up time (s) to reach full RPM while firing; 0 = instant (non-rotary). Vulcan/gatling wind-up.",
+            DispersionDeg => "R42: shot dispersion half-angle (degrees) — a cone of fire; 0 = pinpoint. Deterministic per-shot scatter, no RNG.",
+            RangeUnits => "R42: projectile travel range in game units (lifetime = range / muzzle speed).",
+            ProjRadius => "Read-only: the derived projectile radius (caliber × mm→world).",
             LethalRam => "Closing speed at or above which a ram is a one-shot kill (scenario ram tuning).",
             // --- Defense / penetration ---
             RicochetAngle => "Glancing-hit threshold (degrees): shots striking the surface steeper than this bounce off instead of penetrating.",
@@ -554,7 +649,12 @@ impl StatId {
             SmoothNormalRadius => "Cell radius sampled to estimate a smoothed surface normal for the ricochet-angle test.",
             ProjMass => "Default projectile mass (the unfitted-weapon path).",
             ProjDamage => "Default projectile damage (the unfitted-weapon path).",
-            ProjLifetime => "Seconds a projectile lives before despawning (effective range ≈ lifetime × muzzle speed).",
+            ProjLifetime => "Seconds a projectile lives before despawning (the unfitted gun; fitted weapons derive lifetime from their range).",
+            MmToWorld => "R42 scale: projectile radius per mm of caliber (visual + collision size).",
+            VelocityScale => "R42 scale: real m/s → game muzzle speed (≈0.2 keeps real proportions at arcade scale).",
+            RpmScale => "R42 scale: RPM → shots/second (1/60 = the literal real rate; lower to tame projectile spam).",
+            ProjDensity => "R42 scale: slug mass per mm³ of caliber (mass = density × caliber³). Drives recoil/knockback + KE damage.",
+            DamagePerJoule => "R42 scale: damage per joule of muzzle kinetic energy (½ · mass · velocity²).",
             PenPerDamage => "Penetration gained per point of damage — how deep a shot carves for its damage.",
             PenSize => "Projectile size factor used in the penetration calculation.",
             WreckLifetime => "Seconds a wreck / debris chunk drifts before it fades and despawns.",
@@ -726,18 +826,20 @@ fn build_equipment(fit: &Fit, catalog: Option<&ModuleCatalog>) -> (Vec<Equipment
                 t.armor_value += *armor_value;
                 stats.push((StatId::Armor, fmt(StatId::Armor, *armor_value)));
             }
-            ModuleSpecifics::Weapon {
-                muzzle_speed,
-                fire_rate,
-                damage,
-                projectile_mass,
-                .. // Phase C class/ammo/damage_type/secondary — not in the equipment rows yet.
-            } => {
-                t.weapon_damage += *damage;
-                stats.push((StatId::Dmg, fmt(StatId::Dmg, *damage)));
-                stats.push((StatId::Rof, fmt(StatId::Rof, *fire_rate)));
-                stats.push((StatId::Muzzle, fmt(StatId::Muzzle, *muzzle_speed)));
-                stats.push((StatId::Slug, fmt(StatId::Slug, *projectile_mass)));
+            ModuleSpecifics::Weapon { .. } => {
+                // R42: the weapon's game stats are PHYSICS-DERIVED from its real specs. Show the
+                // derived values (at default scales — the live re-derive uses the live `SimTuning`).
+                if let Some(d) = derive_weapon(&m.specifics, &SimTuning::default()) {
+                    t.weapon_damage += d.damage;
+                    stats.push((StatId::Dmg, fmt(StatId::Dmg, d.damage)));
+                    stats.push((StatId::Rof, fmt(StatId::Rof, d.fire_rate)));
+                    stats.push((StatId::Muzzle, fmt(StatId::Muzzle, d.muzzle_speed)));
+                    stats.push((StatId::Slug, fmt(StatId::Slug, d.projectile_mass)));
+                    stats.push((
+                        StatId::ProjRadius,
+                        fmt(StatId::ProjRadius, d.projectile_radius),
+                    ));
+                }
             }
             // Phase C: Sensor shows only its common cost rows (range/resolution have no StatId yet).
             ModuleSpecifics::Thruster { .. }
@@ -1476,6 +1578,32 @@ fn dev_panel_ui(
                         &mut sim.projectile_lifetime,
                         0.2..=10.0,
                     );
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("R42 weapon physics — caliber → size/rate/damage")
+                            .strong(),
+                    );
+                    slider(ui, label(StatId::MmToWorld), &mut sim.mm_to_world, 0.001..=0.05);
+                    slider(
+                        ui,
+                        label(StatId::VelocityScale),
+                        &mut sim.velocity_scale,
+                        0.05..=1.0,
+                    );
+                    slider(ui, label(StatId::RpmScale), &mut sim.rpm_scale, 0.002..=0.1);
+                    slider(
+                        ui,
+                        label(StatId::ProjDensity),
+                        &mut sim.projectile_density,
+                        0.0..=0.00001,
+                    );
+                    slider(
+                        ui,
+                        label(StatId::DamagePerJoule),
+                        &mut sim.damage_per_joule,
+                        0.0..=0.01,
+                    );
+                    ui.separator();
                     slider(
                         ui,
                         label(StatId::PenPerDamage),
@@ -1717,21 +1845,43 @@ fn dev_panel_ui(
                                                         slider(ui, label(StatId::Armor), armor_value, 0.0..=300.0);
                                                     }
                                                     ModuleSpecifics::Weapon {
-                                                        muzzle_speed,
-                                                        fire_rate,
-                                                        damage,
-                                                        projectile_mass,
+                                                        caliber_mm,
+                                                        muzzle_velocity_ms,
+                                                        rpm,
+                                                        spin_up_time,
+                                                        dispersion_deg,
+                                                        range_units,
                                                         ..
                                                     } => {
-                                                        slider(ui, label(StatId::Dmg), damage, 1.0..=100.0);
-                                                        slider(ui, label(StatId::Rof), fire_rate, 0.5..=30.0);
-                                                        slider(ui, label(StatId::Muzzle), muzzle_speed, 20.0..=600.0);
-                                                        slider(ui, label(StatId::Slug), projectile_mass, 0.001..=2.0);
+                                                        // R42: author the REAL specs; the game derives
+                                                        // size/rate/damage/mass (read-only ↳ below).
+                                                        slider(ui, label(StatId::CaliberMm), caliber_mm, 1.0..=120.0);
+                                                        slider(ui, label(StatId::MuzzleVelocityMs), muzzle_velocity_ms, 100.0..=2000.0);
+                                                        slider(ui, label(StatId::Rpm), rpm, 30.0..=8000.0);
+                                                        slider(ui, label(StatId::SpinUp), spin_up_time, 0.0..=3.0);
+                                                        slider(ui, label(StatId::DispersionDeg), dispersion_deg, 0.0..=5.0);
+                                                        slider(ui, label(StatId::RangeUnits), range_units, 100.0..=3000.0);
                                                     }
                                                     ModuleSpecifics::Thruster { .. }
                                                     | ModuleSpecifics::Reactor
                                                     | ModuleSpecifics::Utility
                                                     | ModuleSpecifics::Sensor { .. } => {}
+                                                }
+                                                // R42: read-only DERIVED game stats (the real specs
+                                                // above × the live weapon-physics scales).
+                                                if let Some(d) = derive_weapon(&m.specifics, &sim) {
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "↳ derived: muzzle {:.0}  rof {:.1}/s  dmg {:.1}  slug {:.3}  radius {:.3}  life {:.1}s",
+                                                            d.muzzle_speed,
+                                                            d.fire_rate,
+                                                            d.damage,
+                                                            d.projectile_mass,
+                                                            d.projectile_radius,
+                                                            d.lifetime,
+                                                        ))
+                                                        .weak(),
+                                                    );
                                                 }
                                             });
                                     }

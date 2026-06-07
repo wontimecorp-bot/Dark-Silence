@@ -2500,6 +2500,8 @@ fn spawn_fitted_player_aimed(w: &mut World, pos: Vec2, aim_at: Vec2) -> Entity {
             cooldown: 0.0,
             fire_rate: stats.weapon.map(|p| p.fire_rate).unwrap_or(5.0),
             muzzle_speed: stats.weapon.map(|p| p.muzzle_speed).unwrap_or(200.0),
+            spool: 1.0,
+            shot_counter: 0,
         },
         fit,
         layout,

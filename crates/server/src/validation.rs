@@ -337,6 +337,8 @@ mod tests {
             cooldown: 0.0,
             fire_rate: 5.0,
             muzzle_speed: 200.0,
+            spool: 1.0,
+            shot_counter: 0,
         };
         let hot = Weapon {
             cooldown: 0.2,

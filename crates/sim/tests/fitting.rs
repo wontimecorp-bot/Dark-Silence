@@ -563,7 +563,7 @@ mod stats_phase4 {
     use sim::components::*;
     use sim::fitting::{
         baseline_fit, baseline_hull, build_layout, derive_ship_stats, recompute_ship_stats_system,
-        seed_catalogs, Fit, Hull, ModuleCatalog, ModuleSpecifics, ShipStats, SlotId, HULL_FIGHTER,
+        seed_catalogs, Fit, Hull, ModuleCatalog, ShipStats, SlotId, HULL_FIGHTER,
         MODULE_ARMOR_PLATE, MODULE_AUTOCANNON, MODULE_THRUSTER_BASIC,
     };
     use sim::{FixedDt, ShipIntent, Tuning};
@@ -657,24 +657,23 @@ mod stats_phase4 {
         assert!(armed_stats.can_fire, "a weapon module enables firing");
         let profile = armed_stats.weapon.expect("weapon profile present");
         let cannon = modules.get(MODULE_AUTOCANNON).unwrap();
-        if let ModuleSpecifics::Weapon {
-            muzzle_speed,
-            fire_rate,
-            damage,
-            projectile_mass,
-            .. // Phase C added class/ammo/damage_type/secondary — not asserted here.
-        } = cannon.specifics
-        {
-            assert_eq!(profile.muzzle_speed, muzzle_speed);
-            assert_eq!(profile.fire_rate, fire_rate);
-            assert_eq!(profile.damage, damage);
-            // Phase M5: the profile carries the weapon's per-shot slug mass through unchanged,
-            // pinned to the seed value (recoil/knockback unchanged until a heavier gun is authored).
-            assert_eq!(profile.projectile_mass, projectile_mass);
-            assert_eq!(projectile_mass, 0.03, "seed autocannon slug mass is pinned");
-        } else {
-            panic!("autocannon should be a Weapon module");
-        }
+        // R42: the profile's game-space outputs are PHYSICS-DERIVED from the autocannon's real specs
+        // (30 mm / 1000 m·s / 300 rpm) via the default `SimTuning` scales. At full health (hf == 1.0)
+        // the profile equals the raw `derive_weapon` outputs, calibrated to reproduce the historical
+        // autocannon feel (≈ 200 u/s, 5 shots/s, 12 damage, 0.03 slug, 0.2 radius — the no-regression
+        // anchor).
+        let d = sim::fitting::derive_weapon(&cannon.specifics, &sim::SimTuning::default())
+            .expect("autocannon is a Weapon module");
+        assert_eq!(profile.muzzle_speed, d.muzzle_speed);
+        assert_eq!(profile.fire_rate, d.fire_rate);
+        assert_eq!(profile.damage, d.damage);
+        assert_eq!(profile.projectile_mass, d.projectile_mass);
+        assert_eq!(profile.projectile_radius, d.projectile_radius);
+        assert!((d.muzzle_speed - 200.0).abs() < 1e-3, "≈200 u/s muzzle");
+        assert!((d.fire_rate - 5.0).abs() < 1e-3, "5 shots/s");
+        assert!((d.damage - 12.0).abs() < 0.05, "≈12 damage");
+        assert!((d.projectile_mass - 0.03).abs() < 1e-4, "≈0.03 slug");
+        assert!((d.projectile_radius - 0.2).abs() < 1e-4, "≈0.2 radius");
     }
 
     /// Phase M5: a ship's flight `total_mass` IS its per-cell `layout_mass` — so flight, the

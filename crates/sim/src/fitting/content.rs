@@ -282,18 +282,23 @@ fn seed_modules() -> ModuleCatalog {
             hardpoint_type: HardpointType::Weapon,
             hardpoint_size: SlotSize::Small,
             specifics: ModuleSpecifics::Weapon {
-                // Phase C: ballistic shell gun. `damage_type: Kinetic` keeps the live
-                // damage byte-identical to the old hardcoded `Channel::Kinetic`.
+                // R42: ballistic shell gun authored from REAL specs (30 mm / 1000 m·s / 300 rpm);
+                // the four cooked outputs are `None` ⇒ physics-derived (≈ 200 u/s, 5 shots/s, 12
+                // damage, 0.03 slug under the default scales — the no-regression anchor).
                 class: WeaponClass::Ballistic,
                 ammo: AmmoType::Shell,
                 damage_type: Channel::Kinetic,
                 secondary_damage_type: None,
-                muzzle_speed: 200.0,
-                fire_rate: 5.0,
-                damage: 12.0,
-                // Phase M5: per-weapon slug mass — the seed autocannon keeps the prior global
-                // value so recoil/knockback are unchanged until a heavier gun is authored.
-                projectile_mass: 0.03,
+                caliber_mm: 30.0,
+                muzzle_velocity_ms: 1000.0,
+                rpm: 300.0,
+                spin_up_time: 0.0,
+                dispersion_deg: 0.0,
+                range_units: 1000.0,
+                muzzle_speed: None,
+                fire_rate: None,
+                damage: None,
+                projectile_mass: None,
             },
         },
         // shield_basic — shield hp/regen (tank); dominant cost axis = power_draw
@@ -864,8 +869,8 @@ mod tests {
         // thruster (HINT-002) — 7 module rows in total.
         assert_eq!(
             modules.len(),
-            18,
-            "6 archetypes + baseline thruster + 11 Phase C4 seed rows (propulsion/sensors/weapons)"
+            21,
+            "6 archetypes + baseline thruster + 11 Phase C4 rows + 3 R42 ballistic guns (MG/HMG/Gatling)"
         );
         assert!(modules.get(MODULE_BASELINE_THRUSTER).is_some());
         assert_eq!(hulls.len(), 2, "expected the fighter + corvette seed hulls");

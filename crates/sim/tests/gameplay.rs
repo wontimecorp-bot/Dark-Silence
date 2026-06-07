@@ -69,6 +69,8 @@ fn spawn_ship(w: &mut World, pos: Vec2, heading: f32, vel: Vec2) -> Entity {
             cooldown: 0.0,
             fire_rate: 5.0,
             muzzle_speed: 200.0,
+            spool: 1.0,
+            shot_counter: 0,
         },
     ))
     .id()
@@ -684,6 +686,8 @@ fn spawn_flight_model_ship(w: &mut World) -> Entity {
             cooldown: 0.0,
             fire_rate: 5.0,
             muzzle_speed: 200.0,
+            spool: 1.0,
+            shot_counter: 0,
         },
     ))
     .id()

@@ -218,6 +218,10 @@ pub fn collision_detect_system(
             &PrevPosition,
             &Damage,
             Option<&ProjectileFaction>,
+            // R42: a fitted weapon's caliber-derived shot radius (Minkowski-summed onto the target
+            // circle below). `Option` ⇒ absent for unfitted/turret shots → `0.0` → point sweep,
+            // byte-identical to today.
+            Option<&CollisionRadius>,
         ),
         With<Projectile>,
     >,
@@ -235,7 +239,8 @@ pub fn collision_detect_system(
 ) {
     let friendly_fire = rules.is_some_and(|r| r.friendly_fire);
     let physics = RapierPhysics::new();
-    for (projectile, pos, prev, dmg, proj_faction) in &projectiles {
+    for (projectile, pos, prev, dmg, proj_faction, proj_radius) in &projectiles {
+        let proj_r = proj_radius.map(|r| r.0).unwrap_or(0.0);
         for (tentity, tpos, radius, mut health, target_faction, voxelize) in &mut targets {
             // Mining-skirmish friend/foe gate: a FACTIONED shot skips a non-enemy target. A no-op
             // for an unfactioned shot (`proj_faction` is `None`) → today's free-for-all, so every
@@ -246,7 +251,7 @@ pub fn collision_detect_system(
                 }
             }
             if physics
-                .swept_cast(prev.0, pos.0, tpos.0, radius.0)
+                .swept_cast(prev.0, pos.0, tpos.0, radius.0 + proj_r)
                 .is_some()
             {
                 if voxelize.is_some() {
@@ -532,12 +537,18 @@ pub fn fitted_damage_system(world: &mut World) {
         Option<&ProjectileOwner>,
         Option<&ProjectileMass>,
         Option<&ProjectileFaction>,
+        // R42: the shot's caliber-derived radius (Minkowski-summed onto the broad-phase target
+        // circle). `Option` ⇒ absent for unfitted/turret shots → `0.0` → today's point reject.
+        Option<&CollisionRadius>,
     ), With<Projectile>>();
-    for (projectile, pos, prev, vel, dmg, src, owner, pmass, pfac) in proj_q.iter(world) {
+    for (projectile, pos, prev, vel, dmg, src, owner, pmass, pfac, pradius) in proj_q.iter(world) {
         let owner_e = owner.map(|o| o.0);
         // Phase M5: the per-weapon slug mass the shot carries (falls back to the global
         // `PROJECTILE_MASS` for a projectile spawned without one — e.g. a minimal-world test shot).
         let proj_mass = pmass.map(|m| m.0).unwrap_or(PROJECTILE_MASS);
+        // R42: the shot's own radius widens ONLY the broad-phase circle (the narrow-phase cell test
+        // below is the truth); `0` for a legacy point shot ⇒ identical reject.
+        let proj_r = pradius.map(|r| r.0).unwrap_or(0.0);
         // **Cell-precise hit selection** (the targeting-bug fix): a projectile hits a target
         // ONLY if its swept segment actually crosses one of that target's present CELLS —
         // not merely the loose `CollisionRadius` circle. The circle (sized to the whole
@@ -572,8 +583,9 @@ pub fn fitted_damage_system(world: &mut World) {
                     continue;
                 }
             }
-            // Broad-phase: cheap circle reject — skip targets the projectile clearly misses.
-            let Some(hit) = physics.swept_cast(prev.0, pos.0, *tpos, *radius) else {
+            // Broad-phase: cheap circle reject — skip targets the projectile clearly misses. R42:
+            // the shot's own radius inflates the circle (Minkowski sum); `proj_r == 0` ⇒ unchanged.
+            let Some(hit) = physics.swept_cast(prev.0, pos.0, *tpos, *radius + proj_r) else {
                 continue;
             };
             // The carve entry ray (and `center`) must resolve, else this target is skipped in

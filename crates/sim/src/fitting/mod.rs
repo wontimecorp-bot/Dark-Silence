@@ -65,8 +65,8 @@ pub use module::{
     SensorType, SlotSize, Violation, WeaponClass,
 };
 pub use stats::{
-    derive_ship_stats, derive_ship_stats_with, module_conditions, ModuleCondition, ShipStats,
-    WeaponProfile,
+    derive_ship_stats, derive_ship_stats_with, derive_weapon, module_conditions, DerivedWeapon,
+    ModuleCondition, ShipStats, WeaponProfile,
 };
 pub use validate::{
     budget_usage, check_slot_fit, validate_fit, AxisUsage, BudgetUsage, FitValidation,
@@ -138,7 +138,7 @@ pub fn recompute_ship_stats_system(
         if fit.is_changed() {
             *layout = build_layout_with(hull, &fit, &modules, sim.struct_cell_hp);
         }
-        *stats = derive_ship_stats_with(hull, &fit, &modules, &layout, sim.struct_cell_mass);
+        *stats = derive_ship_stats_with(hull, &fit, &modules, &layout, &sim);
 
         // Refinement 10: sync the live defense pools' CAPS to the freshly-derived stats so a
         // carved/damaged generator (or armor module) shrinks — or zeroes — the pool. Shields now

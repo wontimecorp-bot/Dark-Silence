@@ -171,6 +171,17 @@ pub struct SimTuning {
     pub afterburner_regen_rate: f32,
     /// Phase F — translational thrust multiplier while boosting (`thrust ×= 1 + this`).
     pub afterburner_boost_factor: f32,
+    // --- Refinement 42: ballistic weapon physics scales (real caliber/velocity/rpm → game space) ---
+    /// R42 — projectile RADIUS per mm of caliber (`radius = caliber_mm · this`; visual + collision).
+    pub mm_to_world: f32,
+    /// R42 — real m/s → game muzzle speed (`muzzle_speed = muzzle_velocity_ms · this`).
+    pub velocity_scale: f32,
+    /// R42 — rounds/min → shots/s (`fire_rate = rpm · this`; `1/60` = the literal real rate).
+    pub rpm_scale: f32,
+    /// R42 — projectile slug mass per mm³ of caliber (`mass = projectile_density · caliber_mm³`).
+    pub projectile_density: f32,
+    /// R42 — damage per joule of muzzle KE (`damage = ½ · mass · muzzle_velocity_ms² · this`).
+    pub damage_per_joule: f32,
 }
 
 impl Default for SimTuning {
@@ -205,6 +216,15 @@ impl Default for SimTuning {
             afterburner_drain_rate: 40.0,
             afterburner_regen_rate: 20.0,
             afterburner_boost_factor: 0.6,
+            // R42 ballistic physics — calibrated so the seed 30mm / 1000 m·s / 300 rpm autocannon
+            // reproduces today's feel: muzzle 200 u/s, 5 shots/s, ~0.03 slug, ~12 dmg, ~0.2 radius.
+            mm_to_world: 1.0 / 150.0, // 30 mm → 0.2 radius (today's mesh)
+            velocity_scale: 0.2,      // 1000 m/s → 200 u/s
+            rpm_scale: 1.0 / 60.0,    // 300 rpm → 5 shots/s
+            // caliber³ slug density: 30 mm → ~0.03 game slug (today's autocannon).
+            projectile_density: 0.03 / (30.0 * 30.0 * 30.0),
+            // KE → damage: 30 mm autocannon (½·0.03·1000²·this) → ~12 damage (today's value).
+            damage_per_joule: 0.0008,
         }
     }
 }
@@ -229,6 +249,9 @@ mod tests {
         );
         assert!(t.pen_per_damage > 0.0 && t.pen_size > 0.0 && t.wreck_lifetime_secs > 0.0);
         assert!(t.ship_ram_mass > 0.0 && t.asteroid_ram_mass > 0.0);
+        // R42 weapon-physics scales are all positive.
+        assert!(t.mm_to_world > 0.0 && t.velocity_scale > 0.0 && t.rpm_scale > 0.0);
+        assert!(t.projectile_density > 0.0 && t.damage_per_joule > 0.0);
     }
 
     #[test]
