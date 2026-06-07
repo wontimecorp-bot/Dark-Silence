@@ -75,6 +75,7 @@ fn client_input_full_tail_roundtrips() {
             fire_primary: i % 2 == 0,
             fire_secondary: i % 5 == 0,
             active_group: (i % 6) as u8,
+            instant_fire: (i as u8) & 0b0011_1111,
             toggle_assist: i % 3 == 0,
             afterburner: i % 4 == 0,
         })
@@ -94,6 +95,7 @@ fn client_input_tail_is_capped() {
             fire_primary: false,
             fire_secondary: false,
             active_group: 0,
+            instant_fire: 0,
             toggle_assist: false,
             afterburner: false,
         })
@@ -198,6 +200,7 @@ fn intent_roundtrips_through_quantized_form() {
         fire_primary: true,
         fire_secondary: true,
         active_group: 3,
+        instant_fire: 0b0010_1010,
         toggle_assist: false,
         afterburner: true,
     };

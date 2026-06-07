@@ -79,6 +79,9 @@ pub struct FittingSession {
     /// enter, edited via the slot panel, committed alongside the `Fit` on Apply. Slots absent from
     /// the map default to group 1 / Primary (so an unconfigured ship fires everything on Space).
     pub weapon_groups: WeaponGroups,
+    /// R46 — the committed fire-group baseline (rebased on Apply, like [`applied_fit`](Self::applied_fit)).
+    /// Drives the "unsaved changes" indicator alongside `applied_fit`.
+    pub applied_groups: WeaponGroups,
     /// Human-readable outcome of the last action (install/remove/apply rejection or success).
     pub status: String,
 }
@@ -95,6 +98,7 @@ impl Default for FittingSession {
             applied_fit,
             selected_slot: None,
             weapon_groups: WeaponGroups::default(),
+            applied_groups: WeaponGroups::default(),
             status: String::new(),
         }
     }
@@ -135,6 +139,8 @@ fn load_fitting_session(
             // R45 — load the ship's live fire-group assignment (absent → all weapons default to
             // group 1 / Primary, so editing starts from the same "fires on Space" baseline).
             session.weapon_groups = w.get::<WeaponGroups>(ship).cloned().unwrap_or_default();
+            // R46 — rebase the "unsaved changes" baseline to the just-loaded groups.
+            session.applied_groups = session.weapon_groups.clone();
         }
     }
     inventory.available = session.modules.modules.keys().copied().collect();
@@ -165,6 +171,9 @@ fn fitting_screen_ui(
     let modules = session.modules.clone();
     let selected = session.selected_slot;
     let groups = session.weapon_groups.clone();
+    // R46 — are there edits not yet committed to the ship? (drives the "unsaved changes" label)
+    let dirty = session.working_fit != session.applied_fit
+        || session.weapon_groups != session.applied_groups;
     let (budget, stats) = preview_stats(&hull, &working, &modules);
     let baseline = preview_stats(&hull, &session.applied_fit, &modules).1;
 
@@ -229,6 +238,12 @@ fn fitting_screen_ui(
                 if ui.button("✖ Close (Tab)").clicked() {
                     do_close = true;
                 }
+                if dirty {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(240, 200, 80),
+                        "● Unsaved changes — press Apply",
+                    );
+                }
             });
             if !session.status.is_empty() {
                 ui.label(&session.status);
@@ -247,12 +262,18 @@ fn fitting_screen_ui(
     }
     if let Some((slot, module)) = to_install {
         let cat = session.modules.clone();
+        // R46 — name the module in the status so a rejected swap is legible ("Can't fit X — Over
+        // budget: Cpu"); the slot panel keeps showing the TRUE working_fit module (the old one stays).
+        let name = cat
+            .get(module)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| format!("{module:?}"));
         match session
             .working_fit
             .install_module(slot, module, &hull, &cat)
         {
-            Ok(()) => session.status = format!("Installed into slot {}", slot.0),
-            Err(rej) => session.status = describe_rejection(&rej),
+            Ok(()) => session.status = format!("Installed {name} in slot {}", slot.0),
+            Err(rej) => session.status = format!("Can't fit {name} — {}", describe_rejection(&rej)),
         }
     }
     if let Some((slot, mapping)) = to_assign {
@@ -279,6 +300,8 @@ fn fitting_screen_ui(
             session.status =
                 apply_to_ship(host, state, &session.working_fit, &session.weapon_groups);
             session.applied_fit = session.working_fit.clone();
+            // R46 — rebase the fire-group baseline too, so the "unsaved changes" label clears.
+            session.applied_groups = session.weapon_groups.clone();
         } else {
             let over = if v.usage.power.over {
                 "power"
@@ -316,9 +339,17 @@ fn apply_to_ship(
     let Some(ship) = host.server.ship_entity_for(state.local_id) else {
         return "No player ship to apply to".to_string();
     };
+    let world = host.server.world_mut();
+    // R46 — diff against what's ALREADY on the ship so we only claim "Applied ✓" on a real change.
+    // (A swap silently rejected at install leaves working_fit == the live fit, so this catches the
+    // "Applied ✓ but nothing changed" lie.) `.cloned()` ends the immutable borrows before the mut one.
+    let cur_fit = world.get::<Fit>(ship).cloned();
+    let cur_groups = world.get::<WeaponGroups>(ship).cloned().unwrap_or_default();
+    if cur_fit.as_ref() == Some(fit) && &cur_groups == groups {
+        return "No changes to apply".to_string();
+    }
     let fit = fit.clone();
     let groups = groups.clone();
-    let world = host.server.world_mut();
     match world.get_entity_mut(ship) {
         Ok(mut e) => {
             e.insert((fit, groups));
@@ -347,8 +378,12 @@ fn draw_ship(
     egui::Grid::new("ship_silhouette")
         .spacing(egui::vec2(2.0, 2.0))
         .show(ui, |ui| {
+            // Rows top-down (nose up) AND columns RIGHT-to-LEFT (R46): the hull mesh + muzzle map
+            // `col → +Y`, and an overhead nose-up view is right-handed with +Y to the LEFT — so drawing
+            // col left→right mirrors port/starboard. Reversing the columns makes the silhouette match
+            // the side a weapon actually renders + fires from in-game.
             for row in (0..rows).rev() {
-                for col in 0..cols {
+                for col in (0..cols).rev() {
                     let coord = (col, row);
                     if let Some(slot) = hull.slots.iter().find(|s| s.coord == coord) {
                         let installed = fit.assignments.get(&slot.id).and_then(|m| modules.get(*m));

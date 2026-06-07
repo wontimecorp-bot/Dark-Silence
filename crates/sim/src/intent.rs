@@ -30,6 +30,10 @@ pub struct ShipIntent {
     /// R45 — the active fire group, **0-indexed** (`0` = group 1 … `5` = group 6). The combat number
     /// keys select it; `Default` is `0` (= group 1) so an unconfigured ship fires its group-1 weapons.
     pub active_group: u8,
+    /// R46 — per-group INSTANT-fire bitmask (`F1`…`F6` held): bit `N` set ⇒ fire every non-`Off`
+    /// weapon in group `N+1` this step, regardless of `active_group`. Only the low 6 bits are used;
+    /// `Default` is `0` (no instant fire) so the determinism input stream is unchanged.
+    pub instant_fire: u8,
     /// Toggle the flight-assist mode this step (edge-triggered by the client).
     pub toggle_assist: bool,
     /// Phase F — hold the afterburner (boost) this step. Boosts translational thrust while the

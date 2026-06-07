@@ -143,6 +143,8 @@ pub struct QuantizedIntent {
     pub fire_secondary: bool,
     /// R45 — the active fire group (0-indexed; `0` = group 1 … `5` = group 6).
     pub active_group: u8,
+    /// R46 — per-group INSTANT-fire bitmask (`F1`…`F6`): bit `N` ⇒ fire group `N+1` this step.
+    pub instant_fire: u8,
     /// Toggle flight-assist this step.
     pub toggle_assist: bool,
     /// Phase F — hold the afterburner (boost) this step.
@@ -169,6 +171,7 @@ impl From<ShipIntent> for QuantizedIntent {
             fire_primary: intent.fire_primary,
             fire_secondary: intent.fire_secondary,
             active_group: intent.active_group,
+            instant_fire: intent.instant_fire,
             toggle_assist: intent.toggle_assist,
             afterburner: intent.afterburner,
         }
@@ -185,6 +188,7 @@ impl From<QuantizedIntent> for ShipIntent {
             fire_secondary: q.fire_secondary,
             // Defensive: a malformed client can't index past the 6 groups (gating is by equality).
             active_group: q.active_group,
+            instant_fire: q.instant_fire,
             toggle_assist: q.toggle_assist,
             afterburner: q.afterburner,
         }

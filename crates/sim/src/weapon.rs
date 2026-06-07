@@ -274,7 +274,11 @@ pub fn weapon_fire_system(
                     Trigger::Secondary => intent.fire_secondary,
                     Trigger::Off => false,
                 };
-                let active = map.group == intent.active_group && trigger_held;
+                // R46 — F1…F6 INSTANT-fire: holding this weapon's group's F-key fires it regardless of
+                // the active group / its trigger, EXCEPT an `Off` weapon stays disabled.
+                let instant =
+                    (intent.instant_fire & (1 << map.group)) != 0 && map.trigger != Trigger::Off;
+                let active = (map.group == intent.active_group && trigger_held) || instant;
                 // R42 rotary spool, now per weapon: ramp while this weapon is being fired, decay idle.
                 if profile.spin_up_time > 0.0 {
                     let step = dt / profile.spin_up_time;
@@ -860,6 +864,102 @@ mod tests {
             count_projectiles(&mut w2),
             2,
             "Space+Ctrl fires both the Primary and Secondary weapons"
+        );
+    }
+
+    #[test]
+    fn instant_fire_fires_a_groups_weapons_regardless_of_active_group() {
+        use crate::components::FireMapping;
+        use crate::fitting::SlotId;
+        let mut groups = WeaponGroups::default();
+        groups.mapping.insert(
+            SlotId(3),
+            FireMapping {
+                group: 0, // group 1
+                trigger: Trigger::Primary,
+            },
+        );
+        groups.mapping.insert(
+            SlotId(4),
+            FireMapping {
+                group: 1, // group 2
+                trigger: Trigger::Primary,
+            },
+        );
+
+        // Group 1 active, NO trigger held, NO F-key → nothing fires.
+        let mut w = fire_world();
+        spawn_two_autocannon_ship(
+            &mut w,
+            groups.clone(),
+            ShipIntent {
+                active_group: 0,
+                ..Default::default()
+            },
+        );
+        run_fire(&mut w);
+        assert_eq!(
+            count_projectiles(&mut w),
+            0,
+            "no trigger + no F-key → nothing fires"
+        );
+
+        // Hold F2 (bit 1) while group 1 is the active group and Space is NOT held → the group-2
+        // weapon instant-fires anyway; the group-1 weapon (no trigger held) stays silent.
+        let mut w2 = fire_world();
+        spawn_two_autocannon_ship(
+            &mut w2,
+            groups,
+            ShipIntent {
+                active_group: 0,
+                instant_fire: 0b10,
+                ..Default::default()
+            },
+        );
+        run_fire(&mut w2);
+        assert_eq!(
+            count_projectiles(&mut w2),
+            1,
+            "F2 instant-fires group 2's weapon even though group 1 is active"
+        );
+    }
+
+    #[test]
+    fn instant_fire_skips_off_weapons() {
+        use crate::components::FireMapping;
+        use crate::fitting::SlotId;
+        let mut groups = WeaponGroups::default();
+        // Both in group 1; slot 3 is Off (disabled), slot 4 is Primary.
+        groups.mapping.insert(
+            SlotId(3),
+            FireMapping {
+                group: 0,
+                trigger: Trigger::Off,
+            },
+        );
+        groups.mapping.insert(
+            SlotId(4),
+            FireMapping {
+                group: 0,
+                trigger: Trigger::Primary,
+            },
+        );
+
+        // Hold F1 (group 1): the Primary weapon fires, the Off weapon stays disabled.
+        let mut w = fire_world();
+        spawn_two_autocannon_ship(
+            &mut w,
+            groups,
+            ShipIntent {
+                instant_fire: 0b1,
+                ..Default::default()
+            },
+        );
+        run_fire(&mut w);
+        assert_eq!(
+            count_projectiles(&mut w),
+            1,
+            "F1 fires the group's Primary weapon but skips the Off weapon"
         );
     }
 }

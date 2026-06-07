@@ -66,6 +66,23 @@ pub fn read_input(keys: Res<ButtonInput<KeyCode>>, mut q: Query<&mut ShipIntent,
             intent.active_group = group;
         }
     }
+    // R46: function keys F1-F6 INSTANT-fire their group (hold-to-fire) regardless of the active
+    // group — bit N set ⇒ fire every non-Off weapon in group N+1 this step. Rebuilt each frame so a
+    // released key clears its bit.
+    let mut instant_fire = 0u8;
+    for (key, bit) in [
+        (KeyCode::F1, 0u8),
+        (KeyCode::F2, 1),
+        (KeyCode::F3, 2),
+        (KeyCode::F4, 3),
+        (KeyCode::F5, 4),
+        (KeyCode::F6, 5),
+    ] {
+        if keys.pressed(key) {
+            instant_fire |= 1 << bit;
+        }
+    }
+    intent.instant_fire = instant_fire;
     // Phase F: hold Left Shift to afterburner (boost). Held, not edge-triggered.
     intent.afterburner = keys.pressed(KeyCode::ShiftLeft);
     // Assist toggle is handled client-side (below) to avoid fixed-step timing

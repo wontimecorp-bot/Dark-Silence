@@ -54,6 +54,9 @@ pub struct ValidatedIntent {
     pub fire_secondary: bool,
     /// R45 — the active fire group, clamped to `0..=5` (a hostile out-of-range value is bounded).
     pub active_group: u8,
+    /// R46 — per-group INSTANT-fire bitmask, masked to the low 6 bits (`F1`…`F6`); the sim still gates
+    /// each weapon by cooldown. A hostile value can only ever flag the 6 real groups.
+    pub instant_fire: u8,
     /// Toggle flight-assist this step. Any boolean is in-bounds, so it is
     /// accepted as-is (TR-020).
     pub toggle_assist: bool,
@@ -70,6 +73,7 @@ impl From<ValidatedIntent> for ShipIntent {
             fire_primary: v.fire_primary,
             fire_secondary: v.fire_secondary,
             active_group: v.active_group,
+            instant_fire: v.instant_fire,
             toggle_assist: v.toggle_assist,
             afterburner: v.afterburner,
         }
@@ -104,6 +108,8 @@ pub fn validate_input(intent: &QuantizedIntent) -> ValidatedIntent {
         fire_secondary: intent.fire_secondary,
         // R45 — bound the group to the 6 valid groups (a hostile out-of-range value can't escape).
         active_group: intent.active_group.min(5),
+        // R46 — keep only the 6 real group bits (F1…F6); higher bits can't flag a nonexistent group.
+        instant_fire: intent.instant_fire & 0b0011_1111,
         toggle_assist: intent.toggle_assist,
         afterburner: intent.afterburner,
     }
@@ -317,6 +323,7 @@ mod tests {
             fire_primary: fire,
             fire_secondary: false,
             active_group: 0,
+            instant_fire: 0,
             toggle_assist: toggle,
             afterburner: false,
         }
@@ -370,6 +377,7 @@ mod tests {
             fire_primary: true,
             fire_secondary: false,
             active_group: 0,
+            instant_fire: 0,
             toggle_assist: false,
             afterburner: false,
         };
