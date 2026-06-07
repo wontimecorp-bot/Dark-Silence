@@ -66,3 +66,63 @@ pub fn save_render_tuning(starfield: &StarfieldTuning, hud: &HudLayout) -> Resul
     std::fs::write(&path, s).map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(format!("saved {}", path.display()))
 }
+
+/// Refinement 36 — drop-in starfield presets. The directory of `*.ron` presets, beside
+/// `render_tuning.ron` (under `$DARK_SILENCE_CONTENT` / `assets/content`).
+fn starfield_presets_dir() -> PathBuf {
+    let dir = std::env::var_os("DARK_SILENCE_CONTENT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("assets/content"));
+    dir.join("starfield_presets")
+}
+
+/// List the available `*.ron` starfield presets as `(display_name, path)`, sorted by name. Empty if
+/// the directory is absent/unreadable (the dev panel still shows the built-ins).
+pub fn list_starfield_presets() -> Vec<(String, PathBuf)> {
+    let dir = starfield_presets_dir();
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("ron") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    out.push((stem.to_string(), path));
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Load a single starfield preset RON into a [`StarfieldTuning`].
+pub fn load_starfield_preset(path: &std::path::Path) -> Result<StarfieldTuning, String> {
+    let s = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    ron::from_str::<StarfieldTuning>(&s).map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+/// Save the current starfield tuning as a named preset RON (creating the presets dir if needed).
+/// The name is sanitized to a safe file stem. Returns a short status string for the panel.
+pub fn save_starfield_preset(name: &str, starfield: &StarfieldTuning) -> Result<String, String> {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = safe.trim();
+    if safe.is_empty() {
+        return Err("empty preset name".to_string());
+    }
+    let dir = starfield_presets_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    let path = dir.join(format!("{safe}.ron"));
+    let body = ron::ser::to_string_pretty(starfield, ron::ser::PrettyConfig::default())
+        .map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(format!("saved preset {}", path.display()))
+}

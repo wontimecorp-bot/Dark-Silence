@@ -33,7 +33,7 @@ use sim::{MiningTuning, SimTuning, Tuning};
 
 use crate::hud_bars::HudLayout;
 use crate::net::{LoopbackHost, NetClientState};
-use crate::starfield::{StarfieldTuning, MAX_LAYERS};
+use crate::starfield::{GalaxyTuning, StarfieldTuning, MAX_LAYERS, NUM_CLASSES};
 use crate::tuning_io;
 
 // Refinement 28: shared hover-tooltip text for the render-tuning sliders whose labels repeat across
@@ -44,15 +44,11 @@ const TIP_BAR_Y: &str =
 const TIP_BAR_EXTENT: &str = "Bar size along its main axis — length for the EHA row bars, height for the SAH stacks. Bigger = longer/taller.";
 const TIP_LAYER_PARALLAX: &str = "This layer's depth/parallax: 0 ≈ screen-locked / infinitely far (barely moves), toward 1 = world-anchored / drifts fast as you fly. Spread layers across 0..~0.5 for depth.";
 const TIP_LAYER_FREQUENCY: &str = "This layer's cell frequency (cells per world unit) = star SPACING. Higher = denser/closer-packed stars. (Star pixel SIZE is the 'size' knob.)";
-const TIP_LAYER_DENSITY: &str = "This layer's star density (0..1) = fraction of candidate cells that host a star. Final = this × 'density (all)' × the clustering map.";
-const TIP_LAYER_BRIGHTNESS: &str = "This layer's brightness factor. Final = this × 'brightness (all)'. Brighter stars bloom more (HDR).";
-const TIP_LAYER_TWINKLE: &str = "This layer's twinkle DEPTH — how FAR its stars pulse. 0 = steady at full brightness; higher = deeper scintillation. (Pulse RATE is 'twinkle speed' just below.)";
-const TIP_LAYER_SIZE: &str = "This layer's star pixel-radius factor (hard points, ~1px min). Bigger = chunkier stars. (Star SPACING is the 'frequency' knob.)";
-const TIP_LAYER_TEMP_MIN: &str = "This layer's COOL-end stellar temperature (Kelvin). Most stars sit near here (cool-weighted), so this sets the layer's dominant color: ≈3000K red (M) … ≈6000K yellow (G) … ≈10000K white (A). The layer becomes a distinct stellar class at a distance.";
-const TIP_LAYER_TEMP_MAX: &str = "This layer's HOT-end stellar temperature (Kelvin) — the rare hottest stars reach this: ≈10000K white (A) … ≈30000K blue (O). Set temp min = max for a single-class monochrome layer; spread them for variety.";
-const TIP_LAYER_TINT: &str = "This layer's flat color TINT hue — blended on top of the blackbody color by 'tint strength' below (which is 0/off by default, so this swatch does nothing until you raise it). Pushes the layer toward a hue (e.g. nebula-ish teal/violet) regardless of temperature.";
-const TIP_LAYER_TINT_STRENGTH: &str = "How strongly the layer 'tint' applies — a SECONDARY effect. 0 = off (pure stellar/blackbody color, the default); partial = a subtle hue push that keeps the temperature variation; 1 = full tint multiply (a saturated hue overrides the temperature). For overall dimming use 'brightness', not this.";
-const TIP_TWINKLE_SPEED: &str = "This layer's twinkle SPEED — how FAST its stars pulse (scales the pulse rate). Separate from 'twinkle depth' (how FAR they pulse). 1.0 = default rate; 0 = frozen phase.";
+const TIP_LAYER_DENSITY: &str = "This layer's star density (0..1) = fraction of candidate cells that host a star, × the cellular clustering map (and, in spectral mode, the galactic-core boost).";
+const TIP_LAYER_BRIGHTNESS: &str = "This layer's brightness — a DEPTH multiplier on each star's class brightness (dim far layers); brighter stars bloom (HDR).";
+const TIP_LAYER_SIZE: &str = "This layer's size — a DEPTH multiplier on each star's class pixel-radius. Bigger = chunkier stars on this layer. (Star SPACING is the 'frequency' knob.)";
+const TIP_LAYER_TINT: &str = "OPTIONAL per-layer color TINT hue — blended on top of the star's class color by 'tint strength' below (0/off by default, so this swatch does nothing until you raise it). Pushes a whole depth plane toward a hue.";
+const TIP_LAYER_TINT_STRENGTH: &str = "How strongly the layer 'tint' applies — a SECONDARY, off-by-default effect. 0 = off (pure class color); partial = a subtle hue push; 1 = full tint multiply. For overall dimming use 'brightness', not this.";
 
 /// Phase M6e — the single source of truth for every stat/knob the panel shows. A section refers to
 /// a [`StatId`] instead of hand-writing its label/order/format, so a rename or reorder is a
@@ -876,6 +872,138 @@ fn stat(ui: &mut egui::Ui, label: &str, value: impl std::fmt::Display) -> egui::
     ui.label(egui::RichText::new(format!("{label:<16}{value}")).monospace())
 }
 
+/// Refinement 35: the galaxy (spectral-population) controls — the 7-class table + the galactic band,
+/// haze/dust, core bulge and bright-star glare. All live + RON-persisted. Shown only when spectral
+/// mode is on (the per-layer temp/tint/twinkle sliders take over in legacy mode).
+fn galaxy_controls(ui: &mut egui::Ui, g: &mut GalaxyTuning) {
+    const CLASS_NAMES: [&str; NUM_CLASSES] = [
+        "M (red dwarf)",
+        "K (orange)",
+        "G (yellow / solar)",
+        "F (yellow-white)",
+        "A (white)",
+        "B (blue-white giant)",
+        "O (blue supergiant)",
+    ];
+    egui::CollapsingHeader::new("Spectral classes (M–O)").show(ui, |ui| {
+        ui.label(
+            egui::RichText::new("Population weights set the mix; everything else is per-class look.")
+                .weak(),
+        );
+        for (ci, name) in CLASS_NAMES.iter().enumerate() {
+            let c = &mut g.classes[ci];
+            egui::CollapsingHeader::new(*name).show(ui, |ui| {
+                slider(ui, &format!("C{ci} weight %"), &mut c.weight, 0.0..=100.0).on_hover_text(
+                    "This class's share of the population (relative weight; the CDF is normalized from all 7). M ~76, O ~0.00003 in reality (O is boosted here so it shows).",
+                );
+                slider(ui, &format!("C{ci} temp min K"), &mut c.temp_min, 1000.0..=45000.0)
+                    .on_hover_text("Cool end of this class's blackbody temperature (most stars sit here).");
+                slider(ui, &format!("C{ci} temp max K"), &mut c.temp_max, 1000.0..=45000.0)
+                    .on_hover_text("Hot end of this class's temperature (the rarer, hotter members).");
+                slider(ui, &format!("C{ci} brightness"), &mut c.brightness, 0.0..=10.0)
+                    .on_hover_text("Base HDR brightness — >1 blooms. The brightest member of the class (magnitude spread fades the rest).");
+                slider(ui, &format!("C{ci} size"), &mut c.size, 0.2..=5.0)
+                    .on_hover_text("Star pixel radius for this class (× the per-layer size depth multiplier).");
+                ui.horizontal(|ui| {
+                    ui.label("tint").on_hover_text("Flat color multiply on the blackbody color (e.g. nudge O toward violet, which blackbody can't reach). White = none.");
+                    ui.color_edit_button_rgb(&mut c.tint);
+                });
+                slider(ui, &format!("C{ci} clustering"), &mut c.clustering, 0.0..=1.0).on_hover_text(
+                    "0 = spread uniformly (M/K/G) … 1 = confined to the galactic band (hot O/B/A young stars).",
+                );
+                slider(ui, &format!("C{ci} twinkle depth"), &mut c.twinkle, 0.0..=2.0)
+                    .on_hover_text("Scintillation depth (0 = steady; space realism = low).");
+                slider(ui, &format!("C{ci} twinkle speed"), &mut c.twinkle_speed, 0.0..=5.0)
+                    .on_hover_text("Scintillation pulse rate.");
+                slider(ui, &format!("C{ci} softness"), &mut c.softness, 0.0..=3.0).on_hover_text(
+                    "Edge anti-aliasing px: ~0 = a hard point (M; but hard points shimmer on motion), higher = a soft Gaussian (O). ~0.4+ stays crisp AND stable.",
+                );
+                slider(ui, &format!("C{ci} mag spread"), &mut c.mag_spread, 0.0..=1.0).on_hover_text(
+                    "Within-class brightness spread: 0 = every star equal; higher = a few much brighter, many faint.",
+                );
+            });
+        }
+    });
+    egui::CollapsingHeader::new("Galactic band").show(ui, |ui| {
+        slider(
+            ui,
+            "band angle",
+            &mut g.band_angle,
+            0.0..=std::f32::consts::PI,
+        )
+        .on_hover_text("Orientation (radians) of the Milky-Way lane across the field.");
+        slider(ui, "band width", &mut g.band_width, 0.05..=2.0)
+            .on_hover_text("Thickness of the band (Gaussian across its axis).");
+        slider(ui, "band offset", &mut g.band_offset, -1.0..=1.0)
+            .on_hover_text("Shift the band off-center (perpendicular to its axis).");
+        slider(ui, "band strength", &mut g.band_strength, 0.0..=1.0)
+            .on_hover_text("How strongly high-clustering classes are confined to the band.");
+        slider(ui, "band clumpiness", &mut g.band_clumpiness, 0.0..=1.0)
+            .on_hover_text("Patchiness along the band (0 = smooth lane, 1 = clumpy).");
+    });
+    egui::CollapsingHeader::new("Galactic haze & dust").show(ui, |ui| {
+        slider(ui, "haze brightness", &mut g.haze_brightness, 0.0..=0.5).on_hover_text(
+            "Faint milky glow along the band (unresolved-star haze). The Milky Way read.",
+        );
+        ui.horizontal(|ui| {
+            ui.label("haze color")
+                .on_hover_text("Tint of the milky haze glow.");
+            ui.color_edit_button_rgb(&mut g.haze_color);
+        });
+        slider(ui, "dust depth", &mut g.dust_depth, 0.0..=1.0)
+            .on_hover_text("How dark the dust lanes carve into the haze (occlusion strength).");
+        slider(ui, "dust scale", &mut g.dust_scale, 0.01..=0.5)
+            .on_hover_text("Dust-lane feature size (smaller = finer, more lanes).");
+        slider(ui, "dust contrast", &mut g.dust_contrast, 0.2..=4.0)
+            .on_hover_text("Dust lane contrast (higher = sharper dark veins).");
+    });
+    egui::CollapsingHeader::new("Galactic core").show(ui, |ui| {
+        slider(ui, "core along band", &mut g.core_along, -1.0..=1.0)
+            .on_hover_text("Position of the bright core bulge along the band axis.");
+        slider(ui, "core size", &mut g.core_size, 0.02..=1.0)
+            .on_hover_text("Radius of the core bulge glow.");
+        slider(ui, "core brightness", &mut g.core_brightness, 0.0..=1.0)
+            .on_hover_text("Brightness of the warm galactic-center bulge.");
+        ui.horizontal(|ui| {
+            ui.label("core color")
+                .on_hover_text("Color of the core bulge (warm/yellow looks galactic).");
+            ui.color_edit_button_rgb(&mut g.core_color);
+        });
+        slider(
+            ui,
+            "core density boost",
+            &mut g.core_density_boost,
+            0.0..=3.0,
+        )
+        .on_hover_text("Extra star density near the core (denser center).");
+    });
+    egui::CollapsingHeader::new("Bright-star glare").show(ui, |ui| {
+        slider(ui, "glare threshold", &mut g.glare_threshold, 0.0..=8.0).on_hover_text(
+            "HDR brightness a star must exceed to get diffraction glare (so only A/B/O glare).",
+        );
+        slider(ui, "glare halo size", &mut g.glare_halo_size, 1.0..=40.0)
+            .on_hover_text("Radius (px) of the soft glow halo around a bright star.");
+        slider(
+            ui,
+            "glare halo intensity",
+            &mut g.glare_halo_intensity,
+            0.0..=1.0,
+        )
+        .on_hover_text("Strength of the halo glow.");
+        slider(ui, "glare spike length", &mut g.glare_spike_len, 1.0..=60.0)
+            .on_hover_text("Length (px) of the diffraction spikes.");
+        slider(ui, "glare spike count", &mut g.glare_spike_count, 0.0..=8.0)
+            .on_hover_text("4 = a cross; >5 adds diagonals (6/8-point).");
+        slider(
+            ui,
+            "glare spike intensity",
+            &mut g.glare_spike_intensity,
+            0.0..=1.0,
+        )
+        .on_hover_text("Strength of the diffraction spikes.");
+    });
+}
+
 /// Render the read-only **Ship Stats** window body. Three groups, every one in the SAME canonical
 /// field order (Phase M6c-fix): **Applied** = the cached [`ShipStats`] the ship currently flies on
 /// (only refreshes on Apply / damage), **Runtime** = live dynamic telemetry, then the installed
@@ -1687,20 +1815,71 @@ fn dev_panel_ui(
                         .on_hover_text("Camera bloom strength — the glow on bright pixels across the WHOLE image (bright stars, emissive, ships). Higher = more glow; keep modest so ships stay readable against the field.");
                 });
 
-                // Refinement 25/34: live starfield (client-side). All LOOK knobs are PER-LAYER (the
-                // old global brightness/density/twinkle masters were removed); only the structural
-                // `layers` count + the global `edge softness` quality knob live here.
+                // Refinement 25/35/36: live starfield — ONE unified galaxy model. `layers` = depth,
+                // the spectral class table = star character, + the galaxy globals. Presets load a full
+                // look (built-in buttons + drop-in RON files); Save persists the active config.
                 egui::CollapsingHeader::new("Starfield (client, live)").show(ui, |ui| {
-                    slider(ui, "layers (4-16)", &mut starfield.layer_count, 4.0..=16.0)
-                        .on_hover_text("How many parallax star layers to draw (4–16). More = deeper field, slightly more GPU. The 'Layer N' rows below appear/disappear with this.");
-                    slider(ui, "edge softness (AA)", &mut starfield.edge_softness, 0.0..=1.5)
-                        .on_hover_text("Star-edge anti-aliasing width in pixels. 0 = pure hard points (crispest, but they SHIMMER as the camera moves — twinkle can't be fully turned off). ~0.75 = smooth analytic coverage: stars stay crisp (~1px, NOT blurred) but stop popping, so twinkle becomes fully controllable. Also energy-conserving: sub-pixel stars dim instead of clamping to 1px.");
+                    egui::CollapsingHeader::new("Presets").show(ui, |ui| {
+                        ui.label("Load a full look, then tweak:");
+                        ui.horizontal_wrapped(|ui| {
+                            for (name, make) in crate::starfield::BUILTIN_STARFIELD_PRESETS {
+                                if ui.button(*name).clicked() {
+                                    *starfield = make();
+                                    state.save_status = format!("loaded preset: {name}");
+                                }
+                            }
+                        });
+                        let files = tuning_io::list_starfield_presets();
+                        if !files.is_empty() {
+                            ui.label("Saved (.ron):");
+                            ui.horizontal_wrapped(|ui| {
+                                for (name, path) in &files {
+                                    if ui.button(name).clicked() {
+                                        state.save_status =
+                                            match tuning_io::load_starfield_preset(path) {
+                                                Ok(t) => {
+                                                    *starfield = t;
+                                                    format!("loaded preset: {name}")
+                                                }
+                                                Err(e) => format!("load failed: {e}"),
+                                            };
+                                    }
+                                }
+                            });
+                        }
+                        ui.horizontal(|ui| {
+                            let name_id = ui.make_persistent_id("sf_preset_name");
+                            let mut nm =
+                                ui.data_mut(|d| d.get_temp::<String>(name_id).unwrap_or_default());
+                            ui.add(
+                                egui::TextEdit::singleline(&mut nm)
+                                    .hint_text("preset name")
+                                    .desired_width(120.0),
+                            );
+                            if ui.button("Save as preset").clicked() && !nm.trim().is_empty() {
+                                state.save_status =
+                                    match tuning_io::save_starfield_preset(&nm, &starfield) {
+                                        Ok(msg) => msg,
+                                        Err(e) => format!("save failed: {e}"),
+                                    };
+                            }
+                            ui.data_mut(|d| d.insert_temp(name_id, nm));
+                        });
+                    });
                     ui.separator();
-                    // Refinement 26: per-layer rows (depth/spacing/density/brightness/twinkle/size).
+                    slider(ui, "layers (4-16)", &mut starfield.layer_count, 4.0..=16.0)
+                        .on_hover_text("How many parallax DEPTH layers to draw (4–16). More = deeper field, slightly more GPU. The 'Layer N' rows below appear/disappear with this.");
+                    ui.separator();
+                    // Star CHARACTER: the spectral class table + the galaxy band/haze/dust/core/glare.
+                    galaxy_controls(ui, &mut starfield.galaxy);
+                    ui.separator();
+                    // Per-layer DEPTH rows: parallax/spacing/density + brightness & size depth
+                    // multipliers + an OPTIONAL per-layer tint overlay (off by default). Star
+                    // character (color/twinkle/size base) is the spectral class table above.
                     let count = (starfield.layer_count.round() as usize).clamp(1, MAX_LAYERS);
                     for i in 0..count {
                         let l = &mut starfield.layers[i];
-                        egui::CollapsingHeader::new(format!("Layer {i}")).show(ui, |ui| {
+                        egui::CollapsingHeader::new(format!("Layer {i} (depth)")).show(ui, |ui| {
                             slider(ui, &format!("L{i} parallax"), &mut l.parallax, 0.0..=1.0)
                                 .on_hover_text(TIP_LAYER_PARALLAX);
                             slider(ui, &format!("L{i} frequency"), &mut l.frequency, 0.05..=4.0)
@@ -1709,43 +1888,9 @@ fn dev_panel_ui(
                                 .on_hover_text(TIP_LAYER_DENSITY);
                             slider(ui, &format!("L{i} brightness"), &mut l.brightness, 0.0..=3.0)
                                 .on_hover_text(TIP_LAYER_BRIGHTNESS);
-                            slider(ui, &format!("L{i} twinkle depth"), &mut l.twinkle, 0.0..=2.0)
-                                .on_hover_text(TIP_LAYER_TWINKLE);
-                            slider(ui, &format!("L{i} twinkle speed"), &mut l.twinkle_speed, 0.0..=5.0)
-                                .on_hover_text(TIP_TWINKLE_SPEED);
                             slider(ui, &format!("L{i} size"), &mut l.size, 0.3..=4.0)
                                 .on_hover_text(TIP_LAYER_SIZE);
-                            // R29-fix: live estimate of the on-screen star radius for this `size`.
-                            // Shader: radius = max(mix(1.0,2.2,tn)*size, 1.0) px; tn=0 cool .. 1 hot,
-                            // floored at 1px. Zoom-independent.
-                            stat(
-                                ui,
-                                "  ↳ px radius",
-                                format!(
-                                    "≈ {:.1} (cool) … {:.1} (hot)",
-                                    l.size.max(1.0),
-                                    (2.2 * l.size).max(1.0)
-                                ),
-                            )
-                            .on_hover_text(
-                                "Estimated on-screen star RADIUS in pixels for this layer's size. Most stars are cool (≈ the first number); rare hot stars reach the second. Hard floor of 1px (a hard point can't be smaller), so size below ~0.45 stops shrinking them. Zoom-independent.",
-                            );
-                            // R32: this layer's stellar-class temperature RANGE (→ blackbody color)
-                            // + an optional flat color TINT multiplier on top.
-                            slider(
-                                ui,
-                                &format!("L{i} temp min (K)"),
-                                &mut l.temp_min,
-                                1000.0..=40000.0,
-                            )
-                            .on_hover_text(TIP_LAYER_TEMP_MIN);
-                            slider(
-                                ui,
-                                &format!("L{i} temp max (K)"),
-                                &mut l.temp_max,
-                                1000.0..=40000.0,
-                            )
-                            .on_hover_text(TIP_LAYER_TEMP_MAX);
+                            // OPTIONAL per-layer tint overlay (off by default — strength 0 = no-op).
                             ui.horizontal(|ui| {
                                 ui.label("layer tint").on_hover_text(TIP_LAYER_TINT);
                                 ui.color_edit_button_rgb(&mut l.tint)
