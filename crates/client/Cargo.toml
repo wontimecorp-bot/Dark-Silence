@@ -33,11 +33,12 @@ ron = { workspace = true }
 
 [features]
 # Default-ON for the solo windowed client: the live dev tuning panel (Phase M6).
-# Compile it out with `--no-default-features` (the egui dep + the panel module are
-# gated behind this). The panel only functions on the embedded-server solo path.
+# Compile out the PANEL MODULE with `--no-default-features` (egui itself is now a normal dep — the
+# fitting screen uses it always, so it's no longer gated here). The panel only functions on the
+# embedded-server solo path.
 default = ["dev_panel"]
-# The egui-based runtime tuning panel (`crate::dev_panel`); pulls in `bevy_egui`.
-dev_panel = ["dep:bevy_egui"]
+# The egui-based runtime tuning panel (`crate::dev_panel`). egui (`bevy_egui`) is unconditional now.
+dev_panel = []
 # Dev-only convenience (AD-005): faster iterative linking. Never enabled in a
 # release/CI artifact.
 dynamic_linking = ["bevy/dynamic_linking"]

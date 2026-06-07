@@ -25,6 +25,11 @@ use crate::starfield::StarfieldTuning;
 /// load — the name is now a slight misnomer.
 const RENDER_TUNING_RON: &str = "render_tuning.ron";
 
+/// R44 — file name (under the content dir) holding ONLY the client HUD layout. The HUD now has its own
+/// file + dedicated dev-panel Save button (it used to ride in `render_tuning.ron`); a one-time
+/// migration in [`load_hud_layout`] still reads the old `render_tuning.ron` `hud` field if absent.
+const HUD_LAYOUT_RON: &str = "hud_layout.ron";
+
 /// The content dir (`$DARK_SILENCE_CONTENT` if set, else `assets/content/` relative to the CWD —
 /// mirrors `server::load_content_or_default`). Shared by the dev override, the module/hull content
 /// RONs, and the starfield-preset library.
@@ -34,15 +39,15 @@ fn content_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("assets/content"))
 }
 
-/// Refinement 39/41 — the windowed-client dev override: ALL the dev-panel-tuned **sim tuning**
+/// Refinement 39/41/44 — the windowed-client dev override: ALL the dev-panel-tuned **sim tuning**
 /// (loaded into the embedded server world WINDOWED-ONLY — never `ServerApp::new`, so headless
-/// determinism is untouched) + the client HUD + starfield.
+/// determinism is untouched) + the client starfield.
 ///
 /// Module/hull **DESIGN** edits are NOT stored here — R41 writes them back to the canonical
-/// `modules.ron`/`ships.ron` via [`save_catalogs`] (the user's chosen persistence), which the existing
-/// `load_content_or_default` then loads for both headless and windowed. `#[serde(default)]`
-/// (container) so an old `render_tuning.ron` still loads (and any stale `modules`/`hulls` keys a
-/// previous build wrote are silently ignored — serde skips unknown fields).
+/// `modules.ron`/`ships.ron` via [`save_catalogs`]. The client **HUD layout** is NOT stored here
+/// either — R44 moved it to its own `hud_layout.ron` ([`save_hud_layout`]/[`load_hud_layout`]).
+/// `#[serde(default)]` (container) so an old `render_tuning.ron` still loads (any stale `hud`/`modules`
+/// keys a previous build wrote are silently ignored — serde skips unknown fields).
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct DevSettings {
@@ -54,7 +59,6 @@ pub struct DevSettings {
     pub stat_scaling: StatScalingConfig,
     pub resistance: ResistanceMatrix,
     pub mining: MiningTuning,
-    pub hud: HudLayout,
     pub starfield: StarfieldTuning,
 }
 
@@ -69,7 +73,6 @@ impl Default for DevSettings {
             stat_scaling: StatScalingConfig::default(),
             resistance: default_resistance_matrix(),
             mining: MiningTuning::default(),
-            hud: HudLayout::default(),
             starfield: StarfieldTuning::default(),
         }
     }
@@ -102,6 +105,42 @@ pub fn save_dev_settings(dev: &DevSettings) -> Result<String, String> {
         .map_err(|e| format!("serialize: {e}"))?;
     std::fs::write(&path, s).map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(format!("saved {}", path.display()))
+}
+
+/// R44 — save ONLY the client HUD layout to `hud_layout.ron` (the dev panel's dedicated "Save HUD"
+/// button). Returns a status string.
+pub fn save_hud_layout(hud: &HudLayout) -> Result<String, String> {
+    let path = content_dir().join(HUD_LAYOUT_RON);
+    let s = ron::ser::to_string_pretty(hud, ron::ser::PrettyConfig::default())
+        .map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(&path, s).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(format!("saved {}", path.display()))
+}
+
+/// R44 — load the client HUD layout: `hud_layout.ron` first; ELSE a one-time migration that extracts
+/// the legacy `hud` field from `render_tuning.ron` (where it used to live — serde ignores the other
+/// keys); ELSE the code default. So existing HUD tweaks survive the split until the user re-saves.
+/// Called once at startup.
+pub fn load_hud_layout() -> HudLayout {
+    let dir = content_dir();
+    // The new canonical source.
+    if let Ok(s) = std::fs::read_to_string(dir.join(HUD_LAYOUT_RON)) {
+        if let Ok(hud) = ron::from_str::<HudLayout>(&s) {
+            return hud;
+        }
+    }
+    // Legacy migration: pull just the `hud` field out of the old combined `render_tuning.ron`.
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct LegacyHud {
+        hud: HudLayout,
+    }
+    if let Ok(s) = std::fs::read_to_string(dir.join(RENDER_TUNING_RON)) {
+        if let Ok(legacy) = ron::from_str::<LegacyHud>(&s) {
+            return legacy.hud;
+        }
+    }
+    HudLayout::default()
 }
 
 /// Refinement 39/41 — filter the live catalogs to **canonical seed ids only**, so runtime-injected

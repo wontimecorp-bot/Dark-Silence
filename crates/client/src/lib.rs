@@ -98,6 +98,9 @@ pub fn run() -> AppExit {
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins)
+        // Refinement 44: egui is now ALWAYS-ON (the EVE-style fitting screen uses it, not just the
+        // feature-gated dev panel) — `EguiPlugin` is added here once; `DevPanelPlugin` no longer adds it.
+        .add_plugins(bevy_egui::EguiPlugin::default())
         // Refinement 25: the procedural starfield background material (custom WGSL shader).
         .add_plugins(MaterialPlugin::<starfield::StarfieldMaterial>::default())
         // Fixed-step clock the embedded-server lifecycle runs on, and the matching
@@ -113,11 +116,11 @@ pub fn run() -> AppExit {
         // Module-color toggle (Fix #11 M3): default off; `C` tints cells by module
         // type (voxel = per-cell vertex colors, contour = a marker overlay). Cosmetic.
         .init_resource::<net::ModuleColorMode>()
-        // Refinement 24: live-tunable HUD bar/readout layout (the dev panel edits it; default = the
-        // hardcoded positions). Present even without the dev panel → the HUD sits at its defaults.
-        // Refinement 24/25/27/39: the live HUD + starfield tuning, loaded from `render_tuning.ron`
-        // (the dev panel edits them; its Save button writes them back). Code defaults if no file.
-        .insert_resource(dev.hud)
+        // Refinement 24/44: live-tunable HUD bar/readout layout (the dev panel edits it; default = the
+        // hardcoded positions). R44 loads it from its OWN `hud_layout.ron` (dedicated "Save HUD"
+        // button), migrating the legacy `render_tuning.ron` `hud` field if that file is absent.
+        // Refinement 25/27/39: the starfield tuning loads from `render_tuning.ron` (the dev override).
+        .insert_resource(tuning_io::load_hud_layout())
         .insert_resource(dev.starfield)
         // Refinement 21/22: load the shared HUD fonts (label + mono) + icon images into
         // `FontAssets`/`IconAssets` BEFORE the Startup HUD setups, which clone the handles.

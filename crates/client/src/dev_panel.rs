@@ -18,7 +18,7 @@
 //! [`EguiContexts::ctx_mut`] returns a `Result` (we early-return before the context exists).
 
 use bevy::prelude::*;
-use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
+use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 
 use sim::components::{Afterburner, ArmorHp, Energy, Heading, Health, Heat, Velocity};
 use sim::damage::{
@@ -885,8 +885,8 @@ pub struct DevPanelPlugin;
 
 impl Plugin for DevPanelPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(EguiPlugin::default())
-            .init_resource::<DevPanelState>()
+        // R44: `EguiPlugin` is added once in `lib::run()` (egui is always-on now), not here.
+        app.init_resource::<DevPanelState>()
             .add_systems(Update, toggle_dev_panel)
             // egui 0.39 multi-pass default: UI systems belong in EguiPrimaryContextPass.
             .add_systems(EguiPrimaryContextPass, dev_panel_ui);
@@ -2012,6 +2012,19 @@ fn dev_panel_ui(
                         .on_hover_text("Width of each per-type segmented bar track, in pixels.");
                     slider(ui, "module bar height px", &mut hud_layout.module_bar_height_px, 4.0..=40.0)
                         .on_hover_text("Height (thickness) of each per-type segmented bar track, in pixels.");
+                    ui.separator();
+                    // R44: the HUD layout has its OWN file + Save button now (it used to ride in the
+                    // sim-tuning `render_tuning.ron`). Status shows by the Save buttons below.
+                    if ui
+                        .button("Save HUD layout → hud_layout.ron")
+                        .on_hover_text("Persist the HUD bar/readout layout to its own hud_layout.ron, separate from the sim-tuning render_tuning.ron.")
+                        .clicked()
+                    {
+                        state.save_status = match tuning_io::save_hud_layout(&hud_layout) {
+                            Ok(m) => m,
+                            Err(e) => format!("HUD save failed: {e}"),
+                        };
+                    }
                 });
 
                 // Refinement 34: bloom is a CAMERA post-process (the whole rendered image), NOT a
@@ -2148,7 +2161,6 @@ fn dev_panel_ui(
                     stat_scaling: scaling,
                     resistance,
                     mining,
-                    hud: *hud_layout,
                     starfield: *starfield,
                 };
                 state.save_status = match tuning_io::save_dev_settings(&dev) {
