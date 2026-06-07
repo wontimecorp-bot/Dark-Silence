@@ -20,6 +20,9 @@ use bevy_ecs::entity::Entity;
 use bevy_ecs::prelude::Resource;
 use glam::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+use crate::fitting::SlotId;
 
 /// World-space position of an entity on the 2D gameplay plane, in sim units.
 ///
@@ -495,6 +498,86 @@ pub struct Weapon {
     /// (`aim_noise(owner_bits, shot_counter)`). Wraps; sim-internal, no RNG.
     #[serde(default)]
     pub shot_counter: u32,
+}
+
+/// R45 — one fitted weapon's runtime firing STATE (cooldown / rotary spool / shot counter), kept per
+/// weapon slot in a [`WeaponBank`] so a multi-weapon ship times each gun independently. Mirrors the
+/// per-weapon fields of the legacy single [`Weapon`] component (which the UNFITTED path still uses).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WeaponState {
+    /// Seconds until this weapon can fire again.
+    pub cooldown: f32,
+    /// Rotary spool fraction (`0..=1`); ramps to `1` while firing a `spin_up_time > 0` weapon.
+    pub spool: f32,
+    /// Monotonic shot counter — the deterministic dispersion seed.
+    pub shot_counter: u32,
+}
+
+impl Default for WeaponState {
+    fn default() -> Self {
+        Self {
+            cooldown: 0.0,
+            spool: 0.0,
+            shot_counter: 0,
+        }
+    }
+}
+
+/// R45 — per-weapon runtime state for a FITTED ship, keyed by the weapon's `SlotId`.
+/// [`recompute_ship_stats_system`](crate::fitting::recompute_ship_stats_system) maintains it (sized to
+/// the ship's alive weapons; kept slots preserve their cooldown/spool). The fitted firing path reads
+/// it; the unfitted/legacy path keeps the single [`Weapon`].
+#[derive(Component, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WeaponBank {
+    /// `SlotId` → that weapon's live firing state.
+    pub states: BTreeMap<SlotId, WeaponState>,
+}
+
+/// R45 — which trigger fires a weapon within its fire group (Elite-Dangerous style).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Trigger {
+    /// Fires on the PRIMARY trigger (Space).
+    #[default]
+    Primary,
+    /// Fires on the SECONDARY trigger.
+    Secondary,
+    /// Never fires (assigned but disabled).
+    Off,
+}
+
+/// R45 — a weapon hardpoint's fire assignment: which group + which trigger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FireMapping {
+    /// Fire group, 0-indexed (`0` = group 1 … `5` = group 6).
+    pub group: u8,
+    /// Which trigger fires this weapon.
+    pub trigger: Trigger,
+}
+
+impl Default for FireMapping {
+    fn default() -> Self {
+        // Unassigned ⇒ group 1, Primary — so an unconfigured ship fires ALL its weapons on Space.
+        Self {
+            group: 0,
+            trigger: Trigger::Primary,
+        }
+    }
+}
+
+/// R45 — the ship's fire-group ASSIGNMENT: per weapon `SlotId` → its `(group, trigger)`. Set in the
+/// fitting screen, committed alongside the [`Fit`](crate::fitting::Fit). A slot absent (or no
+/// component) defaults to group 1 / Primary, so an unconfigured ship fires all its weapons on Space.
+#[derive(Component, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WeaponGroups {
+    /// `SlotId` → its fire assignment. Missing entries default to group 1 / Primary.
+    pub mapping: BTreeMap<SlotId, FireMapping>,
+}
+
+impl WeaponGroups {
+    /// The `(group, trigger)` for a weapon slot — group 1 / Primary when unassigned.
+    pub fn for_slot(&self, slot: SlotId) -> FireMapping {
+        self.mapping.get(&slot).copied().unwrap_or_default()
+    }
 }
 
 #[cfg(test)]

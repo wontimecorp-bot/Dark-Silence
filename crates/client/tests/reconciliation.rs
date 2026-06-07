@@ -43,14 +43,7 @@ fn connect_msg() -> Message {
 }
 
 fn neutral() -> QuantizedIntent {
-    QuantizedIntent {
-        forward: 0,
-        strafe: 0,
-        turn: 0,
-        fire: false,
-        toggle_assist: false,
-        afterburner: false,
-    }
+    QuantizedIntent::default()
 }
 
 fn handshake(

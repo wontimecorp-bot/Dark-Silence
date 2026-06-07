@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use super::content::ModuleCatalog;
 use super::fit::Fit;
-use super::hull::{Hull, CELL_WORLD_SIZE};
+use super::hull::{Hull, SlotId, CELL_WORLD_SIZE};
 use super::layout::{layout_mass_with, CellOccupant, FitLayout};
 use super::module::{Module, ModuleKind, ModuleSpecifics};
 use crate::damage::{Channel, StatScalingConfig, DEFAULT_SHIELD_HP, DEFAULT_SHIELD_REGEN};
@@ -164,6 +164,87 @@ pub fn derive_weapon(spec: &ModuleSpecifics, sim: &SimTuning) -> Option<DerivedW
         spin_up_time,
         lifetime,
     })
+}
+
+/// R45 — the per-ship list of EVERY alive weapon's runtime [`WeaponProfile`], by `SlotId`. A separate
+/// component (not on the `Copy` [`ShipStats`]) so a fitted ship can fire all its guns; the fire system
+/// pairs each with its [`WeaponState`](crate::components::WeaponState) +
+/// [`FireMapping`](crate::components::FireMapping). Derived by [`derive_weapons`] +
+/// `recompute_ship_stats_system`. `ShipStats.weapon` stays = `weapons[0]` (back-compat).
+#[derive(Component, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShipWeapons {
+    /// `(SlotId, profile)` for each alive weapon, in slot order (first = `ShipStats.weapon`).
+    pub weapons: Vec<(SlotId, WeaponProfile)>,
+}
+
+/// R45 — collect EVERY alive weapon module's runtime [`WeaponProfile`] in `SlotId` order (so the
+/// first matches `ShipStats.weapon`). Each carries its own `muzzle_offset` (its cell) + physics;
+/// `damage` is health-scaled, the rest physical (mirrors the single-weapon derivation). The fitted
+/// firing path fires all of these, gated by each weapon's fire group/trigger.
+pub fn derive_weapons(
+    hull: &Hull,
+    fit: &Fit,
+    catalog: &ModuleCatalog,
+    layout: &FitLayout,
+    sim: &SimTuning,
+) -> Vec<(SlotId, WeaponProfile)> {
+    let cfg = StatScalingConfig::default();
+    let mut out = Vec::new();
+    for (slot_id, module_id) in fit.assignments.iter() {
+        let Some(module) = catalog.get(*module_id) else {
+            continue;
+        };
+        if module.kind != ModuleKind::Weapon {
+            continue;
+        }
+        let ModuleSpecifics::Weapon { damage_type, .. } = module.specifics else {
+            continue;
+        };
+        // The alive layout cell carrying this weapon slot (a carved-off weapon → no cell → skipped).
+        let Some(occ) = layout
+            .cells
+            .values()
+            .find(|o| o.slot == *slot_id && o.module.is_some())
+        else {
+            continue;
+        };
+        let hf = health_factor(occ, module, &cfg);
+        if hf <= 0.0 {
+            continue;
+        }
+        let Some(d) = derive_weapon(&module.specifics, sim) else {
+            continue;
+        };
+        let muzzle_offset = layout
+            .cells
+            .iter()
+            .find(|(_, o)| o.slot == *slot_id && o.module.is_some())
+            .map(|(cell, _)| {
+                let (cols, rows) = hull.grid_dims;
+                Vec2::new(
+                    ((cell.1 as f32 + 0.5) - rows as f32 * 0.5) * CELL_WORLD_SIZE,
+                    ((cell.0 as f32 + 0.5) - cols as f32 * 0.5) * CELL_WORLD_SIZE,
+                )
+            })
+            .unwrap_or(Vec2::ZERO);
+        out.push((
+            *slot_id,
+            WeaponProfile {
+                channel: damage_type,
+                muzzle_speed: d.muzzle_speed,
+                fire_rate: d.fire_rate,
+                damage: d.damage * hf,
+                projectile_mass: d.projectile_mass,
+                heat: module.heat,
+                muzzle_offset,
+                projectile_radius: d.projectile_radius,
+                spin_up_time: d.spin_up_time,
+                dispersion_rad: d.dispersion_rad,
+                lifetime: d.lifetime,
+            },
+        ));
+    }
+    out
 }
 
 /// The fit-derived effective stats for a ship — the per-entity flight + weapon

@@ -50,16 +50,13 @@ const ENCODE_SAMPLES: u32 = 256;
 /// fires. Fixed loop ⇒ a reproducible session run-to-run.
 fn client_scripts() -> Vec<InputScript> {
     let forward_fire = protocol::QuantizedIntent {
-        fire: true,
+        fire_primary: true,
         ..forward_intent()
     };
     let strafe_fire = protocol::QuantizedIntent {
-        forward: 0,
         strafe: 1,
-        turn: 0,
-        fire: true,
-        toggle_assist: false,
-        afterburner: false,
+        fire_primary: true,
+        ..Default::default()
     };
     vec![
         InputScript::constant(forward_fire),
@@ -72,11 +69,9 @@ fn client_scripts() -> Vec<InputScript> {
 fn bot_ship_intent() -> sim::ShipIntent {
     sim::ShipIntent {
         forward: 1.0,
-        strafe: 0.0,
         turn: 1.0,
-        fire: true,
-        toggle_assist: false,
-        afterburner: false,
+        fire_primary: true,
+        ..Default::default()
     }
 }
 

@@ -82,11 +82,7 @@ fn out_of_bounds_axis_is_clamped_when_driven_over_loopback() {
     // would let this drive the ship at 127× thrust; the clamp bounds it to +1.
     let hostile = QuantizedIntent {
         forward: i8::MAX,
-        strafe: 0,
-        turn: 0,
-        fire: false,
-        toggle_assist: false,
-        afterburner: false,
+        ..Default::default()
     };
 
     // Drive the same hostile input each tick over the wire (increasing seq so the
@@ -152,12 +148,8 @@ fn excessive_fire_rate_is_gated_when_driven_over_loopback() {
     // so within the first ~6 ticks at most ONE projectile may spawn. Fire on every
     // one of 6 consecutive ticks: a bypass would spawn 6 projectiles.
     let firing = QuantizedIntent {
-        forward: 0,
-        strafe: 0,
-        turn: 0,
-        fire: true,
-        toggle_assist: false,
-        afterburner: false,
+        fire_primary: true,
+        ..Default::default()
     };
 
     const TICKS_WITHIN_ONE_COOLDOWN: u32 = 6; // 6 * 33.3 ms ≈ 200 ms = one cooldown

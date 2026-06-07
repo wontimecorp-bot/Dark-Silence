@@ -65,8 +65,8 @@ pub use module::{
     SensorType, SlotSize, Violation, WeaponClass,
 };
 pub use stats::{
-    derive_ship_stats, derive_ship_stats_with, derive_weapon, module_conditions, DerivedWeapon,
-    ModuleCondition, ShipStats, WeaponProfile,
+    derive_ship_stats, derive_ship_stats_with, derive_weapon, derive_weapons, module_conditions,
+    DerivedWeapon, ModuleCondition, ShipStats, ShipWeapons, WeaponProfile,
 };
 pub use validate::{
     budget_usage, check_slot_fit, validate_fit, AxisUsage, BudgetUsage, FitValidation,
@@ -74,7 +74,7 @@ pub use validate::{
 
 use bevy_ecs::prelude::*;
 
-use crate::components::ArmorHp;
+use crate::components::{ArmorHp, WeaponBank};
 use crate::damage::Shields;
 
 /// Re-derive a ship's [`ShipStats`] whenever its [`Fit`] **or** its [`FitLayout`]
@@ -110,6 +110,7 @@ use crate::damage::Shields;
 /// layout both require a resolvable hull; the dangling-ref *rejection* is
 /// `validate_fit`'s concern (INV-F13).
 pub fn recompute_ship_stats_system(
+    mut commands: Commands,
     hulls: Res<HullCatalog>,
     modules: Res<ModuleCatalog>,
     // Phase M6: read the live tuning so a re-derive (incl. the dev panel's "Apply / Re-derive"
@@ -118,17 +119,20 @@ pub fn recompute_ship_stats_system(
     sim: Option<Res<crate::tuning::SimTuning>>,
     mut q: Query<
         (
+            Entity,
             Ref<Fit>,
             &mut ShipStats,
             &mut FitLayout,
             Option<&mut Shields>,
             Option<&mut ArmorHp>,
+            // R45 — the per-weapon firing state, read to PRESERVE cooldown/spool across a re-derive.
+            Option<&WeaponBank>,
         ),
         Or<(Changed<Fit>, Changed<FitLayout>)>,
     >,
 ) {
     let sim = sim.map(|s| *s).unwrap_or_default();
-    for (fit, mut stats, mut layout, shields, armor) in &mut q {
+    for (entity, fit, mut stats, mut layout, shields, armor, weapon_bank) in &mut q {
         let Some(hull) = hulls.get(fit.hull) else {
             // Unknown hull: cannot derive; leave the prior stats/layout untouched.
             continue;
@@ -139,6 +143,24 @@ pub fn recompute_ship_stats_system(
             *layout = build_layout_with(hull, &fit, &modules, sim.struct_cell_hp);
         }
         *stats = derive_ship_stats_with(hull, &fit, &modules, &layout, &sim);
+
+        // R45 — derive the FULL alive-weapon list + maintain the per-weapon firing-state bank: each
+        // surviving weapon slot keeps its cooldown/spool, a new weapon starts fresh, a removed one is
+        // dropped. Inserted via `Commands` so a ship that lacked them gains them; the multi-weapon
+        // firing path reads `ShipWeapons` + `WeaponBank` next tick. (No-op-equivalent for unfitted
+        // ships — they carry no `Fit`/`ShipStats`/`FitLayout` and never enter this loop.)
+        let weapons = derive_weapons(hull, &fit, &modules, &layout, &sim);
+        let mut states = std::collections::BTreeMap::new();
+        for (slot, _) in &weapons {
+            let prev = weapon_bank
+                .and_then(|b| b.states.get(slot))
+                .copied()
+                .unwrap_or_default();
+            states.insert(*slot, prev);
+        }
+        commands
+            .entity(entity)
+            .insert((ShipWeapons { weapons }, WeaponBank { states }));
 
         // Refinement 10: sync the live defense pools' CAPS to the freshly-derived stats so a
         // carved/damaged generator (or armor module) shrinks — or zeroes — the pool. Shields now

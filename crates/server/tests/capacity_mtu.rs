@@ -105,11 +105,8 @@ fn every_snapshot_for_the_baseline_world_fits_the_mtu() {
     // baseline than ships alone), then drive several snapshot broadcasts.
     let firing = QuantizedIntent {
         forward: 1,
-        strafe: 0,
-        turn: 0,
-        fire: true,
-        toggle_assist: false,
-        afterburner: false,
+        fire_primary: true,
+        ..Default::default()
     };
 
     let mut largest = 0usize;

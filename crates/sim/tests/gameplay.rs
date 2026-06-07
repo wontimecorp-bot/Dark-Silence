@@ -119,7 +119,7 @@ fn firing_destroys_a_target_ahead() {
     ));
     let mut sched = make_schedule();
 
-    set_intent(&mut w, ship, |i| i.fire = true);
+    set_intent(&mut w, ship, |i| i.fire_primary = true);
     for _ in 0..20 {
         sched.run(&mut w);
     }
@@ -152,7 +152,7 @@ fn factioned_fire_spares_friendlies_but_destroys_enemies() {
         ))
         .id();
     let mut sched = make_schedule();
-    set_intent(&mut w, ship, |i| i.fire = true);
+    set_intent(&mut w, ship, |i| i.fire_primary = true);
     for _ in 0..20 {
         sched.run(&mut w);
     }
@@ -176,7 +176,7 @@ fn factioned_fire_spares_friendlies_but_destroys_enemies() {
         Faction::Blue,
     ));
     let mut sched2 = make_schedule();
-    set_intent(&mut w2, ship2, |i| i.fire = true);
+    set_intent(&mut w2, ship2, |i| i.fire_primary = true);
     for _ in 0..20 {
         sched2.run(&mut w2);
     }
@@ -529,7 +529,7 @@ fn fixed_step_is_bit_identical_under_identical_inputs() {
             intent.forward = input.0;
             intent.strafe = input.1;
             intent.turn = input.2;
-            intent.fire = input.3;
+            intent.fire_primary = input.3;
             intent.toggle_assist = false;
         });
         sched.run(w);
@@ -625,7 +625,7 @@ fn shot_connects_with_a_drifting_asteroid() {
         Health(15.0),
     ));
     let mut sched = make_schedule();
-    set_intent(&mut w, ship, |i| i.fire = true);
+    set_intent(&mut w, ship, |i| i.fire_primary = true);
     for _ in 0..30 {
         sched.run(&mut w);
     }
@@ -651,7 +651,7 @@ fn projectiles_resolve_harmlessly_after_target_destroyed() {
         Health(5.0),
     ));
     let mut sched = make_schedule();
-    set_intent(&mut w, ship, |i| i.fire = true);
+    set_intent(&mut w, ship, |i| i.fire_primary = true);
     for _ in 0..10 {
         sched.run(&mut w);
     }
@@ -659,7 +659,7 @@ fn projectiles_resolve_harmlessly_after_target_destroyed() {
 
     // Stop firing and let any in-flight projectiles fly on past the empty space
     // and expire (lifetime 3 s = 180 ticks).
-    set_intent(&mut w, ship, |i| i.fire = false);
+    set_intent(&mut w, ship, |i| i.fire_primary = false);
     for _ in 0..200 {
         sched.run(&mut w);
     }
@@ -753,7 +753,7 @@ fn firing_recoils_the_shooter_conserving_momentum() {
     let mass = w.get_resource::<Tuning>().unwrap().mass;
     let mut sched = make_schedule();
 
-    set_intent(&mut w, ship, |i| i.fire = true);
+    set_intent(&mut w, ship, |i| i.fire_primary = true);
     sched.run(&mut w); // one tick: cooldown starts at 0 → exactly one shot fires
 
     let v = w.get::<Velocity>(ship).unwrap().0;
@@ -781,7 +781,7 @@ fn a_moving_ships_shot_inherits_its_velocity() {
     let ship = spawn_ship(&mut w, Vec2::ZERO, 0.0, drift); // nose +x, drifting +y
     let mut sched = make_schedule();
 
-    set_intent(&mut w, ship, |i| i.fire = true);
+    set_intent(&mut w, ship, |i| i.fire_primary = true);
     sched.run(&mut w);
 
     let pv = {

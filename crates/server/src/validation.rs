@@ -47,9 +47,13 @@ pub struct ValidatedIntent {
     pub strafe: f32,
     /// Turn left (+1) / right (−1), clamped to `-1.0..=1.0`.
     pub turn: f32,
-    /// Fire this step. Accepted into the intent, but the authoritative
-    /// projectile is still gated by the sim weapon cooldown ([`fire_allowed`]).
-    pub fire: bool,
+    /// R45 — hold PRIMARY fire this step. Accepted into the intent, but the authoritative projectile
+    /// is still gated by the sim weapon cooldown ([`fire_allowed`]).
+    pub fire_primary: bool,
+    /// R45 — hold SECONDARY fire this step (accepted as-is; the sim gates per weapon).
+    pub fire_secondary: bool,
+    /// R45 — the active fire group, clamped to `0..=5` (a hostile out-of-range value is bounded).
+    pub active_group: u8,
     /// Toggle flight-assist this step. Any boolean is in-bounds, so it is
     /// accepted as-is (TR-020).
     pub toggle_assist: bool,
@@ -63,7 +67,9 @@ impl From<ValidatedIntent> for ShipIntent {
             forward: v.forward,
             strafe: v.strafe,
             turn: v.turn,
-            fire: v.fire,
+            fire_primary: v.fire_primary,
+            fire_secondary: v.fire_secondary,
+            active_group: v.active_group,
             toggle_assist: v.toggle_assist,
             afterburner: v.afterburner,
         }
@@ -94,7 +100,10 @@ pub fn validate_input(intent: &QuantizedIntent) -> ValidatedIntent {
         forward: clamp_axis(intent.forward),
         strafe: clamp_axis(intent.strafe),
         turn: clamp_axis(intent.turn),
-        fire: intent.fire,
+        fire_primary: intent.fire_primary,
+        fire_secondary: intent.fire_secondary,
+        // R45 — bound the group to the 6 valid groups (a hostile out-of-range value can't escape).
+        active_group: intent.active_group.min(5),
         toggle_assist: intent.toggle_assist,
         afterburner: intent.afterburner,
     }
@@ -305,7 +314,9 @@ mod tests {
             forward,
             strafe,
             turn,
-            fire,
+            fire_primary: fire,
+            fire_secondary: false,
+            active_group: 0,
             toggle_assist: toggle,
             afterburner: false,
         }
@@ -319,7 +330,7 @@ mod tests {
         assert_eq!(v.strafe, -1.0, "strafe clamps to the lower bound");
         assert_eq!(v.turn, 1.0, "turn clamps to the upper bound");
         // Flags are accepted as-is (TR-020): any boolean is in-bounds.
-        assert!(v.fire);
+        assert!(v.fire_primary);
         assert!(v.toggle_assist);
     }
 
@@ -327,7 +338,7 @@ mod tests {
     fn validate_passes_in_range_axes_unchanged() {
         let v = validate_input(&intent(1, 0, -1, false, false));
         assert_eq!((v.forward, v.strafe, v.turn), (1.0, 0.0, -1.0));
-        assert!(!v.fire);
+        assert!(!v.fire_primary);
         assert!(!v.toggle_assist);
     }
 
@@ -356,7 +367,9 @@ mod tests {
             forward: 0.5,
             strafe: -0.5,
             turn: 1.0,
-            fire: true,
+            fire_primary: true,
+            fire_secondary: false,
+            active_group: 0,
             toggle_assist: false,
             afterburner: false,
         };
@@ -364,7 +377,7 @@ mod tests {
         assert_eq!(intent.forward, 0.5);
         assert_eq!(intent.strafe, -0.5);
         assert_eq!(intent.turn, 1.0);
-        assert!(intent.fire);
+        assert!(intent.fire_primary);
         assert!(!intent.toggle_assist);
     }
 

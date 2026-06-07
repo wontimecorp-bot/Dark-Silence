@@ -50,11 +50,7 @@ fn connect_msg() -> Message {
 fn forward() -> QuantizedIntent {
     QuantizedIntent {
         forward: 1,
-        strafe: 0,
-        turn: 0,
-        fire: false,
-        toggle_assist: false,
-        afterburner: false,
+        ..Default::default()
     }
 }
 

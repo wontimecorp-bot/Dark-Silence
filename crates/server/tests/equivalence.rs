@@ -39,12 +39,8 @@ use sim::components::Position;
 /// (motion, reconstruction, reconciliation, and each seeing the other).
 fn scripts() -> Vec<InputScript> {
     let strafe = protocol::QuantizedIntent {
-        forward: 0,
         strafe: 1,
-        turn: 0,
-        fire: false,
-        toggle_assist: false,
-        afterburner: false,
+        ..Default::default()
     };
     vec![
         InputScript::constant(forward_intent()),

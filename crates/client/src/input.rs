@@ -49,7 +49,23 @@ pub fn read_input(keys: Res<ButtonInput<KeyCode>>, mut q: Query<&mut ShipIntent,
     intent.forward = forward;
     intent.strafe = strafe;
     intent.turn = turn;
-    intent.fire = keys.pressed(KeyCode::Space);
+    intent.fire_primary = keys.pressed(KeyCode::Space);
+    // R45: secondary fire (the active group's Secondary-trigger weapons). Hold Left Ctrl (tunable).
+    intent.fire_secondary = keys.pressed(KeyCode::ControlLeft);
+    // R45: number keys 1-6 select the active fire group (0-indexed); the selection PERSISTS until
+    // another number is pressed (we only overwrite on a fresh press).
+    for (key, group) in [
+        (KeyCode::Digit1, 0u8),
+        (KeyCode::Digit2, 1),
+        (KeyCode::Digit3, 2),
+        (KeyCode::Digit4, 3),
+        (KeyCode::Digit5, 4),
+        (KeyCode::Digit6, 5),
+    ] {
+        if keys.just_pressed(key) {
+            intent.active_group = group;
+        }
+    }
     // Phase F: hold Left Shift to afterburner (boost). Held, not edge-triggered.
     intent.afterburner = keys.pressed(KeyCode::ShiftLeft);
     // Assist toggle is handled client-side (below) to avoid fixed-step timing

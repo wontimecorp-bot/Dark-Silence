@@ -2488,7 +2488,7 @@ fn spawn_fitted_player_aimed(w: &mut World, pos: Vec2, aim_at: Vec2) -> Entity {
     w.spawn((
         Ship,
         ShipIntent {
-            fire: true,
+            fire_primary: true,
             ..Default::default()
         },
         Position(pos),

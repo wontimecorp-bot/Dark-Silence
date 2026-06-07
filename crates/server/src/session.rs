@@ -675,18 +675,7 @@ mod tests {
     // --- T052: seq/tick classification ---------------------------------------
 
     fn input(seq: u32, tick: u32) -> ClientInput {
-        ClientInput::new(
-            seq,
-            tick,
-            vec![protocol::QuantizedIntent {
-                forward: 0,
-                strafe: 0,
-                turn: 0,
-                fire: false,
-                toggle_assist: false,
-                afterburner: false,
-            }],
-        )
+        ClientInput::new(seq, tick, vec![protocol::QuantizedIntent::default()])
     }
 
     fn admitted_state() -> ClientState {

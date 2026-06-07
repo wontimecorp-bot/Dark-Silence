@@ -11,11 +11,11 @@
 use crate::clock::FixedDt;
 use crate::components::{
     CollisionRadius, Damage, Energy, Faction, Heading, Heat, Lifetime, Position, PrevPosition,
-    Projectile, ProjectileFaction, ProjectileMass, ProjectileOwner, RenderScale, Ship, Velocity,
-    Weapon,
+    Projectile, ProjectileFaction, ProjectileMass, ProjectileOwner, RenderScale, Ship, Trigger,
+    Velocity, Weapon, WeaponBank, WeaponGroups,
 };
 use crate::damage::{Channel, DamageEvent};
-use crate::fitting::ShipStats;
+use crate::fitting::{ShipStats, ShipWeapons, WeaponProfile};
 use crate::intent::ShipIntent;
 use crate::physics::SweptHit;
 use crate::tuning::{SimTuning, Tuning};
@@ -205,6 +205,13 @@ pub fn weapon_fire_system(
             &Heading,
             &mut Velocity,
             &ShipStats,
+            // R45 — multi-weapon firing: the full weapon list + per-weapon state + fire-group
+            // assignment (recompute populates `ShipWeapons`/`WeaponBank`). All absent ⇒ the LEGACY
+            // single-weapon fallback (the `Weapon` component), which the unit tests + the spawn tick
+            // before the first re-derive rely on.
+            Option<&ShipWeapons>,
+            Option<&mut WeaponBank>,
+            Option<&WeaponGroups>,
             Option<&mut Weapon>,
             // Phase E: the dynamic pools — present only on LIVE-spawned fitted ships. `Option` so the
             // headless sim/determinism worlds (no pools) keep the exact prior firing behavior.
@@ -233,24 +240,94 @@ pub fn weapon_fire_system(
     let dt = dt.0;
     let sim = sim.map(|s| *s).unwrap_or_default();
 
-    // Fitted path: fit-derived can_fire + WeaponProfile (FR-016).
-    for (owner, intent, pos, heading, mut ship_vel, stats, weapon, mut energy, mut heat, faction) in
-        &mut fitted
+    // Fitted path: fire EVERY alive weapon, gated by fire groups (R45). `ShipWeapons`/`WeaponBank`
+    // (recompute-maintained) carry the multi-weapon list + per-weapon state; when absent (unit tests,
+    // the spawn tick before the first re-derive) it falls back to the legacy single-weapon path.
+    for (
+        owner,
+        intent,
+        pos,
+        heading,
+        mut ship_vel,
+        stats,
+        ship_weapons,
+        weapon_bank,
+        groups,
+        weapon,
+        mut energy,
+        mut heat,
+        faction,
+    ) in &mut fitted
     {
-        // No weapon module ⇒ cannot fire; if a Weapon component lingers, still
-        // tick its cooldown so it stays a valid (idle) state machine.
+        if let (Some(ship_weapons), Some(mut bank)) = (ship_weapons, weapon_bank) {
+            // MULTI-weapon: fire each weapon whose fire group is ACTIVE and whose trigger is HELD,
+            // each on its OWN cooldown/spool/shot-counter. The energy/heat pools are shared, so they
+            // deplete as successive weapons fire this tick (a heavy salvo can self-gate on energy).
+            for (slot, profile) in &ship_weapons.weapons {
+                let map = groups.map(|g| g.for_slot(*slot)).unwrap_or_default();
+                let state = bank.states.entry(*slot).or_default();
+                if state.cooldown > 0.0 {
+                    state.cooldown -= dt;
+                }
+                let trigger_held = match map.trigger {
+                    Trigger::Primary => intent.fire_primary,
+                    Trigger::Secondary => intent.fire_secondary,
+                    Trigger::Off => false,
+                };
+                let active = map.group == intent.active_group && trigger_held;
+                // R42 rotary spool, now per weapon: ramp while this weapon is being fired, decay idle.
+                if profile.spin_up_time > 0.0 {
+                    let step = dt / profile.spin_up_time;
+                    state.spool = if active {
+                        (state.spool + step).min(1.0)
+                    } else {
+                        (state.spool - step).max(0.0)
+                    };
+                } else {
+                    state.spool = 1.0;
+                }
+                let shot_cost = profile.damage * sim.weapon_energy_per_damage;
+                let energy_ok = energy.as_ref().is_none_or(|e| e.current >= shot_cost);
+                let heat_ok = heat.as_ref().is_none_or(|h| h.current < h.max);
+                if active && state.spool >= 1.0 && can_fire(state.cooldown) && energy_ok && heat_ok
+                {
+                    fire_one_weapon(
+                        &mut commands,
+                        owner,
+                        pos.0,
+                        heading.0,
+                        &mut ship_vel.0,
+                        stats.total_mass,
+                        profile,
+                        state.shot_counter,
+                        faction.copied(),
+                        &sim,
+                    );
+                    if let Some(e) = energy.as_mut() {
+                        e.current = (e.current - shot_cost).max(0.0);
+                    }
+                    if let Some(h) = heat.as_mut() {
+                        h.current += profile.heat;
+                    }
+                    state.shot_counter = state.shot_counter.wrapping_add(1);
+                    state.cooldown = cooldown_after_fire(profile.fire_rate);
+                }
+            }
+            continue;
+        }
+
+        // LEGACY single-weapon fallback (no `ShipWeapons`/`WeaponBank` yet): the original single
+        // `Weapon`-component path, gated on PRIMARY fire (group-agnostic). Keeps the firing unit tests
+        // + the spawn tick before the first re-derive working unchanged.
         let (Some(profile), Some(mut weapon)) = (stats.weapon, weapon) else {
             continue;
         };
         if weapon.cooldown > 0.0 {
             weapon.cooldown -= dt;
         }
-        // R42 — rotary spool: a weapon with `spin_up_time > 0` (vulcan/gatling) ramps `spool` toward
-        // full RPM while firing and decays it when idle; firing is gated on full spool below. A weapon
-        // with `spin_up_time == 0` (every gun today) sits at `1.0` ⇒ no behavior change.
         if profile.spin_up_time > 0.0 {
             let step = dt / profile.spin_up_time;
-            weapon.spool = if intent.fire {
+            weapon.spool = if intent.fire_primary {
                 (weapon.spool + step).min(1.0)
             } else {
                 (weapon.spool - step).max(0.0)
@@ -258,83 +335,34 @@ pub fn weapon_fire_system(
         } else {
             weapon.spool = 1.0;
         }
-        // Phase E: a shot costs Energy + builds Heat, and is gated on both (when the pools exist).
-        // `is_none_or` ⇒ a ship without the pools (the headless/test path) fires exactly as before.
         let shot_cost = profile.damage * sim.weapon_energy_per_damage;
         let energy_ok = energy.as_ref().is_none_or(|e| e.current >= shot_cost);
         let heat_ok = heat.as_ref().is_none_or(|h| h.current < h.max);
         if stats.can_fire
-            && intent.fire
+            && intent.fire_primary
             && weapon.spool >= 1.0
             && can_fire(weapon.cooldown)
             && energy_ok
             && heat_ok
         {
-            // R42 — dispersion: scatter the shot within the weapon's cone by a DETERMINISTIC per-shot
-            // angle (`aim_noise` = splitmix64 of the owner bits + shot counter — no RNG). `0` ⇒ the
-            // shot flies exactly on heading (byte-identical to today). The gun's muzzle POSITION stays
-            // on `heading` (the barrel doesn't move); only the round's launch direction scatters.
-            let aim = if profile.dispersion_rad > 0.0 {
-                heading.0
-                    + crate::turret::aim_noise(owner.to_bits(), weapon.shot_counter)
-                        * profile.dispersion_rad
-            } else {
-                heading.0
-            };
-            // Phase M4: the muzzle velocity (the gun's contribution) plus the shooter's own
-            // velocity, so a moving ship's shots carry its motion (a true Newtonian gun).
-            let muzzle = Vec2::from_angle(aim) * profile.muzzle_speed;
-            let vel = muzzle + ship_vel.0;
-            // Refinement 18: spawn at the installed gun's world position — the body-frame
-            // `muzzle_offset` (derived from the weapon's grid cell) rotated by the ship's heading —
-            // so the shot leaves from the actual weapon cell, not the ship centre.
-            let spawn = pos.0 + Vec2::from_angle(heading.0).rotate(profile.muzzle_offset);
-            let mut shot = commands.spawn((
-                Projectile,
-                Position(spawn),
-                PrevPosition(spawn),
-                Velocity(vel),
-                Damage(profile.damage),
-                // Phase M5: the per-weapon slug mass, carried to the hit for the impulse.
-                ProjectileMass(profile.projectile_mass),
-                // R42: per-weapon range — `lifetime = range_units / muzzle_speed` (was the global TTL).
-                Lifetime(profile.lifetime),
-                ProjectileOwner(owner),
-                // E007 damage typing (T037) + Phase C: the shot carries the fitted weapon's own
-                // damage `Channel` with penetration derived from the shot damage.
-                WeaponSource::from_damage_typed(
-                    profile.channel,
-                    profile.damage,
-                    sim.pen_per_damage,
-                    sim.pen_size,
-                ),
-                // Mining-skirmish friend/foe: the shot carries the shooter's team (None = neutral).
-                ProjectileFaction(faction.copied()),
-            ));
-            // R42: a caliber-derived radius gives the shot its on-screen size (RenderScale on the
-            // shared 0.2 sphere) AND its hit radius (CollisionRadius, Minkowski-summed in collision).
-            // Absent (radius 0) ⇒ the legacy point shot at the default mesh size (unfitted/turret).
-            if profile.projectile_radius > 0.0 {
-                shot.insert((
-                    CollisionRadius(profile.projectile_radius),
-                    RenderScale(Vec3::splat(
-                        profile.projectile_radius / PROJECTILE_MESH_RADIUS,
-                    )),
-                ));
-            }
-            // Phase M4/M5 recoil: conserve momentum against the MUZZLE component only (the inherited
-            // part was already the ship's momentum), using the per-weapon slug mass.
-            // Δv = −(projectile_mass·muzzle)/ship_mass.
-            ship_vel.0 -=
-                profile.projectile_mass * muzzle / stats.total_mass.max(f32::MIN_POSITIVE);
-            // Phase E: spend energy + add heat on the shot (no-op when the pools are absent).
+            fire_one_weapon(
+                &mut commands,
+                owner,
+                pos.0,
+                heading.0,
+                &mut ship_vel.0,
+                stats.total_mass,
+                &profile,
+                weapon.shot_counter,
+                faction.copied(),
+                &sim,
+            );
             if let Some(e) = energy.as_mut() {
                 e.current = (e.current - shot_cost).max(0.0);
             }
             if let Some(h) = heat.as_mut() {
                 h.current += profile.heat;
             }
-            // R42: advance the dispersion seed each shot (unread by a pinpoint weapon).
             weapon.shot_counter = weapon.shot_counter.wrapping_add(1);
             weapon.cooldown = cooldown_after_fire(profile.fire_rate);
         }
@@ -345,7 +373,7 @@ pub fn weapon_fire_system(
         if weapon.cooldown > 0.0 {
             weapon.cooldown -= dt;
         }
-        if intent.fire && can_fire(weapon.cooldown) {
+        if intent.fire_primary && can_fire(weapon.cooldown) {
             let muzzle = Vec2::from_angle(heading.0) * weapon.muzzle_speed;
             let vel = muzzle + ship_vel.0;
             commands.spawn((
@@ -375,6 +403,67 @@ pub fn weapon_fire_system(
             weapon.cooldown = cooldown_after_fire(weapon.fire_rate);
         }
     }
+}
+
+/// R45 — spawn ONE weapon's projectile (R42 dispersion + muzzle offset + caliber size) and apply the
+/// shooter's recoil. Shared by the multi-weapon + legacy single-weapon firing paths; the caller owns
+/// the per-weapon cooldown / spool / shot-counter and the energy/heat bookkeeping.
+#[allow(clippy::too_many_arguments)]
+fn fire_one_weapon(
+    commands: &mut Commands,
+    owner: Entity,
+    pos: Vec2,
+    heading: f32,
+    ship_vel: &mut Vec2,
+    total_mass: f32,
+    profile: &WeaponProfile,
+    shot_counter: u32,
+    faction: Option<Faction>,
+    sim: &SimTuning,
+) {
+    // R42 dispersion: scatter the round within the cone by a DETERMINISTIC per-shot angle (splitmix64
+    // of owner + shot counter — no RNG); `0` ⇒ exactly on heading. The barrel POSITION stays on
+    // heading; only the launch direction scatters.
+    let aim = if profile.dispersion_rad > 0.0 {
+        heading + crate::turret::aim_noise(owner.to_bits(), shot_counter) * profile.dispersion_rad
+    } else {
+        heading
+    };
+    // Phase M4: muzzle velocity + the shooter's own velocity (a true Newtonian gun).
+    let muzzle = Vec2::from_angle(aim) * profile.muzzle_speed;
+    let vel = muzzle + *ship_vel;
+    // R18: spawn at the installed gun's world position (the body-frame muzzle offset, rotated by the
+    // ship heading), not the ship centre.
+    let spawn = pos + Vec2::from_angle(heading).rotate(profile.muzzle_offset);
+    let mut shot = commands.spawn((
+        Projectile,
+        Position(spawn),
+        PrevPosition(spawn),
+        Velocity(vel),
+        Damage(profile.damage),
+        ProjectileMass(profile.projectile_mass),
+        Lifetime(profile.lifetime),
+        ProjectileOwner(owner),
+        WeaponSource::from_damage_typed(
+            profile.channel,
+            profile.damage,
+            sim.pen_per_damage,
+            sim.pen_size,
+        ),
+        ProjectileFaction(faction),
+    ));
+    // R42: a caliber-derived radius gives the shot its on-screen size (RenderScale on the shared 0.2
+    // sphere) AND its hit radius (CollisionRadius, Minkowski-summed in collision). `0` ⇒ legacy point.
+    if profile.projectile_radius > 0.0 {
+        shot.insert((
+            CollisionRadius(profile.projectile_radius),
+            RenderScale(Vec3::splat(
+                profile.projectile_radius / PROJECTILE_MESH_RADIUS,
+            )),
+        ));
+    }
+    // Phase M4/M5 recoil: conserve momentum against the MUZZLE component only, using the slug mass.
+    *ship_vel -= profile.projectile_mass * muzzle / total_mass.max(f32::MIN_POSITIVE);
 }
 
 /// Fixed-step projectile advance (FR-006): record the previous position (the
@@ -490,7 +579,7 @@ mod tests {
             .spawn((
                 Ship,
                 ShipIntent {
-                    fire: true,
+                    fire_primary: true,
                     ..Default::default()
                 },
                 Position(Vec2::ZERO),
@@ -550,6 +639,227 @@ mod tests {
             w.get::<Energy>(ship).unwrap().current,
             100.0,
             "blocked while overheated → energy unchanged"
+        );
+    }
+
+    // ---- R45 fire-group firing ---------------------------------------------------------------
+
+    /// Count the live projectiles in the world (one per weapon that fired this tick).
+    fn count_projectiles(w: &mut World) -> usize {
+        w.query_filtered::<Entity, With<Projectile>>()
+            .iter(w)
+            .count()
+    }
+
+    /// A fighter with TWO autocannons (slots 3 & 4) on the MULTI-weapon path (`ShipWeapons` +
+    /// `WeaponBank` present), plus generous Energy/Heat so the gates never block. `groups` assigns the
+    /// fire groups/triggers; `intent` sets the active group + which triggers are held.
+    fn spawn_two_autocannon_ship(
+        w: &mut World,
+        groups: WeaponGroups,
+        intent: ShipIntent,
+    ) -> Entity {
+        use crate::components::{Energy, Heat, WeaponState};
+        use crate::fitting::content::{
+            MODULE_AUTOCANNON, MODULE_REACTOR_BASIC, MODULE_THRUSTER_BASIC,
+        };
+        use crate::fitting::{
+            build_layout, derive_ship_stats, derive_weapons, seed_catalogs, Fit, SlotId,
+            HULL_FIGHTER,
+        };
+
+        let (modules, hulls) = seed_catalogs();
+        let hull = hulls.get(HULL_FIGHTER).unwrap();
+        let mut fit = Fit::new(HULL_FIGHTER);
+        fit.install_raw(SlotId(0), MODULE_REACTOR_BASIC);
+        fit.install_raw(SlotId(1), MODULE_THRUSTER_BASIC);
+        fit.install_raw(SlotId(3), MODULE_AUTOCANNON);
+        fit.install_raw(SlotId(4), MODULE_AUTOCANNON);
+        let layout = build_layout(hull, &fit, &modules);
+        let stats = derive_ship_stats(hull, &fit, &modules, &layout);
+        let sim = SimTuning::default();
+        let weapons = derive_weapons(hull, &fit, &modules, &layout, &sim);
+        assert_eq!(weapons.len(), 2, "two autocannons fitted in slots 3 & 4");
+        let mut bank = WeaponBank::default();
+        for (slot, _) in &weapons {
+            bank.states.insert(*slot, WeaponState::default());
+        }
+        w.spawn((
+            Ship,
+            intent,
+            Position(Vec2::ZERO),
+            Heading(0.0),
+            Velocity(Vec2::ZERO),
+            stats,
+            ShipWeapons { weapons },
+            bank,
+            groups,
+            Energy {
+                current: 1_000.0,
+                max: 1_000.0,
+                regen: 0.0,
+                rate: 0.0,
+            },
+            Heat {
+                current: 0.0,
+                max: 1_000.0,
+                dissipation: 0.0,
+            },
+        ))
+        .id()
+    }
+
+    /// Build a minimal world (dt + tuning) ready for `weapon_fire_system`.
+    fn fire_world() -> World {
+        let mut w = World::new();
+        w.insert_resource(FixedDt(0.05));
+        w.insert_resource(Tuning::default());
+        w.insert_resource(SimTuning::default());
+        w
+    }
+
+    fn run_fire(w: &mut World) {
+        let mut sched = Schedule::default();
+        sched.add_systems(weapon_fire_system);
+        sched.run(w);
+    }
+
+    #[test]
+    fn unconfigured_ship_fires_both_weapons_on_primary() {
+        // No `WeaponGroups` mapping ⇒ every weapon defaults to group 1 / Primary, so an
+        // unconfigured ship fires ALL its weapons on Space (the Bug-#2 fix: both slots shoot).
+        let mut w = fire_world();
+        spawn_two_autocannon_ship(
+            &mut w,
+            WeaponGroups::default(),
+            ShipIntent {
+                fire_primary: true,
+                active_group: 0,
+                ..Default::default()
+            },
+        );
+        run_fire(&mut w);
+        assert_eq!(
+            count_projectiles(&mut w),
+            2,
+            "both group-1 weapons fire on Space"
+        );
+    }
+
+    #[test]
+    fn a_weapon_fires_only_when_its_group_is_active() {
+        use crate::components::FireMapping;
+        use crate::fitting::SlotId;
+        let mut groups = WeaponGroups::default();
+        groups.mapping.insert(
+            SlotId(3),
+            FireMapping {
+                group: 0, // group 1
+                trigger: Trigger::Primary,
+            },
+        );
+        groups.mapping.insert(
+            SlotId(4),
+            FireMapping {
+                group: 1, // group 2
+                trigger: Trigger::Primary,
+            },
+        );
+
+        // Group 1 active → only the slot-3 weapon fires.
+        let mut w = fire_world();
+        spawn_two_autocannon_ship(
+            &mut w,
+            groups.clone(),
+            ShipIntent {
+                fire_primary: true,
+                active_group: 0,
+                ..Default::default()
+            },
+        );
+        run_fire(&mut w);
+        assert_eq!(
+            count_projectiles(&mut w),
+            1,
+            "only the group-1 weapon fires when group 1 is active"
+        );
+
+        // Group 2 active → only the slot-4 weapon fires.
+        let mut w2 = fire_world();
+        spawn_two_autocannon_ship(
+            &mut w2,
+            groups,
+            ShipIntent {
+                fire_primary: true,
+                active_group: 1,
+                ..Default::default()
+            },
+        );
+        run_fire(&mut w2);
+        assert_eq!(
+            count_projectiles(&mut w2),
+            1,
+            "only the group-2 weapon fires when group 2 is active"
+        );
+    }
+
+    #[test]
+    fn secondary_trigger_fires_only_on_secondary_fire() {
+        use crate::components::FireMapping;
+        use crate::fitting::SlotId;
+        let mut groups = WeaponGroups::default();
+        // Both in group 1; slot 3 on Primary, slot 4 on Secondary.
+        groups.mapping.insert(
+            SlotId(3),
+            FireMapping {
+                group: 0,
+                trigger: Trigger::Primary,
+            },
+        );
+        groups.mapping.insert(
+            SlotId(4),
+            FireMapping {
+                group: 0,
+                trigger: Trigger::Secondary,
+            },
+        );
+
+        // Space only → only the Primary weapon fires.
+        let mut w = fire_world();
+        spawn_two_autocannon_ship(
+            &mut w,
+            groups.clone(),
+            ShipIntent {
+                fire_primary: true,
+                fire_secondary: false,
+                active_group: 0,
+                ..Default::default()
+            },
+        );
+        run_fire(&mut w);
+        assert_eq!(
+            count_projectiles(&mut w),
+            1,
+            "Space fires only the Primary weapon"
+        );
+
+        // Space + Ctrl → both fire.
+        let mut w2 = fire_world();
+        spawn_two_autocannon_ship(
+            &mut w2,
+            groups,
+            ShipIntent {
+                fire_primary: true,
+                fire_secondary: true,
+                active_group: 0,
+                ..Default::default()
+            },
+        );
+        run_fire(&mut w2);
+        assert_eq!(
+            count_projectiles(&mut w2),
+            2,
+            "Space+Ctrl fires both the Primary and Secondary weapons"
         );
     }
 }

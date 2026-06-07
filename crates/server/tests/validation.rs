@@ -125,9 +125,7 @@ fn case1_out_of_bounds_axes_are_clamped_to_the_bound() {
         forward: i8::MAX, // → clamps to +1
         strafe: i8::MIN,  // → clamps to -1
         turn: 100,        // → clamps to +1
-        fire: false,
-        toggle_assist: false,
-        afterburner: false,
+        ..Default::default()
     };
     client.send_unreliable(
         conn,
@@ -145,9 +143,7 @@ fn case1_out_of_bounds_axes_are_clamped_to_the_bound() {
         forward: 1,
         strafe: -1,
         turn: 1,
-        fire: false,
-        toggle_assist: false,
-        afterburner: false,
+        ..Default::default()
     };
     ref_client.send_unreliable(
         ref_conn,
@@ -187,12 +183,8 @@ fn case2_excessive_fire_rate_produces_no_extra_projectile() {
     // projectile in authoritative state. fire_rate 5.0 ⇒ 0.2 s cooldown ≈ 6 ticks.
     let (mut server, mut client, conn, _id) = connect_one(7403);
     let firing = QuantizedIntent {
-        forward: 0,
-        strafe: 0,
-        turn: 0,
-        fire: true,
-        toggle_assist: false,
-        afterburner: false,
+        fire_primary: true,
+        ..Default::default()
     };
 
     const TICKS: u32 = 6; // one cooldown window at 30 Hz
@@ -224,14 +216,7 @@ fn case3_replayed_and_stale_inputs_are_discarded_state_unmutated() {
 
     // Establish a baseline last-processed seq with a real, applied input, then let
     // the world settle a couple of ticks so it is non-trivial but stable.
-    let neutral = QuantizedIntent {
-        forward: 0,
-        strafe: 0,
-        turn: 0,
-        fire: false,
-        toggle_assist: false,
-        afterburner: false,
-    };
+    let neutral = QuantizedIntent::default();
     client.send_unreliable(
         conn,
         &Message::ClientInput(ClientInput::new(10, server.server_tick(), vec![neutral])),
@@ -329,14 +314,7 @@ fn case4_client_cannot_assert_position_motion_comes_only_from_the_sim() {
     // QuantizedIntent. There is no position or hit parameter to pass — the
     // structural guarantee of TR-012. (If a position field were ever added, this
     // call would no longer compile, failing the test.)
-    let neutral = QuantizedIntent {
-        forward: 0,
-        strafe: 0,
-        turn: 0,
-        fire: false,
-        toggle_assist: false,
-        afterburner: false,
-    };
+    let neutral = QuantizedIntent::default();
     let _typecheck: fn(u32, u32, Vec<QuantizedIntent>) -> ClientInput = ClientInput::new;
 
     for seq in 1..=30u32 {

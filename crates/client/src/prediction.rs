@@ -552,24 +552,13 @@ mod tests {
     use super::*;
 
     fn neutral() -> QuantizedIntent {
-        QuantizedIntent {
-            forward: 0,
-            strafe: 0,
-            turn: 0,
-            fire: false,
-            toggle_assist: false,
-            afterburner: false,
-        }
+        QuantizedIntent::default()
     }
 
     fn forward() -> QuantizedIntent {
         QuantizedIntent {
             forward: 1,
-            strafe: 0,
-            turn: 0,
-            fire: false,
-            toggle_assist: false,
-            afterburner: false,
+            ..Default::default()
         }
     }
 

@@ -133,6 +133,7 @@ pub fn run() -> AppExit {
                 hud::setup_hud,
                 hud::setup_energy_bars,
                 hud::setup_score_hud,
+                hud::setup_firegroup_hud,
                 // Refinement 14: segmented per-module-type condition bars (right side) — plain Bevy
                 // UI nodes, no camera dependency.
                 module_bars::setup_module_bars,
@@ -179,6 +180,7 @@ pub fn run() -> AppExit {
                 hud::update_hud,
                 hud::update_energy_hud,
                 hud::update_score_hud,
+                hud::update_firegroup_hud,
                 hud_bars::update_trapezoid_bars,
                 module_bars::update_module_bars,
                 radar::update_radar,

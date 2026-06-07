@@ -175,14 +175,7 @@ fn replayed_and_stale_inputs_are_discarded_logged_and_mutate_no_state() {
     // logged, mutating no authoritative state.
     let (mut server, mut client, conn, _id) = connect_one(7503);
 
-    let neutral = QuantizedIntent {
-        forward: 0,
-        strafe: 0,
-        turn: 0,
-        fire: false,
-        toggle_assist: false,
-        afterburner: false,
-    };
+    let neutral = QuantizedIntent::default();
     client.send_unreliable(
         conn,
         &Message::ClientInput(ClientInput::new(7, server.server_tick(), vec![neutral])),

@@ -15,9 +15,10 @@
 
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
+use sim::components::{FireMapping, Trigger, WeaponGroups};
 use sim::fitting::{
-    check_slot_fit, derive_weapon, preview_stats, seed_catalogs, Fit, FitRejection, HardpointType,
-    Hull, HullCatalog, Module, ModuleCatalog, ModuleId, SlotId, HULL_FIGHTER,
+    check_slot_fit, derive_weapon, preview_stats, seed_catalogs, validate_fit, Fit, FitRejection,
+    HardpointType, Hull, HullCatalog, Module, ModuleCatalog, ModuleId, SlotId, HULL_FIGHTER,
 };
 
 use crate::net::{LoopbackHost, NetClientState};
@@ -74,6 +75,10 @@ pub struct FittingSession {
     pub applied_fit: Fit,
     /// The slot the player clicked — drives the compatible-module list on the right.
     pub selected_slot: Option<SlotId>,
+    /// R45 — the working fire-group assignment (slot → group/trigger), loaded from the live ship on
+    /// enter, edited via the slot panel, committed alongside the `Fit` on Apply. Slots absent from
+    /// the map default to group 1 / Primary (so an unconfigured ship fires everything on Space).
+    pub weapon_groups: WeaponGroups,
     /// Human-readable outcome of the last action (install/remove/apply rejection or success).
     pub status: String,
 }
@@ -89,6 +94,7 @@ impl Default for FittingSession {
             working_fit,
             applied_fit,
             selected_slot: None,
+            weapon_groups: WeaponGroups::default(),
             status: String::new(),
         }
     }
@@ -126,6 +132,9 @@ fn load_fitting_session(
                 session.working_fit = fit.clone();
                 session.applied_fit = fit.clone();
             }
+            // R45 — load the ship's live fire-group assignment (absent → all weapons default to
+            // group 1 / Primary, so editing starts from the same "fires on Space" baseline).
+            session.weapon_groups = w.get::<WeaponGroups>(ship).cloned().unwrap_or_default();
         }
     }
     inventory.available = session.modules.modules.keys().copied().collect();
@@ -155,6 +164,7 @@ fn fitting_screen_ui(
     let working = session.working_fit.clone();
     let modules = session.modules.clone();
     let selected = session.selected_slot;
+    let groups = session.weapon_groups.clone();
     let (budget, stats) = preview_stats(&hull, &working, &modules);
     let baseline = preview_stats(&hull, &session.applied_fit, &modules).1;
 
@@ -162,6 +172,8 @@ fn fitting_screen_ui(
     let mut select: Option<SlotId> = None;
     let mut to_install: Option<(SlotId, ModuleId)> = None;
     let mut to_remove: Option<SlotId> = None;
+    // R45 — a fire-group edit (slot → new group/trigger), applied to `session.weapon_groups` after.
+    let mut to_assign: Option<(SlotId, FireMapping)> = None;
     let mut do_apply = false;
     let mut do_close = false;
 
@@ -192,6 +204,7 @@ fn fitting_screen_ui(
                     &hull,
                     &working,
                     &modules,
+                    &groups,
                     selected,
                     &mut select,
                 );
@@ -201,9 +214,11 @@ fn fitting_screen_ui(
                     &working,
                     &modules,
                     &inventory,
+                    &groups,
                     selected,
                     &mut to_install,
                     &mut to_remove,
+                    &mut to_assign,
                 );
             });
             ui.separator();
@@ -240,21 +255,60 @@ fn fitting_screen_ui(
             Err(rej) => session.status = describe_rejection(&rej),
         }
     }
+    if let Some((slot, mapping)) = to_assign {
+        // R45 — group 1 / Primary is the implicit default, so drop a default-mapping back to "absent"
+        // to keep the committed `WeaponGroups` minimal (and a no-config ship truly empty).
+        if mapping == FireMapping::default() {
+            session.weapon_groups.mapping.remove(&slot);
+        } else {
+            session.weapon_groups.mapping.insert(slot, mapping);
+        }
+        session.status = format!(
+            "Slot {} → group {} / {:?}",
+            slot.0,
+            mapping.group + 1,
+            mapping.trigger
+        );
+    }
     if do_apply {
-        session.status = apply_to_ship(host, state, &session.working_fit);
-        session.applied_fit = session.working_fit.clone();
+        // R45 (Bug #1): validate BEFORE committing — refuse an over-budget / invalid fit (you can
+        // over-REMOVE, e.g. drop a reactor → power.over, which install never lets you do) instead of
+        // a false "Applied ✓".
+        let v = validate_fit(&hull, &session.working_fit, &session.modules);
+        if v.valid {
+            session.status =
+                apply_to_ship(host, state, &session.working_fit, &session.weapon_groups);
+            session.applied_fit = session.working_fit.clone();
+        } else {
+            let over = if v.usage.power.over {
+                "power"
+            } else if v.usage.cpu.over {
+                "CPU"
+            } else if v.usage.mass.over {
+                "mass"
+            } else {
+                ""
+            };
+            session.status = if over.is_empty() {
+                "Can't apply — invalid fit".to_string()
+            } else {
+                format!("Can't apply — over budget: {over}")
+            };
+        }
     }
     if do_close {
         next_state.set(FittingScreenState::Flying);
     }
 }
 
-/// R44 — commit the working fit to the live player ship (the R43 path): resolve the ship via the wire
-/// id, write the `Fit` (→ `recompute_ship_stats_system` re-derives next tick). Returns a status.
+/// R44/R45 — commit the working fit to the live player ship (the R43 path): resolve the ship via the
+/// wire id, write the `Fit` (→ `recompute_ship_stats_system` re-derives next tick) **and** the
+/// `WeaponGroups` (read by `weapon_fire_system` to gate each weapon by group/trigger). Returns a status.
 fn apply_to_ship(
     host: Option<NonSendMut<LoopbackHost>>,
     state: Option<NonSend<NetClientState>>,
     fit: &Fit,
+    groups: &WeaponGroups,
 ) -> String {
     let (Some(mut host), Some(state)) = (host, state) else {
         return "No embedded server to apply to".to_string();
@@ -263,10 +317,11 @@ fn apply_to_ship(
         return "No player ship to apply to".to_string();
     };
     let fit = fit.clone();
+    let groups = groups.clone();
     let world = host.server.world_mut();
     match world.get_entity_mut(ship) {
         Ok(mut e) => {
-            e.insert(fit);
+            e.insert((fit, groups));
             "Applied to ship ✓".to_string()
         }
         Err(_) => "Player ship entity missing".to_string(),
@@ -284,6 +339,7 @@ fn draw_ship(
     hull: &Hull,
     fit: &Fit,
     modules: &ModuleCatalog,
+    groups: &WeaponGroups,
     selected: Option<SlotId>,
     select: &mut Option<SlotId>,
 ) {
@@ -296,11 +352,27 @@ fn draw_ship(
                     let coord = (col, row);
                     if let Some(slot) = hull.slots.iter().find(|s| s.coord == coord) {
                         let installed = fit.assignments.get(&slot.id).and_then(|m| modules.get(*m));
-                        let label = installed
-                            .map(|m| short(&m.name))
-                            .unwrap_or_else(|| type_initial(slot.slot_type).to_string());
+                        // R45 — a weapon slot holding a weapon shows its FIRE GROUP digit (1-6) so the
+                        // silhouette reads as a fire-group map at a glance; its trigger tints it (Off =
+                        // dim grey, Secondary = blue). Other slots keep the module's short name.
+                        let map = groups.for_slot(slot.id);
+                        let is_weapon =
+                            slot.slot_type == HardpointType::Weapon && installed.is_some();
+                        let label = if is_weapon {
+                            (map.group + 1).to_string()
+                        } else {
+                            installed
+                                .map(|m| short(&m.name))
+                                .unwrap_or_else(|| type_initial(slot.slot_type).to_string())
+                        };
                         let fill = if selected == Some(slot.id) {
                             egui::Color32::from_rgb(240, 220, 80)
+                        } else if is_weapon {
+                            match map.trigger {
+                                Trigger::Primary => egui::Color32::from_rgb(210, 120, 70),
+                                Trigger::Secondary => egui::Color32::from_rgb(80, 140, 210),
+                                Trigger::Off => egui::Color32::from_rgb(90, 90, 95),
+                            }
                         } else {
                             slot_color(slot.slot_type)
                         };
@@ -309,17 +381,22 @@ fn draw_ship(
                                 [CELL, CELL],
                                 egui::Button::new(
                                     egui::RichText::new(label)
-                                        .size(8.0)
+                                        .size(if is_weapon { 10.0 } else { 8.0 })
                                         .color(egui::Color32::BLACK),
                                 )
                                 .fill(fill),
                             )
                             .on_hover_text(format!(
-                                "{:?} slot {} ({:?}) — {}",
+                                "{:?} slot {} ({:?}) — {}{}",
                                 slot.slot_type,
                                 slot.id.0,
                                 slot.size,
                                 installed.map(|m| m.name.as_str()).unwrap_or("empty"),
+                                if is_weapon {
+                                    format!("  [group {} / {:?}]", map.group + 1, map.trigger)
+                                } else {
+                                    String::new()
+                                },
                             ));
                         if resp.clicked() {
                             *select = Some(slot.id);
@@ -348,9 +425,11 @@ fn slot_panel(
     fit: &Fit,
     modules: &ModuleCatalog,
     inventory: &Inventory,
+    groups: &WeaponGroups,
     selected: Option<SlotId>,
     to_install: &mut Option<(SlotId, ModuleId)>,
     to_remove: &mut Option<SlotId>,
+    to_assign: &mut Option<(SlotId, FireMapping)>,
 ) {
     let Some(slot_id) = selected else {
         ui.label("Click a slot on the ship to fit a module.");
@@ -363,7 +442,8 @@ fn slot_panel(
         "Slot {} — {:?} ({:?})",
         slot.id.0, slot.slot_type, slot.size
     ));
-    if let Some(m) = fit.assignments.get(&slot_id).and_then(|m| modules.get(*m)) {
+    let installed = fit.assignments.get(&slot_id).and_then(|m| modules.get(*m));
+    if let Some(m) = installed {
         ui.horizontal(|ui| {
             ui.label(format!("Installed: {}", m.name));
             if ui.button("Remove").clicked() {
@@ -372,6 +452,47 @@ fn slot_panel(
         });
     } else {
         ui.label("Empty");
+    }
+    // R45 — a weapon slot with a weapon installed gets a FIRE-GROUP editor: a group (1-6) it belongs
+    // to + the trigger that fires it. In combat, number keys 1-6 select the active group; Space fires
+    // its Primary weapons, Ctrl its Secondary. Off = assigned but never fires.
+    if slot.slot_type == HardpointType::Weapon && installed.is_some() {
+        ui.separator();
+        ui.label("Fire group");
+        let map = groups.for_slot(slot_id);
+        ui.horizontal(|ui| {
+            for g in 0u8..6 {
+                if ui
+                    .selectable_label(map.group == g, format!("{}", g + 1))
+                    .clicked()
+                {
+                    *to_assign = Some((
+                        slot_id,
+                        FireMapping {
+                            group: g,
+                            trigger: map.trigger,
+                        },
+                    ));
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            for (label, trig) in [
+                ("Primary", Trigger::Primary),
+                ("Secondary", Trigger::Secondary),
+                ("Off", Trigger::Off),
+            ] {
+                if ui.selectable_label(map.trigger == trig, label).clicked() {
+                    *to_assign = Some((
+                        slot_id,
+                        FireMapping {
+                            group: map.group,
+                            trigger: trig,
+                        },
+                    ));
+                }
+            }
+        });
     }
     ui.separator();
     ui.label("Compatible modules (inventory):");

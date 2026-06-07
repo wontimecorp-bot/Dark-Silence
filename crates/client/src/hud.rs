@@ -7,9 +7,9 @@
 //! embedded server world like the dev panel.
 
 use bevy::prelude::*;
-use sim::components::{Energy, FlightAssist, Ship, Velocity};
+use sim::components::{Energy, FlightAssist, Ship, Trigger, Velocity, WeaponGroups};
 use sim::damage::HitKind;
-use sim::{HitFeedback, RefinedResources};
+use sim::{HitFeedback, RefinedResources, ShipIntent};
 
 use crate::fonts::{FontAssets, IconAssets};
 use crate::hud_bars::HudLayout;
@@ -200,6 +200,107 @@ pub fn setup_hud(mut commands: Commands, fonts: Res<FontAssets>) {
                 TextColor(HUD_BLUE),
             ));
         });
+}
+
+/// Marker for the active fire-group readout (top-left, below SPD).
+#[derive(Component)]
+pub struct FireGroupText;
+
+/// R45 — the active fire-group tint (cyan; distinct from the blue SPD/Energy lines).
+const FIREGROUP_CYAN: Color = Color::srgb(0.55, 0.95, 0.95);
+
+/// Spawn the **active fire-group** readout (top-left, under SPD): `GRP 1  ▶2 ▷1` — the active group
+/// (the number keys 1-6 select) + how many of its weapons fire on the Primary (Space) vs Secondary
+/// (Ctrl) trigger. Blank on any ship without weapons (unfitted / Sandbox / destroyed).
+pub fn setup_firegroup_hud(mut commands: Commands, fonts: Res<FontAssets>) {
+    // Multi-font line: "GRP "(label) <group>(mono) "  ▶<p> ▷<s>"(label).
+    commands
+        .spawn((
+            Text::new("GRP "), // span 0: label
+            TextFont {
+                font: fonts.label.clone(),
+                font_size: 16.0,
+                ..default()
+            },
+            TextColor(FIREGROUP_CYAN),
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(34.0),
+                left: Val::Px(10.0),
+                ..default()
+            },
+            FireGroupText,
+        ))
+        .with_children(|p| {
+            p.spawn((
+                TextSpan::new("1"), // 1: active group digit (mono, tabular)
+                TextFont {
+                    font: fonts.mono.clone(),
+                    font_size: 16.0,
+                    ..default()
+                },
+                TextColor(FIREGROUP_CYAN),
+            ));
+            p.spawn((
+                TextSpan::new("  ▶0 ▷0"), // 2: primary/secondary weapon counts (label)
+                TextFont {
+                    font: fonts.label.clone(),
+                    font_size: 16.0,
+                    ..default()
+                },
+                TextColor(FIREGROUP_CYAN),
+            ));
+        });
+}
+
+/// Drive the [`FireGroupText`] readout each frame from the live player ship's intent + weapons +
+/// group assignment (read from the embedded server world, like the Energy readout).
+pub fn update_firegroup_hud(
+    host: Option<NonSend<LoopbackHost>>,
+    net: Option<NonSend<NetClientState>>,
+    roots: Query<Entity, With<FireGroupText>>,
+    mut writer: TextUiWriter,
+) {
+    let Ok(e) = roots.single() else {
+        return;
+    };
+    // Resolve the local ship's (active group, primary count, secondary count). None until fitted.
+    let readout = match (host.as_ref(), net.as_ref()) {
+        (Some(host), Some(net)) => host.server.ship_entity_for(net.local_id).and_then(|ship| {
+            let w = host.server.world();
+            let weapons = w.get::<sim::fitting::ShipWeapons>(ship)?;
+            let active = w
+                .get::<ShipIntent>(ship)
+                .map(|i| i.active_group)
+                .unwrap_or(0);
+            let groups = w.get::<WeaponGroups>(ship).cloned().unwrap_or_default();
+            let (mut prim, mut sec) = (0u32, 0u32);
+            for (slot, _) in &weapons.weapons {
+                let m = groups.for_slot(*slot);
+                if m.group == active {
+                    match m.trigger {
+                        Trigger::Primary => prim += 1,
+                        Trigger::Secondary => sec += 1,
+                        Trigger::Off => {}
+                    }
+                }
+            }
+            Some((active, prim, sec))
+        }),
+        _ => None,
+    };
+    match readout {
+        Some((active, prim, sec)) => {
+            *writer.text(e, 0) = "GRP ".to_string();
+            *writer.text(e, 1) = format!("{}", active + 1);
+            *writer.text(e, 2) = format!("  ▶{prim} ▷{sec}");
+        }
+        None => {
+            for i in 0..3 {
+                *writer.text(e, i) = String::new();
+            }
+        }
+    }
 }
 
 /// Spawn the **Energy numeric + net-rate** text readout (the Energy BAR itself is a camera-anchored

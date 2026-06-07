@@ -129,7 +129,7 @@ pub struct Disconnect {
 /// A single step's pilot intent, quantized for the wire. The networked form of
 /// [`sim::ShipIntent`]: analog axes are quantized to `-1..=1` (`i8` of −1/0/+1),
 /// the two flags stay boolean. Convert with [`From`]/[`Into`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub struct QuantizedIntent {
     /// Forward (+1) / reverse (−1) thrust, quantized to −1/0/+1.
     pub forward: i8,
@@ -137,8 +137,12 @@ pub struct QuantizedIntent {
     pub strafe: i8,
     /// Turn left (+1) / right (−1), quantized to −1/0/+1.
     pub turn: i8,
-    /// Fire this step.
-    pub fire: bool,
+    /// R45 — hold PRIMARY fire this step (the active group's Primary-trigger weapons).
+    pub fire_primary: bool,
+    /// R45 — hold SECONDARY fire this step (the active group's Secondary-trigger weapons).
+    pub fire_secondary: bool,
+    /// R45 — the active fire group (0-indexed; `0` = group 1 … `5` = group 6).
+    pub active_group: u8,
     /// Toggle flight-assist this step.
     pub toggle_assist: bool,
     /// Phase F — hold the afterburner (boost) this step.
@@ -162,7 +166,9 @@ impl From<ShipIntent> for QuantizedIntent {
             forward: quantize_axis(intent.forward),
             strafe: quantize_axis(intent.strafe),
             turn: quantize_axis(intent.turn),
-            fire: intent.fire,
+            fire_primary: intent.fire_primary,
+            fire_secondary: intent.fire_secondary,
+            active_group: intent.active_group,
             toggle_assist: intent.toggle_assist,
             afterburner: intent.afterburner,
         }
@@ -175,7 +181,10 @@ impl From<QuantizedIntent> for ShipIntent {
             forward: q.forward as f32,
             strafe: q.strafe as f32,
             turn: q.turn as f32,
-            fire: q.fire,
+            fire_primary: q.fire_primary,
+            fire_secondary: q.fire_secondary,
+            // Defensive: a malformed client can't index past the 6 groups (gating is by equality).
+            active_group: q.active_group,
             toggle_assist: q.toggle_assist,
             afterburner: q.afterburner,
         }

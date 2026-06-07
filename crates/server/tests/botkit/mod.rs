@@ -213,14 +213,7 @@ impl InputScript {
 
     /// The neutral (no-op) intent — coast in place.
     pub fn neutral_intent() -> QuantizedIntent {
-        QuantizedIntent {
-            forward: 0,
-            strafe: 0,
-            turn: 0,
-            fire: false,
-            toggle_assist: false,
-            afterburner: false,
-        }
+        QuantizedIntent::default()
     }
 
     /// Take the next scripted intent, advancing (and wrapping) the cursor.
@@ -722,11 +715,7 @@ fn bot_addr(index: u64) -> SocketAddr {
 pub fn forward_intent() -> QuantizedIntent {
     QuantizedIntent {
         forward: 1,
-        strafe: 0,
-        turn: 0,
-        fire: false,
-        toggle_assist: false,
-        afterburner: false,
+        ..Default::default()
     }
 }
 

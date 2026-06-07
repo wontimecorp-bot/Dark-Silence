@@ -76,14 +76,7 @@ fn two_clients_share_one_world_and_see_each_others_ships() {
     );
 
     // --- Each client sends an input so the validate-and-apply path runs. -----
-    let neutral = QuantizedIntent {
-        forward: 0,
-        strafe: 0,
-        turn: 0,
-        fire: false,
-        toggle_assist: false,
-        afterburner: false,
-    };
+    let neutral = QuantizedIntent::default();
     client.send_unreliable(
         conn_a,
         &Message::ClientInput(ClientInput::new(1, 0, vec![neutral])),
@@ -163,19 +156,11 @@ fn two_clients_with_different_inputs_drive_their_ships_independently() {
     // origin facing heading 0, so opposite thrust must drive them apart.
     let forward = QuantizedIntent {
         forward: 1,
-        strafe: 0,
-        turn: 0,
-        fire: false,
-        toggle_assist: false,
-        afterburner: false,
+        ..Default::default()
     };
     let reverse = QuantizedIntent {
         forward: -1,
-        strafe: 0,
-        turn: 0,
-        fire: false,
-        toggle_assist: false,
-        afterburner: false,
+        ..Default::default()
     };
 
     // Re-send the per-step input each tick (inputs are consumed per step) and
