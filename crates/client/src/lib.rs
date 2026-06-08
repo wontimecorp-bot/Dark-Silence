@@ -32,6 +32,7 @@ pub mod fitting_ui;
 pub mod fonts;
 pub mod hud;
 pub mod hud_bars;
+pub mod hull_shader;
 pub mod input;
 pub mod interpolation;
 pub mod module_bars;
@@ -40,12 +41,14 @@ pub mod prediction;
 pub mod radar;
 pub mod render_sync;
 pub mod scene;
+pub mod ship_visuals;
 pub mod starfield;
 pub mod tuning_io;
 
 use bevy::prelude::*;
 use fitting_ui::{FittingScreenState, FittingUiPlugin};
 use net::NetClientPlugin;
+pub use ship_visuals::ShipVisualTuning;
 use sim::{FixedDt, HitFeedback, Tuning};
 
 /// The Bevy `FixedUpdate` cadence the embedded-server lifecycle runs at. It MUST
@@ -103,6 +106,8 @@ pub fn run() -> AppExit {
         .add_plugins(bevy_egui::EguiPlugin::default())
         // Refinement 25: the procedural starfield background material (custom WGSL shader).
         .add_plugins(MaterialPlugin::<starfield::StarfieldMaterial>::default())
+        // R48/R49: the cinematic hull material (ExtendedMaterial — fresnel rim + panels + grime).
+        .add_plugins(MaterialPlugin::<hull_shader::HullMaterial>::default())
         // Fixed-step clock the embedded-server lifecycle runs on, and the matching
         // dt the shared sim reads (the embedded server uses its announced rate).
         .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
@@ -122,6 +127,8 @@ pub fn run() -> AppExit {
         // Refinement 25/27/39: the starfield tuning loads from `render_tuning.ron` (the dev override).
         .insert_resource(tuning_io::load_hud_layout())
         .insert_resource(dev.starfield)
+        // R49: live-tunable ship visuals (glow / flame / nav / accent / fill / bloom / hull shader).
+        .insert_resource(dev.ship_visual)
         // Refinement 21/22: load the shared HUD fonts (label + mono) + icon images into
         // `FontAssets`/`IconAssets` BEFORE the Startup HUD setups, which clone the handles.
         .add_systems(PreStartup, fonts::load_hud_assets)
@@ -191,6 +198,9 @@ pub fn run() -> AppExit {
                 module_bars::apply_module_bar_layout,
                 // Refinement 25: feed camera uniforms + live tuning to the starfield + bloom.
                 starfield::update_starfield.after(camera::follow_camera),
+                // R49: throttle-reactive per-thruster engine flames + live ship-visual tuning apply.
+                net::update_engine_flames,
+                ship_visuals::apply_ship_visuals,
             ),
         );
 

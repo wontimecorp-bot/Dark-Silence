@@ -67,8 +67,8 @@ use sim::{FactionSpawns, FixedDt, HitFeedback, ShipIntent};
 
 use crate::input::{build_client_input, InputSequencer};
 use crate::render_sync::{
-    interpolate_transforms, EngineExhaust, EngineFlame, HullTile, RemoteEntity, RenderInterp,
-    ShieldBubble, ShieldChild, ShipHull,
+    interpolate_transforms, EngineFlame, HullTile, RemoteEntity, RenderInterp, ShieldBubble,
+    ShieldChild, ShipHull, ShipThrottle,
 };
 use crate::scene::{
     build_hull_mesh, build_hull_mesh_contour, build_module_overlay_mesh, build_ship_fixtures,
@@ -171,6 +171,10 @@ pub const SHIP_VOXEL_LOD_DIST: f32 = 60.0;
 /// scaled to the footprint (so it reads at the right size), where a ship just uses `ship_mesh` at
 /// scale ONE. ~7.0 sits between the corvette's ~4.8 u and the transport's ~10.2 u.
 pub const STRUCTURE_LOD_FOOTPRINT: f32 = 7.0;
+
+/// R49 — minimum hull footprint (`max(grid_dims) · CELL_SIZE`) for a ship to carry nav/running lights.
+/// Excludes the fighter (~3.5) + corvette (~4.8) so only bigger ships get them. Tunable.
+pub const NAV_MIN_FOOTPRINT: f32 = 6.0;
 
 /// Runtime hull-render style toggle (Fix #11 M2), flipped in-game by
 /// [`crate::input::toggle_hull_render`] (the `V` key). `false` (default) = the blocky per-cell
@@ -516,7 +520,6 @@ fn capture_render_state(
     mut vel_q: Query<&mut Velocity, With<LocalShip>>,
     shield_child_q: Query<&ShieldChild>,
     mut bubble_q: Query<(&mut Visibility, &mut Transform)>,
-    exhaust_q: Query<&EngineExhaust>,
     mut ship_hull_q: Query<&mut ShipHull>,
     hull_mode: Res<HullRenderMode>,
     module_mode: Res<ModuleColorMode>,
@@ -609,17 +612,10 @@ fn capture_render_state(
                 e.heading,
                 e.grid_dims,
             );
-            update_engine_exhaust(
-                &mut commands,
-                &assets,
-                &exhaust_q,
-                &mut bubble_q,
-                bevy_entity,
-                e.kind,
-                e.vel,
-                e.heading,
-                e.grid_dims,
-            );
+            // R49 — stamp the ship's throttle so `update_engine_flames` can size its exhaust flames.
+            if let Ok(mut ec) = commands.get_entity(bevy_entity) {
+                ec.insert(ShipThrottle(e.throttle));
+            }
         } else {
             // Newly-appeared entity (never the local ship — it is pre-registered):
             // spawn a rendered remote with the right look. Its interp `prev` is
@@ -655,17 +651,9 @@ fn capture_render_state(
                 e.heading,
                 e.grid_dims,
             );
-            update_engine_exhaust(
-                &mut commands,
-                &assets,
-                &exhaust_q,
-                &mut bubble_q,
-                spawned,
-                e.kind,
-                e.vel,
-                e.heading,
-                e.grid_dims,
-            );
+            if let Ok(mut ec) = commands.get_entity(spawned) {
+                ec.insert(ShipThrottle(e.throttle));
+            }
             render_map.map.insert(e.id, spawned);
         }
     }
@@ -1005,13 +993,34 @@ fn sync_ship_hull(
                 };
                 let mesh = meshes.add(raw_mesh);
 
-                let child = commands
-                    .spawn((
-                        Mesh3d(mesh.clone()),
-                        MeshMaterial3d(hull_mat.clone()),
-                        Transform::IDENTITY,
-                    ))
-                    .id();
+                // R48/R49 — the COMBAT look (a live ship, plain voxel mesh) wears the cinematic
+                // ExtendedMaterial hull (fresnel rim + panels + grime), faction-tinted. Wrecks, the
+                // module-colour inspection view, and the contour mesh keep plain StandardMaterial. The
+                // child is fully despawned+rebuilt (never component-swapped), so the differing material
+                // component types never collide on one entity.
+                let use_ext = !is_wreck && !module_color && !contour;
+                let child = if use_ext {
+                    let ext = match e.faction {
+                        1 => assets.hull_ext_red.clone(),
+                        2 => assets.hull_ext_blue.clone(),
+                        _ => assets.hull_ext_neutral.clone(),
+                    };
+                    commands
+                        .spawn((
+                            Mesh3d(mesh.clone()),
+                            MeshMaterial3d(ext),
+                            Transform::IDENTITY,
+                        ))
+                        .id()
+                } else {
+                    commands
+                        .spawn((
+                            Mesh3d(mesh.clone()),
+                            MeshMaterial3d(hull_mat.clone()),
+                            Transform::IDENTITY,
+                        ))
+                        .id()
+                };
                 if let Ok(mut ec) = commands.get_entity(parent) {
                     ec.add_child(child);
                 }
@@ -1049,7 +1058,21 @@ fn sync_ship_hull(
                 // the matching shared material; the Accent role is tinted by the ship's faction. A
                 // wreck stays bare debris; the module-colour debug view keeps the raw cell look.
                 if !is_wreck && !module_color {
-                    for (raw, role) in build_ship_fixtures(&cell_tuples, CELL_SIZE, center) {
+                    // R49 — nav/running lights only on BIGGER ships (transports etc.), not nimble
+                    // fighters: the player fighter (footprint ~3.5) + corvette (~4.8) are excluded;
+                    // `NAV_MIN_FOOTPRINT` (~6.0) is the cut. (Transports render via the chunked path
+                    // and don't get fixtures yet — a follow-up.)
+                    let nav_ok = footprint >= NAV_MIN_FOOTPRINT;
+                    let (fixtures, thrusters) =
+                        build_ship_fixtures(&cell_tuples, CELL_SIZE, center);
+                    for (raw, role) in fixtures {
+                        if matches!(
+                            role,
+                            FixtureRole::NavRed | FixtureRole::NavGreen | FixtureRole::NavWhite
+                        ) && !nav_ok
+                        {
+                            continue;
+                        }
                         let mat = match role {
                             FixtureRole::Metal => assets.fixture_metal_material.clone(),
                             FixtureRole::Glow => assets.fixture_glow_material.clone(),
@@ -1072,6 +1095,24 @@ fn sync_ship_hull(
                         let h = current.hull_mut();
                         h.fixture_children.push(child);
                         h.fixture_meshes.push(mh);
+                    }
+                    // R49 — one throttle-reactive engine FLAME child per thruster (shared cone mesh, so
+                    // NOT pushed to `fixture_meshes`; hidden until `update_engine_flames` shows it). It
+                    // rides in `fixture_children` so a carved-off thruster drops its flame on rebuild.
+                    for origin in thrusters {
+                        let flame = commands
+                            .spawn((
+                                EngineFlame { origin },
+                                Mesh3d(assets.engine_flame_mesh.clone()),
+                                MeshMaterial3d(assets.engine_flame_material.clone()),
+                                Transform::from_translation(origin),
+                                Visibility::Hidden,
+                            ))
+                            .id();
+                        if let Ok(mut ec) = commands.get_entity(parent) {
+                            ec.add_child(flame);
+                        }
+                        current.hull_mut().fixture_children.push(flame);
                     }
                 }
             }
@@ -1582,73 +1623,33 @@ fn update_shield_bubble(
     }
 }
 
-/// Forward speed (world u/s) at which the engine exhaust reaches full length (R48). Tunable.
-const EXHAUST_MAX_SPEED: f32 = 60.0;
-
-/// R48 — show + scale a ship's throttle-reactive engine EXHAUST: a rear-centre additive flame cone,
-/// lazily spawned as a child (mirrors [`update_shield_bubble`] — shared mesh/material, per-frame child
-/// transform). The flame appears + lengthens with FORWARD speed and hides when slow/reversing. One per
-/// LIVE ship (not projectiles / debris / plain targets).
-#[allow(clippy::too_many_arguments)]
-fn update_engine_exhaust(
-    commands: &mut Commands,
-    assets: &RenderAssets,
-    exhaust_q: &Query<&EngineExhaust>,
-    tf_vis_q: &mut Query<(&mut Visibility, &mut Transform)>,
-    parent: Entity,
-    kind: EntityKind,
-    vel: Vec2,
-    heading: f32,
-    grid_dims: (u16, u16),
+/// R49 — drive every per-thruster engine FLAME each frame from its parent ship's [`ShipThrottle`]: the
+/// flame (a shared additive cone child, anchored at the thruster's nozzle-mouth `origin`) is oriented
+/// aft (`-X`, base at the nozzle) and scaled in length by throttle, hidden when idle. Replaces the old
+/// single rear-centre velocity-driven exhaust. Tunable scale via [`ShipVisualTuning`].
+pub fn update_engine_flames(
+    tuning: Res<crate::ShipVisualTuning>,
+    ships: Query<&ShipThrottle>,
+    mut flames: Query<(&EngineFlame, &ChildOf, &mut Transform, &mut Visibility)>,
 ) {
-    let is_ship = kind == EntityKind::Ship;
-    let fwd = Vec2::from_angle(heading);
-    let throttle = if is_ship {
-        (vel.dot(fwd) / EXHAUST_MAX_SPEED).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let show = is_ship && throttle > 0.03;
-
-    // Rear-centre in the ship-LOCAL frame (the child inherits the ship transform). Aft = the row-0
-    // edge; the cone (Bevy `Cone` axis +Y) is rotated +Y→-X so it trails aft, base at the nozzle.
-    let rear_x = (0.5 - grid_dims.1 as f32 * 0.5) * CELL_SIZE;
-    let length = CELL_SIZE * (1.0 + 3.5 * throttle);
-    let width = CELL_SIZE * 0.7;
-    let tf = Transform::from_xyz(rear_x - length * 0.5, 0.0, CELL_SIZE * 0.18)
-        .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2))
-        .with_scale(Vec3::new(width, length, width));
-
-    match exhaust_q.get(parent) {
-        Ok(ex) => {
-            if let Ok((mut vis, mut t)) = tf_vis_q.get_mut(ex.flame) {
-                *vis = if show {
-                    Visibility::Inherited
-                } else {
-                    Visibility::Hidden
-                };
-                *t = tf;
-            }
+    for (flame, parent, mut tf, mut vis) in &mut flames {
+        let throttle = ships.get(parent.parent()).map(|t| t.0).unwrap_or(0.0);
+        let show = throttle > 0.03;
+        *vis = if show {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if !show {
+            continue;
         }
-        Err(_) => {
-            let flame = commands
-                .spawn((
-                    EngineFlame,
-                    Mesh3d(assets.engine_flame_mesh.clone()),
-                    MeshMaterial3d(assets.engine_flame_material.clone()),
-                    tf,
-                    if show {
-                        Visibility::Inherited
-                    } else {
-                        Visibility::Hidden
-                    },
-                ))
-                .id();
-            if let Ok(mut ec) = commands.get_entity(parent) {
-                ec.add_child(flame);
-                ec.insert(EngineExhaust { flame });
-            }
-        }
+        // Length grows with throttle; the cone (Bevy `Cone` axis +Y) is rotated +Y→-X so it trails aft,
+        // base at the nozzle `origin`, tip `length` further aft.
+        let length = CELL_SIZE * tuning.flame_length * (0.35 + throttle);
+        let width = CELL_SIZE * tuning.flame_width;
+        *tf = Transform::from_translation(flame.origin - Vec3::new(length * 0.5, 0.0, 0.0))
+            .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2))
+            .with_scale(Vec3::new(width, length, width));
     }
 }
 

@@ -14,7 +14,10 @@ struct HullSettings {
     faction_color: vec4<f32>,   // rgb rim tint, a rim strength
     params: vec4<f32>,          // x panel spacing, y line width, z grime, w rim power
 };
-@group(2) @binding(100) var<uniform> hull: HullSettings;
+// R49 — the forward-pass MATERIAL bind group is index 3 in Bevy 0.18 (group 2 is the prepass); the
+// `#{MATERIAL_BIND_GROUP}` preprocessor placeholder substitutes the correct index. Hardcoding `2` was
+// the R48 crash ("binding 100 not available in the pipeline layout").
+@group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> hull: HullSettings;
 
 fn hash21(p: vec2<f32>) -> f32 {
     let h = dot(p, vec2<f32>(127.1, 311.7));

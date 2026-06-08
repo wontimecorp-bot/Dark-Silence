@@ -26,6 +26,11 @@ use sim::ShipIntent;
 /// Render assets reused for the entities [`crate::net::capture_render_state`]
 /// spawns from the server world: projectiles, **ships**, and per-kind **targets**,
 /// keyed on [`protocol::EntityKind`] (+ the target sub-kind in `flags`).
+/// R49 — marker on the cool fill `DirectionalLight` so [`crate::ship_visuals::apply_ship_visuals`] can
+/// live-tune its illuminance.
+#[derive(Component)]
+pub struct FillLight;
+
 #[derive(Resource)]
 pub struct RenderAssets {
     pub projectile_mesh: Handle<Mesh>,
@@ -130,6 +135,12 @@ pub struct RenderAssets {
     /// with speed). The per-ship engine PointLight uses no shared asset (its intensity is per-entity).
     pub engine_flame_mesh: Handle<Mesh>,
     pub engine_flame_material: Handle<StandardMaterial>,
+    /// R48/R49 — the cinematic hull material (ExtendedMaterial: fresnel rim + panels + grime) per
+    /// faction (neutral / red / blue). Used for the COMBAT hull look in `sync_ship_hull`; one handle
+    /// per faction (not per cell-set) so it doesn't churn on carve. Live-tuned by `apply_ship_visuals`.
+    pub hull_ext_neutral: Handle<crate::hull_shader::HullMaterial>,
+    pub hull_ext_red: Handle<crate::hull_shader::HullMaterial>,
+    pub hull_ext_blue: Handle<crate::hull_shader::HullMaterial>,
 }
 
 /// Hull cell size, in sim units — the side length of one hull cell as laid out in the
@@ -746,14 +757,15 @@ pub enum FixtureRole {
 }
 
 /// Build the hard-surface fixture meshes for a fitted ship from its live cell set, each tagged with the
-/// [`FixtureRole`] (= shared material) the caller spawns it with. Empty roles are omitted. Cell
-/// convention matches [`build_hull_mesh_with`]: row→`+X` forward, col→`+Y` lateral, around `center`.
-/// Intended for SMALL ships (the single-mesh near path) — NOT the chunked big-structure path.
+/// [`FixtureRole`] (= shared material) the caller spawns it with, plus the per-THRUSTER flame origins
+/// (local nozzle-mouth positions) the caller spawns throttle-reactive engine flames at. Empty roles
+/// are omitted. Cell convention matches [`build_hull_mesh_with`]: row→`+X` forward, col→`+Y` lateral,
+/// around `center`. Intended for SMALL ships (the single-mesh near path) — NOT the chunked path.
 pub fn build_ship_fixtures(
     cells: &[(u16, u16, u8)],
     cell_size: f32,
     center: Vec2,
-) -> Vec<(Mesh, FixtureRole)> {
+) -> (Vec<(Mesh, FixtureRole)>, Vec<Vec3>) {
     let top = HULL_THICKNESS;
     let s = cell_size;
     let mut metal = MeshBuf::default();
@@ -762,6 +774,7 @@ pub fn build_ship_fixtures(
     let mut nav_green = MeshBuf::default();
     let mut nav_white = MeshBuf::default();
     let mut accent = MeshBuf::default();
+    let mut thrusters: Vec<Vec3> = Vec::new();
 
     let world = |col: u16, row: u16| -> (f32, f32) {
         (
@@ -829,11 +842,9 @@ pub fn build_ship_fixtures(
                 top * 0.40,
                 top * 0.95,
             ),
-            // Thruster → aft nozzle housing (metal) + emissive nozzle core + a longer aft exhaust
-            // plume (glow), at the rear (-X). R48: the glow now sits PROUD of the hull (z above
-            // `top` = HULL_THICKNESS) — previously it was buried inside the housing/below the hull
-            // top, so the top-down camera couldn't see it (the reported "no engine glow" bug). The
-            // dynamic throttle-reactive flame is a separate rear-centre child (see `update_engine_exhaust`).
+            // Thruster → aft nozzle housing (metal) + emissive nozzle core (glow), at the rear (-X).
+            // R49: the static plume is GONE — a per-thruster throttle-reactive FLAME (see
+            // `update_engine_flames`) is spawned at this thruster's nozzle mouth instead; record it.
             2 => {
                 push_box(
                     &mut metal,
@@ -854,17 +865,8 @@ pub fn build_ship_fixtures(
                     top * 1.05,
                     top * 1.50,
                 );
-                // Aft exhaust plume — a slimmer, longer glow stub trailing behind the nozzle, also
-                // proud of the hull.
-                push_box(
-                    &mut glow,
-                    cx - s * 1.55,
-                    cx - s * 0.84,
-                    cy - s * 0.15,
-                    cy + s * 0.15,
-                    top * 1.10,
-                    top * 1.40,
-                );
+                // The flame's local origin: the nozzle mouth (rear of the housing, engine height).
+                thrusters.push(Vec3::new(cx - s * 0.72, cy, top * 1.25));
             }
             // Reactor → a glowing top vent.
             1 => push_box(
@@ -934,8 +936,10 @@ pub fn build_ship_fixtures(
         );
     }
 
-    // Faction accent strip down the spine: a thin emissive line on every centre-column cell.
-    let center_col = center.x.round() as i32;
+    // Faction accent strip down the spine: a thin emissive line on every centre-column cell. R49 — the
+    // true centre column is `(center.x - 0.5).round()` (e.g. a 9-wide grid has `center.x = 4.5` → col 4,
+    // the spine); the old `center.x.round()` gave 5 (off to one side — the reported "dashed line").
+    let center_col = (center.x - 0.5).round() as i32;
     for &(col, row, _) in cells {
         if col as i32 == center_col {
             let (cx, cy) = world(col, row);
@@ -990,7 +994,7 @@ pub fn build_ship_fixtures(
             out.push((m, role));
         }
     }
-    out
+    (out, thrusters)
 }
 
 // ============================================================================
@@ -1403,6 +1407,7 @@ pub fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut hull_ext: ResMut<Assets<crate::hull_shader::HullMaterial>>,
 ) {
     // Lighting: a key directional light so PBR primitives read (ambient fill is
     // attached to the camera in `camera::setup_camera`).
@@ -1413,9 +1418,12 @@ pub fn setup_scene(
         },
         Transform::from_xyz(6.0, 8.0, 20.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
-    // R48 — a dim COOL fill light from roughly the opposite side so the unlit faces of the gritty
-    // hull aren't pure black (cinematic key+fill); no shadows (it's a fill).
+    // R48/R49 — a dim COOL fill light from roughly the opposite side so the unlit faces of the gritty
+    // hull aren't pure black (cinematic key+fill); no shadows (it's a fill). Subtle top-down (you mostly
+    // see the key-lit top face) — the fresnel rim is the real edge cue. Illuminance is live-tuned by
+    // `apply_ship_visuals` via the `FillLight` marker.
     commands.spawn((
+        FillLight,
         DirectionalLight {
             illuminance: 2200.0,
             color: Color::srgb(0.55, 0.7, 1.0),
@@ -1626,6 +1634,28 @@ pub fn setup_scene(
         ..default()
     });
 
+    // R48/R49 — the cinematic hull material per faction: the base PBR metal (matching the plain hull)
+    // + the fresnel-rim/panels/grime extension, rim-tinted neutral cool / team red / team blue. The
+    // rim/panel/grime params are live-tuned each frame by `apply_ship_visuals`.
+    let make_hull_ext = |base: Color, rim: Vec4| crate::hull_shader::HullMaterial {
+        base: StandardMaterial {
+            base_color: base,
+            metallic: 0.85,
+            perceptual_roughness: 0.35,
+            ..default()
+        },
+        extension: crate::hull_shader::hull_extension(rim),
+    };
+    let hull_ext_neutral = hull_ext.add(make_hull_ext(HULL_COLOR, Vec4::new(0.35, 0.6, 1.0, 0.9)));
+    let hull_ext_red = hull_ext.add(make_hull_ext(
+        Color::srgb(0.55, 0.22, 0.20),
+        Vec4::new(1.4, 0.35, 0.30, 1.1),
+    ));
+    let hull_ext_blue = hull_ext.add(make_hull_ext(
+        Color::srgb(0.22, 0.34, 0.62),
+        Vec4::new(0.30, 0.6, 1.5, 1.1),
+    ));
+
     commands.insert_resource(RenderAssets {
         projectile_mesh,
         projectile_material,
@@ -1667,6 +1697,9 @@ pub fn setup_scene(
         accent_blue_material,
         engine_flame_mesh,
         engine_flame_material,
+        hull_ext_neutral,
+        hull_ext_red,
+        hull_ext_blue,
     });
 
     // The LOCAL player ship — spawned here deterministically so the `LocalShip`

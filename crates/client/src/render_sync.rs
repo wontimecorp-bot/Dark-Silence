@@ -86,18 +86,19 @@ pub struct ShieldChild {
 #[derive(Component, Clone, Copy, Debug)]
 pub struct ShieldBubble;
 
-/// R48 — a ship's throttle-reactive engine-exhaust tracking, on the PARENT entity. Holds the rear-
-/// centre flame child (a shared additive emissive cone) which [`crate::net::update_engine_exhaust`]
-/// lengthens + shows with forward speed. Lazily spawned once per live ship; despawned with the parent.
-#[derive(Component, Clone, Copy, Debug)]
-pub struct EngineExhaust {
-    pub flame: Entity,
-}
+/// R49 — a ship's current THROTTLE (0..1 forward thrust), set on the ship entity each frame from
+/// `RenderEntity.throttle` by [`crate::net::capture_render_state`]; read by
+/// [`crate::net::update_engine_flames`] to size each thruster's exhaust flame.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct ShipThrottle(pub f32);
 
-/// Marker for the engine-exhaust flame child (so its [`Visibility`]/[`Transform`] are driven each
-/// frame by [`crate::net::update_engine_exhaust`]).
+/// R49 — one engine-exhaust flame child, anchored at a thruster's nozzle-mouth `origin` (ship-local).
+/// [`crate::net::update_engine_flames`] orients it aft (`-X`) + scales its length by the parent ship's
+/// [`ShipThrottle`] each frame (hidden when idle). Spawned per thruster cell, freed with the fixtures.
 #[derive(Component, Clone, Copy, Debug)]
-pub struct EngineFlame;
+pub struct EngineFlame {
+    pub origin: Vec3,
+}
 
 /// Revise-B seamless hull-surface tracking on a rendered fitted ship's PARENT entity.
 ///

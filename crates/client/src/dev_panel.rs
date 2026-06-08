@@ -1248,6 +1248,8 @@ fn dev_panel_ui(
     mut hud_layout: ResMut<HudLayout>,
     // Refinement 25: CLIENT-side live starfield + bloom tuning (applied by `update_starfield`).
     mut starfield: ResMut<StarfieldTuning>,
+    // R49: CLIENT-side live ship-visual tuning (applied by `apply_ship_visuals` + `update_engine_flames`).
+    mut ship_visual: ResMut<crate::ShipVisualTuning>,
 ) {
     if !state.tuning_open && !state.stats_open {
         return;
@@ -2035,6 +2037,41 @@ fn dev_panel_ui(
                         .on_hover_text("Camera bloom strength — the glow on bright pixels across the WHOLE image (bright stars, emissive, ships). Higher = more glow; keep modest so ships stay readable against the field.");
                 });
 
+                // R49: live ship-visual tuning (glow / flame / nav / accent / fill / bloom / hull shader).
+                egui::CollapsingHeader::new("Ship visuals (client, live)").show(ui, |ui| {
+                    let sv = &mut *ship_visual;
+                    ui.label("Engine / reactor glow (bloom halo):");
+                    slider(ui, "glow intensity", &mut sv.glow_intensity, 0.0..=16.0)
+                        .on_hover_text("Emissive brightness of the engine nozzles + reactor vents (HDR → bloom). Higher = brighter halo.");
+                    slider(ui, "glow R", &mut sv.glow_color[0], 0.0..=1.0);
+                    slider(ui, "glow G", &mut sv.glow_color[1], 0.0..=1.0);
+                    slider(ui, "glow B", &mut sv.glow_color[2], 0.0..=1.0);
+                    ui.label("Engine exhaust flame (throttle-driven):");
+                    slider(ui, "flame length", &mut sv.flame_length, 0.0..=8.0)
+                        .on_hover_text("Length of each thruster's exhaust flame at full throttle (× cell size).");
+                    slider(ui, "flame width", &mut sv.flame_width, 0.1..=2.0);
+                    ui.label("Lights / accents:");
+                    slider(ui, "nav-light intensity", &mut sv.nav_intensity, 0.0..=8.0)
+                        .on_hover_text("Nav/running lights (transports etc.; fighters have none). 0 = off.");
+                    slider(ui, "accent intensity", &mut sv.accent_intensity, 0.0..=8.0)
+                        .on_hover_text("Faction-colour accent spine strip + canopy cap. 0 = off.");
+                    slider(ui, "fill light", &mut sv.fill_intensity, 0.0..=8000.0)
+                        .on_hover_text("Cool fill DirectionalLight illuminance — softly lights the hull's shadowed sides. Subtle top-down. 0 = off.");
+                    slider(ui, "ship bloom", &mut sv.bloom_intensity, 0.0..=1.0)
+                        .on_hover_text("Camera bloom (shared with the starfield's bloom slider).");
+                    ui.label("Hull shader (fresnel rim + panels + grime):");
+                    slider(ui, "rim strength", &mut sv.rim_strength, 0.0..=4.0)
+                        .on_hover_text("Faction fresnel RIM glow on the silhouette edge. 0 = off.");
+                    slider(ui, "rim power", &mut sv.rim_power, 0.5..=8.0)
+                        .on_hover_text("Rim falloff — higher = a thinner, sharper edge glow.");
+                    slider(ui, "panel scale", &mut sv.panel_scale, 0.05..=2.0)
+                        .on_hover_text("Spacing of the procedural panel-line grid (world units).");
+                    slider(ui, "panel width", &mut sv.panel_width, 0.0..=0.2)
+                        .on_hover_text("Width of the darkened panel-line grooves.");
+                    slider(ui, "grime", &mut sv.grime, 0.0..=2.0)
+                        .on_hover_text("Splotchy used-future wear/dirt across the hull.");
+                });
+
                 // Refinement 25/35/36: live starfield — ONE unified galaxy model. `layers` = depth,
                 // the spectral class table = star character, + the galaxy globals. Presets load a full
                 // look (built-in buttons + drop-in RON files); Save persists the active config.
@@ -2162,6 +2199,7 @@ fn dev_panel_ui(
                     resistance,
                     mining,
                     starfield: *starfield,
+                    ship_visual: *ship_visual,
                 };
                 state.save_status = match tuning_io::save_dev_settings(&dev) {
                     Ok(m) => m,

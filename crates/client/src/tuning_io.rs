@@ -60,6 +60,9 @@ pub struct DevSettings {
     pub resistance: ResistanceMatrix,
     pub mining: MiningTuning,
     pub starfield: StarfieldTuning,
+    /// R49 — live-tunable ship visuals (glow / flame / nav / accent / fill / bloom / hull shader).
+    #[serde(default)]
+    pub ship_visual: crate::ship_visuals::ShipVisualTuning,
 }
 
 impl Default for DevSettings {
@@ -74,6 +77,7 @@ impl Default for DevSettings {
             resistance: default_resistance_matrix(),
             mining: MiningTuning::default(),
             starfield: StarfieldTuning::default(),
+            ship_visual: crate::ship_visuals::ShipVisualTuning::default(),
         }
     }
 }

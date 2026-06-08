@@ -292,6 +292,11 @@ pub struct RenderEntity {
     /// ship, so the shot emerges glued to the gun instead of sliding sideways at spawn. `Vec2::ZERO`
     /// for every non-projectile entity (and a projectile whose owner is gone). Never on the wire.
     pub inherited_vel: Vec2,
+    /// R49 (**client-only / in-process**): a ship's THROTTLE (0..1 forward thrust), read from its
+    /// [`ShipIntent.forward`](sim::ShipIntent) at render-state time so the windowed client can size
+    /// each thruster's exhaust flame by actual throttle (not coasting velocity). `0.0` for non-ships /
+    /// ships without an intent. Never on the wire → determinism-neutral.
+    pub throttle: f32,
 }
 
 /// The [`RenderEntity::shield_frac`] of an optional [`Shields`]: `current / max`
@@ -1167,6 +1172,7 @@ impl ServerApp {
             Option<&ShieldHitFlash>,
             Option<&LastShieldHit>,
             Option<&FitLayout>,
+            Option<&sim::ShipIntent>,
         ), With<Ship>>();
         let ship_rows: Vec<(
             Entity,
@@ -1179,10 +1185,13 @@ impl ServerApp {
             Vec2,
             Vec<RenderCell>,
             (u16, u16),
+            f32,
         )> = ships
             .iter(&self.world)
-            .map(|(e, p, v, h, s, f, sf, lsh, fit)| {
+            .map(|(e, p, v, h, s, f, sf, lsh, fit, intent)| {
                 let (cells, grid_dims) = cells_of(fit, &catalog_hulls, &catalog_modules);
+                // R49: throttle = forward thrust intent (0..1), for sizing the exhaust flames.
+                let throttle = intent.map(|i| i.forward.clamp(0.0, 1.0)).unwrap_or(0.0);
                 (
                     e,
                     p.0,
@@ -1194,6 +1203,7 @@ impl ServerApp {
                     hit_dir_of(lsh),
                     cells,
                     grid_dims,
+                    throttle,
                 )
             })
             .collect();
@@ -1208,6 +1218,7 @@ impl ServerApp {
             hit_dir,
             cells,
             grid_dims,
+            throttle,
         ) in ship_rows
         {
             out.push(RenderEntity {
@@ -1223,6 +1234,7 @@ impl ServerApp {
                 hit_dir,
                 cells,
                 grid_dims,
+                throttle,
                 // A live ship uses the grid centre (no frozen anchor).
                 mesh_anchor: None,
                 faction: factions.get(&entity).copied().unwrap_or(0),
@@ -1282,6 +1294,7 @@ impl ServerApp {
                 faction: factions.get(&entity).copied().unwrap_or(0),
                 scale: render_scales.get(&entity).copied().unwrap_or(Vec3::ONE),
                 inherited_vel,
+                throttle: 0.0,
             });
         }
 
@@ -1412,6 +1425,8 @@ impl ServerApp {
                 faction: factions.get(&entity).copied().unwrap_or(0),
                 scale: render_scales.get(&entity).copied().unwrap_or(Vec3::ONE),
                 inherited_vel: Vec2::ZERO,
+                // Fitted enemies/targets carry no `ShipIntent`, so no exhaust flame.
+                throttle: 0.0,
             });
         }
 
@@ -1501,6 +1516,7 @@ impl ServerApp {
                 faction: factions.get(&entity).copied().unwrap_or(0),
                 scale: render_scales.get(&entity).copied().unwrap_or(Vec3::ONE),
                 inherited_vel: Vec2::ZERO,
+                throttle: 0.0,
             });
         }
 
