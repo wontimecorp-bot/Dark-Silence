@@ -71,7 +71,8 @@ use crate::render_sync::{
     ShipHull,
 };
 use crate::scene::{
-    build_hull_mesh, build_hull_mesh_contour, build_module_overlay_mesh, RenderAssets, CELL_SIZE,
+    build_hull_mesh, build_hull_mesh_contour, build_module_overlay_mesh, build_ship_fixtures,
+    RenderAssets, CELL_SIZE,
 };
 
 /// The loopback solo-play host: the embedded authoritative [`ServerApp`] plus the
@@ -961,6 +962,9 @@ fn sync_ship_hull(
                         ec.despawn();
                     }
                 }
+                // R47 — the hard-surface fixtures rebuild with the hull (same cells/style triggers),
+                // so tear the old ones down first.
+                free_fixtures(commands, meshes, current.hull_mut());
 
                 // Merge the present cells into ONE seamless hull surface + add it to the mesh store,
                 // centred on `center` (grid centre for a ship, cell-COM for a wreck) so the cells sit
@@ -1015,6 +1019,47 @@ fn sync_ship_hull(
                         current.set_module_overlay_mesh(Some(overlay_mesh));
                     }
                 }
+
+                // R47 — hard-surface FIXTURES (the 3D ship parts): built for the normal COMBAT look
+                // (a live ship, not the module-colour inspection overlay). Two children: gunmetal
+                // greebles + warm emissive glow. A wreck stays bare debris; the module-colour debug
+                // view keeps the raw cell look.
+                if !is_wreck && !module_color {
+                    let (metal_mesh, glow_mesh) =
+                        build_ship_fixtures(&cell_tuples, CELL_SIZE, center);
+                    if let Some(raw) = metal_mesh {
+                        let mh = meshes.add(raw);
+                        let child = commands
+                            .spawn((
+                                Mesh3d(mh.clone()),
+                                MeshMaterial3d(assets.fixture_metal_material.clone()),
+                                Transform::IDENTITY,
+                            ))
+                            .id();
+                        if let Ok(mut ec) = commands.get_entity(parent) {
+                            ec.add_child(child);
+                        }
+                        let h = current.hull_mut();
+                        h.fixture_metal_child = Some(child);
+                        h.fixture_metal_mesh = Some(mh);
+                    }
+                    if let Some(raw) = glow_mesh {
+                        let gh = meshes.add(raw);
+                        let child = commands
+                            .spawn((
+                                Mesh3d(gh.clone()),
+                                MeshMaterial3d(assets.fixture_glow_material.clone()),
+                                Transform::IDENTITY,
+                            ))
+                            .id();
+                        if let Ok(mut ec) = commands.get_entity(parent) {
+                            ec.add_child(child);
+                        }
+                        let h = current.hull_mut();
+                        h.fixture_glow_child = Some(child);
+                        h.fixture_glow_mesh = Some(gh);
+                    }
+                }
             }
         }
     } else if current.voxelized() {
@@ -1039,6 +1084,8 @@ fn sync_ship_hull(
                 ec.despawn();
             }
         }
+        // R47 — drop the hard-surface fixture children too (near→far / destruction).
+        free_fixtures(commands, meshes, current.hull_mut());
         if let Ok(mut ec) = commands.get_entity(parent) {
             // Restore the coarse far-LOD placeholder: a wreck → the tinted debris box; a big STRUCTURE
             // → the UNIT `lod_box_mesh` (the parent transform scales it to the hull footprint, so it
@@ -1163,6 +1210,27 @@ fn free_hull_tile(commands: &mut Commands, meshes: &mut Assets<Mesh>, tile: Hull
     }
 }
 
+/// R47 — despawn + free the hard-surface fixture children (metal + glow) tracked on a [`ShipHull`].
+/// Called on a hull rebuild (so a carve refreshes the parts) and on near→far / teardown.
+fn free_fixtures(commands: &mut Commands, meshes: &mut Assets<Mesh>, h: &mut ShipHull) {
+    if let Some(m) = h.fixture_metal_mesh.take() {
+        meshes.remove(&m);
+    }
+    if let Some(c) = h.fixture_metal_child.take() {
+        if let Ok(mut ec) = commands.get_entity(c) {
+            ec.despawn();
+        }
+    }
+    if let Some(m) = h.fixture_glow_mesh.take() {
+        meshes.remove(&m);
+    }
+    if let Some(c) = h.fixture_glow_child.take() {
+        if let Ok(mut ec) = commands.get_entity(c) {
+            ec.despawn();
+        }
+    }
+}
+
 /// **Chunked hull rebuild** (the chunked-mesh optimization, for a big STRUCTURE only): split the
 /// present cells into `HULL_TILE`-cell tiles and rebuild ONLY the tiles whose cell set changed since
 /// last tick (plus drop tiles fully carved away), instead of rebuilding the whole ~8k-cell hull every
@@ -1241,6 +1309,13 @@ enum HullView<'a> {
 }
 
 impl HullView<'_> {
+    /// R47 — direct `&mut ShipHull` for the fixture fields (avoids a getter/setter per field).
+    fn hull_mut(&mut self) -> &mut ShipHull {
+        match self {
+            HullView::Existing(c) => c,
+            HullView::New(c) => c,
+        }
+    }
     fn voxelized(&self) -> bool {
         match self {
             HullView::Existing(c) => c.voxelized,

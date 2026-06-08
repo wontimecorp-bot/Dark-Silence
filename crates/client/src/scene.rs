@@ -111,6 +111,12 @@ pub struct RenderAssets {
     /// base so the markers' per-vertex [`module_palette`] colors show as-is, sitting just above
     /// the smooth hull. (Fix #11 M3.)
     pub module_overlay_material: Handle<StandardMaterial>,
+    /// R47 — the dark gunmetal material for the hard-surface FIXTURES ([`build_ship_fixtures`]): gun
+    /// barrels, engine-nozzle housings, sensor dishes, shield nodes, the nose canopy. Shared.
+    pub fixture_metal_material: Handle<StandardMaterial>,
+    /// R47 — the bright warm HDR emissive material for the GLOW fixtures (engine nozzle cores +
+    /// reactor vents + the aft exhaust plume); blooms via the camera Bloom. Shared.
+    pub fixture_glow_material: Handle<StandardMaterial>,
 }
 
 /// Hull cell size, in sim units — the side length of one hull cell as laid out in the
@@ -170,7 +176,11 @@ fn color_rgba(c: Color) -> [f32; 4] {
 /// top-down light without looking like a flat decal. Small (the camera is top-down, so
 /// only the top face is normally seen); the side walls at the silhouette boundary give a
 /// thin lip. Tunable for feel.
-const HULL_THICKNESS: f32 = 0.1;
+///
+/// R47: raised from `0.1` to give the hard-surface hull a more substantial plate lip at the
+/// silhouette — the sleeker metal (higher metallic / lower roughness) catches the key light on the
+/// thicker side walls so the edge reads as beveled plating, and the 3D fixtures sit proud of it.
+const HULL_THICKNESS: f32 = 0.18;
 
 /// Inner radius **fraction** of the shield-impact arc band — the near edge of the
 /// glowing ring slice as a fraction of the (normalized) outer radius `1.0`. The mesh is
@@ -609,6 +619,239 @@ fn build_hull_mesh_with(
     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
     .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
     .with_inserted_indices(Indices::U32(indices))
+}
+
+// ============================================================================
+// R47 — hard-surface FIXTURES: the 3D "ship parts" overlaid on the cell hull so a ship reads as a
+// starfighter (gun barrels, engine nozzles + glow, reactor vent, sensor dishes, shield nodes, nose
+// canopy). Built from the SAME live cell set as the hull (on a `cells_hash` change), so a shot-off
+// weapon/engine cell drops its barrel/nozzle. Client render only — determinism-neutral.
+// ============================================================================
+
+/// A growable triangle-mesh buffer (positions/normals/uvs/colors/indices) the fixture builder appends
+/// boxes into, finalized to a [`Mesh`] (or `None` when empty).
+#[derive(Default)]
+struct MeshBuf {
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    uvs: Vec<[f32; 2]>,
+    colors: Vec<[f32; 4]>,
+    indices: Vec<u32>,
+}
+
+impl MeshBuf {
+    /// One CCW-from-`normal` quad (two triangles), winding matching the hull mesh's faces.
+    fn quad(&mut self, corners: [[f32; 3]; 4], normal: [f32; 3], color: [f32; 4]) {
+        let base = self.positions.len() as u32;
+        self.positions.extend_from_slice(&corners);
+        for _ in 0..4 {
+            self.normals.push(normal);
+            self.colors.push(color);
+        }
+        self.uvs.push([0.0, 0.0]);
+        self.uvs.push([1.0, 0.0]);
+        self.uvs.push([1.0, 1.0]);
+        self.uvs.push([0.0, 1.0]);
+        self.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    fn into_mesh(self) -> Option<Mesh> {
+        if self.positions.is_empty() {
+            return None;
+        }
+        Some(
+            Mesh::new(
+                PrimitiveTopology::TriangleList,
+                RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+            )
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, self.uvs)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
+            .with_inserted_indices(Indices::U32(self.indices)),
+        )
+    }
+}
+
+/// Append an axis-aligned box `[x0,x1]×[y0,y1]×[z0,z1]` (6 faces, outward normals, winding matching
+/// the hull mesh). Vertex color is white so the fixture wears its material colour as-is.
+#[allow(clippy::too_many_arguments)]
+fn push_box(buf: &mut MeshBuf, x0: f32, x1: f32, y0: f32, y1: f32, z0: f32, z1: f32) {
+    let c = [1.0, 1.0, 1.0, 1.0];
+    // +Z top / -Z bottom
+    buf.quad(
+        [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]],
+        [0.0, 0.0, 1.0],
+        c,
+    );
+    buf.quad(
+        [[x0, y1, z0], [x1, y1, z0], [x1, y0, z0], [x0, y0, z0]],
+        [0.0, 0.0, -1.0],
+        c,
+    );
+    // -X / +X
+    buf.quad(
+        [[x0, y0, z0], [x0, y1, z0], [x0, y1, z1], [x0, y0, z1]],
+        [-1.0, 0.0, 0.0],
+        c,
+    );
+    buf.quad(
+        [[x1, y1, z0], [x1, y0, z0], [x1, y0, z1], [x1, y1, z1]],
+        [1.0, 0.0, 0.0],
+        c,
+    );
+    // -Y / +Y
+    buf.quad(
+        [[x1, y0, z0], [x0, y0, z0], [x0, y0, z1], [x1, y0, z1]],
+        [0.0, -1.0, 0.0],
+        c,
+    );
+    buf.quad(
+        [[x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1]],
+        [0.0, 1.0, 0.0],
+        c,
+    );
+}
+
+/// Build the hard-surface fixture meshes for a fitted ship from its live cell set. Returns
+/// `(metal, glow)` (each `None` when it has no geometry). Cell convention matches
+/// [`build_hull_mesh_with`]: row→`+X` forward, col→`+Y` lateral, around `center`. Intended for SMALL
+/// ships (the single-mesh near path) — NOT the chunked big-structure path (structures are all
+/// structural cells → no fixtures anyway).
+pub fn build_ship_fixtures(
+    cells: &[(u16, u16, u8)],
+    cell_size: f32,
+    center: Vec2,
+) -> (Option<Mesh>, Option<Mesh>) {
+    let top = HULL_THICKNESS;
+    let s = cell_size;
+    let mut metal = MeshBuf::default();
+    let mut glow = MeshBuf::default();
+
+    // Nose cell for the canopy: the forward-most present cell (max row), ties broken toward the
+    // centre column so the canopy sits on the spine.
+    let nose: Option<(u16, u16)> =
+        cells
+            .iter()
+            .map(|&(c, r, _)| (c, r))
+            .fold(None, |best, (c, r)| match best {
+                None => Some((c, r)),
+                Some((bc, br)) => {
+                    if r > br {
+                        Some((c, r))
+                    } else if r == br {
+                        let dc = (c as f32 + 0.5 - center.x).abs();
+                        let dbc = (bc as f32 + 0.5 - center.x).abs();
+                        Some(if dc < dbc { (c, r) } else { (bc, br) })
+                    } else {
+                        Some((bc, br))
+                    }
+                }
+            });
+
+    let world = |col: u16, row: u16| -> (f32, f32) {
+        (
+            ((row as f32 + 0.5) - center.y) * cell_size,
+            ((col as f32 + 0.5) - center.x) * cell_size,
+        )
+    };
+
+    for &(col, row, kind) in cells {
+        let (cx, cy) = world(col, row);
+        match kind {
+            // Weapon → a forward gun barrel proud of the cell front (+X).
+            3 => push_box(
+                &mut metal,
+                cx + s * 0.20,
+                cx + s * 0.95,
+                cy - s * 0.12,
+                cy + s * 0.12,
+                top * 0.40,
+                top * 0.95,
+            ),
+            // Thruster → aft nozzle housing (metal) + emissive nozzle core + a short aft exhaust
+            // plume (glow), at the rear (-X). The plume is a static bloomy stub; a throttle-reactive
+            // flame is a later refinement.
+            2 => {
+                push_box(
+                    &mut metal,
+                    cx - s * 0.70,
+                    cx - s * 0.12,
+                    cy - s * 0.34,
+                    cy + s * 0.34,
+                    top * 0.10,
+                    top * 1.00,
+                );
+                push_box(
+                    &mut glow,
+                    cx - s * 0.82,
+                    cx - s * 0.62,
+                    cy - s * 0.26,
+                    cy + s * 0.26,
+                    top * 0.20,
+                    top * 0.85,
+                );
+                // Aft exhaust plume — a slimmer, longer glow stub trailing behind the nozzle.
+                push_box(
+                    &mut glow,
+                    cx - s * 1.25,
+                    cx - s * 0.82,
+                    cy - s * 0.16,
+                    cy + s * 0.16,
+                    top * 0.30,
+                    top * 0.70,
+                );
+            }
+            // Reactor → a glowing top vent.
+            1 => push_box(
+                &mut glow,
+                cx - s * 0.30,
+                cx + s * 0.30,
+                cy - s * 0.30,
+                cy + s * 0.30,
+                top * 1.00,
+                top * 1.25,
+            ),
+            // Sensor → a flat top dish.
+            7 => push_box(
+                &mut metal,
+                cx - s * 0.32,
+                cx + s * 0.32,
+                cy - s * 0.32,
+                cy + s * 0.32,
+                top * 1.00,
+                top * 1.18,
+            ),
+            // Shield → a small raised emitter node.
+            4 => push_box(
+                &mut metal,
+                cx - s * 0.16,
+                cx + s * 0.16,
+                cy - s * 0.16,
+                cy + s * 0.16,
+                top * 1.00,
+                top * 1.55,
+            ),
+            _ => {}
+        }
+    }
+
+    // Cockpit canopy on the nose cell.
+    if let Some((col, row)) = nose {
+        let (cx, cy) = world(col, row);
+        push_box(
+            &mut metal,
+            cx - s * 0.28,
+            cx + s * 0.28,
+            cy - s * 0.20,
+            cy + s * 0.20,
+            top * 1.00,
+            top * 1.70,
+        );
+    }
+
+    (metal.into_mesh(), glow.into_mesh())
 }
 
 // ============================================================================
@@ -1124,10 +1367,12 @@ pub fn setup_scene(
     // is not used by this material); Phase 2 will reveal an exposed module cell at a breach.
     // A modest metallic/low-perceptual-roughness so the plate catches the top-down key
     // light and reads as metal rather than flat paint.
+    // R47 — sleeker hard-surface metal: higher metallic + lower roughness so the plate reads as a
+    // polished sci-fi hull (sharper speculars that bloom) rather than matte paint.
     let hull_material = materials.add(StandardMaterial {
         base_color: HULL_COLOR,
-        metallic: 0.6,
-        perceptual_roughness: 0.55,
+        metallic: 0.85,
+        perceptual_roughness: 0.35,
         ..default()
     });
 
@@ -1137,14 +1382,14 @@ pub fn setup_scene(
     // in `sync_ship_hull`; the white-base module-colour view + wrecks keep their own materials.
     let faction_red_hull_material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.55, 0.22, 0.20),
-        metallic: 0.6,
-        perceptual_roughness: 0.55,
+        metallic: 0.85,
+        perceptual_roughness: 0.35,
         ..default()
     });
     let faction_blue_hull_material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.22, 0.34, 0.62),
-        metallic: 0.6,
-        perceptual_roughness: 0.55,
+        metallic: 0.85,
+        perceptual_roughness: 0.35,
         ..default()
     });
 
@@ -1165,8 +1410,8 @@ pub fn setup_scene(
     // `vertex × base_color`). Used ONLY by the voxel look while module coloring is ON.
     let hull_material_white = materials.add(StandardMaterial {
         base_color: Color::WHITE,
-        metallic: 0.6,
-        perceptual_roughness: 0.55,
+        metallic: 0.85,
+        perceptual_roughness: 0.35,
         ..default()
     });
     let wreck_hull_material_white = materials.add(StandardMaterial {
@@ -1182,6 +1427,24 @@ pub fn setup_scene(
         base_color: Color::WHITE,
         metallic: 0.2,
         perceptual_roughness: 0.5,
+        ..default()
+    });
+
+    // R47 — hard-surface FIXTURE materials. `fixture_metal` is dark polished gunmetal for the
+    // structural greebles (gun barrels, nozzle housings, sensor dishes, shield nodes, the nose
+    // canopy). `fixture_glow` is a bright HDR warm emissive (engine nozzle cores + reactor vents)
+    // that blooms via the camera Bloom. Both are SHARED across all ships (the per-ship variation is
+    // the fixture geometry built in `build_ship_fixtures`).
+    let fixture_metal_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.10, 0.11, 0.13),
+        metallic: 0.95,
+        perceptual_roughness: 0.40,
+        ..default()
+    });
+    let fixture_glow_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.30, 0.14, 0.05),
+        // >1 emissive so the engine/reactor glow + aft exhaust plume bloom under the camera Bloom.
+        emissive: LinearRgba::rgb(3.0, 1.3, 0.3),
         ..default()
     });
 
@@ -1216,6 +1479,8 @@ pub fn setup_scene(
         hull_material_white,
         wreck_hull_material_white,
         module_overlay_material,
+        fixture_metal_material,
+        fixture_glow_material,
     });
 
     // The LOCAL player ship — spawned here deterministically so the `LocalShip`

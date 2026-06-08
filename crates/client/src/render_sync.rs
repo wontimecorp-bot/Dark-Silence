@@ -158,6 +158,14 @@ pub struct ShipHull {
     /// The overlay mesh's handle, kept so it is removed from [`Assets<Mesh>`] on rebuild / despawn
     /// (no per-session mesh leak), mirroring [`ShipHull::mesh`].
     pub module_overlay_mesh: Option<Handle<Mesh>>,
+    /// R47 — the hard-surface FIXTURE children (the 3D ship parts): a `metal` mesh (barrels / nozzle
+    /// housings / dishes / nodes / canopy) and a `glow` mesh (engine nozzle cores + reactor vents),
+    /// rebuilt + freed alongside the hull child. `None` when absent (no relevant cells / module-color
+    /// inspection mode / far / big structure).
+    pub fixture_metal_child: Option<Entity>,
+    pub fixture_metal_mesh: Option<Handle<Mesh>>,
+    pub fixture_glow_child: Option<Entity>,
+    pub fixture_glow_mesh: Option<Handle<Mesh>>,
 }
 
 /// Previous + current sim snapshots for one entity. `interpolate_transforms`
