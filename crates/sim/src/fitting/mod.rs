@@ -51,8 +51,8 @@ pub use fit::{
     load_preset, preview_stats, save_preset, Fit, FitPreset, FitRejection, ModuleRef, PresetId,
 };
 pub use hull::{
-    disc_hull, hull_collision_radius, station_hull, FiringArc, GridCell, Hull, HullId, SectionId,
-    ShipClass, ShipRole, Slot, SlotId, CELL_WORLD_SIZE,
+    disc_hull, hull_collision_radius, station_hull, CellShape, FiringArc, GridCell, Hull, HullId,
+    SectionId, ShipClass, ShipRole, Slot, SlotId, CELL_WORLD_SIZE,
 };
 pub use layout::{
     build_layout, build_layout_with, cell_map, cell_mass, cell_mass_with, center_or_anchor,

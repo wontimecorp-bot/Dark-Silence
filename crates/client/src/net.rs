@@ -1010,16 +1010,19 @@ fn sync_ship_hull(
                 // around the parent `Position`.
                 let cell_tuples: Vec<(u16, u16, u8)> =
                     e.cells.iter().map(|c| (c.col, c.row, c.kind)).collect();
+                // R58 — the beveled combat builder also needs each cell's SHAPE (full / corner triangle).
+                let cell_shapes: Vec<(u16, u16, sim::fitting::CellShape)> =
+                    e.cells.iter().map(|c| (c.col, c.row, c.shape)).collect();
                 // The runtime toggles pick the look: smoothed rounded contour (Fix #11 M2) vs the
                 // blocky per-cell voxel mesh. Both share the same `center`-relative local frame, so the
-                // child sits identically under the parent transform either way. R55 — the combat look is
-                // ONE BEVELED solid (`build_hull_mesh_beveled`, live `style`) on ship-sized hulls (the
-                // cell-count cap keeps it off any large hull). The module-colour view paints per-cell
-                // vertex colours via `build_hull_mesh` (white-base material).
+                // child sits identically under the parent transform either way. R55/R58 — the combat look
+                // is ONE BEVELED solid (`build_hull_mesh_beveled`, live `style`, honouring sub-cell SHAPES)
+                // on ship-sized hulls (the cell-count cap keeps it off any large hull). The module-colour
+                // view paints per-cell vertex colours via `build_hull_mesh` (white-base material).
                 let raw_mesh = if contour {
                     build_hull_mesh_contour(&cell_tuples, CELL_SIZE, center)
                 } else if use_ext && cell_tuples.len() <= DETAIL_MAX_CELLS {
-                    build_hull_mesh_beveled(&cell_tuples, CELL_SIZE, center, style)
+                    build_hull_mesh_beveled(&cell_shapes, CELL_SIZE, center, style)
                 } else {
                     build_hull_mesh(&cell_tuples, CELL_SIZE, center, module_color)
                 };

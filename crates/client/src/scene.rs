@@ -737,14 +737,14 @@ fn inset_ring(ring: &[Vec2], inset: f32) -> Vec<Vec2> {
 /// Output POSITION/NORMAL/UV (no per-vertex COLOR — the faction tint is the material `base_color`).
 /// Carving rebuilds it from the live cells.
 pub fn build_hull_mesh_beveled(
-    cells: &[(u16, u16, u8)],
+    cells: &[(u16, u16, sim::fitting::CellShape)],
     cell_size: f32,
     center: Vec2,
     style: HullStyle,
 ) -> Mesh {
-    let present: std::collections::HashSet<(u16, u16)> =
-        cells.iter().map(|&(c, r, _)| (c, r)).collect();
-    let loops = cell_boundary_loops(&present);
+    // R58 — trace the per-cell SHAPE polygons' silhouette (handles full squares + corner triangles), in
+    // GRID space (`x = col`, `y = row`); then map each point to LOCAL (`row → x`, `col → y` swap, scaled).
+    let loops = cell_boundary_loops_shaped(cells);
 
     // Local-space rings, oriented canonically (outer CCW, holes CW) — mirrors `build_hull_mesh_contour`.
     let mut outers: Vec<Vec<Vec2>> = Vec::new();
@@ -752,12 +752,7 @@ pub fn build_hull_mesh_beveled(
     for raw in &loops {
         let mut pts: Vec<Vec2> = raw
             .iter()
-            .map(|&(cc, rr)| {
-                Vec2::new(
-                    (rr as f32 - center.y) * cell_size,
-                    (cc as f32 - center.x) * cell_size,
-                )
-            })
+            .map(|&g| Vec2::new((g.y - center.y) * cell_size, (g.x - center.x) * cell_size))
             .collect();
         let area2 = signed_area2(&pts);
         if area2 < -1.0e-6 {
@@ -1301,6 +1296,68 @@ fn signed_area2(pts: &[Vec2]) -> f32 {
         a += p.x * q.y - q.x * p.y;
     }
     a
+}
+
+/// R58 — trace the silhouette of per-cell SHAPE polygons (full squares + corner triangles) into ordered
+/// grid-space loops (`x = col`, `y = row`, CCW around the material). Each cell emits its CCW polygon
+/// edges; an edge is INTERNAL (culled) iff its REVERSE also exists (shared between two cells), so the
+/// kept edges are the hull boundary — INCLUDING the diagonals of sub-shapes. Endpoints are quantized to
+/// the half-grid (coords are multiples of 0.5) for exact matching; the kept edges link head-to-tail into
+/// loops. (Full-cell hulls reproduce the axis-aligned silhouette; half-cells add clean 45° diagonals;
+/// quarter junctions may have minor artifacts — a later refinement.)
+fn cell_boundary_loops_shaped(cells: &[(u16, u16, sim::fitting::CellShape)]) -> Vec<Vec<Vec2>> {
+    use std::collections::{HashMap, HashSet};
+    let key = |v: Vec2| ((v.x * 2.0).round() as i32, (v.y * 2.0).round() as i32);
+
+    // All directed CCW polygon edges + a set of their (start,end) keys for the reverse test.
+    let mut edges: Vec<(Vec2, Vec2)> = Vec::new();
+    let mut present: HashSet<((i32, i32), (i32, i32))> = HashSet::new();
+    for &(c, r, shape) in cells {
+        let poly = shape.corners(c, r);
+        let n = poly.len();
+        for i in 0..n {
+            let (a, b) = (poly[i], poly[(i + 1) % n]);
+            edges.push((a, b));
+            present.insert((key(a), key(b)));
+        }
+    }
+    // Keep only boundary edges (reverse absent → not shared with a neighbour).
+    let mut next: HashMap<(i32, i32), (Vec2, (i32, i32))> = HashMap::new();
+    let mut start_pt: HashMap<(i32, i32), Vec2> = HashMap::new();
+    for &(a, b) in &edges {
+        if !present.contains(&(key(b), key(a))) {
+            next.insert(key(a), (b, key(b)));
+            start_pt.insert(key(a), a);
+        }
+    }
+    // Link head-to-tail into closed loops (deterministic start order).
+    let mut starts: Vec<(i32, i32)> = next.keys().copied().collect();
+    starts.sort_unstable();
+    let mut used: HashSet<(i32, i32)> = HashSet::new();
+    let mut loops = Vec::new();
+    for &s in &starts {
+        if used.contains(&s) {
+            continue;
+        }
+        let mut pts = Vec::new();
+        let mut cur = s;
+        while used.insert(cur) {
+            if let Some(&p) = start_pt.get(&cur) {
+                pts.push(p);
+            }
+            match next.get(&cur) {
+                Some(&(_, nk)) => cur = nk,
+                None => break,
+            }
+            if cur == s {
+                break;
+            }
+        }
+        if pts.len() >= 3 {
+            loops.push(pts);
+        }
+    }
+    loops
 }
 
 /// Trace the boundary of a cell set into ordered grid-corner loops, CCW around the material in

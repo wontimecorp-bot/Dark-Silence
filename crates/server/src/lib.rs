@@ -202,6 +202,9 @@ pub struct RenderCell {
     /// Color/role code: `0` structural; `1..=6` per [`ModuleKind`] (see
     /// [`render_cell_kind`]).
     pub kind: u8,
+    /// R58 — the cell's sub-shape (full square / corner triangle), so the client renders the real
+    /// polygon (matching the carve hitbox). Client-only readout (off the wire).
+    pub shape: sim::fitting::CellShape,
 }
 
 /// One entity's **unquantized** authoritative render pose, as read directly from
@@ -424,6 +427,7 @@ fn cells_of(
             col,
             row,
             kind: render_cell_kind(occ, modules),
+            shape: occ.shape,
         })
         .collect();
     // Prefer the authored hull dims; fall back to a bounding box of the live cells so a

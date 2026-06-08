@@ -955,6 +955,7 @@ fn corridor_layout() -> FitLayout {
                 health: 0.0,
                 depth,
                 structural: false,
+                shape: sim::fitting::CellShape::Full,
             },
         );
     }
@@ -1316,6 +1317,7 @@ fn one_module_layout(module_id: ModuleId, health: f32) -> FitLayout {
             health,
             depth: 0,
             structural: false,
+            shape: sim::fitting::CellShape::Full,
         },
     );
     FitLayout {
@@ -1346,6 +1348,7 @@ fn clean_sever_yields_intact_through_kill_yields_scrap() {
         health: 40.0,
         depth: 0,
         structural: false,
+        shape: sim::fitting::CellShape::Full,
     };
     let exactly_at = CellOccupant {
         health: 20.0,
@@ -1457,6 +1460,7 @@ fn salvage_world(module_health: f32) -> (World, Entity, ModuleId) {
             health: module_health,
             depth: 0,
             structural: false,
+            shape: sim::fitting::CellShape::Full,
         },
     );
     // The core cell (deepest; in the destroyed section). Empty/structural.
@@ -1468,6 +1472,7 @@ fn salvage_world(module_health: f32) -> (World, Entity, ModuleId) {
             health: 0.0,
             depth: 1,
             structural: true,
+            shape: sim::fitting::CellShape::Full,
         },
     );
     let layout = FitLayout {
@@ -3210,6 +3215,7 @@ fn spawn_offcenter_wing_wreck(w: &mut World) -> Entity {
                 health: 5.0, // small structural HP so a carve removes cells
                 depth,
                 structural: true,
+                shape: sim::fitting::CellShape::Full,
             },
         );
     }
@@ -3536,6 +3542,7 @@ fn spawn_thin_sliver_wreck(w: &mut World) -> Entity {
                 health: 5.0, // small structural HP so a carve removes the cell
                 depth,
                 structural: true,
+                shape: sim::fitting::CellShape::Full,
             },
         );
     }
@@ -3777,6 +3784,7 @@ fn repro_targeting_bug_world() -> (World, Entity, Entity) {
                 health: 5.0,
                 depth,
                 structural: true,
+                shape: sim::fitting::CellShape::Full,
             },
         );
     }
@@ -3818,6 +3826,7 @@ fn repro_targeting_bug_world() -> (World, Entity, Entity) {
             health: 5.0,
             depth: 0,
             structural: true,
+            shape: sim::fitting::CellShape::Full,
         },
     );
     let chunk_layout = FitLayout {
@@ -3965,6 +3974,7 @@ fn spawn_offrow_wreck(w: &mut World) -> Entity {
                 health: 5.0, // small structural HP so a carve does real work
                 depth,
                 structural: true,
+                shape: sim::fitting::CellShape::Full,
             },
         );
     }
@@ -4160,6 +4170,7 @@ fn spawn_drilled_wedge(w: &mut World) -> Entity {
                 health: 5.0, // small structural HP so a carve removes the cell
                 depth,
                 structural: true,
+                shape: sim::fitting::CellShape::Full,
             },
         );
     }
@@ -4535,6 +4546,7 @@ fn spawn_bar_wreck(w: &mut World, cells: &[(u16, u16)]) -> Entity {
                 health: 5.0,
                 depth: 0,
                 structural: true,
+                shape: sim::fitting::CellShape::Full,
             },
         );
     }

@@ -521,6 +521,7 @@ mod tests {
                     health: 1.0,
                     depth,
                     structural: false,
+                    shape: crate::fitting::CellShape::Full,
                 },
             );
         }

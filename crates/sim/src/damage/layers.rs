@@ -361,6 +361,70 @@ fn carve_order(a: &(f32, u16, Cell), b: &(f32, u16, Cell)) -> std::cmp::Ordering
         .then(a.2.cmp(&b.2))
 }
 
+/// R58 — is `p` inside the CCW convex polygon `poly` (on-edge counts as inside)?
+fn point_in_convex(p: Vec2, poly: &[Vec2]) -> bool {
+    let n = poly.len();
+    for i in 0..n {
+        let a = poly[i];
+        let b = poly[(i + 1) % n];
+        // Cross of edge a→b with a→p; <0 = p is to the RIGHT of a CCW edge = outside.
+        if (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x) < 0.0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// R58 — the entry time-of-impact (fraction `0..1` along `p0→p1`) where the segment first reaches the
+/// CCW convex polygon `poly`: `0` if `p0` is already inside, else the smallest edge-crossing `t`, or
+/// `None` for a miss. Pure 2-D f32 (deterministic). The polygon analogue of the legacy swept-circle toi.
+fn swept_point_convex_toi(p0: Vec2, p1: Vec2, poly: &[Vec2]) -> Option<f32> {
+    if poly.len() < 3 {
+        return None;
+    }
+    if point_in_convex(p0, poly) {
+        return Some(0.0);
+    }
+    let d = p1 - p0;
+    let n = poly.len();
+    let mut best: Option<f32> = None;
+    for i in 0..n {
+        let a = poly[i];
+        let e = poly[(i + 1) % n] - a;
+        let denom = d.x * e.y - d.y * e.x;
+        if denom.abs() < 1.0e-9 {
+            continue; // parallel
+        }
+        let diff = a - p0;
+        let t = (diff.x * e.y - diff.y * e.x) / denom;
+        let u = (diff.x * d.y - diff.y * d.x) / denom;
+        if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
+            best = Some(best.map_or(t, |bt| bt.min(t)));
+        }
+    }
+    best
+}
+
+/// R58 — the cell-crossing toi for one cell, honouring its [`CellShape`]: a `Full` cell uses the EXACT
+/// legacy inscribed-circle swept test (byte-identical); a sub-shape cell uses the segment-vs-its-convex-
+/// polygon entry test, so the HITBOX matches the visual. `None` = the ray misses this cell.
+fn cell_toi(
+    physics: &RapierPhysics,
+    p0: Vec2,
+    p1: Vec2,
+    cell: Cell,
+    occ: &CellOccupant,
+) -> Option<f32> {
+    if occ.shape.is_full() {
+        let center = Vec2::new(cell.0 as f32 + 0.5, cell.1 as f32 + 0.5);
+        physics
+            .swept_cast(p0, p1, center, CARVE_CELL_RADIUS)
+            .map(|h| h.toi)
+    } else {
+        swept_point_convex_toi(p0, p1, &occ.shape.corners(cell.0, cell.1))
+    }
+}
+
 /// The **first present cell** of `layout` the ray `p0 → p1` crosses, paired with its
 /// cell-crossing time-of-impact — the single-sourced "which cell does the ray reach
 /// first" test (Principle II). `None` when the ray crosses no present cell (a genuine
@@ -377,9 +441,8 @@ pub fn first_cell_hit(layout: &FitLayout, p0: Vec2, p1: Vec2) -> Option<(Cell, f
     let physics = RapierPhysics::new();
     let mut best: Option<(f32, u16, Cell)> = None;
     for (&cell, occ) in &layout.cells {
-        let center = Vec2::new(cell.0 as f32 + 0.5, cell.1 as f32 + 0.5);
-        if let Some(hit) = physics.swept_cast(p0, p1, center, CARVE_CELL_RADIUS) {
-            let candidate = (hit.toi, occ.depth, cell);
+        if let Some(toi) = cell_toi(&physics, p0, p1, cell, occ) {
+            let candidate = (toi, occ.depth, cell);
             if best.is_none_or(|b| carve_order(&candidate, &b) == std::cmp::Ordering::Less) {
                 best = Some(candidate);
             }
@@ -435,9 +498,8 @@ fn carve_path(layout: &FitLayout, p0: Vec2, p1: Vec2) -> Vec<(Cell, CellOccupant
     let physics = RapierPhysics::new();
     let mut hits: Vec<(f32, u16, Cell, CellOccupant)> = Vec::new();
     for (&cell, occ) in &layout.cells {
-        let center = Vec2::new(cell.0 as f32 + 0.5, cell.1 as f32 + 0.5);
-        if let Some(hit) = physics.swept_cast(p0, p1, center, CARVE_CELL_RADIUS) {
-            hits.push((hit.toi, occ.depth, cell, *occ));
+        if let Some(toi) = cell_toi(&physics, p0, p1, cell, occ) {
+            hits.push((toi, occ.depth, cell, *occ));
         }
     }
     hits.sort_by(|a, b| carve_order(&(a.0, a.1, a.2), &(b.0, b.1, b.2)));
@@ -1054,5 +1116,40 @@ mod tests {
         };
         assert_eq!(ctx.shields.max, 50.0);
         assert_eq!(ctx.hull.max, 200.0);
+    }
+
+    // R58 — the sub-cell HITBOX matches the visual: a shot through a corner triangle's solid side hits,
+    // a shot that only crosses its cut-away (empty) corner misses. `HalfNE` at cell (0,0) keeps the NE
+    // right-angle (corners (1,1)/(0,1)/(1,0)), so the solid region is x+y >= 1 and the SW corner is gone.
+    #[test]
+    fn sub_shape_hitbox_matches_the_triangle() {
+        use crate::fitting::CellShape;
+        let tri = CellShape::HalfNE.corners(0, 0);
+
+        // Inside the solid NE half (x+y > 1) vs the cut-away SW corner (x+y < 1).
+        assert!(point_in_convex(Vec2::new(0.9, 0.9), &tri));
+        assert!(!point_in_convex(Vec2::new(0.2, 0.2), &tri));
+
+        // A horizontal ray at y=0.2: the triangle there spans x∈[0.8, 1.0]. A ray reaching x=0.95 enters
+        // the triangle → hit; a ray that stops at x=0.5 stays in the cut corner → miss.
+        assert!(
+            swept_point_convex_toi(Vec2::new(-1.0, 0.2), Vec2::new(0.95, 0.2), &tri).is_some(),
+            "a shot crossing the solid triangle side must hit",
+        );
+        assert!(
+            swept_point_convex_toi(Vec2::new(-1.0, 0.2), Vec2::new(0.5, 0.2), &tri).is_none(),
+            "a shot that only crosses the cut-away corner must miss",
+        );
+    }
+
+    // R58 — a sub-shape's area_factor (mass weight) is its true fraction of the unit cell: full 1.0,
+    // half 0.5, quarter 0.125. `Full`'s centroid stays the cell centre (byte-identical mass/COM path).
+    #[test]
+    fn sub_shape_area_factor_and_full_centroid() {
+        use crate::fitting::CellShape;
+        assert_eq!(CellShape::Full.area_factor(), 1.0);
+        assert_eq!(CellShape::HalfNE.area_factor(), 0.5);
+        assert_eq!(CellShape::QuarterSW.area_factor(), 0.125);
+        assert_eq!(CellShape::Full.centroid(3, 7), Vec2::new(3.5, 7.5));
     }
 }

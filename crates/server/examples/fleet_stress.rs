@@ -221,12 +221,11 @@ fn densify_hull(orig: &Hull, k: u16) -> Hull {
         .iter()
         .flat_map(|c| {
             let (cc, rr) = c.coord;
-            let (section, structural) = (c.section, c.structural);
+            let cell = *c; // copy preserves section/structural/shape; only coord changes
             (0..k).flat_map(move |dr| {
                 (0..k).map(move |dc| GridCell {
                     coord: (cc * k + dc, rr * k + dr),
-                    section,
-                    structural,
+                    ..cell
                 })
             })
         })

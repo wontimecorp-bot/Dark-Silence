@@ -79,6 +79,11 @@ pub struct CellOccupant {
     /// downstream code (Phase 1B voxel rendering, Phase 2 carving) tell hull plating
     /// from hardpoints without re-deriving the slot-coord match.
     pub structural: bool,
+    /// R58 — the cell's sub-shape, copied from its [`GridCell`], so the carve HITBOX
+    /// ([`crate::damage::first_cell_hit`]) + render can honour it per cell. `Full` (default) is
+    /// byte-identical to before.
+    #[serde(default)]
+    pub shape: super::CellShape,
 }
 
 /// The full per-cell occupant + health map E007 consumes (contracts/fitting-api.md
@@ -181,11 +186,14 @@ pub fn cell_mass_with(
     modules: &ModuleCatalog,
     struct_cell_mass: f32,
 ) -> f32 {
-    occupant
+    let base = occupant
         .module
         .and_then(|m| modules.get(m))
         .map(|m| m.mass)
-        .unwrap_or(struct_cell_mass)
+        .unwrap_or(struct_cell_mass);
+    // R58 — a sub-shape cell (triangle) occupies less of the unit cell → proportionally less mass.
+    // `Full` → `area_factor() == 1.0` → byte-identical to before.
+    base * occupant.shape.area_factor()
 }
 
 /// A body's total inertial **mass** = Σ [`cell_mass`] over its current cells (Phase M5). The one
@@ -224,16 +232,17 @@ pub fn layout_inertia_with(
     if total <= f32::MIN_POSITIVE {
         return f32::MIN_POSITIVE;
     }
-    // Mass-weighted centre of mass in cell-space.
+    // Mass-weighted centre of mass in cell-space. R58 — a sub-shape cell's mass sits at its triangle
+    // CENTROID, not the cell centre; `Full` → `centroid == cell_center` → byte-identical.
     let com = layout.cells.iter().fold(Vec2::ZERO, |acc, (&coord, occ)| {
-        acc + cell_center(coord) * cell_mass_with(occ, modules, struct_cell_mass)
+        acc + occ.shape.centroid(coord.0, coord.1) * cell_mass_with(occ, modules, struct_cell_mass)
     }) / total;
     let i_cellspace: f32 = layout
         .cells
         .iter()
         .map(|(&coord, occ)| {
             cell_mass_with(occ, modules, struct_cell_mass)
-                * (cell_center(coord) - com).length_squared()
+                * (occ.shape.centroid(coord.0, coord.1) - com).length_squared()
         })
         .sum();
     (i_cellspace * CELL_WORLD_SIZE * CELL_WORLD_SIZE).max(f32::MIN_POSITIVE)
@@ -335,6 +344,7 @@ pub fn build_layout_with(
                 health,
                 depth: cell_depth(hull, coord),
                 structural: grid_cell.structural,
+                shape: grid_cell.shape,
             },
         );
     }
@@ -651,6 +661,7 @@ mod tests {
             health: 1.0,
             depth: 0,
             structural: false,
+            shape: crate::fitting::CellShape::Full,
         };
         assert_eq!(cell_mass(&module_cell, &modules), reactor_mass);
         // A structural / empty cell weighs the structural constant.
@@ -660,6 +671,7 @@ mod tests {
             health: 0.0,
             depth: 0,
             structural: true,
+            shape: crate::fitting::CellShape::Full,
         };
         assert_eq!(cell_mass(&struct_cell, &modules), STRUCT_CELL_MASS);
     }

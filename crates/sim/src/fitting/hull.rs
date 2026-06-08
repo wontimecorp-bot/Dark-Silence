@@ -15,6 +15,7 @@
 //! Derive discipline matches `module.rs` and the E001/E002 components: serde as a
 //! replication/persistence seam (not exercised this epic), value semantics.
 
+use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
 use super::module::{HardpointType, SlotSize};
@@ -102,6 +103,72 @@ pub struct SectionId(pub u32);
 ///
 /// The set of authored cells is still **sparse** in the sense that not every
 /// `cols × rows` coordinate need exist (the silhouette need not fill the bounding box).
+/// R58 — a cell's occupied sub-region: the full unit square, a 45° corner triangle (half), or a small
+/// corner triangle (quarter). Each shape is a CONVEX polygon in GRID space — a cell `(c,r)` spans
+/// `[c,c+1]×[r,r+1]` (x = col, y = row) — via [`CellShape::corners`], so ONE path drives the carve
+/// HITBOX (segment-vs-polygon), the MASS (area + centroid), and the RENDER (polygon edges). `Full` keeps
+/// the exact legacy inscribed-circle hitbox + full mass/centre → byte-identical; only SUB-shapes use the
+/// polygon. Half names = the kept right-angle corner (`HalfSW` keeps the SW corner, cutting NE). New
+/// shapes = a new variant + its polygon (extensible).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum CellShape {
+    #[default]
+    Full,
+    /// 45° corner triangle (right angle at the named corner, legs 1.0, area 0.5).
+    HalfSW,
+    HalfSE,
+    HalfNE,
+    HalfNW,
+    /// Small corner triangle (right angle at the named corner, legs 0.5, area 0.125) — sharp tips.
+    QuarterSW,
+    QuarterSE,
+    QuarterNE,
+    QuarterNW,
+}
+
+impl CellShape {
+    /// The convex polygon (CCW) for a cell at `(c, r)` in GRID space (`x = col`, `y = row`). `Full` = the
+    /// unit square; the others are corner triangles. Used by the render tracer + the sub-shape hitbox.
+    pub fn corners(self, c: u16, r: u16) -> Vec<Vec2> {
+        let (c, r) = (c as f32, r as f32);
+        let p = |x: f32, y: f32| Vec2::new(c + x, r + y);
+        match self {
+            CellShape::Full => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::HalfSW => vec![p(0.0, 0.0), p(1.0, 0.0), p(0.0, 1.0)],
+            CellShape::HalfSE => vec![p(1.0, 0.0), p(1.0, 1.0), p(0.0, 0.0)],
+            CellShape::HalfNE => vec![p(1.0, 1.0), p(0.0, 1.0), p(1.0, 0.0)],
+            CellShape::HalfNW => vec![p(0.0, 1.0), p(0.0, 0.0), p(1.0, 1.0)],
+            CellShape::QuarterSW => vec![p(0.0, 0.0), p(0.5, 0.0), p(0.0, 0.5)],
+            CellShape::QuarterSE => vec![p(1.0, 0.0), p(1.0, 0.5), p(0.5, 0.0)],
+            CellShape::QuarterNE => vec![p(1.0, 1.0), p(0.5, 1.0), p(1.0, 0.5)],
+            CellShape::QuarterNW => vec![p(0.0, 1.0), p(0.0, 0.5), p(0.5, 1.0)],
+        }
+    }
+
+    /// Fraction of the unit cell's area this shape occupies (the mass multiplier).
+    pub fn area_factor(self) -> f32 {
+        match self {
+            CellShape::Full => 1.0,
+            CellShape::HalfSW | CellShape::HalfSE | CellShape::HalfNE | CellShape::HalfNW => 0.5,
+            CellShape::QuarterSW
+            | CellShape::QuarterSE
+            | CellShape::QuarterNE
+            | CellShape::QuarterNW => 0.125,
+        }
+    }
+
+    /// Centroid in GRID space — the mean of the polygon corners (a triangle's centroid; the square's
+    /// centre). For `Full` this is exactly `(c+0.5, r+0.5)`, so mass/COM stay byte-identical.
+    pub fn centroid(self, c: u16, r: u16) -> Vec2 {
+        let pts = self.corners(c, r);
+        pts.iter().fold(Vec2::ZERO, |a, &p| a + p) / pts.len() as f32
+    }
+
+    pub fn is_full(self) -> bool {
+        matches!(self, CellShape::Full)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GridCell {
     /// Grid coordinate `(col, row)`, in-bounds of the owning hull's `grid_dims`.
@@ -113,6 +180,10 @@ pub struct GridCell {
     /// seeding, Phase 1B voxel rendering) tell the two kinds apart without re-deriving
     /// the slot-coord match each time.
     pub structural: bool,
+    /// R58 — the cell's sub-shape (full square or a corner triangle). `#[serde(default)]` → old RON
+    /// without it loads as `Full`. The sim treats `Full` byte-identically to before.
+    #[serde(default)]
+    pub shape: CellShape,
 }
 
 impl GridCell {
@@ -123,6 +194,7 @@ impl GridCell {
             coord,
             section,
             structural: false,
+            shape: CellShape::Full,
         }
     }
 
@@ -134,6 +206,7 @@ impl GridCell {
             coord,
             section,
             structural: true,
+            shape: CellShape::Full,
         }
     }
 }
@@ -262,11 +335,7 @@ pub fn station_hull(id: HullId, name: &str, cols: u16, rows: u16) -> Hull {
     let mut cells = Vec::new();
     for row in 0..rows {
         for col in 0..cols {
-            cells.push(GridCell {
-                coord: (col, row),
-                section: SectionId(1),
-                structural: true,
-            });
+            cells.push(GridCell::structural((col, row), SectionId(1)));
         }
     }
     Hull {
@@ -299,11 +368,7 @@ pub fn disc_hull(id: HullId, name: &str, diameter: u16) -> Hull {
             let dx = col as f32 - c;
             let dy = row as f32 - c;
             if dx * dx + dy * dy <= r * r {
-                cells.push(GridCell {
-                    coord: (col, row),
-                    section: SectionId(1),
-                    structural: true,
-                });
+                cells.push(GridCell::structural((col, row), SectionId(1)));
             }
         }
     }

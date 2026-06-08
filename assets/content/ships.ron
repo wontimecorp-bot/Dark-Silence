@@ -136,6 +136,7 @@
                     coord: (0, 5),
                     section: (10000),
                     structural: true,
+                    shape: HalfSE,
                 ),
                 (
                     coord: (1, 5),
@@ -176,6 +177,7 @@
                     coord: (8, 5),
                     section: (10000),
                     structural: true,
+                    shape: HalfSW,
                 ),
                 (
                     coord: (2, 6),
@@ -246,6 +248,7 @@
                     coord: (3, 9),
                     section: (10000),
                     structural: true,
+                    shape: HalfSE,
                 ),
                 (
                     coord: (4, 9),
@@ -256,6 +259,7 @@
                     coord: (5, 9),
                     section: (10000),
                     structural: true,
+                    shape: HalfSW,
                 ),
                 (
                     coord: (4, 10),
