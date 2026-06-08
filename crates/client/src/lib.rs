@@ -33,6 +33,7 @@ pub mod fonts;
 pub mod hud;
 pub mod hud_bars;
 pub mod hull_shader;
+pub mod hull_textures;
 pub mod input;
 pub mod interpolation;
 pub mod module_bars;

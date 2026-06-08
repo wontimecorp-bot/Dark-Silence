@@ -213,6 +213,11 @@ fn color_rgba(c: Color) -> [f32; 4] {
 /// thicker side walls so the edge reads as beveled plating, and the 3D fixtures sit proud of it.
 const HULL_THICKNESS: f32 = 0.18;
 
+/// R51 — UV tiling multiplier on the hull-LOCAL coords: the baked plating texture (4 plates/tile)
+/// repeats every `1.0 / HULL_UV_TILE` world units, so `1.2` ≈ a tile every ~2.6 cells (~plate ≈ ⅔
+/// cell). Tunable in code for plate density.
+const HULL_UV_TILE: f32 = 1.2;
+
 /// Inner radius **fraction** of the shield-impact arc band — the near edge of the
 /// glowing ring slice as a fraction of the (normalized) outer radius `1.0`. The mesh is
 /// built normalized to outer radius `1.0` so it can be **scaled per ship** to hug any
@@ -344,7 +349,7 @@ fn build_arc_band_mesh(inner_frac: f32, half_angle: f32, segments: u32) -> Mesh 
         indices.extend_from_slice(&[inner0, outer1, inner1]);
     }
 
-    Mesh::new(
+    let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
     )
@@ -352,7 +357,12 @@ fn build_arc_band_mesh(inner_frac: f32, half_angle: f32, segments: u32) -> Mesh 
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
     .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
-    .with_inserted_indices(Indices::U32(indices))
+    .with_inserted_indices(Indices::U32(indices));
+    // R51 — generate tangents so the baked normal-map plating lights correctly (the combat hull wears
+    // it; the wreck/tile/contour paths just carry the harmless extra attribute). Ignored on the rare
+    // error (indexed TriangleList with POSITION/NORMAL/UV_0 succeeds).
+    let _ = mesh.generate_tangents();
+    mesh
 }
 
 /// Build a flat **trapezoid** in the XY plane (`z = 0`), **anchored at its bottom edge on
@@ -532,12 +542,11 @@ fn build_hull_mesh_with(
             normals.push(normal);
             colors.push(color);
         }
-        // R50: UV = the corner's hull-LOCAL XY (not a per-quad [0,1]). The cinematic hull shader keys
-        // its panel lines + grime off `in.uv`, so anchoring the UVs to the ship-local frame keeps the
-        // pattern PAINTED ON the hull (it moves WITH the ship) instead of swimming in world space.
-        // Nothing else reads these UVs (the hull materials have no textures), so this is safe.
+        // R50/R51: UV = the corner's hull-LOCAL XY × HULL_UV_TILE — anchored to the ship-local frame
+        // (so the baked plating texture is PAINTED ON the hull + moves WITH it, no world-space swim) and
+        // scaled for plate density. The R51 normal/ORM textures tile against these.
         for c in &corners {
-            uvs.push([c[0], c[1]]);
+            uvs.push([c[0] * HULL_UV_TILE, c[1] * HULL_UV_TILE]);
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     };
@@ -644,7 +653,7 @@ fn build_hull_mesh_with(
         }
     }
 
-    Mesh::new(
+    let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
     )
@@ -652,7 +661,12 @@ fn build_hull_mesh_with(
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
     .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
-    .with_inserted_indices(Indices::U32(indices))
+    .with_inserted_indices(Indices::U32(indices));
+    // R51 — generate tangents so the baked normal-map plating lights correctly (the combat hull wears
+    // it; the wreck/tile/contour paths just carry the harmless extra attribute). Ignored on the rare
+    // error (indexed TriangleList with POSITION/NORMAL/UV_0 succeeds).
+    let _ = mesh.generate_tangents();
+    mesh
 }
 
 // ============================================================================
@@ -1418,6 +1432,7 @@ pub fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut hull_ext: ResMut<Assets<crate::hull_shader::HullMaterial>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     // Lighting: a key directional light so PBR primitives read (ambient fill is
     // attached to the camera in `camera::setup_camera`).
@@ -1644,14 +1659,23 @@ pub fn setup_scene(
         ..default()
     });
 
-    // R48/R49 — the cinematic hull material per faction: the base PBR metal (matching the plain hull)
-    // + the fresnel-rim/panels/grime extension, rim-tinted neutral cool / team red / team blue. The
-    // rim/panel/grime params are live-tuned each frame by `apply_ship_visuals`.
+    // R51 — bake the procedural hull-plating textures (tiling normal + ORM) once. The relief catches
+    // the key light → real plated metal (the panel detail the flat shader "+ signs" couldn't give).
+    let hull_normal = images.add(crate::hull_textures::generate_hull_normal_map());
+    let hull_orm = images.add(crate::hull_textures::generate_hull_orm_map());
+
+    // R48/R49/R51 — the cinematic hull material per faction: PBR metal + the baked normal/ORM plating
+    // textures + the fresnel-rim extension, rim-tinted neutral cool / team red / team blue. The rim +
+    // grime params are live-tuned each frame by `apply_ship_visuals`.
     let make_hull_ext = |base: Color, rim: Vec4| crate::hull_shader::HullMaterial {
         base: StandardMaterial {
             base_color: base,
             metallic: 0.85,
             perceptual_roughness: 0.35,
+            normal_map_texture: Some(hull_normal.clone()),
+            metallic_roughness_texture: Some(hull_orm.clone()),
+            occlusion_texture: Some(hull_orm.clone()),
+            flip_normal_map_y: false,
             ..default()
         },
         extension: crate::hull_shader::hull_extension(rim),
