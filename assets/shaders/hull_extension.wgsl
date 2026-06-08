@@ -35,16 +35,37 @@ fn vnoise(p: vec2<f32>) -> f32 {
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
+// R50 — IRREGULAR panel seams (not a uniform grid): brick-offset alternate rows + a per-plate hash
+// jitter on the seam position so plate sizes vary → reads as real hull plating, not graph paper.
+// `uv` is hull-LOCAL (world units); `scale` = plate spacing; `width` = seam half-width (in plate units).
+fn panel_seam(uv: vec2<f32>, scale: f32, width: f32) -> f32 {
+    let row = floor(uv.y / scale);
+    // Stagger vertical seams per row (half-plate brick offset + a per-row hash wobble).
+    let shift = (fract(row * 0.5) * 0.5 + (hash21(vec2<f32>(row, 7.3)) - 0.5) * 0.4) * scale;
+    let p = vec2<f32>(uv.x + shift, uv.y) / scale;
+    let cell = floor(p);
+    // Jitter the seam centre per plate so plate widths/heights differ.
+    let jx = (hash21(cell) - 0.5) * 0.35;
+    let jy = (hash21(cell + vec2<f32>(3.1, 1.7)) - 0.5) * 0.35;
+    let g = abs(fract(p) - vec2<f32>(0.5) + vec2<f32>(jx, jy));
+    return 1.0 - smoothstep(0.0, width, min(g.x, g.y));
+}
+
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
     // Build the StandardMaterial PBR input (albedo / metallic / roughness from the base material).
     var pbr_input = pbr_input_from_standard_material(in, is_front);
 
     // --- used-future surface: panel grooves + grime, BEFORE lighting ---
-    let wp = in.world_position.xy;
-    let g = abs(fract(wp / hull.params.x) - vec2<f32>(0.5));     // distance to nearest grid line
-    let line = 1.0 - smoothstep(0.0, hull.params.y, min(g.x, g.y));
-    let grime = vnoise(wp * 0.7) * hull.params.z;                // low-freq splotchy wear
+    // R50: key off `in.uv` = the hull-LOCAL position (baked into the mesh UVs) so the pattern is fixed
+    // to the hull and moves WITH the ship — NOT `world_position` (which made it swim).
+    let wp = in.uv;
+    // Two plate scales (coarse + fine) of irregular seams so the paneling doesn't read as one grid.
+    let line = max(
+        panel_seam(wp, hull.params.x, hull.params.y),
+        panel_seam(wp, hull.params.x * 2.3, hull.params.y * 1.3) * 0.7,
+    );
+    let grime = vnoise(wp * (1.4 / hull.params.x)) * hull.params.z;  // low-freq splotchy wear
     pbr_input.material.base_color = vec4<f32>(
         pbr_input.material.base_color.rgb * (1.0 - 0.45 * line) * (0.80 + 0.30 * grime),
         pbr_input.material.base_color.a,

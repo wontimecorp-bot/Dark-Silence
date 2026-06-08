@@ -141,6 +141,13 @@ pub struct RenderAssets {
     pub hull_ext_neutral: Handle<crate::hull_shader::HullMaterial>,
     pub hull_ext_red: Handle<crate::hull_shader::HullMaterial>,
     pub hull_ext_blue: Handle<crate::hull_shader::HullMaterial>,
+    /// R50 — shared assets for the particle effects (engine ion-trail + damage smoke/sparks): one small
+    /// sphere mesh scaled per particle, an additive warm TRAIL material, an additive white-hot SPARK
+    /// material, and a dark alpha-blend SMOKE material.
+    pub particle_mesh: Handle<Mesh>,
+    pub trail_material: Handle<StandardMaterial>,
+    pub spark_material: Handle<StandardMaterial>,
+    pub smoke_material: Handle<StandardMaterial>,
 }
 
 /// Hull cell size, in sim units — the side length of one hull cell as laid out in the
@@ -525,10 +532,13 @@ fn build_hull_mesh_with(
             normals.push(normal);
             colors.push(color);
         }
-        uvs.push([0.0, 0.0]);
-        uvs.push([1.0, 0.0]);
-        uvs.push([1.0, 1.0]);
-        uvs.push([0.0, 1.0]);
+        // R50: UV = the corner's hull-LOCAL XY (not a per-quad [0,1]). The cinematic hull shader keys
+        // its panel lines + grime off `in.uv`, so anchoring the UVs to the ship-local frame keeps the
+        // pattern PAINTED ON the hull (it moves WITH the ship) instead of swimming in world space.
+        // Nothing else reads these UVs (the hull materials have no textures), so this is safe.
+        for c in &corners {
+            uvs.push([c[0], c[1]]);
+        }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     };
 
@@ -1656,6 +1666,29 @@ pub fn setup_scene(
         Vec4::new(0.30, 0.6, 1.5, 1.1),
     ));
 
+    // R50 — particle assets (shared; fade is via per-particle SCALE so one material per kind suffices).
+    let particle_mesh = meshes.add(Sphere::new(0.5).mesh().ico(2).unwrap());
+    let trail_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 0.6, 0.25, 1.0),
+        emissive: LinearRgba::rgb(2.4, 1.2, 0.4),
+        alpha_mode: AlphaMode::Add,
+        unlit: true,
+        ..default()
+    });
+    let spark_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 0.9, 0.6, 1.0),
+        emissive: LinearRgba::rgb(5.0, 3.5, 1.6),
+        alpha_mode: AlphaMode::Add,
+        unlit: true,
+        ..default()
+    });
+    let smoke_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.06, 0.06, 0.07, 0.6),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        ..default()
+    });
+
     commands.insert_resource(RenderAssets {
         projectile_mesh,
         projectile_material,
@@ -1700,6 +1733,10 @@ pub fn setup_scene(
         hull_ext_neutral,
         hull_ext_red,
         hull_ext_blue,
+        particle_mesh,
+        trail_material,
+        spark_material,
+        smoke_material,
     });
 
     // The LOCAL player ship — spawned here deterministically so the `LocalShip`

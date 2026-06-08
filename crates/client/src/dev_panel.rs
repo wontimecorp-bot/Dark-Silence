@@ -2070,6 +2070,17 @@ fn dev_panel_ui(
                         .on_hover_text("Width of the darkened panel-line grooves.");
                     slider(ui, "grime", &mut sv.grime, 0.0..=2.0)
                         .on_hover_text("Splotchy used-future wear/dirt across the hull.");
+                    ui.label("Engine ion-trail:");
+                    ui.checkbox(&mut sv.trail_on, "trail on");
+                    slider(ui, "trail rate", &mut sv.trail_rate, 0.0..=200.0)
+                        .on_hover_text("Particles/sec at full throttle streaming aft from each thruster.");
+                    slider(ui, "trail size", &mut sv.trail_size, 0.0..=0.5);
+                    slider(ui, "trail life", &mut sv.trail_life, 0.05..=1.5);
+                    ui.label("Damage smoke / sparks:");
+                    ui.checkbox(&mut sv.smoke_on, "smoke on (carve)");
+                    slider(ui, "smoke amount", &mut sv.smoke_amount, 0.0..=30.0)
+                        .on_hover_text("Smoke puffs emitted each time a hull cell is carved off.");
+                    ui.checkbox(&mut sv.spark_on, "sparks on (hit)");
                 });
 
                 // Refinement 25/35/36: live starfield — ONE unified galaxy model. `layers` = depth,

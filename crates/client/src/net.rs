@@ -68,7 +68,7 @@ use sim::{FactionSpawns, FixedDt, HitFeedback, ShipIntent};
 use crate::input::{build_client_input, InputSequencer};
 use crate::render_sync::{
     interpolate_transforms, EngineFlame, HullTile, RemoteEntity, RenderInterp, ShieldBubble,
-    ShieldChild, ShipHull, ShipThrottle,
+    ShieldChild, ShipDamageFx, ShipHull, ShipThrottle,
 };
 use crate::scene::{
     build_hull_mesh, build_hull_mesh_contour, build_module_overlay_mesh, build_ship_fixtures,
@@ -612,9 +612,17 @@ fn capture_render_state(
                 e.heading,
                 e.grid_dims,
             );
-            // R49 — stamp the ship's throttle so `update_engine_flames` can size its exhaust flames.
+            // R49/R50 — stamp the ship's throttle (sizes the exhaust flames) + its damage signal (drives
+            // the hit sparks + carve smoke in `spawn_ship_particles`).
             if let Ok(mut ec) = commands.get_entity(bevy_entity) {
-                ec.insert(ShipThrottle(e.throttle));
+                ec.insert((
+                    ShipThrottle(e.throttle),
+                    ShipDamageFx {
+                        flash: e.flash,
+                        hit_dir: e.hit_dir,
+                        cells: e.cells.len() as u32,
+                    },
+                ));
             }
         } else {
             // Newly-appeared entity (never the local ship — it is pre-registered):
@@ -652,7 +660,14 @@ fn capture_render_state(
                 e.grid_dims,
             );
             if let Ok(mut ec) = commands.get_entity(spawned) {
-                ec.insert(ShipThrottle(e.throttle));
+                ec.insert((
+                    ShipThrottle(e.throttle),
+                    ShipDamageFx {
+                        flash: e.flash,
+                        hit_dir: e.hit_dir,
+                        cells: e.cells.len() as u32,
+                    },
+                ));
             }
             render_map.map.insert(e.id, spawned);
         }
@@ -1651,6 +1666,115 @@ pub fn update_engine_flames(
             .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2))
             .with_scale(Vec3::new(width, length, width));
     }
+}
+
+/// R50 — spawn the engine ION-TRAIL (a fading glow wake streaming aft from each thruster while
+/// thrusting) + DAMAGE particles (sparks on a fresh hit, smoke on a carve). World-space, capped, fading
+/// via [`crate::particles`]. Client render only → determinism-neutral.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_ship_particles(
+    mut commands: Commands,
+    assets: Res<RenderAssets>,
+    tuning: Res<crate::ShipVisualTuning>,
+    time: Res<Time>,
+    mut count: ResMut<crate::particles::ParticleCount>,
+    mut frame: Local<u32>,
+    mut prev: Local<std::collections::HashMap<Entity, (f32, u32)>>,
+    flames: Query<(Entity, &GlobalTransform, &ChildOf), With<EngineFlame>>,
+    ships: Query<(&ShipThrottle, &GlobalTransform)>,
+    damaged: Query<(Entity, &ShipDamageFx, &GlobalTransform)>,
+) {
+    use crate::particles::{hash01, jitter, spawn_particle};
+    *frame = frame.wrapping_add(1);
+    let dt = time.delta_secs();
+    let f = *frame;
+
+    // --- engine ion-trail: per thruster flame, rate ∝ throttle ---
+    if tuning.trail_on {
+        for (fe, gt, parent) in &flames {
+            let Ok((thr, ship_gt)) = ships.get(parent.parent()) else {
+                continue;
+            };
+            let throttle = thr.0;
+            if throttle < 0.05 {
+                continue;
+            }
+            let aft = (ship_gt.rotation() * Vec3::NEG_X).normalize_or_zero();
+            let pos = gt.translation();
+            let eid = fe.to_bits() as u32;
+            // Fractional spawn count → emit `floor` + a hashed remainder so low rates still trickle.
+            let n = tuning.trail_rate * throttle * dt;
+            let total = n.floor() as u32 + u32::from(hash01(f ^ eid) < n.fract());
+            for i in 0..total {
+                let seed = f.wrapping_mul(131).wrapping_add(eid).wrapping_add(i);
+                let j = jitter(seed);
+                let vel = aft * (CELL_SIZE * 9.0 * throttle) + j * (CELL_SIZE * 1.5);
+                let s = CELL_SIZE * tuning.trail_size;
+                spawn_particle(
+                    &mut commands,
+                    &mut count,
+                    assets.particle_mesh.clone(),
+                    assets.trail_material.clone(),
+                    pos + j * (CELL_SIZE * 0.2),
+                    vel,
+                    tuning.trail_life,
+                    s,
+                    s * 0.1,
+                );
+            }
+        }
+    }
+
+    // --- damage: sparks on a fresh hit (flash edge) + smoke on a carve (cell count drop) ---
+    let mut seen = std::collections::HashSet::new();
+    for (se, fx, gt) in &damaged {
+        seen.insert(se);
+        let (pflash, pcells) = prev.get(&se).copied().unwrap_or((0.0, fx.cells));
+        let pos = gt.translation() + Vec3::Z * (CELL_SIZE * 0.5);
+        let sid = se.to_bits() as u32;
+        if tuning.spark_on && fx.flash > 0.3 && pflash <= 0.3 {
+            let dir = Vec3::new(fx.hit_dir.x, fx.hit_dir.y, 0.0).normalize_or_zero();
+            for i in 0..10u32 {
+                let seed = f.wrapping_mul(977).wrapping_add(sid).wrapping_add(i);
+                let vel = dir * (CELL_SIZE * 10.0) + jitter(seed) * (CELL_SIZE * 14.0);
+                let s = CELL_SIZE * 0.10;
+                spawn_particle(
+                    &mut commands,
+                    &mut count,
+                    assets.particle_mesh.clone(),
+                    assets.spark_material.clone(),
+                    pos,
+                    vel,
+                    0.35,
+                    s,
+                    s * 0.15,
+                );
+            }
+        }
+        if tuning.smoke_on && fx.cells < pcells {
+            let puffs = tuning.smoke_amount as u32;
+            for i in 0..puffs {
+                let seed = f.wrapping_mul(733).wrapping_add(sid).wrapping_add(i);
+                let j = jitter(seed);
+                let vel =
+                    Vec3::new(j.x, j.y, 0.0) * (CELL_SIZE * 3.0) + Vec3::Z * (CELL_SIZE * 1.2);
+                let s = CELL_SIZE * 0.3;
+                spawn_particle(
+                    &mut commands,
+                    &mut count,
+                    assets.particle_mesh.clone(),
+                    assets.smoke_material.clone(),
+                    pos + j * (CELL_SIZE * 0.9),
+                    vel,
+                    1.2,
+                    s * 0.5,
+                    s * 2.2,
+                );
+            }
+        }
+        prev.insert(se, (fx.flash, fx.cells));
+    }
+    prev.retain(|k, _| seen.contains(k));
 }
 
 /// The loopback registry address (any address works for loopback — it is a

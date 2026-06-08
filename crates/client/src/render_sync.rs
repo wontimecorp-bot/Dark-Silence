@@ -100,6 +100,17 @@ pub struct EngineFlame {
     pub origin: Vec3,
 }
 
+/// R50 — per-ship damage signal, set on the ship entity each frame from its `RenderEntity` by
+/// [`crate::net::capture_render_state`]; [`crate::net::spawn_ship_particles`] reads it (vs. its own
+/// remembered previous state) to emit SPARKS on a fresh hit (`flash` edge) + SMOKE on a carve (live
+/// `cells` count drop).
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct ShipDamageFx {
+    pub flash: f32,
+    pub hit_dir: Vec2,
+    pub cells: u32,
+}
+
 /// Revise-B seamless hull-surface tracking on a rendered fitted ship's PARENT entity.
 ///
 /// When a fitted ship is **near** (the camera-distance LOD gate, see

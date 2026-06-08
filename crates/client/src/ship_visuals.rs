@@ -35,6 +35,38 @@ pub struct ShipVisualTuning {
     pub panel_scale: f32,
     pub panel_width: f32,
     pub grime: f32,
+    /// R50 — engine ION-TRAIL: on/off, spawn rate (particles/sec at full throttle), size, life (s).
+    #[serde(default = "default_true")]
+    pub trail_on: bool,
+    #[serde(default = "default_trail_rate")]
+    pub trail_rate: f32,
+    #[serde(default = "default_trail_size")]
+    pub trail_size: f32,
+    #[serde(default = "default_trail_life")]
+    pub trail_life: f32,
+    /// R50 — DAMAGE smoke (puffs per carve) + sparks on hit, each on/off.
+    #[serde(default = "default_true")]
+    pub smoke_on: bool,
+    #[serde(default = "default_smoke_amount")]
+    pub smoke_amount: f32,
+    #[serde(default = "default_true")]
+    pub spark_on: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_trail_rate() -> f32 {
+    60.0
+}
+fn default_trail_size() -> f32 {
+    0.10
+}
+fn default_trail_life() -> f32 {
+    0.45
+}
+fn default_smoke_amount() -> f32 {
+    8.0
 }
 
 impl Default for ShipVisualTuning {
@@ -53,6 +85,13 @@ impl Default for ShipVisualTuning {
             panel_scale: 0.45,
             panel_width: 0.045,
             grime: 1.0,
+            trail_on: true,
+            trail_rate: default_trail_rate(),
+            trail_size: default_trail_size(),
+            trail_life: default_trail_life(),
+            smoke_on: true,
+            smoke_amount: default_smoke_amount(),
+            spark_on: true,
         }
     }
 }

@@ -37,6 +37,7 @@ pub mod input;
 pub mod interpolation;
 pub mod module_bars;
 pub mod net;
+pub mod particles;
 pub mod prediction;
 pub mod radar;
 pub mod render_sync;
@@ -129,6 +130,8 @@ pub fn run() -> AppExit {
         .insert_resource(dev.starfield)
         // R49: live-tunable ship visuals (glow / flame / nav / accent / fill / bloom / hull shader).
         .insert_resource(dev.ship_visual)
+        // R50: live particle count (engine ion-trail + damage smoke/sparks cap).
+        .init_resource::<particles::ParticleCount>()
         // Refinement 21/22: load the shared HUD fonts (label + mono) + icon images into
         // `FontAssets`/`IconAssets` BEFORE the Startup HUD setups, which clone the handles.
         .add_systems(PreStartup, fonts::load_hud_assets)
@@ -201,6 +204,9 @@ pub fn run() -> AppExit {
                 // R49: throttle-reactive per-thruster engine flames + live ship-visual tuning apply.
                 net::update_engine_flames,
                 ship_visuals::apply_ship_visuals,
+                // R50: engine ion-trail + damage smoke/sparks particles (spawn + age/despawn).
+                net::spawn_ship_particles,
+                particles::update_particles,
             ),
         );
 
