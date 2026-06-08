@@ -1817,6 +1817,60 @@ impl ServerApp {
             .id()
     }
 
+    /// R56 — spawn a FIRING, carveable, factioned `Ship` for benchmarks/tests: a combatant variant of
+    /// [`Self::spawn_fitted_enemy`] (the same armed fighter fit + hit-map + the three defense layers),
+    /// but spawned as a `Ship` with a firing `ShipIntent` (`fire_primary`) + a `Faction`, so it actually
+    /// shoots (its `WeaponBank` is populated by `recompute_ship_stats_system` on the first `Changed<Fit>`
+    /// tick) and its shots are friend/foe-gated. Reads the LIVE `HULL_FIGHTER` from the catalog, so a
+    /// benchmark can swap in a densified fighter first. NOT called by any golden world → determinism-neutral.
+    pub fn spawn_fitted_ship(&mut self, pos: Vec2, heading: f32, faction: Faction) -> Entity {
+        let modules = self
+            .world
+            .get_resource::<ModuleCatalog>()
+            .cloned()
+            .unwrap_or_else(|| seed_catalogs().0);
+        let hulls = self
+            .world
+            .get_resource::<HullCatalog>()
+            .cloned()
+            .unwrap_or_else(|| seed_catalogs().1);
+        let hull = hulls
+            .get(HULL_FIGHTER)
+            .cloned()
+            .expect("seed catalog always contains the fighter hull");
+        let mut fit = Fit::new(HULL_FIGHTER);
+        let _ = fit.install_module(SlotId(0), MODULE_REACTOR_BASIC, &hull, &modules);
+        let _ = fit.install_module(SlotId(1), MODULE_THRUSTER_BASIC, &hull, &modules);
+        // R57 — fit BOTH of the fighter's weapon slots (3 + 4) so each ship fires its full autocannon
+        // loadout (heavier, more realistic per-ship combat load than a single gun).
+        let _ = fit.install_module(SlotId(3), MODULE_AUTOCANNON, &hull, &modules);
+        let _ = fit.install_module(SlotId(4), MODULE_AUTOCANNON, &hull, &modules);
+        let _ = fit.install_module(SlotId(5), MODULE_ARMOR_PLATE, &hull, &modules);
+        let layout = build_layout(&hull, &fit, &modules);
+        let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
+        let (shields, section_armor, hull_structure) = seed_defense_layers(&hull, &fit, &modules);
+        self.world
+            .spawn((
+                (
+                    Ship,
+                    ShipIntent {
+                        fire_primary: true,
+                        ..Default::default()
+                    },
+                    Position(pos),
+                    Velocity(Vec2::ZERO),
+                    Heading(heading),
+                    AngularVelocity(0.0),
+                    FlightAssist::On,
+                    CollisionRadius(hull_collision_radius(hull.grid_dims)),
+                    Destructible,
+                    faction,
+                ),
+                (fit, layout, stats, shields, section_armor, hull_structure),
+            ))
+            .id()
+    }
+
     /// Spawn a fresh authoritative ship for a newly connected client, reusing the
     /// `sim` gameplay components and [`Tuning`] (mirrors the client scene minus
     /// rendering). The flight-model (`FlightAssist::On`) is the default feel.
