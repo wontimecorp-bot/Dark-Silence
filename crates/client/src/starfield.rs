@@ -496,7 +496,7 @@ impl Default for StarfieldTuning {
             }
         });
         Self {
-            bloom_intensity: 0.15,
+            bloom_intensity: 0.20,
             layer_count: 8.0,
             layers,
             galaxy: GalaxyTuning::default(),

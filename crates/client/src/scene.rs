@@ -117,6 +117,19 @@ pub struct RenderAssets {
     /// R47 — the bright warm HDR emissive material for the GLOW fixtures (engine nozzle cores +
     /// reactor vents + the aft exhaust plume); blooms via the camera Bloom. Shared.
     pub fixture_glow_material: Handle<StandardMaterial>,
+    /// R48 — emissive running/nav-light materials (port red / starboard green / white spine) + the
+    /// faction-tinted ACCENT materials (neutral / red / blue) for the spine strip + canopy cap.
+    pub nav_red_material: Handle<StandardMaterial>,
+    pub nav_green_material: Handle<StandardMaterial>,
+    pub nav_white_material: Handle<StandardMaterial>,
+    pub accent_neutral_material: Handle<StandardMaterial>,
+    pub accent_red_material: Handle<StandardMaterial>,
+    pub accent_blue_material: Handle<StandardMaterial>,
+    /// R48 — the dynamic THROTTLE-reactive engine exhaust: a shared additive emissive cone (axis `+Y`,
+    /// oriented + scaled per ship by [`crate::net::update_engine_exhaust`] so it flares aft and grows
+    /// with speed). The per-ship engine PointLight uses no shared asset (its intensity is per-entity).
+    pub engine_flame_mesh: Handle<Mesh>,
+    pub engine_flame_material: Handle<StandardMaterial>,
 }
 
 /// Hull cell size, in sim units — the side length of one hull cell as laid out in the
@@ -714,23 +727,51 @@ fn push_box(buf: &mut MeshBuf, x0: f32, x1: f32, y0: f32, y1: f32, z0: f32, z1: 
     );
 }
 
-/// Build the hard-surface fixture meshes for a fitted ship from its live cell set. Returns
-/// `(metal, glow)` (each `None` when it has no geometry). Cell convention matches
-/// [`build_hull_mesh_with`]: row→`+X` forward, col→`+Y` lateral, around `center`. Intended for SMALL
-/// ships (the single-mesh near path) — NOT the chunked big-structure path (structures are all
-/// structural cells → no fixtures anyway).
+/// Which shared material a fixture mesh wears — lets [`build_ship_fixtures`] return several role-tagged
+/// meshes the caller spawns with the matching material (the [`FixtureRole::Accent`] is faction-tinted).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FixtureRole {
+    /// Dark gunmetal greebles: gun barrels, nozzle housings, sensor dishes, shield nodes, canopy frame.
+    Metal,
+    /// Warm emissive engine nozzle cores / reactor vents / exhaust plume.
+    Glow,
+    /// Port (left, `-Y`) red running light.
+    NavRed,
+    /// Starboard (right, `+Y`) green running light.
+    NavGreen,
+    /// White spine light.
+    NavWhite,
+    /// Faction-tinted emissive accent: a spine strip + a canopy cap (material chosen by faction).
+    Accent,
+}
+
+/// Build the hard-surface fixture meshes for a fitted ship from its live cell set, each tagged with the
+/// [`FixtureRole`] (= shared material) the caller spawns it with. Empty roles are omitted. Cell
+/// convention matches [`build_hull_mesh_with`]: row→`+X` forward, col→`+Y` lateral, around `center`.
+/// Intended for SMALL ships (the single-mesh near path) — NOT the chunked big-structure path.
 pub fn build_ship_fixtures(
     cells: &[(u16, u16, u8)],
     cell_size: f32,
     center: Vec2,
-) -> (Option<Mesh>, Option<Mesh>) {
+) -> Vec<(Mesh, FixtureRole)> {
     let top = HULL_THICKNESS;
     let s = cell_size;
     let mut metal = MeshBuf::default();
     let mut glow = MeshBuf::default();
+    let mut nav_red = MeshBuf::default();
+    let mut nav_green = MeshBuf::default();
+    let mut nav_white = MeshBuf::default();
+    let mut accent = MeshBuf::default();
 
-    // Nose cell for the canopy: the forward-most present cell (max row), ties broken toward the
-    // centre column so the canopy sits on the spine.
+    let world = |col: u16, row: u16| -> (f32, f32) {
+        (
+            ((row as f32 + 0.5) - center.y) * cell_size,
+            ((col as f32 + 0.5) - center.x) * cell_size,
+        )
+    };
+
+    // Nose cell (canopy + white spine light): the forward-most present cell (max row), ties broken
+    // toward the centre column so the canopy sits on the spine.
     let nose: Option<(u16, u16)> =
         cells
             .iter()
@@ -750,12 +791,30 @@ pub fn build_ship_fixtures(
                 }
             });
 
-    let world = |col: u16, row: u16| -> (f32, f32) {
-        (
-            ((row as f32 + 0.5) - center.y) * cell_size,
-            ((col as f32 + 0.5) - center.x) * cell_size,
-        )
+    // Port (min col, `-Y`) + starboard (max col, `+Y`) wing cells for the running lights; ties broken
+    // toward mid-body (row nearest the centre) so the lights sit on the wings, not the nose/tail.
+    let pick_side = |want_max: bool| -> Option<(u16, u16)> {
+        cells
+            .iter()
+            .map(|&(c, r, _)| (c, r))
+            .fold(None, |best, (c, r)| match best {
+                None => Some((c, r)),
+                Some((bc, br)) => {
+                    let better = if want_max { c > bc } else { c < bc };
+                    if better {
+                        Some((c, r))
+                    } else if c == bc {
+                        let dr = (r as f32 + 0.5 - center.y).abs();
+                        let dbr = (br as f32 + 0.5 - center.y).abs();
+                        Some(if dr < dbr { (c, r) } else { (bc, br) })
+                    } else {
+                        Some((bc, br))
+                    }
+                }
+            })
     };
+    let port = pick_side(false);
+    let starboard = pick_side(true);
 
     for &(col, row, kind) in cells {
         let (cx, cy) = world(col, row);
@@ -770,9 +829,11 @@ pub fn build_ship_fixtures(
                 top * 0.40,
                 top * 0.95,
             ),
-            // Thruster → aft nozzle housing (metal) + emissive nozzle core + a short aft exhaust
-            // plume (glow), at the rear (-X). The plume is a static bloomy stub; a throttle-reactive
-            // flame is a later refinement.
+            // Thruster → aft nozzle housing (metal) + emissive nozzle core + a longer aft exhaust
+            // plume (glow), at the rear (-X). R48: the glow now sits PROUD of the hull (z above
+            // `top` = HULL_THICKNESS) — previously it was buried inside the housing/below the hull
+            // top, so the top-down camera couldn't see it (the reported "no engine glow" bug). The
+            // dynamic throttle-reactive flame is a separate rear-centre child (see `update_engine_exhaust`).
             2 => {
                 push_box(
                     &mut metal,
@@ -783,24 +844,26 @@ pub fn build_ship_fixtures(
                     top * 0.10,
                     top * 1.00,
                 );
+                // Nozzle core — raised above the housing top so it reads from above.
                 push_box(
                     &mut glow,
-                    cx - s * 0.82,
-                    cx - s * 0.62,
+                    cx - s * 0.84,
+                    cx - s * 0.58,
                     cy - s * 0.26,
                     cy + s * 0.26,
-                    top * 0.20,
-                    top * 0.85,
+                    top * 1.05,
+                    top * 1.50,
                 );
-                // Aft exhaust plume — a slimmer, longer glow stub trailing behind the nozzle.
+                // Aft exhaust plume — a slimmer, longer glow stub trailing behind the nozzle, also
+                // proud of the hull.
                 push_box(
                     &mut glow,
-                    cx - s * 1.25,
-                    cx - s * 0.82,
-                    cy - s * 0.16,
-                    cy + s * 0.16,
-                    top * 0.30,
-                    top * 0.70,
+                    cx - s * 1.55,
+                    cx - s * 0.84,
+                    cy - s * 0.15,
+                    cy + s * 0.15,
+                    top * 1.10,
+                    top * 1.40,
                 );
             }
             // Reactor → a glowing top vent.
@@ -837,7 +900,7 @@ pub fn build_ship_fixtures(
         }
     }
 
-    // Cockpit canopy on the nose cell.
+    // Cockpit canopy (metal frame) + a faction-accent cap + a white spine light on the nose.
     if let Some((col, row)) = nose {
         let (cx, cy) = world(col, row);
         push_box(
@@ -849,9 +912,85 @@ pub fn build_ship_fixtures(
             top * 1.00,
             top * 1.70,
         );
+        // Accent cap riding just above the canopy (faction-tinted emissive).
+        push_box(
+            &mut accent,
+            cx - s * 0.20,
+            cx + s * 0.12,
+            cy - s * 0.14,
+            cy + s * 0.14,
+            top * 1.70,
+            top * 1.86,
+        );
+        // White spine light just aft of the canopy.
+        push_box(
+            &mut nav_white,
+            cx - s * 0.52,
+            cx - s * 0.30,
+            cy - s * 0.08,
+            cy + s * 0.08,
+            top * 1.05,
+            top * 1.35,
+        );
     }
 
-    (metal.into_mesh(), glow.into_mesh())
+    // Faction accent strip down the spine: a thin emissive line on every centre-column cell.
+    let center_col = center.x.round() as i32;
+    for &(col, row, _) in cells {
+        if col as i32 == center_col {
+            let (cx, cy) = world(col, row);
+            push_box(
+                &mut accent,
+                cx - s * 0.35,
+                cx + s * 0.35,
+                cy - s * 0.05,
+                cy + s * 0.05,
+                top * 1.00,
+                top * 1.12,
+            );
+        }
+    }
+
+    // Port (red) / starboard (green) running lights on the wing edges.
+    if let Some((col, row)) = port {
+        let (cx, cy) = world(col, row);
+        push_box(
+            &mut nav_red,
+            cx - s * 0.10,
+            cx + s * 0.10,
+            cy - s * 0.50,
+            cy - s * 0.26,
+            top * 0.60,
+            top * 1.05,
+        );
+    }
+    if let Some((col, row)) = starboard {
+        let (cx, cy) = world(col, row);
+        push_box(
+            &mut nav_green,
+            cx - s * 0.10,
+            cx + s * 0.10,
+            cy + s * 0.26,
+            cy + s * 0.50,
+            top * 0.60,
+            top * 1.05,
+        );
+    }
+
+    let mut out = Vec::new();
+    for (buf, role) in [
+        (metal, FixtureRole::Metal),
+        (glow, FixtureRole::Glow),
+        (nav_red, FixtureRole::NavRed),
+        (nav_green, FixtureRole::NavGreen),
+        (nav_white, FixtureRole::NavWhite),
+        (accent, FixtureRole::Accent),
+    ] {
+        if let Some(m) = buf.into_mesh() {
+            out.push((m, role));
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -1274,6 +1413,17 @@ pub fn setup_scene(
         },
         Transform::from_xyz(6.0, 8.0, 20.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
+    // R48 — a dim COOL fill light from roughly the opposite side so the unlit faces of the gritty
+    // hull aren't pure black (cinematic key+fill); no shadows (it's a fill).
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 2200.0,
+            color: Color::srgb(0.55, 0.7, 1.0),
+            shadows_enabled: false,
+            ..default()
+        },
+        Transform::from_xyz(-7.0, -6.0, 14.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
 
     // Shared projectile visuals (a small glowing bullet).
     let projectile_mesh = meshes.add(Sphere::new(0.2));
@@ -1448,6 +1598,34 @@ pub fn setup_scene(
         ..default()
     });
 
+    // R48 — emissive nav/running lights (HDR so they bloom into bright dots).
+    let mut nav_emissive = |r: f32, g: f32, b: f32| {
+        materials.add(StandardMaterial {
+            base_color: Color::srgb(0.02, 0.02, 0.02),
+            emissive: LinearRgba::rgb(r, g, b),
+            ..default()
+        })
+    };
+    let nav_red_material = nav_emissive(3.2, 0.05, 0.05);
+    let nav_green_material = nav_emissive(0.05, 3.2, 0.12);
+    let nav_white_material = nav_emissive(2.4, 2.4, 2.8);
+    // R48 — faction-tinted accent (spine strip + canopy cap): neutral cool, team red, team blue.
+    let accent_neutral_material = nav_emissive(0.6, 1.3, 2.4);
+    let accent_red_material = nav_emissive(2.6, 0.35, 0.28);
+    let accent_blue_material = nav_emissive(0.32, 1.0, 2.8);
+
+    // R48 — the dynamic engine exhaust flame: a unit cone (axis +Y), additive emissive so it reads as
+    // exhaust plasma; oriented + scaled per ship by `update_engine_exhaust`.
+    let engine_flame_mesh = meshes.add(Cone::new(0.5, 1.0).mesh());
+    let engine_flame_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 0.55, 0.18, 1.0),
+        emissive: LinearRgba::rgb(5.0, 2.2, 0.6),
+        alpha_mode: AlphaMode::Add,
+        cull_mode: None,
+        double_sided: true,
+        ..default()
+    });
+
     commands.insert_resource(RenderAssets {
         projectile_mesh,
         projectile_material,
@@ -1481,6 +1659,14 @@ pub fn setup_scene(
         module_overlay_material,
         fixture_metal_material,
         fixture_glow_material,
+        nav_red_material,
+        nav_green_material,
+        nav_white_material,
+        accent_neutral_material,
+        accent_red_material,
+        accent_blue_material,
+        engine_flame_mesh,
+        engine_flame_material,
     });
 
     // The LOCAL player ship — spawned here deterministically so the `LocalShip`

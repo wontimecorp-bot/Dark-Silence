@@ -67,12 +67,12 @@ use sim::{FactionSpawns, FixedDt, HitFeedback, ShipIntent};
 
 use crate::input::{build_client_input, InputSequencer};
 use crate::render_sync::{
-    interpolate_transforms, HullTile, RemoteEntity, RenderInterp, ShieldBubble, ShieldChild,
-    ShipHull,
+    interpolate_transforms, EngineExhaust, EngineFlame, HullTile, RemoteEntity, RenderInterp,
+    ShieldBubble, ShieldChild, ShipHull,
 };
 use crate::scene::{
     build_hull_mesh, build_hull_mesh_contour, build_module_overlay_mesh, build_ship_fixtures,
-    RenderAssets, CELL_SIZE,
+    FixtureRole, RenderAssets, CELL_SIZE,
 };
 
 /// The loopback solo-play host: the embedded authoritative [`ServerApp`] plus the
@@ -516,6 +516,7 @@ fn capture_render_state(
     mut vel_q: Query<&mut Velocity, With<LocalShip>>,
     shield_child_q: Query<&ShieldChild>,
     mut bubble_q: Query<(&mut Visibility, &mut Transform)>,
+    exhaust_q: Query<&EngineExhaust>,
     mut ship_hull_q: Query<&mut ShipHull>,
     hull_mode: Res<HullRenderMode>,
     module_mode: Res<ModuleColorMode>,
@@ -608,6 +609,17 @@ fn capture_render_state(
                 e.heading,
                 e.grid_dims,
             );
+            update_engine_exhaust(
+                &mut commands,
+                &assets,
+                &exhaust_q,
+                &mut bubble_q,
+                bevy_entity,
+                e.kind,
+                e.vel,
+                e.heading,
+                e.grid_dims,
+            );
         } else {
             // Newly-appeared entity (never the local ship — it is pre-registered):
             // spawn a rendered remote with the right look. Its interp `prev` is
@@ -640,6 +652,17 @@ fn capture_render_state(
                 spawned,
                 e.shield_flash,
                 e.hit_dir,
+                e.heading,
+                e.grid_dims,
+            );
+            update_engine_exhaust(
+                &mut commands,
+                &assets,
+                &exhaust_q,
+                &mut bubble_q,
+                spawned,
+                e.kind,
+                e.vel,
                 e.heading,
                 e.grid_dims,
             );
@@ -1020,44 +1043,35 @@ fn sync_ship_hull(
                     }
                 }
 
-                // R47 — hard-surface FIXTURES (the 3D ship parts): built for the normal COMBAT look
-                // (a live ship, not the module-colour inspection overlay). Two children: gunmetal
-                // greebles + warm emissive glow. A wreck stays bare debris; the module-colour debug
-                // view keeps the raw cell look.
+                // R47/R48 — hard-surface FIXTURES (the 3D ship parts): built for the normal COMBAT
+                // look (a live ship, not the module-colour inspection overlay). Each role-tagged mesh
+                // (gunmetal greebles / warm glow / nav lights / faction accent) is one child wearing
+                // the matching shared material; the Accent role is tinted by the ship's faction. A
+                // wreck stays bare debris; the module-colour debug view keeps the raw cell look.
                 if !is_wreck && !module_color {
-                    let (metal_mesh, glow_mesh) =
-                        build_ship_fixtures(&cell_tuples, CELL_SIZE, center);
-                    if let Some(raw) = metal_mesh {
+                    for (raw, role) in build_ship_fixtures(&cell_tuples, CELL_SIZE, center) {
+                        let mat = match role {
+                            FixtureRole::Metal => assets.fixture_metal_material.clone(),
+                            FixtureRole::Glow => assets.fixture_glow_material.clone(),
+                            FixtureRole::NavRed => assets.nav_red_material.clone(),
+                            FixtureRole::NavGreen => assets.nav_green_material.clone(),
+                            FixtureRole::NavWhite => assets.nav_white_material.clone(),
+                            FixtureRole::Accent => match e.faction {
+                                1 => assets.accent_red_material.clone(),
+                                2 => assets.accent_blue_material.clone(),
+                                _ => assets.accent_neutral_material.clone(),
+                            },
+                        };
                         let mh = meshes.add(raw);
                         let child = commands
-                            .spawn((
-                                Mesh3d(mh.clone()),
-                                MeshMaterial3d(assets.fixture_metal_material.clone()),
-                                Transform::IDENTITY,
-                            ))
+                            .spawn((Mesh3d(mh.clone()), MeshMaterial3d(mat), Transform::IDENTITY))
                             .id();
                         if let Ok(mut ec) = commands.get_entity(parent) {
                             ec.add_child(child);
                         }
                         let h = current.hull_mut();
-                        h.fixture_metal_child = Some(child);
-                        h.fixture_metal_mesh = Some(mh);
-                    }
-                    if let Some(raw) = glow_mesh {
-                        let gh = meshes.add(raw);
-                        let child = commands
-                            .spawn((
-                                Mesh3d(gh.clone()),
-                                MeshMaterial3d(assets.fixture_glow_material.clone()),
-                                Transform::IDENTITY,
-                            ))
-                            .id();
-                        if let Ok(mut ec) = commands.get_entity(parent) {
-                            ec.add_child(child);
-                        }
-                        let h = current.hull_mut();
-                        h.fixture_glow_child = Some(child);
-                        h.fixture_glow_mesh = Some(gh);
+                        h.fixture_children.push(child);
+                        h.fixture_meshes.push(mh);
                     }
                 }
             }
@@ -1210,21 +1224,14 @@ fn free_hull_tile(commands: &mut Commands, meshes: &mut Assets<Mesh>, tile: Hull
     }
 }
 
-/// R47 — despawn + free the hard-surface fixture children (metal + glow) tracked on a [`ShipHull`].
-/// Called on a hull rebuild (so a carve refreshes the parts) and on near→far / teardown.
+/// R47/R48 — despawn + free ALL the hard-surface fixture children (greebles, glow, nav lights,
+/// accents) tracked on a [`ShipHull`]. Called on a hull rebuild (so a carve refreshes the parts) and
+/// on near→far / teardown.
 fn free_fixtures(commands: &mut Commands, meshes: &mut Assets<Mesh>, h: &mut ShipHull) {
-    if let Some(m) = h.fixture_metal_mesh.take() {
+    for m in h.fixture_meshes.drain(..) {
         meshes.remove(&m);
     }
-    if let Some(c) = h.fixture_metal_child.take() {
-        if let Ok(mut ec) = commands.get_entity(c) {
-            ec.despawn();
-        }
-    }
-    if let Some(m) = h.fixture_glow_mesh.take() {
-        meshes.remove(&m);
-    }
-    if let Some(c) = h.fixture_glow_child.take() {
+    for c in h.fixture_children.drain(..) {
         if let Ok(mut ec) = commands.get_entity(c) {
             ec.despawn();
         }
@@ -1570,6 +1577,76 @@ fn update_shield_bubble(
                     entity: bubble,
                     material,
                 });
+            }
+        }
+    }
+}
+
+/// Forward speed (world u/s) at which the engine exhaust reaches full length (R48). Tunable.
+const EXHAUST_MAX_SPEED: f32 = 60.0;
+
+/// R48 — show + scale a ship's throttle-reactive engine EXHAUST: a rear-centre additive flame cone,
+/// lazily spawned as a child (mirrors [`update_shield_bubble`] — shared mesh/material, per-frame child
+/// transform). The flame appears + lengthens with FORWARD speed and hides when slow/reversing. One per
+/// LIVE ship (not projectiles / debris / plain targets).
+#[allow(clippy::too_many_arguments)]
+fn update_engine_exhaust(
+    commands: &mut Commands,
+    assets: &RenderAssets,
+    exhaust_q: &Query<&EngineExhaust>,
+    tf_vis_q: &mut Query<(&mut Visibility, &mut Transform)>,
+    parent: Entity,
+    kind: EntityKind,
+    vel: Vec2,
+    heading: f32,
+    grid_dims: (u16, u16),
+) {
+    let is_ship = kind == EntityKind::Ship;
+    let fwd = Vec2::from_angle(heading);
+    let throttle = if is_ship {
+        (vel.dot(fwd) / EXHAUST_MAX_SPEED).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let show = is_ship && throttle > 0.03;
+
+    // Rear-centre in the ship-LOCAL frame (the child inherits the ship transform). Aft = the row-0
+    // edge; the cone (Bevy `Cone` axis +Y) is rotated +Y→-X so it trails aft, base at the nozzle.
+    let rear_x = (0.5 - grid_dims.1 as f32 * 0.5) * CELL_SIZE;
+    let length = CELL_SIZE * (1.0 + 3.5 * throttle);
+    let width = CELL_SIZE * 0.7;
+    let tf = Transform::from_xyz(rear_x - length * 0.5, 0.0, CELL_SIZE * 0.18)
+        .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2))
+        .with_scale(Vec3::new(width, length, width));
+
+    match exhaust_q.get(parent) {
+        Ok(ex) => {
+            if let Ok((mut vis, mut t)) = tf_vis_q.get_mut(ex.flame) {
+                *vis = if show {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                };
+                *t = tf;
+            }
+        }
+        Err(_) => {
+            let flame = commands
+                .spawn((
+                    EngineFlame,
+                    Mesh3d(assets.engine_flame_mesh.clone()),
+                    MeshMaterial3d(assets.engine_flame_material.clone()),
+                    tf,
+                    if show {
+                        Visibility::Inherited
+                    } else {
+                        Visibility::Hidden
+                    },
+                ))
+                .id();
+            if let Ok(mut ec) = commands.get_entity(parent) {
+                ec.add_child(flame);
+                ec.insert(EngineExhaust { flame });
             }
         }
     }

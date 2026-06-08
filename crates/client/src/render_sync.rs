@@ -86,6 +86,19 @@ pub struct ShieldChild {
 #[derive(Component, Clone, Copy, Debug)]
 pub struct ShieldBubble;
 
+/// R48 — a ship's throttle-reactive engine-exhaust tracking, on the PARENT entity. Holds the rear-
+/// centre flame child (a shared additive emissive cone) which [`crate::net::update_engine_exhaust`]
+/// lengthens + shows with forward speed. Lazily spawned once per live ship; despawned with the parent.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct EngineExhaust {
+    pub flame: Entity,
+}
+
+/// Marker for the engine-exhaust flame child (so its [`Visibility`]/[`Transform`] are driven each
+/// frame by [`crate::net::update_engine_exhaust`]).
+#[derive(Component, Clone, Copy, Debug)]
+pub struct EngineFlame;
+
 /// Revise-B seamless hull-surface tracking on a rendered fitted ship's PARENT entity.
 ///
 /// When a fitted ship is **near** (the camera-distance LOD gate, see
@@ -158,14 +171,13 @@ pub struct ShipHull {
     /// The overlay mesh's handle, kept so it is removed from [`Assets<Mesh>`] on rebuild / despawn
     /// (no per-session mesh leak), mirroring [`ShipHull::mesh`].
     pub module_overlay_mesh: Option<Handle<Mesh>>,
-    /// R47 — the hard-surface FIXTURE children (the 3D ship parts): a `metal` mesh (barrels / nozzle
-    /// housings / dishes / nodes / canopy) and a `glow` mesh (engine nozzle cores + reactor vents),
-    /// rebuilt + freed alongside the hull child. `None` when absent (no relevant cells / module-color
-    /// inspection mode / far / big structure).
-    pub fixture_metal_child: Option<Entity>,
-    pub fixture_metal_mesh: Option<Handle<Mesh>>,
-    pub fixture_glow_child: Option<Entity>,
-    pub fixture_glow_mesh: Option<Handle<Mesh>>,
+    /// R47/R48 — the hard-surface FIXTURE children (the 3D ship parts: greebles, glow, nav lights,
+    /// faction accents), each a role-tagged mesh child spawned alongside the hull and rebuilt + freed
+    /// with it (so a carve drops the part). Tracked as parallel vectors of child entities + their mesh
+    /// handles so any number of role children free uniformly. Empty when absent (no relevant cells /
+    /// module-color inspection mode / far / big structure).
+    pub fixture_children: Vec<Entity>,
+    pub fixture_meshes: Vec<Handle<Mesh>>,
 }
 
 /// Previous + current sim snapshots for one entity. `interpolate_transforms`

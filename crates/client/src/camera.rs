@@ -35,7 +35,8 @@ pub fn setup_camera(mut commands: Commands) {
         // `intensity` is then driven live by `StarfieldTuning` (dev panel); keep it modest.
         Tonemapping::TonyMcMapface,
         Bloom {
-            intensity: 0.15,
+            // R48: nudged up so the emissive engine glow / nav lights / fresnel rim pop.
+            intensity: 0.20,
             ..Bloom::NATURAL
         },
     ));
