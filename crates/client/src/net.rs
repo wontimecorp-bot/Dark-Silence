@@ -71,8 +71,8 @@ use crate::render_sync::{
     ShieldChild, ShipDamageFx, ShipHull, ShipThrottle,
 };
 use crate::scene::{
-    build_hull_mesh, build_hull_mesh_contour, build_module_overlay_mesh, build_ship_fixtures,
-    FixtureRole, RenderAssets, CELL_SIZE,
+    build_hull_mesh, build_hull_mesh_beveled, build_hull_mesh_contour, build_module_overlay_mesh,
+    build_ship_fixtures, FixtureRole, RenderAssets, CELL_SIZE, DETAIL_MAX_CELLS,
 };
 
 /// The loopback solo-play host: the embedded authoritative [`ServerApp`] plus the
@@ -523,10 +523,13 @@ fn capture_render_state(
     mut ship_hull_q: Query<&mut ShipHull>,
     hull_mode: Res<HullRenderMode>,
     module_mode: Res<ModuleColorMode>,
+    ship_visual: Res<crate::ShipVisualTuning>,
 ) {
     let local_id = state.local_id;
     let contour = hull_mode.contour;
     let module_color = module_mode.on;
+    // R53 — the live combat-hull plate dims; a change rebuilds the hull (see `sync_ship_hull`).
+    let style = ship_visual.hull_style();
     let entities = host.server.render_state();
 
     // Phase 1B LOD origin: the local player ship's world position (the follow-camera
@@ -597,6 +600,7 @@ fn capture_render_state(
                 lod_origin,
                 contour,
                 module_color,
+                style,
             );
             // Show + fade (or lazily spawn) this entity's LOCALIZED shield-impact flash
             // from the hit-driven `shield_flash`, placed at the impact (`hit_dir`).
@@ -644,6 +648,7 @@ fn capture_render_state(
                 lod_origin,
                 contour,
                 module_color,
+                style,
             );
             // Seed (if its shield is being hit) its localized impact flash immediately
             // so the first rendered frame already shows it at the impact point.
@@ -861,6 +866,7 @@ fn sync_ship_hull(
     lod_origin: Vec2,
     contour: bool,
     module_color: bool,
+    style: crate::scene::HullStyle,
 ) {
     // Only a fitted ship OR a severed chunk / dead hulk carries a cell payload; everything
     // else (projectiles, plain targets) keeps its single mesh and is handled by the
@@ -884,6 +890,11 @@ fn sync_ship_hull(
     // base_color). The CONTOUR look keeps the normal tinted hull material and shows modules via a
     // separate overlay child instead, so it always uses the plain material.
     let voxel_colored = module_color && !contour;
+    // R48/R49 — the COMBAT look (live ship, plain voxel mesh) wears the cinematic ExtendedMaterial hull
+    // (fresnel rim) + R52/R53 the REAL per-cell plate geometry. Wrecks / module-colour view / contour
+    // keep plain StandardMaterial + the flat builder. Computed up here so `needs_build` can trigger a
+    // rebuild when the live `HullStyle` (plate dims) changes (combat path only).
+    let use_ext = !is_wreck && !module_color && !contour;
     let hull_mat = match (is_wreck, voxel_colored) {
         (true, true) => assets.wreck_hull_material_white.clone(),
         (true, false) => assets.wreck_hull_material.clone(),
@@ -967,7 +978,9 @@ fn sync_ship_hull(
             let needs_build = current.child().is_none()
                 || current.cells_hash() != hash
                 || current.built_contour() != contour
-                || current.built_module_color() != module_color;
+                || current.built_module_color() != module_color
+                // R53 — a live "Hull plates" edit changes the combat-hull dims (cells unchanged).
+                || (use_ext && current.built_style() != Some(style));
             if needs_build {
                 // Free the previous mesh + child (rebuild path) so meshes/entities don't leak.
                 if let Some(old) = current.take_mesh() {
@@ -998,22 +1011,19 @@ fn sync_ship_hull(
                 let cell_tuples: Vec<(u16, u16, u8)> =
                     e.cells.iter().map(|c| (c.col, c.row, c.kind)).collect();
                 // The runtime toggles pick the look: smoothed rounded contour (Fix #11 M2) vs the
-                // blocky per-cell voxel mesh. Both share the same `center`-relative local frame, so
-                // the child sits identically under the parent transform either way. In the voxel look,
-                // `module_color` paints per-cell vertex colors (shown by the white-base material above).
+                // blocky per-cell voxel mesh. Both share the same `center`-relative local frame, so the
+                // child sits identically under the parent transform either way. R55 — the combat look is
+                // ONE BEVELED solid (`build_hull_mesh_beveled`, live `style`) on ship-sized hulls (the
+                // cell-count cap keeps it off any large hull). The module-colour view paints per-cell
+                // vertex colours via `build_hull_mesh` (white-base material).
                 let raw_mesh = if contour {
                     build_hull_mesh_contour(&cell_tuples, CELL_SIZE, center)
+                } else if use_ext && cell_tuples.len() <= DETAIL_MAX_CELLS {
+                    build_hull_mesh_beveled(&cell_tuples, CELL_SIZE, center, style)
                 } else {
                     build_hull_mesh(&cell_tuples, CELL_SIZE, center, module_color)
                 };
                 let mesh = meshes.add(raw_mesh);
-
-                // R48/R49 — the COMBAT look (a live ship, plain voxel mesh) wears the cinematic
-                // ExtendedMaterial hull (fresnel rim + panels + grime), faction-tinted. Wrecks, the
-                // module-colour inspection view, and the contour mesh keep plain StandardMaterial. The
-                // child is fully despawned+rebuilt (never component-swapped), so the differing material
-                // component types never collide on one entity.
-                let use_ext = !is_wreck && !module_color && !contour;
                 let child = if use_ext {
                     let ext = match e.faction {
                         1 => assets.hull_ext_red.clone(),
@@ -1044,6 +1054,7 @@ fn sync_ship_hull(
                 current.set_cells_hash(hash);
                 current.set_built_contour(contour);
                 current.set_built_module_color(module_color);
+                current.set_built_style(Some(style)); // R53 — remember the plate dims this hull used.
 
                 // Module-color OVERLAY (the "second layer", contour look only): thin colored markers
                 // on module cells over the smooth hull. `None` when the chunk has no module cells.
@@ -1078,8 +1089,9 @@ fn sync_ship_hull(
                     // `NAV_MIN_FOOTPRINT` (~6.0) is the cut. (Transports render via the chunked path
                     // and don't get fixtures yet — a follow-up.)
                     let nav_ok = footprint >= NAV_MIN_FOOTPRINT;
+                    // R53 — fixtures sit on the live (taller) combat-hull top.
                     let (fixtures, thrusters) =
-                        build_ship_fixtures(&cell_tuples, CELL_SIZE, center);
+                        build_ship_fixtures(&cell_tuples, CELL_SIZE, center, style.top);
                     for (raw, role) in fixtures {
                         if matches!(
                             role,
@@ -1462,6 +1474,18 @@ impl HullView<'_> {
         match self {
             HullView::Existing(c) => c.built_module_color = v,
             HullView::New(c) => c.built_module_color = v,
+        }
+    }
+    fn built_style(&self) -> Option<crate::scene::HullStyle> {
+        match self {
+            HullView::Existing(c) => c.built_style,
+            HullView::New(c) => c.built_style,
+        }
+    }
+    fn set_built_style(&mut self, v: Option<crate::scene::HullStyle>) {
+        match self {
+            HullView::Existing(c) => c.built_style = v,
+            HullView::New(c) => c.built_style = v,
         }
     }
     fn set_module_overlay_child(&mut self, v: Option<Entity>) {

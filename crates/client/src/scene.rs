@@ -218,6 +218,42 @@ const HULL_THICKNESS: f32 = 0.18;
 /// cell). Tunable in code for plate density.
 const HULL_UV_TILE: f32 = 1.2;
 
+/// Belt-and-suspenders cap: only ship-sized hulls get the beveled combat mesh (big structures stay
+/// flat/chunked). Passed by [`crate::net::sync_ship_hull`] before calling [`build_hull_mesh_beveled`].
+pub const DETAIL_MAX_CELLS: usize = 400;
+
+/// R55 — the live combat-hull BEVEL dimensions (built from [`crate::ship_visuals::ShipVisualTuning`]).
+/// The hull is ONE beveled solid traced from the cell silhouette: a vertical wall up to a `shoulder`,
+/// then a CHAMFER (`bevel`) up to an inset flat top at `top`. `round_iters` smooths the silhouette (0 =
+/// hard/angular, more = rounder). `PartialEq` so a change forces a rebuild.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct HullStyle {
+    /// Combat-hull thickness (the top face's `z`). Modest — the bevel + tilt + shadows carry the 3-D read.
+    pub top: f32,
+    /// Chamfer size: the top face is inset inward by `bevel` from the silhouette, and the chamfer rises
+    /// over ~`bevel` of height → a ~45° beveled edge that catches the raking key light.
+    pub bevel: f32,
+    /// Silhouette smoothing (Chaikin corner-cut passes): `0` = hard/angular cells, `1` = lightly rounded,
+    /// `2` = the contour-look roundness. Higher = rounder (and slightly smaller).
+    pub round_iters: u32,
+}
+
+impl Default for HullStyle {
+    fn default() -> Self {
+        // Mirrors the `ShipVisualTuning` defaults (the dev panel is the live source of truth).
+        Self {
+            top: 0.15,
+            bevel: 0.05,
+            round_iters: 1,
+        }
+    }
+}
+
+/// R53 — marker on the KEY directional light so [`crate::ship_visuals::apply_ship_visuals`] can live-tune
+/// its shadows / illuminance / raking direction (mirrors [`FillLight`]).
+#[derive(Component)]
+pub struct KeyLight;
+
 /// Inner radius **fraction** of the shield-impact arc band — the near edge of the
 /// glowing ring slice as a fraction of the (normalized) outer radius `1.0`. The mesh is
 /// built normalized to outer radius `1.0` so it can be **scaled per ship** to hug any
@@ -653,7 +689,10 @@ fn build_hull_mesh_with(
         }
     }
 
-    let mut mesh = Mesh::new(
+    // R52/R55 — no tangents: the combat hull is real geometry now (see `build_hull_mesh_beveled`), and
+    // the wreck/contour/module-colour paths never used a normal map, so the flat builder reverts to
+    // POSITION/NORMAL/UV_0/COLOR only.
+    Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
     )
@@ -661,12 +700,225 @@ fn build_hull_mesh_with(
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
     .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
-    .with_inserted_indices(Indices::U32(indices));
-    // R51 — generate tangents so the baked normal-map plating lights correctly (the combat hull wears
-    // it; the wreck/tile/contour paths just carry the harmless extra attribute). Ignored on the rare
-    // error (indexed TriangleList with POSITION/NORMAL/UV_0 succeeds).
-    let _ = mesh.generate_tangents();
-    mesh
+    .with_inserted_indices(Indices::U32(indices))
+}
+
+/// R55 — inset a CCW ring INWARD by `inset` via a per-vertex MITER offset (along the angle bisector,
+/// scaled `1/cos(half-angle)`, clamped to avoid spikes at sharp corners). The beveled hull's chamfered
+/// top edge runs between the original outer ring and this inset ring.
+fn inset_ring(ring: &[Vec2], inset: f32) -> Vec<Vec2> {
+    let n = ring.len();
+    (0..n)
+        .map(|i| {
+            let prev = ring[(i + n - 1) % n];
+            let cur = ring[i];
+            let next = ring[(i + 1) % n];
+            let e0 = (cur - prev).normalize_or_zero();
+            let e1 = (next - cur).normalize_or_zero();
+            // Inward normal of a CCW edge dir `e` is `(-e.y, e.x)` (outward is `(e.y, -e.x)`).
+            let n0 = Vec2::new(-e0.y, e0.x);
+            let n1 = Vec2::new(-e1.y, e1.x);
+            let mut bis = n0 + n1;
+            if bis.length_squared() < 1.0e-8 {
+                bis = n1; // straight or degenerate → just use the edge normal
+            }
+            let bis = bis.normalize_or_zero();
+            let cos_h = bis.dot(n1).max(0.30); // clamp keeps sharp corners from spiking inward
+            cur + bis * (inset / cos_h)
+        })
+        .collect()
+}
+
+/// R55 — the COMBAT ship hull as ONE BEVELED solid traced from the cell silhouette (replaces the R52–54
+/// per-cell plates). Reuses the contour builder's boundary tracing + Chaikin smoothing + earcut: each
+/// ring is smoothed by `style.round_iters` (0 = hard/angular, more = rounder); the OUTER ring gets a
+/// vertical wall (`z 0..shoulder`) + a CHAMFER (`shoulder → inset top`, the bevel that catches the raking
+/// key light) + an inset flat top at `z = top`; HOLE rings (carved cavities) keep a plain vertical wall.
+/// Output POSITION/NORMAL/UV (no per-vertex COLOR — the faction tint is the material `base_color`).
+/// Carving rebuilds it from the live cells.
+pub fn build_hull_mesh_beveled(
+    cells: &[(u16, u16, u8)],
+    cell_size: f32,
+    center: Vec2,
+    style: HullStyle,
+) -> Mesh {
+    let present: std::collections::HashSet<(u16, u16)> =
+        cells.iter().map(|&(c, r, _)| (c, r)).collect();
+    let loops = cell_boundary_loops(&present);
+
+    // Local-space rings, oriented canonically (outer CCW, holes CW) — mirrors `build_hull_mesh_contour`.
+    let mut outers: Vec<Vec<Vec2>> = Vec::new();
+    let mut holes: Vec<Vec<Vec2>> = Vec::new();
+    for raw in &loops {
+        let mut pts: Vec<Vec2> = raw
+            .iter()
+            .map(|&(cc, rr)| {
+                Vec2::new(
+                    (rr as f32 - center.y) * cell_size,
+                    (cc as f32 - center.x) * cell_size,
+                )
+            })
+            .collect();
+        let area2 = signed_area2(&pts);
+        if area2 < -1.0e-6 {
+            pts.reverse();
+            outers.push(pts);
+        } else if area2 > 1.0e-6 {
+            pts.reverse();
+            holes.push(pts);
+        }
+    }
+
+    let top = style.top.max(0.01);
+    let bevel = style.bevel.clamp(0.0, cell_size * 0.45);
+    let shoulder = (top - bevel.min(top * 0.7)).max(0.0);
+
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    // Takes the buffers as args (not captured) so the top-face fill can push to them directly between calls.
+    let push_quad = |positions: &mut Vec<[f32; 3]>,
+                     normals: &mut Vec<[f32; 3]>,
+                     uvs: &mut Vec<[f32; 2]>,
+                     indices: &mut Vec<u32>,
+                     corners: [[f32; 3]; 4],
+                     normal: [f32; 3]| {
+        let base = positions.len() as u32;
+        positions.extend_from_slice(&corners);
+        for _ in 0..4 {
+            normals.push(normal);
+        }
+        uvs.extend_from_slice(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+
+    let single_outer = outers.len() == 1;
+    for outer in &outers {
+        let my_holes: Vec<Vec<Vec2>> = if single_outer {
+            holes.clone()
+        } else {
+            holes
+                .iter()
+                .filter(|h| point_in_polygon(ring_centroid(h), outer))
+                .cloned()
+                .collect()
+        };
+        let outer_s = chaikin_closed(outer, style.round_iters);
+        if outer_s.len() < 3 {
+            continue;
+        }
+        let holes_s: Vec<Vec<Vec2>> = my_holes
+            .iter()
+            .map(|h| chaikin_closed(h, style.round_iters))
+            .filter(|h| h.len() >= 3)
+            .collect();
+        let inset = inset_ring(&outer_s, bevel);
+
+        // TOP FACE: the inset outer ring minus the holes, flat at z = top, normal +Z.
+        let base = positions.len() as u32;
+        for p in &inset {
+            positions.push([p.x, p.y, top]);
+            normals.push([0.0, 0.0, 1.0]);
+            uvs.push([0.0, 0.0]);
+        }
+        for h in &holes_s {
+            for p in h {
+                positions.push([p.x, p.y, top]);
+                normals.push([0.0, 0.0, 1.0]);
+                uvs.push([0.0, 0.0]);
+            }
+        }
+        for t in ear_clip_with_holes(&inset, &holes_s) {
+            indices.push(base + t);
+        }
+
+        // OUTER ring: vertical wall (0..shoulder) + CHAMFER (shoulder → inset top = the bevel).
+        let n = outer_s.len();
+        for i in 0..n {
+            let a = outer_s[i];
+            let b = outer_s[(i + 1) % n];
+            let ai = inset[i];
+            let bi = inset[(i + 1) % n];
+            let d = b - a;
+            let len = d.length();
+            if len <= 1.0e-6 {
+                continue;
+            }
+            let nrm = Vec2::new(d.y, -d.x) / len; // outward (CCW outer)
+            push_quad(
+                &mut positions,
+                &mut normals,
+                &mut uvs,
+                &mut indices,
+                [
+                    [a.x, a.y, 0.0],
+                    [b.x, b.y, 0.0],
+                    [b.x, b.y, shoulder],
+                    [a.x, a.y, shoulder],
+                ],
+                [nrm.x, nrm.y, 0.0],
+            );
+            // Chamfer normal (from the quad) points outward+up → catches the raking key light.
+            let c0 = Vec3::new(a.x, a.y, shoulder);
+            let c1 = Vec3::new(b.x, b.y, shoulder);
+            let c2 = Vec3::new(bi.x, bi.y, top);
+            let cn = (c1 - c0)
+                .cross(c2 - c0)
+                .try_normalize()
+                .unwrap_or(Vec3::new(nrm.x, nrm.y, 0.0));
+            push_quad(
+                &mut positions,
+                &mut normals,
+                &mut uvs,
+                &mut indices,
+                [
+                    [a.x, a.y, shoulder],
+                    [b.x, b.y, shoulder],
+                    [bi.x, bi.y, top],
+                    [ai.x, ai.y, top],
+                ],
+                [cn.x, cn.y, cn.z],
+            );
+        }
+
+        // HOLE rings (carved cavities): a plain vertical wall 0..top, normal into the cavity.
+        for ring in &holes_s {
+            let n = ring.len();
+            for i in 0..n {
+                let a = ring[i];
+                let b = ring[(i + 1) % n];
+                let d = b - a;
+                let len = d.length();
+                if len <= 1.0e-6 {
+                    continue;
+                }
+                let nrm = Vec2::new(d.y, -d.x) / len;
+                push_quad(
+                    &mut positions,
+                    &mut normals,
+                    &mut uvs,
+                    &mut indices,
+                    [
+                        [a.x, a.y, 0.0],
+                        [b.x, b.y, 0.0],
+                        [b.x, b.y, top],
+                        [a.x, a.y, top],
+                    ],
+                    [nrm.x, nrm.y, 0.0],
+                );
+            }
+        }
+    }
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_indices(Indices::U32(indices))
 }
 
 // ============================================================================
@@ -789,8 +1041,10 @@ pub fn build_ship_fixtures(
     cells: &[(u16, u16, u8)],
     cell_size: f32,
     center: Vec2,
+    top: f32,
 ) -> (Vec<(Mesh, FixtureRole)>, Vec<Vec3>) {
-    let top = HULL_THICKNESS;
+    // R53 — `top` is the live combat-hull thickness ([`HullStyle::top`]) so the fixtures sit on (and
+    // scale with) the taller hull instead of the const `HULL_THICKNESS`.
     let s = cell_size;
     let mut metal = MeshBuf::default();
     let mut glow = MeshBuf::default();
@@ -1432,15 +1686,32 @@ pub fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut hull_ext: ResMut<Assets<crate::hull_shader::HullMaterial>>,
-    mut images: ResMut<Assets<Image>>,
 ) {
-    // Lighting: a key directional light so PBR primitives read (ambient fill is
-    // attached to the camera in `camera::setup_camera`).
+    // R53 — crisp shadow map; the scene is ship-sized so a high-res map + a tight cascade gives sharp
+    // contact shadows that make the per-cell plate relief + fixtures read as 3-D even near-top-down.
+    commands.insert_resource(bevy::light::DirectionalLightShadowMap { size: 4096 });
+
+    // Lighting: a key directional light so PBR primitives read (ambient fill is attached to the camera
+    // in `camera::setup_camera`). R53 — it now CASTS SHADOWS (`KeyLight` marker → `apply_ship_visuals`
+    // live-tunes its shadows/illuminance/raking direction); a tight `CascadeShadowConfig` concentrates
+    // the shadow-map resolution near the ship. The Transform here is a placeholder — `apply_ship_visuals`
+    // re-aims it from the azimuth/elevation tuning on the first frame.
     commands.spawn((
+        KeyLight,
         DirectionalLight {
             illuminance: 9000.0,
+            shadows_enabled: true,
+            shadow_normal_bias: 1.8,
             ..default()
         },
+        bevy::light::CascadeShadowConfigBuilder {
+            num_cascades: 2,
+            minimum_distance: 0.1,
+            maximum_distance: 120.0,
+            first_cascade_far_bound: 30.0,
+            ..default()
+        }
+        .build(),
         Transform::from_xyz(6.0, 8.0, 20.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     // R48/R49 — a dim COOL fill light from roughly the opposite side so the unlit faces of the gritty
@@ -1659,23 +1930,15 @@ pub fn setup_scene(
         ..default()
     });
 
-    // R51 — bake the procedural hull-plating textures (tiling normal + ORM) once. The relief catches
-    // the key light → real plated metal (the panel detail the flat shader "+ signs" couldn't give).
-    let hull_normal = images.add(crate::hull_textures::generate_hull_normal_map());
-    let hull_orm = images.add(crate::hull_textures::generate_hull_orm_map());
-
-    // R48/R49/R51 — the cinematic hull material per faction: PBR metal + the baked normal/ORM plating
-    // textures + the fresnel-rim extension, rim-tinted neutral cool / team red / team blue. The rim +
-    // grime params are live-tuned each frame by `apply_ship_visuals`.
+    // R48/R49/R52/R55 — the cinematic hull material per faction: PBR metal + the fresnel-rim extension,
+    // rim-tinted neutral cool / team red / team blue. R52 dropped the R51 normal/ORM plating textures
+    // (they faked relief → shimmered); the surface detail is now real geometry (the beveled hull,
+    // `build_hull_mesh_beveled`). The rim params are live-tuned each frame by `apply_ship_visuals`.
     let make_hull_ext = |base: Color, rim: Vec4| crate::hull_shader::HullMaterial {
         base: StandardMaterial {
             base_color: base,
             metallic: 0.85,
             perceptual_roughness: 0.35,
-            normal_map_texture: Some(hull_normal.clone()),
-            metallic_roughness_texture: Some(hull_orm.clone()),
-            occlusion_texture: Some(hull_orm.clone()),
-            flip_normal_map_y: false,
             ..default()
         },
         extension: crate::hull_shader::hull_extension(rim),

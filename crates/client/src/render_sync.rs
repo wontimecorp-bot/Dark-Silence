@@ -175,6 +175,10 @@ pub struct ShipHull {
     /// mode the vertex colors change; in contour mode the module-marker overlay child appears /
     /// disappears).
     pub built_module_color: bool,
+    /// R53 — the live [`crate::scene::HullStyle`] (plate dims) the current combat-hull child was built
+    /// with. Compared against the live `ShipVisualTuning` so dragging a "Hull plates" slider rebuilds the
+    /// hull (the cell set is unchanged, so `cells_hash` alone wouldn't trigger it). `None` until built.
+    pub built_style: Option<crate::scene::HullStyle>,
     /// The contour module-color OVERLAY child entity (Fix #11 M3) — the thin colored markers on
     /// module cells drawn OVER the smooth contour hull. `None` unless in contour mode with module
     /// coloring on and the hull has at least one module cell. Despawned + freed alongside the hull

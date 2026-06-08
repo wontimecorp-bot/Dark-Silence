@@ -51,6 +51,36 @@ pub struct ShipVisualTuning {
     pub smoke_amount: f32,
     #[serde(default = "default_true")]
     pub spark_on: bool,
+    // ---- R53: camera tilt + shadows + raking key light + live hull/plate dims ----
+    /// Camera PITCH off straight-down, degrees (0 = pure top-down). A small tilt reveals the hull's
+    /// 3-D depth. Read live by `follow_camera`.
+    pub camera_tilt_deg: f32,
+    /// Key directional light: cast shadows? (the biggest "it's 3-D" cue), illuminance, and its
+    /// direction as azimuth (around +Z, from +X toward +Y) + elevation (above the XY plane). A LOW
+    /// elevation rakes the light across the hull → long dramatic shadows.
+    pub shadows_on: bool,
+    pub shadow_normal_bias: f32,
+    pub key_illuminance: f32,
+    pub key_azimuth_deg: f32,
+    pub key_elevation_deg: f32,
+    /// R55 — the combat hull is ONE BEVELED solid: `hull_top` = thickness, `hull_bevel` = chamfer size on
+    /// the silhouette edge (catches the key light), `hull_round` = silhouette smoothing passes (0 = hard/
+    /// angular, more = rounder). Live — edits rebuild the hull.
+    pub hull_top: f32,
+    pub hull_bevel: f32,
+    pub hull_round: f32,
+}
+
+impl ShipVisualTuning {
+    /// The live combat-hull bevel dimensions, for `build_hull_mesh_beveled` + the fixtures.
+    pub fn hull_style(&self) -> crate::scene::HullStyle {
+        crate::scene::HullStyle {
+            top: self.hull_top,
+            bevel: self.hull_bevel,
+            // The slider is f32 → round + clamp the smoothing passes (more than 4 over-shrinks).
+            round_iters: (self.hull_round.round() as i32).clamp(0, 4) as u32,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -92,6 +122,17 @@ impl Default for ShipVisualTuning {
             smoke_on: true,
             smoke_amount: default_smoke_amount(),
             spark_on: true,
+            // R53: a small tilt + shadows + a slightly-raking key light so the relief reads.
+            camera_tilt_deg: 5.0,
+            shadows_on: true,
+            shadow_normal_bias: 1.8,
+            key_illuminance: 9000.0,
+            key_azimuth_deg: 50.0,
+            key_elevation_deg: 50.0,
+            // R55 — ONE beveled solid: modest thickness + a chamfered edge + a light rounding.
+            hull_top: 0.15,
+            hull_bevel: 0.05,
+            hull_round: 1.0,
         }
     }
 }
@@ -105,7 +146,11 @@ pub fn apply_ship_visuals(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut hull_mats: ResMut<Assets<crate::hull_shader::HullMaterial>>,
     mut bloom_q: Query<&mut Bloom, With<MainCamera>>,
-    mut fill_q: Query<&mut DirectionalLight, With<FillLight>>,
+    mut fill_q: Query<&mut DirectionalLight, (With<FillLight>, Without<crate::scene::KeyLight>)>,
+    mut key_q: Query<
+        (&mut DirectionalLight, &mut Transform),
+        (With<crate::scene::KeyLight>, Without<FillLight>),
+    >,
 ) {
     if !tuning.is_changed() {
         return;
@@ -188,6 +233,20 @@ pub fn apply_ship_visuals(
     }
     if let Ok(mut fill) = fill_q.single_mut() {
         fill.illuminance = tuning.fill_intensity;
+    }
+
+    // R53 — the KEY light: shadows on/off + bias, illuminance, and a raking direction from
+    // azimuth/elevation (low elevation → long grazing shadows that reveal the plate relief).
+    if let Ok((mut key, mut tf)) = key_q.single_mut() {
+        key.illuminance = tuning.key_illuminance;
+        key.shadows_enabled = tuning.shadows_on;
+        key.shadow_normal_bias = tuning.shadow_normal_bias;
+        let az = tuning.key_azimuth_deg.to_radians();
+        let el = tuning.key_elevation_deg.to_radians();
+        // The light SITS at this point on a hemisphere and looks at the origin, so it shines
+        // down-inward from (az, el); `el = 90°` is straight down, `el → 0` rakes along the hull.
+        let pos = Vec3::new(el.cos() * az.cos(), el.cos() * az.sin(), el.sin()) * 30.0;
+        *tf = Transform::from_translation(pos).looking_at(Vec3::ZERO, Vec3::Y);
     }
 }
 

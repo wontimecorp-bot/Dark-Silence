@@ -42,17 +42,25 @@ pub fn setup_camera(mut commands: Commands) {
     ));
 }
 
-/// Keep the camera centred over the ship, looking straight down.
+/// Keep the camera centred on the ship. R53 — a small configurable PITCH off straight-down
+/// ([`ShipVisualTuning::camera_tilt_deg`]) reveals the hull's 3-D depth: the camera orbits to
+/// `(x, y - sinθ·d, cosθ·d)` and looks AT the ship (which stays centred), `d = height` (zoom). At
+/// `θ = 0` this is byte-identical to the old straight-down `(x, y, height)`. Aiming is heading-based,
+/// so the tilt never touches controls.
 pub fn follow_camera(
     ship_q: Query<&Transform, (With<Ship>, Without<MainCamera>)>,
     mut cam_q: Query<(&mut Transform, &MainCamera)>,
+    tuning: Res<crate::ship_visuals::ShipVisualTuning>,
 ) {
     let Ok(ship) = ship_q.single() else {
         return;
     };
     let (x, y) = (ship.translation.x, ship.translation.y);
+    let theta = tuning.camera_tilt_deg.to_radians();
+    let (s, c) = (theta.sin(), theta.cos());
     for (mut tf, cam) in &mut cam_q {
-        tf.translation = Vec3::new(x, y, cam.height);
+        let d = cam.height;
+        tf.translation = Vec3::new(x, y - s * d, c * d);
         tf.look_at(Vec3::new(x, y, 0.0), Vec3::Y);
     }
 }

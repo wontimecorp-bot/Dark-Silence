@@ -2081,6 +2081,29 @@ fn dev_panel_ui(
                     slider(ui, "smoke amount", &mut sv.smoke_amount, 0.0..=30.0)
                         .on_hover_text("Smoke puffs emitted each time a hull cell is carved off.");
                     ui.checkbox(&mut sv.spark_on, "sparks on (hit)");
+
+                    ui.separator();
+                    ui.label("Camera & lighting (R53 — 3-D depth):");
+                    slider(ui, "camera tilt°", &mut sv.camera_tilt_deg, 0.0..=45.0)
+                        .on_hover_text("Camera PITCH off straight-down. 0 = pure top-down (relief invisible); a few degrees reveals the hull's depth. Aiming is heading-based, so the tilt never affects controls.");
+                    ui.checkbox(&mut sv.shadows_on, "key-light shadows");
+                    slider(ui, "shadow bias", &mut sv.shadow_normal_bias, 0.0..=4.0)
+                        .on_hover_text("Shadow normal-bias — raise to kill acne/striping, lower if shadows detach from contact points.");
+                    slider(ui, "key illuminance", &mut sv.key_illuminance, 0.0..=20000.0)
+                        .on_hover_text("Key directional-light brightness (lux).");
+                    slider(ui, "key azimuth°", &mut sv.key_azimuth_deg, 0.0..=360.0)
+                        .on_hover_text("Compass direction the key light comes from (around +Z).");
+                    slider(ui, "key elevation°", &mut sv.key_elevation_deg, 5.0..=90.0)
+                        .on_hover_text("Key-light height: 90° = straight down (flat, no shadows); LOW = raking across the hull → long shadows that reveal the plate relief.");
+
+                    ui.separator();
+                    ui.label("Hull (beveled, R55 — live, rebuilds on edit):");
+                    slider(ui, "hull thickness", &mut sv.hull_top, 0.03..=0.5)
+                        .on_hover_text("Combat-hull thickness (top-face height). Modest — the bevel + tilt + shadows carry the 3-D read; too tall reads as a block.");
+                    slider(ui, "hull bevel", &mut sv.hull_bevel, 0.0..=0.15)
+                        .on_hover_text("Chamfer size on the silhouette edge: the top face insets by this and the edge slopes down to it → a beveled edge that catches the key light. 0 = a hard vertical wall.");
+                    slider(ui, "hull roundness", &mut sv.hull_round, 0.0..=4.0)
+                        .on_hover_text("Silhouette smoothing passes: 0 = hard/angular cells, 1 = lightly rounded, 2+ = rounder (and slightly smaller). Hard-surface look = low.");
                 });
 
                 // Refinement 25/35/36: live starfield — ONE unified galaxy model. `layers` = depth,
