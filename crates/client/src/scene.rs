@@ -1423,12 +1423,14 @@ fn signed_area2(pts: &[Vec2]) -> f32 {
 /// grid-space loops (`x = col`, `y = row`, CCW around the material). Each cell emits its CCW polygon
 /// edges; an edge is INTERNAL (culled) iff its REVERSE also exists (shared between two cells), so the
 /// kept edges are the hull boundary — INCLUDING the diagonals of sub-shapes. Endpoints are quantized to
-/// the half-grid (coords are multiples of 0.5) for exact matching; the kept edges link head-to-tail into
+/// a 1/12 grid (covering ½/⅓/¼ sub-shape vertices) for exact matching; the kept edges link head-to-tail into
 /// loops. (Full-cell hulls reproduce the axis-aligned silhouette; half-cells add clean 45° diagonals;
 /// quarter junctions may have minor artifacts — a later refinement.)
 fn cell_boundary_loops_shaped(cells: &[(u16, u16, sim::fitting::CellShape)]) -> Vec<Vec<Vec2>> {
     use std::collections::{HashMap, HashSet};
-    let key = |v: Vec2| ((v.x * 2.0).round() as i32, (v.y * 2.0).round() as i32);
+    // R58/R62 — quantize endpoints to a 1/12 grid (LCM of 2,3,4) so half-cell (½), 4:1-slope (¼,¾) and
+    // 3:1-slope (⅓,⅔) vertices all map to DISTINCT integers ({0,3,4,6,8,9,12}) for exact edge linking.
+    let key = |v: Vec2| ((v.x * 12.0).round() as i32, (v.y * 12.0).round() as i32);
 
     // All directed CCW polygon edges + a set of their (start,end) keys for the reverse test.
     let mut edges: Vec<(Vec2, Vec2)> = Vec::new();

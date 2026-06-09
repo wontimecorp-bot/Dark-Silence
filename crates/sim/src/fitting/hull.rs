@@ -177,6 +177,38 @@ pub enum CellShape {
     SlopeNEV,
     SlopeNWH,
     SlopeNWV,
+    /// R62 — shallower 3:1 slope (short leg 1/3, area 5/6) and 4:1 slope (short leg 1/4, area 7/8): the
+    /// same corner-cut ramp as `Slope` but gentler, for sleeker / sharper multi-cell tapers.
+    Slope3SWH,
+    Slope3SWV,
+    Slope3SEH,
+    Slope3SEV,
+    Slope3NEH,
+    Slope3NEV,
+    Slope3NWH,
+    Slope3NWV,
+    Slope4SWH,
+    Slope4SWV,
+    Slope4SEH,
+    Slope4SEV,
+    Slope4NEH,
+    Slope4NEV,
+    Slope4NWH,
+    Slope4NWV,
+    /// R62 — POINT / spire (isoceles triangle from a full base edge to the opposite-edge MIDPOINT apex,
+    /// area 0.5): a sharp 1-cell nose tip + the apex cap of a cone. The named direction is where it points.
+    PointN,
+    PointS,
+    PointE,
+    PointW,
+    /// R62 — ROUND / blunt cap (hexagon, area 0.9375): the named EDGE's two corners cut by 1/4 chamfers —
+    /// a flat-rounded 1-cell cap.
+    RoundN,
+    RoundS,
+    RoundE,
+    RoundW,
+    /// R62 — OCTAGON (area 0.875): all four corners 1/4-chamfered — a fully-rounded cell (pod / dome).
+    Octagon,
 }
 
 impl CellShape {
@@ -241,6 +273,72 @@ impl CellShape {
             CellShape::SlopeNEV => vec![p(0.0, 0.0), p(1.0, 0.0), p(0.5, 1.0), p(0.0, 1.0)],
             CellShape::SlopeNWH => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 0.5)],
             CellShape::SlopeNWV => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.5, 1.0)],
+            // R62 shallower slopes (same corner-cut ramp, short leg `k`): Slope3 k=1/3, Slope4 k=1/4.
+            CellShape::Slope3SWH => vec![p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0), p(0.0, 1.0 / 3.0)],
+            CellShape::Slope3SWV => vec![p(1.0 / 3.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::Slope3SEH => vec![p(0.0, 0.0), p(1.0, 1.0 / 3.0), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::Slope3SEV => vec![p(0.0, 0.0), p(2.0 / 3.0, 0.0), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::Slope3NEH => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 2.0 / 3.0), p(0.0, 1.0)],
+            CellShape::Slope3NEV => vec![p(0.0, 0.0), p(1.0, 0.0), p(2.0 / 3.0, 1.0), p(0.0, 1.0)],
+            CellShape::Slope3NWH => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 2.0 / 3.0)],
+            CellShape::Slope3NWV => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(1.0 / 3.0, 1.0)],
+            CellShape::Slope4SWH => vec![p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0), p(0.0, 0.25)],
+            CellShape::Slope4SWV => vec![p(0.25, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::Slope4SEH => vec![p(0.0, 0.0), p(1.0, 0.25), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::Slope4SEV => vec![p(0.0, 0.0), p(0.75, 0.0), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::Slope4NEH => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 0.75), p(0.0, 1.0)],
+            CellShape::Slope4NEV => vec![p(0.0, 0.0), p(1.0, 0.0), p(0.75, 1.0), p(0.0, 1.0)],
+            CellShape::Slope4NWH => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 0.75)],
+            CellShape::Slope4NWV => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.25, 1.0)],
+            // R62 points (triangle to the opposite-edge midpoint apex, CCW).
+            CellShape::PointN => vec![p(0.0, 0.0), p(1.0, 0.0), p(0.5, 1.0)],
+            CellShape::PointS => vec![p(1.0, 1.0), p(0.0, 1.0), p(0.5, 0.0)],
+            CellShape::PointE => vec![p(0.0, 1.0), p(0.0, 0.0), p(1.0, 0.5)],
+            CellShape::PointW => vec![p(1.0, 0.0), p(1.0, 1.0), p(0.0, 0.5)],
+            // R62 round caps (hexagon — the named edge's two corners 1/4-chamfered, CCW).
+            CellShape::RoundN => vec![
+                p(0.0, 0.0),
+                p(1.0, 0.0),
+                p(1.0, 0.75),
+                p(0.75, 1.0),
+                p(0.25, 1.0),
+                p(0.0, 0.75),
+            ],
+            CellShape::RoundS => vec![
+                p(0.25, 0.0),
+                p(0.75, 0.0),
+                p(1.0, 0.25),
+                p(1.0, 1.0),
+                p(0.0, 1.0),
+                p(0.0, 0.25),
+            ],
+            CellShape::RoundE => vec![
+                p(0.0, 0.0),
+                p(0.75, 0.0),
+                p(1.0, 0.25),
+                p(1.0, 0.75),
+                p(0.75, 1.0),
+                p(0.0, 1.0),
+            ],
+            CellShape::RoundW => vec![
+                p(0.25, 0.0),
+                p(1.0, 0.0),
+                p(1.0, 1.0),
+                p(0.25, 1.0),
+                p(0.0, 0.75),
+                p(0.0, 0.25),
+            ],
+            // R62 octagon — all four corners 1/4-chamfered (CCW).
+            CellShape::Octagon => vec![
+                p(0.25, 0.0),
+                p(0.75, 0.0),
+                p(1.0, 0.25),
+                p(1.0, 0.75),
+                p(0.75, 1.0),
+                p(0.25, 1.0),
+                p(0.0, 0.75),
+                p(0.0, 0.25),
+            ],
         }
     }
 
@@ -265,6 +363,25 @@ impl CellShape {
             | CellShape::SlopeNEV
             | CellShape::SlopeNWH
             | CellShape::SlopeNWV => 0.75,
+            CellShape::Slope3SWH
+            | CellShape::Slope3SWV
+            | CellShape::Slope3SEH
+            | CellShape::Slope3SEV
+            | CellShape::Slope3NEH
+            | CellShape::Slope3NEV
+            | CellShape::Slope3NWH
+            | CellShape::Slope3NWV => 5.0 / 6.0,
+            CellShape::Slope4SWH
+            | CellShape::Slope4SWV
+            | CellShape::Slope4SEH
+            | CellShape::Slope4SEV
+            | CellShape::Slope4NEH
+            | CellShape::Slope4NEV
+            | CellShape::Slope4NWH
+            | CellShape::Slope4NWV => 0.875,
+            CellShape::PointN | CellShape::PointS | CellShape::PointE | CellShape::PointW => 0.5,
+            CellShape::RoundN | CellShape::RoundS | CellShape::RoundE | CellShape::RoundW => 0.9375,
+            CellShape::Octagon => 0.875,
         }
     }
 
@@ -294,8 +411,8 @@ impl CellShape {
         matches!(self, CellShape::Full)
     }
 
-    /// R60 — every shape, in a stable order (for editor dropdowns / iteration).
-    pub const ALL: [CellShape; 21] = [
+    /// R60/R62 — every shape, in a stable order (for editor palette / iteration).
+    pub const ALL: [CellShape; 46] = [
         CellShape::Full,
         CellShape::HalfSW,
         CellShape::HalfSE,
@@ -317,6 +434,31 @@ impl CellShape {
         CellShape::SlopeNEV,
         CellShape::SlopeNWH,
         CellShape::SlopeNWV,
+        CellShape::Slope3SWH,
+        CellShape::Slope3SWV,
+        CellShape::Slope3SEH,
+        CellShape::Slope3SEV,
+        CellShape::Slope3NEH,
+        CellShape::Slope3NEV,
+        CellShape::Slope3NWH,
+        CellShape::Slope3NWV,
+        CellShape::Slope4SWH,
+        CellShape::Slope4SWV,
+        CellShape::Slope4SEH,
+        CellShape::Slope4SEV,
+        CellShape::Slope4NEH,
+        CellShape::Slope4NEV,
+        CellShape::Slope4NWH,
+        CellShape::Slope4NWV,
+        CellShape::PointN,
+        CellShape::PointS,
+        CellShape::PointE,
+        CellShape::PointW,
+        CellShape::RoundN,
+        CellShape::RoundS,
+        CellShape::RoundE,
+        CellShape::RoundW,
+        CellShape::Octagon,
     ];
 
     /// R60 — a short human label for the editor dropdown / per-cell glyph.
@@ -343,6 +485,31 @@ impl CellShape {
             CellShape::SlopeNEV => "Slope NE-V",
             CellShape::SlopeNWH => "Slope NW-H",
             CellShape::SlopeNWV => "Slope NW-V",
+            CellShape::Slope3SWH => "Slope3 SW-H",
+            CellShape::Slope3SWV => "Slope3 SW-V",
+            CellShape::Slope3SEH => "Slope3 SE-H",
+            CellShape::Slope3SEV => "Slope3 SE-V",
+            CellShape::Slope3NEH => "Slope3 NE-H",
+            CellShape::Slope3NEV => "Slope3 NE-V",
+            CellShape::Slope3NWH => "Slope3 NW-H",
+            CellShape::Slope3NWV => "Slope3 NW-V",
+            CellShape::Slope4SWH => "Slope4 SW-H",
+            CellShape::Slope4SWV => "Slope4 SW-V",
+            CellShape::Slope4SEH => "Slope4 SE-H",
+            CellShape::Slope4SEV => "Slope4 SE-V",
+            CellShape::Slope4NEH => "Slope4 NE-H",
+            CellShape::Slope4NEV => "Slope4 NE-V",
+            CellShape::Slope4NWH => "Slope4 NW-H",
+            CellShape::Slope4NWV => "Slope4 NW-V",
+            CellShape::PointN => "Point N",
+            CellShape::PointS => "Point S",
+            CellShape::PointE => "Point E",
+            CellShape::PointW => "Point W",
+            CellShape::RoundN => "Round N",
+            CellShape::RoundS => "Round S",
+            CellShape::RoundE => "Round E",
+            CellShape::RoundW => "Round W",
+            CellShape::Octagon => "Octagon",
         }
     }
 }
@@ -629,13 +796,7 @@ mod tests {
     /// weight), and its `centroid` lands inside the polygon. Guards the chamfer/slope corner lists.
     #[test]
     fn cell_shape_polygons_are_consistent() {
-        use CellShape::*;
-        let all = [
-            Full, HalfSW, HalfSE, HalfNE, HalfNW, QuarterSW, QuarterSE, QuarterNE, QuarterNW,
-            ChamferSW, ChamferSE, ChamferNE, ChamferNW, SlopeSWH, SlopeSWV, SlopeSEH, SlopeSEV,
-            SlopeNEH, SlopeNEV, SlopeNWH, SlopeNWV,
-        ];
-        for s in all {
+        for s in CellShape::ALL {
             let pts = s.corners(2, 3);
             let n = pts.len();
             // Shoelace signed area: CCW ⇒ positive, and its magnitude is the cell-area fraction.

@@ -282,6 +282,26 @@ fn hull_editor_ui(
             } else {
                 ui.add_enabled(false, egui::Button::new("Apply grid"));
             }
+            // R62 — shift the WHOLE design (cells + slots) to re-centre after a grid grow. Screen
+            // orientation: ▲ = +row (up), ◀ = +col (port-left), per the nose-up / port-left grid.
+            ui.label("Move design");
+            ui.horizontal(|ui| {
+                if ui.button("◀").clicked() && !shift_design(s, 1, 0) {
+                    s.status = "shift blocked (edge)".into();
+                }
+                if ui.button("▶").clicked() && !shift_design(s, -1, 0) {
+                    s.status = "shift blocked (edge)".into();
+                }
+                if ui.button("▲").clicked() && !shift_design(s, 0, 1) {
+                    s.status = "shift blocked (edge)".into();
+                }
+                if ui.button("▼").clicked() && !shift_design(s, 0, -1) {
+                    s.status = "shift blocked (edge)".into();
+                }
+                if ui.button("Auto-center").clicked() {
+                    auto_center(s);
+                }
+            });
             ui.separator();
             ui.label("Budgets");
             for (label, val, range) in [
@@ -640,7 +660,7 @@ fn shape_palette(ui: &mut egui::Ui, current: &mut CellShape) -> bool {
             quad(ui, current, ChamferNW, ChamferNE, ChamferSW, ChamferSE);
         });
         ui.vertical(|ui| {
-            ui.small("Slope (corner · H/V)");
+            ui.small("Slope 2:1 (corner · H/V)");
             ui.horizontal(|ui| {
                 icon(ui, current, SlopeNWH);
                 icon(ui, current, SlopeNWV);
@@ -653,6 +673,58 @@ fn shape_palette(ui: &mut egui::Ui, current: &mut CellShape) -> bool {
                 icon(ui, current, SlopeSEH);
                 icon(ui, current, SlopeSEV);
             });
+        });
+        ui.vertical(|ui| {
+            ui.small("Slope 3:1");
+            ui.horizontal(|ui| {
+                icon(ui, current, Slope3NWH);
+                icon(ui, current, Slope3NWV);
+                icon(ui, current, Slope3NEH);
+                icon(ui, current, Slope3NEV);
+            });
+            ui.horizontal(|ui| {
+                icon(ui, current, Slope3SWH);
+                icon(ui, current, Slope3SWV);
+                icon(ui, current, Slope3SEH);
+                icon(ui, current, Slope3SEV);
+            });
+        });
+        ui.vertical(|ui| {
+            ui.small("Slope 4:1");
+            ui.horizontal(|ui| {
+                icon(ui, current, Slope4NWH);
+                icon(ui, current, Slope4NWV);
+                icon(ui, current, Slope4NEH);
+                icon(ui, current, Slope4NEV);
+            });
+            ui.horizontal(|ui| {
+                icon(ui, current, Slope4SWH);
+                icon(ui, current, Slope4SWV);
+                icon(ui, current, Slope4SEH);
+                icon(ui, current, Slope4SEV);
+            });
+        });
+        ui.vertical(|ui| {
+            ui.small("Point (tip)");
+            ui.horizontal(|ui| {
+                icon(ui, current, PointN);
+                icon(ui, current, PointS);
+                icon(ui, current, PointE);
+                icon(ui, current, PointW);
+            });
+        });
+        ui.vertical(|ui| {
+            ui.small("Round (cap)");
+            ui.horizontal(|ui| {
+                icon(ui, current, RoundN);
+                icon(ui, current, RoundS);
+                icon(ui, current, RoundE);
+                icon(ui, current, RoundW);
+            });
+        });
+        ui.vertical(|ui| {
+            ui.small("Octagon");
+            icon(ui, current, Octagon);
         });
     });
     *current != before
@@ -684,6 +756,46 @@ fn erase_cell(s: &mut HullDesignSession, coord: (u16, u16)) {
     s.working.cells.retain(|c| c.coord != coord);
     s.working.slots.retain(|sl| sl.coord != coord);
     s.dirty = true;
+}
+
+/// R62 — translate EVERY cell + slot by `(dc, dr)`. Returns false (no-op) if any would leave the grid,
+/// so nothing is silently lost.
+fn shift_design(s: &mut HullDesignSession, dc: i32, dr: i32) -> bool {
+    let (cols, rows) = s.working.grid_dims;
+    let in_bounds = |coord: (u16, u16)| {
+        let (nc, nr) = (coord.0 as i32 + dc, coord.1 as i32 + dr);
+        nc >= 0 && nr >= 0 && nc < cols as i32 && nr < rows as i32
+    };
+    if !s.working.cells.iter().all(|c| in_bounds(c.coord))
+        || !s.working.slots.iter().all(|sl| in_bounds(sl.coord))
+    {
+        return false;
+    }
+    let mv = |coord: (u16, u16)| ((coord.0 as i32 + dc) as u16, (coord.1 as i32 + dr) as u16);
+    for c in &mut s.working.cells {
+        c.coord = mv(c.coord);
+    }
+    for sl in &mut s.working.slots {
+        sl.coord = mv(sl.coord);
+    }
+    s.selected_cell = s.selected_cell.map(mv);
+    s.dirty = true;
+    true
+}
+
+/// R62 — shift the design so its cell bounding box is centred in the grid.
+fn auto_center(s: &mut HullDesignSession) {
+    if s.working.cells.is_empty() {
+        return;
+    }
+    let (cols, rows) = s.working.grid_dims;
+    let min_c = s.working.cells.iter().map(|c| c.coord.0).min().unwrap();
+    let max_c = s.working.cells.iter().map(|c| c.coord.0).max().unwrap();
+    let min_r = s.working.cells.iter().map(|c| c.coord.1).min().unwrap();
+    let max_r = s.working.cells.iter().map(|c| c.coord.1).max().unwrap();
+    let dc = (cols as i32 - (max_c - min_c + 1) as i32) / 2 - min_c as i32;
+    let dr = (rows as i32 - (max_r - min_r + 1) as i32) / 2 - min_r as i32;
+    shift_design(s, dc, dr);
 }
 
 /// Paint every in-bounds coord with the brush shape (a quick way to start a solid block).
