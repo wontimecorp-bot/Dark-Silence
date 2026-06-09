@@ -17,6 +17,20 @@ Swap a face by dropping a `.ttf` and updating `LABEL_FONT` / `MONO_FONT` in `fon
 Rajdhani weights (Bold/Light/Regular/SemiBold) are available for future emphasis. Future
 title/faction/brand faces: add fields to `FontAssets`.
 
+## egui glyph fallback — `assets/fonts/symbols.ttf` (Refinement 77)
+The dev **hull editor** + **dev panel** (egui) need symbol glyphs (`▲ ▼ ◀ ▶ → ↳ …`) that egui's bundled
+font lacks (they'd render as tofu boxes). `install_egui_fonts` (`crates/client/src/hull_editor/mod.rs`)
+loads `assets/fonts/symbols.ttf` once via `std::fs` and registers it as an egui **fallback** (used only
+for glyphs the body font is missing). It's optional — absent → a one-time log + the glyphs stay boxes;
+the build/tests are unaffected.
+
+| File | Role | Font | License |
+|------|------|------|---------|
+| `symbols.ttf` | egui glyph fallback (arrows / geometric shapes in the editor + dev panel) | any glyph-rich TTF — recommended **DejaVu Sans** | (DejaVu) public-domain-ish / Bitstream Vera |
+
+Drop any TTF that covers the arrows/shapes there as `symbols.ttf` (DejaVu Sans, Noto Sans, Segoe UI
+Symbol, …).
+
 ## Icons — `assets/icons/`
 HUD icons are **PNG images** (rendered as Bevy `ImageNode`s, tinted + pulsed) — simple + efficient
 for a handful of icons. `IconAssets` holds the handles.
