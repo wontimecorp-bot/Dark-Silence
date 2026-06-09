@@ -32,6 +32,9 @@ pub mod fitting_ui;
 pub mod fonts;
 pub mod hud;
 pub mod hud_bars;
+// R60 — the dev-only hull design editor (egui + render-to-texture preview).
+#[cfg(feature = "dev_panel")]
+pub mod hull_editor;
 pub mod hull_shader;
 pub mod input;
 pub mod interpolation;
@@ -214,9 +217,30 @@ pub fn run() -> AppExit {
     // embedded server's tuning resources. Default-on `dev_panel` feature; compiled out by
     // `--no-default-features` (then this is absent and the egui dep is dropped).
     #[cfg(feature = "dev_panel")]
-    app.add_plugins(dev_panel::DevPanelPlugin);
+    {
+        app.add_plugins(dev_panel::DevPanelPlugin);
+        // R60 — the dev hull design editor (F8 toggles it).
+        app.add_plugins(hull_editor::HullEditorPlugin);
+        app.add_systems(Update, toggle_hull_editor);
+    }
 
     app.run()
+}
+
+/// R60 — toggle the dev hull-design editor on F8 (dev builds only).
+#[cfg(feature = "dev_panel")]
+fn toggle_hull_editor(
+    keys: Res<ButtonInput<KeyCode>>,
+    state: Res<State<hull_editor::HullDesignState>>,
+    mut next: ResMut<NextState<hull_editor::HullDesignState>>,
+) {
+    use hull_editor::HullDesignState::*;
+    if keys.just_pressed(KeyCode::F8) {
+        next.set(match state.get() {
+            Flying => Designing,
+            Designing => Flying,
+        });
+    }
 }
 
 /// Toggle between the flying view and the interactive fitting screen on a fresh

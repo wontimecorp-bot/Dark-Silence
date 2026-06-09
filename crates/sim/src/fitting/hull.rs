@@ -64,6 +64,24 @@ pub enum ShipClass {
     Station = 11,
 }
 
+impl ShipClass {
+    /// R60 — every class, in tier order (for editor dropdowns).
+    pub const ALL: [ShipClass; 12] = [
+        ShipClass::Fighter,
+        ShipClass::Corvette,
+        ShipClass::Frigate,
+        ShipClass::Destroyer,
+        ShipClass::LightCruiser,
+        ShipClass::HeavyCruiser,
+        ShipClass::Battlecruiser,
+        ShipClass::Battleship,
+        ShipClass::Carrier,
+        ShipClass::HeavyCarrier,
+        ShipClass::Capital,
+        ShipClass::Station,
+    ];
+}
+
 /// A hull's **battlefield role** (Phase C) — its function, orthogonal to [`ShipClass`] size.
 /// E.g. a small hull can be (Corvette, Gunship) or (Corvette, Interceptor).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -79,6 +97,23 @@ pub enum ShipRole {
     Miner,
     Hauler,
     Utility,
+}
+
+impl ShipRole {
+    /// R60 — every role (for editor dropdowns).
+    pub const ALL: [ShipRole; 11] = [
+        ShipRole::Interceptor,
+        ShipRole::FastAttack,
+        ShipRole::Patrol,
+        ShipRole::Gunship,
+        ShipRole::LineCombatant,
+        ShipRole::Carrier,
+        ShipRole::Support,
+        ShipRole::Recon,
+        ShipRole::Miner,
+        ShipRole::Hauler,
+        ShipRole::Utility,
+    ];
 }
 
 /// Identifies the **section** a [`GridCell`] belongs to — the coarse
@@ -257,6 +292,58 @@ impl CellShape {
 
     pub fn is_full(self) -> bool {
         matches!(self, CellShape::Full)
+    }
+
+    /// R60 — every shape, in a stable order (for editor dropdowns / iteration).
+    pub const ALL: [CellShape; 21] = [
+        CellShape::Full,
+        CellShape::HalfSW,
+        CellShape::HalfSE,
+        CellShape::HalfNE,
+        CellShape::HalfNW,
+        CellShape::QuarterSW,
+        CellShape::QuarterSE,
+        CellShape::QuarterNE,
+        CellShape::QuarterNW,
+        CellShape::ChamferSW,
+        CellShape::ChamferSE,
+        CellShape::ChamferNE,
+        CellShape::ChamferNW,
+        CellShape::SlopeSWH,
+        CellShape::SlopeSWV,
+        CellShape::SlopeSEH,
+        CellShape::SlopeSEV,
+        CellShape::SlopeNEH,
+        CellShape::SlopeNEV,
+        CellShape::SlopeNWH,
+        CellShape::SlopeNWV,
+    ];
+
+    /// R60 — a short human label for the editor dropdown / per-cell glyph.
+    pub fn label(self) -> &'static str {
+        match self {
+            CellShape::Full => "Full",
+            CellShape::HalfSW => "Half SW",
+            CellShape::HalfSE => "Half SE",
+            CellShape::HalfNE => "Half NE",
+            CellShape::HalfNW => "Half NW",
+            CellShape::QuarterSW => "Quarter SW",
+            CellShape::QuarterSE => "Quarter SE",
+            CellShape::QuarterNE => "Quarter NE",
+            CellShape::QuarterNW => "Quarter NW",
+            CellShape::ChamferSW => "Chamfer SW",
+            CellShape::ChamferSE => "Chamfer SE",
+            CellShape::ChamferNE => "Chamfer NE",
+            CellShape::ChamferNW => "Chamfer NW",
+            CellShape::SlopeSWH => "Slope SW-H",
+            CellShape::SlopeSWV => "Slope SW-V",
+            CellShape::SlopeSEH => "Slope SE-H",
+            CellShape::SlopeSEV => "Slope SE-V",
+            CellShape::SlopeNEH => "Slope NE-H",
+            CellShape::SlopeNEV => "Slope NE-V",
+            CellShape::SlopeNWH => "Slope NW-H",
+            CellShape::SlopeNWV => "Slope NW-V",
+        }
     }
 }
 

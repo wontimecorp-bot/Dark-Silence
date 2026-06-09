@@ -155,7 +155,7 @@ pub fn canonical_design_override(
     modules: &ModuleCatalog,
     hulls: &HullCatalog,
 ) -> (ModuleCatalog, HullCatalog) {
-    let (seed_m, seed_h) = sim::fitting::seed_catalogs();
+    let (seed_m, _seed_h) = sim::fitting::seed_catalogs();
     let m = ModuleCatalog {
         modules: modules
             .modules
@@ -164,11 +164,19 @@ pub fn canonical_design_override(
             .map(|(id, m)| (*id, m.clone()))
             .collect(),
     };
+    // R60 — KEEP every AUTHORED hull (the seed fighter/corvette + any new hull the design editor made),
+    // dropping ONLY the runtime-injected scenario procedurals (Transport/Outpost/MineNode) so the
+    // editor can persist new designs while `ships.ron` still never gains the huge scenario hulls.
+    let scenario = [
+        sim::fitting::HULL_TRANSPORT,
+        sim::fitting::HULL_OUTPOST,
+        sim::fitting::HULL_MINENODE,
+    ];
     let h = HullCatalog {
         hulls: hulls
             .hulls
             .iter()
-            .filter(|(id, _)| seed_h.hulls.contains_key(id))
+            .filter(|(id, _)| !scenario.contains(id))
             .map(|(id, h)| (*id, h.clone()))
             .collect(),
     };
