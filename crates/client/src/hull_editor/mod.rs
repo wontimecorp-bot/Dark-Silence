@@ -65,6 +65,17 @@ enum EditMode {
     Armor,
 }
 
+/// R67 — what the grid cell FILL shows, so you can read the hull vs armor material layout at a glance.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GridView {
+    /// Cells coloured by their sub-cell shape / slot (the default authoring view).
+    Shape,
+    /// Cells coloured by their HULL (structural) material.
+    HullMat,
+    /// Cells coloured by their ARMOR material.
+    ArmorMat,
+}
+
 /// R63/R64 — a family of related [`CellShape`]s, shown as one chip in the compact palette.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ShapeFamily {
@@ -245,6 +256,8 @@ pub struct HullDesignSession {
     /// R66 — the hull/armor material ids painted in `HullMat`/`Armor` mode.
     hull_material_brush: u8,
     armor_material_brush: u8,
+    /// R67 — what the grid cell fill shows (shape / hull material / armor material).
+    grid_view: GridView,
     status: String,
     /// Set on any edit → the 3-D preview rebuilds its mesh next frame.
     pub dirty: bool,
@@ -275,6 +288,7 @@ impl Default for HullDesignSession {
             stamp_dir: Dir::N,
             hull_material_brush: 2,  // Heavy (so HullMat painting is visible)
             armor_material_brush: 1, // Light
+            grid_view: GridView::Shape,
             status: String::new(),
             dirty: true,
             orbit: (0.6, 0.5),
@@ -513,15 +527,62 @@ fn hull_editor_ui(
             ui.separator();
             ui.heading("Brush");
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut s.mode, EditMode::Paint, "Paint");
-                ui.selectable_value(&mut s.mode, EditMode::Erase, "Erase");
-                ui.selectable_value(&mut s.mode, EditMode::Select, "Select");
-                ui.selectable_value(&mut s.mode, EditMode::Stamp, "Stamp");
+                // R67 — clicking a shape mode also shows the SHAPE view (auto-switch).
+                for (mode, name) in [
+                    (EditMode::Paint, "Paint"),
+                    (EditMode::Erase, "Erase"),
+                    (EditMode::Select, "Select"),
+                    (EditMode::Stamp, "Stamp"),
+                ] {
+                    if ui.selectable_value(&mut s.mode, mode, name).clicked() {
+                        s.grid_view = GridView::Shape;
+                    }
+                }
             });
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut s.mode, EditMode::HullMat, "Hull mat");
-                ui.selectable_value(&mut s.mode, EditMode::Armor, "Armor");
+                // R67 — clicking a material mode also shows the matching MATERIAL view.
+                if ui
+                    .selectable_value(&mut s.mode, EditMode::HullMat, "Hull mat")
+                    .clicked()
+                {
+                    s.grid_view = GridView::HullMat;
+                }
+                if ui
+                    .selectable_value(&mut s.mode, EditMode::Armor, "Armor")
+                    .clicked()
+                {
+                    s.grid_view = GridView::ArmorMat;
+                }
             });
+            // R67 — the grid colour LAYER (overrides the per-mode auto-switch above).
+            ui.horizontal(|ui| {
+                ui.label("Show:");
+                ui.selectable_value(&mut s.grid_view, GridView::Shape, "Shapes");
+                ui.selectable_value(&mut s.grid_view, GridView::HullMat, "Hull mat");
+                ui.selectable_value(&mut s.grid_view, GridView::ArmorMat, "Armor mat");
+            });
+            // R67 — legend for the active material view (colour swatch → material name).
+            match s.grid_view {
+                GridView::HullMat => {
+                    for (i, h) in cell_materials.hull.iter().enumerate() {
+                        material_legend_row(
+                            ui,
+                            hull_mat_color(i as u8),
+                            &format!("{i}: {}", h.name),
+                        );
+                    }
+                }
+                GridView::ArmorMat => {
+                    for (i, a) in cell_materials.armor.iter().enumerate() {
+                        material_legend_row(
+                            ui,
+                            armor_mat_color(i as u8),
+                            &format!("{i}: {}", a.name),
+                        );
+                    }
+                }
+                GridView::Shape => {}
+            }
             if s.mode == EditMode::HullMat {
                 // R66 — pick a HULL material; click-drag the grid to paint it onto cells.
                 ui.label("Hull material (click-drag to paint):");
@@ -629,6 +690,67 @@ fn hull_editor_ui(
                         s.working.cells[idx].shape = shape;
                         s.dirty = true;
                     }
+                    // R67 — this cell's HULL + ARMOR materials (editable, with the chosen stats).
+                    ui.separator();
+                    let mut hm = s.working.cells[idx].hull_material;
+                    ui.horizontal(|ui| {
+                        ui.label("Hull mat");
+                        egui::ComboBox::from_id_salt("sel_hull_mat")
+                            .selected_text(mat_name(
+                                cell_materials
+                                    .hull
+                                    .get(hm as usize)
+                                    .map(|h| h.name.as_str()),
+                                hm,
+                            ))
+                            .show_ui(ui, |ui| {
+                                for (i, h) in cell_materials.hull.iter().enumerate() {
+                                    ui.selectable_value(
+                                        &mut hm,
+                                        i as u8,
+                                        format!("{i}: {}", h.name),
+                                    );
+                                }
+                            });
+                    });
+                    if hm != s.working.cells[idx].hull_material {
+                        s.working.cells[idx].hull_material = hm;
+                        s.dirty = true;
+                    }
+                    if let Some(h) = cell_materials.hull.get(hm as usize) {
+                        ui.small(format!("hp {:.1} · mass {:.2}", h.cell_hp, h.mass));
+                    }
+                    let mut am = s.working.cells[idx].armor_material;
+                    ui.horizontal(|ui| {
+                        ui.label("Armor mat");
+                        egui::ComboBox::from_id_salt("sel_armor_mat")
+                            .selected_text(mat_name(
+                                cell_materials
+                                    .armor
+                                    .get(am as usize)
+                                    .map(|a| a.name.as_str()),
+                                am,
+                            ))
+                            .show_ui(ui, |ui| {
+                                for (i, a) in cell_materials.armor.iter().enumerate() {
+                                    ui.selectable_value(
+                                        &mut am,
+                                        i as u8,
+                                        format!("{i}: {}", a.name),
+                                    );
+                                }
+                            });
+                    });
+                    if am != s.working.cells[idx].armor_material {
+                        s.working.cells[idx].armor_material = am;
+                        s.dirty = true;
+                    }
+                    if let Some(a) = cell_materials.armor.get(am as usize) {
+                        ui.small(format!(
+                            "th {:.1}×{:.1} · carve {:.0} · mass {:.2}",
+                            a.thickness, a.multiplier, a.carve_hp, a.mass
+                        ));
+                    }
                     // Slot on this cell?
                     if let Some(sidx) = s.working.slots.iter().position(|sl| sl.coord == coord) {
                         ui.separator();
@@ -723,7 +845,14 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
             painter.rect_filled(rect.shrink(0.5), 2.0, egui::Color32::from_rgb(22, 26, 33));
             if let Some(c) = s.working.cells.iter().find(|c| c.coord == coord).copied() {
                 let slot = s.working.slots.iter().find(|sl| sl.coord == coord).copied();
-                let fill = slot.map_or_else(|| shape_color(c.shape), |sl| slot_color(sl.slot_type));
+                // R67 — the cell FILL follows the active grid view (shape / hull mat / armor mat).
+                let fill = match s.grid_view {
+                    GridView::Shape => {
+                        slot.map_or_else(|| shape_color(c.shape), |sl| slot_color(sl.slot_type))
+                    }
+                    GridView::HullMat => hull_mat_color(c.hull_material),
+                    GridView::ArmorMat => armor_mat_color(c.armor_material),
+                };
                 painter.add(egui::Shape::convex_polygon(
                     shape_poly_in_rect(c.shape, rect.shrink(1.5)),
                     fill,
@@ -738,16 +867,22 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
                         egui::Color32::BLACK,
                     );
                 }
-                // R66 — material overlay: a hull-material tint dot (top-left) + an armor-material
-                // border so the painted hull/armor layout reads at a glance.
-                if c.hull_material > 0 {
+                // R66/R67 — material overlay: a hull-material tint dot (top-left) + an armor-material
+                // border. Drawn as a HINT only when that layer is NOT already the fill view (so the
+                // Shape view shows both, the HullMat view keeps the armor border, the ArmorMat view
+                // keeps the hull dot).
+                let show_hull_dot = matches!(s.grid_view, GridView::Shape | GridView::ArmorMat)
+                    && c.hull_material > 0;
+                let show_armor_border = matches!(s.grid_view, GridView::Shape | GridView::HullMat)
+                    && c.armor_material > 0;
+                if show_hull_dot {
                     painter.circle_filled(
                         rect.left_top() + egui::vec2(5.0, 5.0),
                         3.0,
                         hull_mat_color(c.hull_material),
                     );
                 }
-                if c.armor_material > 0 {
+                if show_armor_border {
                     painter.rect_stroke(
                         rect.shrink(2.0),
                         2.0,
@@ -784,18 +919,29 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
         ),
     );
 
-    // Right-click → erase one cell.
-    if resp.secondary_clicked() {
+    // R67 — Right-click / DRAG → erase a swath (line-filled between frames so a fast drag has no
+    // gaps), matching left-drag paint. Reuses the `last_painted` tracker (only one button drags at a
+    // time; the `!resp.dragged()` reset below clears it between drags).
+    if resp.dragged_by(egui::PointerButton::Secondary)
+        || resp.clicked_by(egui::PointerButton::Secondary)
+    {
         if let Some(coord) = resp
-            .hover_pos()
+            .interact_pointer_pos()
             .and_then(|p| cell_at_pointer(canvas, p, (cols, rows), CELL))
         {
             s.selected_cell = Some(coord);
-            erase_cell(s, coord);
+            let from = s.last_painted.unwrap_or(coord);
+            for cc in line_cells(from, coord) {
+                erase_cell(s, cc);
+            }
+            s.last_painted = Some(coord);
         }
     }
-    // Primary click / DRAG → paint / erase / select (line-filled between frames so a fast drag has no gaps).
-    if resp.dragged() || resp.clicked() {
+    // PRIMARY click / DRAG → paint / material / select / stamp (line-filled so a fast drag has no
+    // gaps). R67 — gated to the PRIMARY button so a right-drag (erase, above) does NOT also paint.
+    if resp.dragged_by(egui::PointerButton::Primary)
+        || resp.clicked_by(egui::PointerButton::Primary)
+    {
         if let Some(coord) = resp
             .interact_pointer_pos()
             .and_then(|p| cell_at_pointer(canvas, p, (cols, rows), CELL))
@@ -827,7 +973,7 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
                 }
                 // Stamp places on a fresh CLICK only (a drag mustn't re-stamp every frame).
                 EditMode::Stamp => {
-                    if resp.clicked() {
+                    if resp.clicked_by(egui::PointerButton::Primary) {
                         apply_stamp(s, coord);
                     }
                 }
@@ -1403,23 +1549,50 @@ fn mat_name(name: Option<&str>, id: u8) -> String {
     }
 }
 
-/// R66 — a HULL-material overlay tint (id-based ramp; 1 = Light blue-grey … darker = heavier).
+/// R66/R67 — a HULL-material colour (id 0 = Standard neutral; 1 = Light; 2 = Heavy; 3+ = palette).
+/// Used both for the R66 overlay tint dot (id > 0 only) and the R67 `HullMat` grid view + legend.
 fn hull_mat_color(id: u8) -> egui::Color32 {
     match id {
+        0 => egui::Color32::from_rgb(96, 104, 120), // Standard (neutral)
         1 => egui::Color32::from_rgb(120, 180, 210), // Light
-        2 => egui::Color32::from_rgb(210, 150, 90),  // Heavy
-        _ => egui::Color32::from_rgb(200, 200, 120),
+        2 => egui::Color32::from_rgb(210, 150, 90), // Heavy
+        _ => material_palette(id),
     }
 }
 
-/// R66 — an ARMOR-material overlay border colour (id-based ramp; warmer = heavier plating).
+/// R66/R67 — an ARMOR-material colour (id 0 = None dark/empty; 1 Light; 2 Medium; 3 Heavy; 4+ palette).
+/// Used for the R66 overlay border (id > 0 only) and the R67 `ArmorMat` grid view + legend.
 fn armor_mat_color(id: u8) -> egui::Color32 {
     match id {
+        0 => egui::Color32::from_rgb(50, 56, 66), // None (dark / no plate)
         1 => egui::Color32::from_rgb(180, 200, 210), // Light
         2 => egui::Color32::from_rgb(220, 200, 120), // Medium
-        3 => egui::Color32::from_rgb(235, 150, 70),  // Heavy
-        _ => egui::Color32::from_rgb(235, 110, 110),
+        3 => egui::Color32::from_rgb(235, 150, 70), // Heavy
+        _ => material_palette(id),
     }
+}
+
+/// R67 — a distinct colour for any user-added material id (beyond the named defaults).
+fn material_palette(id: u8) -> egui::Color32 {
+    const P: [(u8, u8, u8); 6] = [
+        (150, 110, 200),
+        (110, 200, 150),
+        (200, 110, 150),
+        (150, 200, 110),
+        (110, 150, 200),
+        (200, 170, 110),
+    ];
+    let (r, g, b) = P[(id as usize) % P.len()];
+    egui::Color32::from_rgb(r, g, b)
+}
+
+/// R67 — a legend row: a small colour swatch + the material's name (readable for any swatch colour).
+fn material_legend_row(ui: &mut egui::Ui, color: egui::Color32, text: &str) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 2.0, color);
+        ui.label(text);
+    });
 }
 
 fn slot_color(ty: HardpointType) -> egui::Color32 {
