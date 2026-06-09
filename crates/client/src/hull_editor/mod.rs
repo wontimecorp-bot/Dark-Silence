@@ -254,8 +254,11 @@ pub struct HullDesignSession {
     /// R61 — the last cell painted during a click-drag (so a held drag fills continuously without
     /// re-painting the same cell, and a fast drag can line-fill between successive cells).
     last_painted: Option<(u16, u16)>,
-    /// R63 — the family shown in the compact shape palette.
-    palette_family: ShapeFamily,
+    /// R74 — the shape-palette family FILTER (`None` = show all 86 shapes) + a name search box. The
+    /// palette shows every matching shape in a scrollable grid (R63's single-family view is now the
+    /// "filter to one family" case).
+    palette_filter: Option<ShapeFamily>,
+    palette_search: String,
     /// R63 — the selected multi-cell stamp + its direction (used in `Stamp` mode).
     stamp_kind: StampKind,
     stamp_dir: Dir,
@@ -292,7 +295,8 @@ impl Default for HullDesignSession {
             selected_slot: None,
             pending_grid,
             last_painted: None,
-            palette_family: ShapeFamily::Full,
+            palette_filter: None, // show all shapes by default
+            palette_search: String::new(),
             stamp_kind: StampKind::Blade5,
             stamp_dir: Dir::N,
             hull_material_brush: 2,  // Heavy (so Hull painting is visible)
@@ -426,324 +430,346 @@ fn hull_editor_ui(
     egui::SidePanel::left("hull_editor_meta")
         .default_width(220.0)
         .show(ctx, |ui| {
-            ui.heading("Hull");
-            ui.horizontal(|ui| {
-                ui.label("Name");
-                if ui.text_edit_singleline(&mut s.working.name).changed() {
-                    s.dirty = true;
-                }
-            });
-            egui::ComboBox::from_label("Class")
-                .selected_text(format!("{:?}", s.working.class))
-                .show_ui(ui, |ui| {
-                    for c in ShipClass::ALL {
-                        ui.selectable_value(&mut s.working.class, c, format!("{c:?}"));
-                    }
-                });
-            egui::ComboBox::from_label("Role")
-                .selected_text(format!("{:?}", s.working.role))
-                .show_ui(ui, |ui| {
-                    for r in ShipRole::ALL {
-                        ui.selectable_value(&mut s.working.role, r, format!("{r:?}"));
-                    }
-                });
-            ui.separator();
-            ui.label("Grid (cols × rows)");
-            ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut s.pending_grid.0).range(1..=40));
-                ui.label("×");
-                ui.add(egui::DragValue::new(&mut s.pending_grid.1).range(1..=40));
-            });
-            // R61 — STAGED: editing the numbers above changes nothing until "Apply grid" (so a resize
-            // never silently wipes the design); a shrink warns how many cells/slots it would drop.
-            let (pc, pr) = s.pending_grid;
-            if s.pending_grid != s.working.grid_dims {
-                let drop_c = s
-                    .working
-                    .cells
-                    .iter()
-                    .filter(|c| c.coord.0 >= pc || c.coord.1 >= pr)
-                    .count();
-                let drop_s = s
-                    .working
-                    .slots
-                    .iter()
-                    .filter(|sl| sl.coord.0 >= pc || sl.coord.1 >= pr)
-                    .count();
-                if drop_c > 0 || drop_s > 0 {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 90, 80),
-                        format!("⚠ Apply drops {drop_c} cells · {drop_s} slots"),
-                    );
-                }
-                if ui.button("Apply grid").clicked() {
-                    s.working.grid_dims = s.pending_grid;
-                    s.working.cells.retain(|c| c.coord.0 < pc && c.coord.1 < pr);
-                    s.working
-                        .slots
-                        .retain(|sl| sl.coord.0 < pc && sl.coord.1 < pr);
-                    if s.selected_cell.is_some_and(|c| c.0 >= pc || c.1 >= pr) {
-                        s.selected_cell = None;
-                    }
-                    s.dirty = true;
-                }
-            } else {
-                ui.add_enabled(false, egui::Button::new("Apply grid"));
-            }
-            // R62 — shift the WHOLE design (cells + slots) to re-centre after a grid grow. Screen
-            // orientation: ▲ = +row (up), ◀ = +col (port-left), per the nose-up / port-left grid.
-            ui.label("Move design");
-            ui.horizontal(|ui| {
-                if ui.button("◀").clicked() && !shift_design(s, 1, 0) {
-                    s.status = "shift blocked (edge)".into();
-                }
-                if ui.button("▶").clicked() && !shift_design(s, -1, 0) {
-                    s.status = "shift blocked (edge)".into();
-                }
-                if ui.button("▲").clicked() && !shift_design(s, 0, 1) {
-                    s.status = "shift blocked (edge)".into();
-                }
-                if ui.button("▼").clicked() && !shift_design(s, 0, -1) {
-                    s.status = "shift blocked (edge)".into();
-                }
-                if ui.button("Auto-center").clicked() {
-                    auto_center(s);
-                }
-            });
-            // R63 — mirror one screen-half onto the other across the centre line (cells + slots +
-            // each cell's shape are reflected E↔W). Screen-left = high col (the grid is port-left).
-            ui.label("Mirror across center");
-            ui.horizontal(|ui| {
-                if ui.button("◀ copy left→right").clicked() {
-                    mirror_design(s, true);
-                }
-                if ui.button("copy right→left ▶").clicked() {
-                    mirror_design(s, false);
-                }
-            });
-            ui.separator();
-            ui.label("Budgets");
-            for (label, val, range) in [
-                ("Power cap", &mut s.working.power_capacity, 0.0..=500.0),
-                ("CPU cap", &mut s.working.cpu_capacity, 0.0..=500.0),
-                ("Mass cap", &mut s.working.mass_capacity, 0.0..=2000.0),
-                ("Base mass", &mut s.working.hull_base_mass, 0.0..=500.0),
-            ] {
-                ui.horizontal(|ui| {
-                    ui.label(label);
-                    ui.add(egui::Slider::new(val, range));
-                });
-            }
-            ui.separator();
-            ui.heading("Brush");
-            // R72/R73 — TWO axes: a TOOL (the action) + the active LAYER. EVERY tool acts on the layer
-            // (Paint sets it, Erase clears it, Select inspects; Stamp lays shapes). The Layer row is the
-            // SAME selection as the "Show:" view above the grid — editing either syncs the other.
-            ui.horizontal(|ui| {
-                ui.label("Tool:");
-                ui.selectable_value(&mut s.tool, Tool::Paint, "Paint");
-                ui.selectable_value(&mut s.tool, Tool::Stamp, "Stamp");
-                ui.selectable_value(&mut s.tool, Tool::Erase, "Erase");
-                ui.selectable_value(&mut s.tool, Tool::Select, "Select");
-            });
-            // The active LAYER (icons echo the grid colouring) — always selectable; shared with "Show:".
-            ui.horizontal(|ui| {
-                ui.label("Layer:");
-                for (layer, which, name) in [
-                    (Layer::Shape, 0u8, "Shape"),
-                    (Layer::Hull, 1u8, "Hull material"),
-                    (Layer::Armor, 2u8, "Armor material"),
-                    (Layer::Module, 3u8, "Module (hardpoint)"),
-                ] {
-                    if layer_icon(ui, which, s.layer == layer, true, name) {
-                        s.layer = layer;
-                    }
-                }
-            });
-            // The active tool's options: Paint → the layer's icon palette (the brush); Stamp → presets;
-            // Erase/Select → a one-line hint (they act on the active layer too).
-            match s.tool {
-                Tool::Paint => match s.layer {
-                    Layer::Shape => {
-                        ui.label("Shape (click an icon)");
-                        shape_palette(ui, &mut s.brush, &mut s.palette_family);
-                    }
-                    Layer::Hull => {
-                        ui.label("Hull material (click-drag to paint):");
-                        let items: Vec<(egui::Color32, &str)> = cell_materials
-                            .hull
-                            .iter()
-                            .enumerate()
-                            .map(|(i, h)| (hull_mat_color(i as u8), h.name.as_str()))
-                            .collect();
-                        swatch_palette(ui, &mut s.hull_material_brush, &items);
-                    }
-                    Layer::Armor => {
-                        ui.label("Armor material (click-drag to plate):");
-                        let items: Vec<(egui::Color32, &str)> = cell_materials
-                            .armor
-                            .iter()
-                            .enumerate()
-                            .map(|(i, a)| (armor_mat_color(i as u8), a.name.as_str()))
-                            .collect();
-                        swatch_palette(ui, &mut s.armor_material_brush, &items);
-                    }
-                    Layer::Module => {
-                        ui.label("Module type (click-drag to paint; — removes):");
-                        module_palette(ui, &mut s.module_brush);
-                    }
-                },
-                Tool::Stamp => {
-                    // R63 — multi-cell stamp (Shape layer): pick a preset + direction, click to place.
-                    egui::ComboBox::from_id_salt("stamp_kind")
-                        .selected_text(s.stamp_kind.label())
+            egui::ScrollArea::vertical()
+                .id_salt("meta_scroll")
+                .show(ui, |ui| {
+                    ui.heading("Hull");
+                    ui.horizontal(|ui| {
+                        ui.label("Name");
+                        if ui.text_edit_singleline(&mut s.working.name).changed() {
+                            s.dirty = true;
+                        }
+                    });
+                    egui::ComboBox::from_label("Class")
+                        .selected_text(format!("{:?}", s.working.class))
                         .show_ui(ui, |ui| {
-                            for k in StampKind::ALL {
-                                ui.selectable_value(&mut s.stamp_kind, k, k.label());
+                            for c in ShipClass::ALL {
+                                ui.selectable_value(&mut s.working.class, c, format!("{c:?}"));
                             }
                         });
+                    egui::ComboBox::from_label("Role")
+                        .selected_text(format!("{:?}", s.working.role))
+                        .show_ui(ui, |ui| {
+                            for r in ShipRole::ALL {
+                                ui.selectable_value(&mut s.working.role, r, format!("{r:?}"));
+                            }
+                        });
+                    ui.separator();
+                    ui.label("Grid (cols × rows)");
                     ui.horizontal(|ui| {
-                        ui.label("Dir");
-                        ui.selectable_value(&mut s.stamp_dir, Dir::N, "N");
-                        ui.selectable_value(&mut s.stamp_dir, Dir::E, "E");
-                        ui.selectable_value(&mut s.stamp_dir, Dir::S, "S");
-                        ui.selectable_value(&mut s.stamp_dir, Dir::W, "W");
+                        ui.add(egui::DragValue::new(&mut s.pending_grid.0).range(1..=40));
+                        ui.label("×");
+                        ui.add(egui::DragValue::new(&mut s.pending_grid.1).range(1..=40));
                     });
-                    ui.small("click the grid to stamp");
-                }
-                Tool::Erase => {
-                    ui.weak(match s.layer {
-                        Layer::Shape => "click / drag to DELETE cells",
-                        Layer::Hull => "click / drag to reset hull → Standard",
-                        Layer::Armor => "click / drag to remove armor",
-                        Layer::Module => "click / drag to remove the slot",
+                    // R61 — STAGED: editing the numbers above changes nothing until "Apply grid" (so a resize
+                    // never silently wipes the design); a shrink warns how many cells/slots it would drop.
+                    let (pc, pr) = s.pending_grid;
+                    if s.pending_grid != s.working.grid_dims {
+                        let drop_c = s
+                            .working
+                            .cells
+                            .iter()
+                            .filter(|c| c.coord.0 >= pc || c.coord.1 >= pr)
+                            .count();
+                        let drop_s = s
+                            .working
+                            .slots
+                            .iter()
+                            .filter(|sl| sl.coord.0 >= pc || sl.coord.1 >= pr)
+                            .count();
+                        if drop_c > 0 || drop_s > 0 {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 90, 80),
+                                format!("⚠ Apply drops {drop_c} cells · {drop_s} slots"),
+                            );
+                        }
+                        if ui.button("Apply grid").clicked() {
+                            s.working.grid_dims = s.pending_grid;
+                            s.working.cells.retain(|c| c.coord.0 < pc && c.coord.1 < pr);
+                            s.working
+                                .slots
+                                .retain(|sl| sl.coord.0 < pc && sl.coord.1 < pr);
+                            if s.selected_cell.is_some_and(|c| c.0 >= pc || c.1 >= pr) {
+                                s.selected_cell = None;
+                            }
+                            s.dirty = true;
+                        }
+                    } else {
+                        ui.add_enabled(false, egui::Button::new("Apply grid"));
+                    }
+                    // R62 — shift the WHOLE design (cells + slots) to re-centre after a grid grow. Screen
+                    // orientation: ▲ = +row (up), ◀ = +col (port-left), per the nose-up / port-left grid.
+                    ui.label("Move design");
+                    ui.horizontal(|ui| {
+                        if ui.button("◀").clicked() && !shift_design(s, 1, 0) {
+                            s.status = "shift blocked (edge)".into();
+                        }
+                        if ui.button("▶").clicked() && !shift_design(s, -1, 0) {
+                            s.status = "shift blocked (edge)".into();
+                        }
+                        if ui.button("▲").clicked() && !shift_design(s, 0, 1) {
+                            s.status = "shift blocked (edge)".into();
+                        }
+                        if ui.button("▼").clicked() && !shift_design(s, 0, -1) {
+                            s.status = "shift blocked (edge)".into();
+                        }
+                        if ui.button("Auto-center").clicked() {
+                            auto_center(s);
+                        }
                     });
-                }
-                Tool::Select => {
-                    ui.weak("click a cell to inspect / edit it");
-                }
-            }
-            ui.horizontal(|ui| {
-                if ui.button("Fill bounding box").clicked() {
-                    fill_bounding_box(&mut s.working, s.brush);
-                    s.dirty = true;
-                }
-                if ui.button("Clear all").clicked() {
-                    s.working.cells.clear();
-                    s.working.slots.clear();
-                    s.dirty = true;
-                }
-            });
-            ui.separator();
-            ui.label(format!(
-                "{} cells · {} slots",
-                s.working.cells.len(),
-                s.working.slots.len()
-            ));
+                    // R63 — mirror one screen-half onto the other across the centre line (cells + slots +
+                    // each cell's shape are reflected E↔W). Screen-left = high col (the grid is port-left).
+                    ui.label("Mirror across center");
+                    ui.horizontal(|ui| {
+                        if ui.button("◀ copy left→right").clicked() {
+                            mirror_design(s, true);
+                        }
+                        if ui.button("copy right→left ▶").clicked() {
+                            mirror_design(s, false);
+                        }
+                    });
+                    ui.separator();
+                    ui.label("Budgets");
+                    for (label, val, range) in [
+                        ("Power cap", &mut s.working.power_capacity, 0.0..=500.0),
+                        ("CPU cap", &mut s.working.cpu_capacity, 0.0..=500.0),
+                        ("Mass cap", &mut s.working.mass_capacity, 0.0..=2000.0),
+                        ("Base mass", &mut s.working.hull_base_mass, 0.0..=500.0),
+                    ] {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            ui.add(egui::Slider::new(val, range));
+                        });
+                    }
+                    ui.separator();
+                    ui.heading("Brush");
+                    // R72/R73 — TWO axes: a TOOL (the action) + the active LAYER. EVERY tool acts on the layer
+                    // (Paint sets it, Erase clears it, Select inspects; Stamp lays shapes). The Layer row is the
+                    // SAME selection as the "Show:" view above the grid — editing either syncs the other.
+                    ui.horizontal(|ui| {
+                        ui.label("Tool:");
+                        ui.selectable_value(&mut s.tool, Tool::Paint, "Paint");
+                        ui.selectable_value(&mut s.tool, Tool::Stamp, "Stamp");
+                        ui.selectable_value(&mut s.tool, Tool::Erase, "Erase");
+                        ui.selectable_value(&mut s.tool, Tool::Select, "Select");
+                    });
+                    // The active LAYER (icons echo the grid colouring) — always selectable; shared with "Show:".
+                    ui.horizontal(|ui| {
+                        ui.label("Layer:");
+                        for (layer, which, name) in [
+                            (Layer::Shape, 0u8, "Shape"),
+                            (Layer::Hull, 1u8, "Hull material"),
+                            (Layer::Armor, 2u8, "Armor material"),
+                            (Layer::Module, 3u8, "Module (hardpoint)"),
+                        ] {
+                            if layer_icon(ui, which, s.layer == layer, true, name) {
+                                s.layer = layer;
+                            }
+                        }
+                    });
+                    // The active tool's options: Paint → the layer's icon palette (the brush); Stamp → presets;
+                    // Erase/Select → a one-line hint (they act on the active layer too).
+                    match s.tool {
+                        Tool::Paint => match s.layer {
+                            Layer::Shape => {
+                                ui.label("Shape (filter / search, then click an icon)");
+                                shape_palette(
+                                    ui,
+                                    "brush",
+                                    &mut s.brush,
+                                    &mut s.palette_filter,
+                                    &mut s.palette_search,
+                                );
+                            }
+                            Layer::Hull => {
+                                ui.label("Hull material (click-drag to paint):");
+                                let items: Vec<(egui::Color32, &str)> = cell_materials
+                                    .hull
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, h)| (hull_mat_color(i as u8), h.name.as_str()))
+                                    .collect();
+                                swatch_palette(ui, &mut s.hull_material_brush, &items);
+                            }
+                            Layer::Armor => {
+                                ui.label("Armor material (click-drag to plate):");
+                                let items: Vec<(egui::Color32, &str)> = cell_materials
+                                    .armor
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, a)| (armor_mat_color(i as u8), a.name.as_str()))
+                                    .collect();
+                                swatch_palette(ui, &mut s.armor_material_brush, &items);
+                            }
+                            Layer::Module => {
+                                ui.label("Module type (click-drag to paint; — removes):");
+                                module_palette(ui, &mut s.module_brush);
+                            }
+                        },
+                        Tool::Stamp => {
+                            // R63 — multi-cell stamp (Shape layer): pick a preset + direction, click to place.
+                            egui::ComboBox::from_id_salt("stamp_kind")
+                                .selected_text(s.stamp_kind.label())
+                                .show_ui(ui, |ui| {
+                                    for k in StampKind::ALL {
+                                        ui.selectable_value(&mut s.stamp_kind, k, k.label());
+                                    }
+                                });
+                            ui.horizontal(|ui| {
+                                ui.label("Dir");
+                                ui.selectable_value(&mut s.stamp_dir, Dir::N, "N");
+                                ui.selectable_value(&mut s.stamp_dir, Dir::E, "E");
+                                ui.selectable_value(&mut s.stamp_dir, Dir::S, "S");
+                                ui.selectable_value(&mut s.stamp_dir, Dir::W, "W");
+                            });
+                            ui.small("click the grid to stamp");
+                        }
+                        Tool::Erase => {
+                            ui.weak(match s.layer {
+                                Layer::Shape => "click / drag to DELETE cells",
+                                Layer::Hull => "click / drag to reset hull → Standard",
+                                Layer::Armor => "click / drag to remove armor",
+                                Layer::Module => "click / drag to remove the slot",
+                            });
+                        }
+                        Tool::Select => {
+                            ui.weak("click a cell to inspect / edit it");
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Fill bounding box").clicked() {
+                            fill_bounding_box(&mut s.working, s.brush);
+                            s.dirty = true;
+                        }
+                        if ui.button("Clear all").clicked() {
+                            s.working.cells.clear();
+                            s.working.slots.clear();
+                            s.dirty = true;
+                        }
+                    });
+                    ui.separator();
+                    ui.label(format!(
+                        "{} cells · {} slots",
+                        s.working.cells.len(),
+                        s.working.slots.len()
+                    ));
+                });
         });
 
     // ---- Right: selected-cell + slots + 3-D preview ----
     egui::SidePanel::right("hull_editor_inspect")
         .default_width(300.0)
         .show(ctx, |ui| {
-            // 3-D preview pane (render-to-texture); drag to orbit.
-            ui.heading("Preview");
-            let size = egui::vec2(280.0, 280.0);
-            let resp = ui.add(
-                egui::Image::new(egui::load::SizedTexture::new(preview_tex, size))
-                    .sense(egui::Sense::drag()),
-            );
-            if resp.dragged() {
-                let d = resp.drag_delta();
-                s.orbit.0 += d.x * 0.01;
-                s.orbit.1 = (s.orbit.1 + d.y * 0.01).clamp(-1.4, 1.4);
-            }
-            ui.separator();
-
-            ui.heading("Selected cell");
-            if let Some(coord) = s.selected_cell {
-                ui.label(format!("({}, {})", coord.0, coord.1));
-                if let Some(idx) = s.working.cells.iter().position(|c| c.coord == coord) {
-                    let mut shape = s.working.cells[idx].shape;
-                    if shape_palette(ui, &mut shape, &mut s.palette_family) {
-                        s.working.cells[idx].shape = shape;
-                        s.dirty = true;
+            egui::ScrollArea::vertical()
+                .id_salt("inspect_scroll")
+                .show(ui, |ui| {
+                    // 3-D preview pane (render-to-texture); drag to orbit.
+                    ui.heading("Preview");
+                    let size = egui::vec2(280.0, 280.0);
+                    let resp = ui.add(
+                        egui::Image::new(egui::load::SizedTexture::new(preview_tex, size))
+                            .sense(egui::Sense::drag()),
+                    );
+                    if resp.dragged() {
+                        let d = resp.drag_delta();
+                        s.orbit.0 += d.x * 0.01;
+                        s.orbit.1 = (s.orbit.1 + d.y * 0.01).clamp(-1.4, 1.4);
                     }
-                    // R68 — this cell's full layer STACK as icon palettes (matching the brush palettes),
-                    // each editing the selected cell directly + showing the chosen entry's stats.
                     ui.separator();
-                    ui.label("Hull material");
-                    let hull_items: Vec<(egui::Color32, &str)> = cell_materials
-                        .hull
-                        .iter()
-                        .enumerate()
-                        .map(|(i, h)| (hull_mat_color(i as u8), h.name.as_str()))
-                        .collect();
-                    let mut hm = s.working.cells[idx].hull_material;
-                    if swatch_palette(ui, &mut hm, &hull_items) {
-                        s.working.cells[idx].hull_material = hm;
-                        s.dirty = true;
+
+                    ui.heading("Selected cell");
+                    if let Some(coord) = s.selected_cell {
+                        ui.label(format!("({}, {})", coord.0, coord.1));
+                        if let Some(idx) = s.working.cells.iter().position(|c| c.coord == coord) {
+                            let mut shape = s.working.cells[idx].shape;
+                            if shape_palette(
+                                ui,
+                                "inspect",
+                                &mut shape,
+                                &mut s.palette_filter,
+                                &mut s.palette_search,
+                            ) {
+                                s.working.cells[idx].shape = shape;
+                                s.dirty = true;
+                            }
+                            // R68 — this cell's full layer STACK as icon palettes (matching the brush palettes),
+                            // each editing the selected cell directly + showing the chosen entry's stats.
+                            ui.separator();
+                            ui.label("Hull material");
+                            let hull_items: Vec<(egui::Color32, &str)> = cell_materials
+                                .hull
+                                .iter()
+                                .enumerate()
+                                .map(|(i, h)| (hull_mat_color(i as u8), h.name.as_str()))
+                                .collect();
+                            let mut hm = s.working.cells[idx].hull_material;
+                            if swatch_palette(ui, &mut hm, &hull_items) {
+                                s.working.cells[idx].hull_material = hm;
+                                s.dirty = true;
+                            }
+                            if let Some(h) = cell_materials.hull.get(hm as usize) {
+                                ui.small(format!("hp {:.1} · mass {:.2}", h.cell_hp, h.mass));
+                            }
+                            ui.label("Armor material");
+                            let armor_items: Vec<(egui::Color32, &str)> = cell_materials
+                                .armor
+                                .iter()
+                                .enumerate()
+                                .map(|(i, a)| (armor_mat_color(i as u8), a.name.as_str()))
+                                .collect();
+                            let mut am = s.working.cells[idx].armor_material;
+                            if swatch_palette(ui, &mut am, &armor_items) {
+                                s.working.cells[idx].armor_material = am;
+                                s.dirty = true;
+                            }
+                            if let Some(a) = cell_materials.armor.get(am as usize) {
+                                ui.small(format!(
+                                    "th {:.1}×{:.1} · carve {:.0} · mass {:.2}",
+                                    a.thickness, a.multiplier, a.carve_hp, a.mass
+                                ));
+                            }
+                            // R68 — Module: pick a hardpoint type as icons (— = none); size/facing edited below.
+                            ui.label("Module");
+                            let mut module = s
+                                .working
+                                .slots
+                                .iter()
+                                .find(|sl| sl.coord == coord)
+                                .map(|sl| sl.slot_type);
+                            if module_palette(ui, &mut module) {
+                                set_cell_module(s, coord, module);
+                            }
+                            if let Some(sidx) =
+                                s.working.slots.iter().position(|sl| sl.coord == coord)
+                            {
+                                ui.label(format!("Slot #{}", s.working.slots[sidx].id.0));
+                                slot_editor(ui, &mut s.working.slots[sidx]);
+                            }
+                        } else {
+                            ui.label("(empty — paint a cell here)");
+                        }
+                    } else {
+                        ui.label("(click a cell)");
                     }
-                    if let Some(h) = cell_materials.hull.get(hm as usize) {
-                        ui.small(format!("hp {:.1} · mass {:.2}", h.cell_hp, h.mass));
-                    }
-                    ui.label("Armor material");
-                    let armor_items: Vec<(egui::Color32, &str)> = cell_materials
-                        .armor
-                        .iter()
-                        .enumerate()
-                        .map(|(i, a)| (armor_mat_color(i as u8), a.name.as_str()))
-                        .collect();
-                    let mut am = s.working.cells[idx].armor_material;
-                    if swatch_palette(ui, &mut am, &armor_items) {
-                        s.working.cells[idx].armor_material = am;
-                        s.dirty = true;
-                    }
-                    if let Some(a) = cell_materials.armor.get(am as usize) {
-                        ui.small(format!(
-                            "th {:.1}×{:.1} · carve {:.0} · mass {:.2}",
-                            a.thickness, a.multiplier, a.carve_hp, a.mass
-                        ));
-                    }
-                    // R68 — Module: pick a hardpoint type as icons (— = none); size/facing edited below.
-                    ui.label("Module");
-                    let mut module = s
+
+                    ui.separator();
+                    ui.heading("Slots");
+                    let coords: Vec<(SlotId, (u16, u16), HardpointType)> = s
                         .working
                         .slots
                         .iter()
-                        .find(|sl| sl.coord == coord)
-                        .map(|sl| sl.slot_type);
-                    if module_palette(ui, &mut module) {
-                        set_cell_module(s, coord, module);
+                        .map(|sl| (sl.id, sl.coord, sl.slot_type))
+                        .collect();
+                    for (id, coord, ty) in coords {
+                        if ui
+                            .button(format!("#{} {:?} ({},{})", id.0, ty, coord.0, coord.1))
+                            .clicked()
+                        {
+                            s.selected_cell = Some(coord);
+                            s.selected_slot = Some(id);
+                        }
                     }
-                    if let Some(sidx) = s.working.slots.iter().position(|sl| sl.coord == coord) {
-                        ui.label(format!("Slot #{}", s.working.slots[sidx].id.0));
-                        slot_editor(ui, &mut s.working.slots[sidx]);
-                    }
-                } else {
-                    ui.label("(empty — paint a cell here)");
-                }
-            } else {
-                ui.label("(click a cell)");
-            }
-
-            ui.separator();
-            ui.heading("Slots");
-            let coords: Vec<(SlotId, (u16, u16), HardpointType)> = s
-                .working
-                .slots
-                .iter()
-                .map(|sl| (sl.id, sl.coord, sl.slot_type))
-                .collect();
-            for (id, coord, ty) in coords {
-                if ui
-                    .button(format!("#{} {:?} ({},{})", id.0, ty, coord.0, coord.1))
-                    .clicked()
-                {
-                    s.selected_cell = Some(coord);
-                    s.selected_slot = Some(id);
-                }
-            }
+                });
         });
 
     // ---- Center: the cell-grid painter ----
@@ -1040,39 +1066,90 @@ fn line_cells(a: (u16, u16), b: (u16, u16)) -> Vec<(u16, u16)> {
 /// R63 — a COMPACT shape palette: a wrapped row of FAMILY chips, then only the SELECTED family's
 /// orientation icons (each drawn as its real polygon). Keeps the panel narrow regardless of shape count.
 /// Sets `*current` on click; returns true if it changed.
-fn shape_palette(ui: &mut egui::Ui, current: &mut CellShape, family: &mut ShapeFamily) -> bool {
+/// R74 — the shape brush palette: a family-FILTER chip row (`All` plus the 17 families), a name SEARCH
+/// box, and a height-capped SCROLLABLE grid of every MATCHING shape (grouped by family). `id`
+/// disambiguates the two instances (the left-panel brush + the right-panel selected-cell inspector) so
+/// their chips / search field / scroll area don't collide. Returns true if `current` changed.
+fn shape_palette(
+    ui: &mut egui::Ui,
+    id: &str,
+    current: &mut CellShape,
+    filter: &mut Option<ShapeFamily>,
+    search: &mut String,
+) -> bool {
     let before = *current;
-    // Family chips.
-    ui.horizontal_wrapped(|ui| {
-        for f in ShapeFamily::ALL {
-            ui.selectable_value(family, f, f.label());
-        }
-    });
-    // The selected family's orientation icons.
-    ui.horizontal_wrapped(|ui| {
-        for shape in family.shapes() {
-            const ICON: f32 = 26.0;
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(ICON, ICON), egui::Sense::click());
-            let selected = *current == shape;
-            let p = ui.painter_at(rect);
-            p.rect_filled(rect, 3.0, egui::Color32::from_rgb(30, 34, 42));
-            p.add(egui::Shape::convex_polygon(
-                shape_poly_in_rect(shape, rect.shrink(3.0)),
-                shape_color(shape),
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(15, 18, 22)),
-            ));
-            let stroke = if selected {
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 220, 80))
-            } else {
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 66, 78))
-            };
-            p.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
-            if resp.on_hover_text(shape.label()).clicked() {
-                *current = shape;
+    ui.push_id(id, |ui| {
+        // Filter chips: All + each family.
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(filter, None, "All");
+            for f in ShapeFamily::ALL {
+                ui.selectable_value(filter, Some(f), f.label());
+            }
+        });
+        // Name search.
+        ui.horizontal(|ui| {
+            ui.label("find");
+            ui.add(egui::TextEdit::singleline(search).desired_width(120.0));
+            if !search.is_empty() && ui.small_button("✕").clicked() {
+                search.clear();
+            }
+        });
+        // Matching shapes (family filter ∩ name search), grouped by family.
+        let q = search.trim().to_lowercase();
+        let fams: Vec<ShapeFamily> = match *filter {
+            Some(f) => vec![f],
+            None => ShapeFamily::ALL.to_vec(),
+        };
+        let mut matching: Vec<CellShape> = Vec::new();
+        for f in fams {
+            for sh in f.shapes() {
+                if q.is_empty()
+                    || format!("{} {}", f.label(), sh.label())
+                        .to_lowercase()
+                        .contains(&q)
+                {
+                    matching.push(sh);
+                }
             }
         }
+        if matching.is_empty() {
+            ui.weak("no shapes match");
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .max_height(168.0)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for shape in matching {
+                        if shape_icon(ui, shape, *current == shape) {
+                            *current = shape;
+                        }
+                    }
+                });
+            });
     });
     *current != before
+}
+
+/// R74 — one 26-px shape icon: the shape's real polygon on a dark swatch, `selected`-bordered,
+/// hover-named. Returns true on click. (Factored out of the R63 `shape_palette`.)
+fn shape_icon(ui: &mut egui::Ui, shape: CellShape, selected: bool) -> bool {
+    const ICON: f32 = 26.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ICON, ICON), egui::Sense::click());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 3.0, egui::Color32::from_rgb(30, 34, 42));
+    p.add(egui::Shape::convex_polygon(
+        shape_poly_in_rect(shape, rect.shrink(3.0)),
+        shape_color(shape),
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(15, 18, 22)),
+    ));
+    let stroke = if selected {
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 220, 80))
+    } else {
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 66, 78))
+    };
+    p.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+    resp.on_hover_text(shape.label()).clicked()
 }
 
 /// R66 — the hardpoint types selectable as a module (Armor removed in R66 — it's a per-cell material).
