@@ -1,0 +1,23 @@
+// R84 — hull-editor UI sizes/positions. Edit + click the editor's "⟳ UI" button (or close + F8)
+// to apply — no rebuild. Missing fields fall back to code defaults.
+(
+    // The top Design|Brush tabbed panel's height (px). Sized so the Brush tab shows ~one full
+    // row of shape cards plus a peek of the next.
+    tabs_panel_height: 190.0,
+    // The Brush tab's LEFT column width (Tool/Layer + the wrapped legend).
+    brush_left_width: 210.0,
+    // The right inspector panel's default width.
+    inspect_panel_width: 300.0,
+    // The 3-D preview image size (square, px).
+    preview_px: 280.0,
+    // Palette icon size (shape / tool / layer / material swatches), px.
+    icon_px: 26.0,
+    // Grid canvas cell size, px.
+    grid_cell_px: 26.0,
+    // The hull Name text field width (Design tab).
+    name_field_width: 140.0,
+    // The budget sliders' width (Design tab).
+    slider_width: 150.0,
+    // The shape-palette search box width.
+    search_width: 120.0,
+)

@@ -32,8 +32,8 @@ const HUD_LAYOUT_RON: &str = "hud_layout.ron";
 
 /// The content dir (`$DARK_SILENCE_CONTENT` if set, else `assets/content/` relative to the CWD —
 /// mirrors `server::load_content_or_default`). Shared by the dev override, the module/hull content
-/// RONs, and the starfield-preset library.
-fn content_dir() -> PathBuf {
+/// RONs, the starfield-preset library, and the hull editor's `editor_layout.ron` (R84).
+pub(crate) fn content_dir() -> PathBuf {
     std::env::var_os("DARK_SILENCE_CONTENT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("assets/content"))

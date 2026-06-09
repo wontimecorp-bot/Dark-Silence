@@ -126,6 +126,82 @@ enum Layer {
     Module,
 }
 
+/// R80 — the top tabbed-panel tab: `Design` (hull meta / grid / move / mirror / budgets) or `Brush`
+/// (Tool / Layer / the active tool's palette).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditorTab {
+    Design,
+    Brush,
+}
+
+/// R84 — ALL the hull-editor UI sizes/positions, loaded from `assets/content/editor_layout.ron` so they
+/// can be tuned by editing the file (no rebuild): reloaded on every editor open (F8) and via the title
+/// bar's "⟳ UI" button. Missing fields fall back to the defaults (`#[serde(default)]`); a missing FILE
+/// is written out as an editable template.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct EditorLayout {
+    /// The top Design|Brush tabbed panel's height (px). Sized so the Brush tab shows ~one full row of
+    /// shape cards plus a peek of the next.
+    tabs_panel_height: f32,
+    /// The Brush tab's LEFT column width (Tool/Layer + the wrapped legend).
+    brush_left_width: f32,
+    /// The right inspector panel's default width.
+    inspect_panel_width: f32,
+    /// The 3-D preview image size (square, px).
+    preview_px: f32,
+    /// Palette icon size (shape / tool / layer / material swatches), px.
+    icon_px: f32,
+    /// Grid canvas cell size, px.
+    grid_cell_px: f32,
+    /// The hull Name text field width (Design tab).
+    name_field_width: f32,
+    /// The budget sliders' width (Design tab).
+    slider_width: f32,
+    /// The shape-palette search box width.
+    search_width: f32,
+}
+
+impl Default for EditorLayout {
+    fn default() -> Self {
+        Self {
+            tabs_panel_height: 190.0,
+            brush_left_width: 210.0,
+            inspect_panel_width: 300.0,
+            preview_px: 280.0,
+            icon_px: 26.0,
+            grid_cell_px: 26.0,
+            name_field_width: 140.0,
+            slider_width: 150.0,
+            search_width: 120.0,
+        }
+    }
+}
+
+/// R84 — load `editor_layout.ron` from the content dir; absent → write the DEFAULT out as an editable
+/// template + use it; unparseable → log + defaults. Windowed/dev-only `std::fs` (never on a test path).
+fn load_editor_layout() -> EditorLayout {
+    let path = crate::tuning_io::content_dir().join("editor_layout.ron");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match ron::from_str(&text) {
+            Ok(layout) => layout,
+            Err(e) => {
+                warn!("editor_layout.ron parse error ({e}); using defaults");
+                EditorLayout::default()
+            }
+        },
+        Err(_) => {
+            let def = EditorLayout::default();
+            if let Ok(text) = ron::ser::to_string_pretty(&def, ron::ser::PrettyConfig::default()) {
+                if std::fs::write(&path, text).is_ok() {
+                    info!("wrote default {} (edit + \"⟳ UI\" to tune)", path.display());
+                }
+            }
+            def
+        }
+    }
+}
+
 /// R63/R64 — a family of related [`CellShape`]s, shown as one chip in the compact palette.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ShapeFamily {
@@ -291,6 +367,10 @@ pub struct HullDesignSession {
     brush: CellShape,
     /// R72 — the editing ACTION (the tool). The LAYER it targets is the shared `layer` below.
     tool: Tool,
+    /// R80 — the active top-panel tab (Design / Brush).
+    tab: EditorTab,
+    /// R84 — the RON-tunable UI sizes (`editor_layout.ron`), reloaded on editor open + "⟳ UI".
+    layout: EditorLayout,
     selected_cell: Option<(u16, u16)>,
     selected_slot: Option<SlotId>,
     /// R61 — staged grid size (the cols/rows fields edit this; "Apply grid" commits it so editing the
@@ -382,6 +462,8 @@ impl Default for HullDesignSession {
             selected_hull: HULL_FIGHTER,
             brush: CellShape::Full,
             tool: Tool::Paint,
+            tab: EditorTab::Design,
+            layout: EditorLayout::default(),
             selected_cell: None,
             selected_slot: None,
             pending_grid,
@@ -424,6 +506,8 @@ fn load_design_session(
     session.selected_slot = None;
     session.dirty = true;
     session.status.clear();
+    // R84 — re-read the UI sizes on every editor open, so editing editor_layout.ron + F8 applies it.
+    session.layout = load_editor_layout();
 }
 
 /// The editor screen (egui), drawn every frame while `Designing`.
@@ -530,201 +614,98 @@ fn hull_editor_ui(
                 do_save_new = true;
             }
             ui.separator();
-            // R79 — undo / redo (also Ctrl+Z / Ctrl+Y, wired below).
+            // R79/R80 — undo / redo glyph icons (↶ / ↷; render with a glyph font, else boxes). Also
+            // Ctrl+Z / Ctrl+Y, wired below.
             if ui
-                .add_enabled(!s.undo.is_empty(), egui::Button::new("Undo"))
-                .on_hover_text("Ctrl+Z")
+                .add_enabled(!s.undo.is_empty(), egui::Button::new("↶"))
+                .on_hover_text("Undo (Ctrl+Z)")
                 .clicked()
             {
                 s.undo();
             }
             if ui
-                .add_enabled(!s.redo.is_empty(), egui::Button::new("Redo"))
-                .on_hover_text("Ctrl+Y / Ctrl+Shift+Z")
+                .add_enabled(!s.redo.is_empty(), egui::Button::new("↷"))
+                .on_hover_text("Redo (Ctrl+Y / Ctrl+Shift+Z)")
                 .clicked()
             {
                 s.redo();
             }
-            if ui.button("Close").clicked() {
-                do_close = true;
+            // R84 — re-read editor_layout.ron live (edit the file → click → the sizes apply).
+            if ui
+                .button("⟳ UI")
+                .on_hover_text("Reload assets/content/editor_layout.ron (UI sizes)")
+                .clicked()
+            {
+                s.layout = load_editor_layout();
+                s.status = "UI layout reloaded".into();
             }
+            // R80 — Close ✕ pinned to the FAR RIGHT of the title bar.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("✕").on_hover_text("Close").clicked() {
+                    do_close = true;
+                }
+            });
         });
         if !s.status.is_empty() {
             ui.label(&s.status);
         }
     });
 
-    // ---- Top: the Brush — Tool/Layer PINNED, the palette scrolls below (R79 moved it from the bottom) ----
-    egui::TopBottomPanel::top("hull_editor_brush")
-        .resizable(true)
-        .default_height(220.0)
+    // ---- Top: a TABBED panel — Design (hull/grid/move/mirror/budgets) | Brush (tool/layer/palette) ----
+    // R80 — replaces the left side panel + the R79 brush top panel. `auto_shrink(false)` on each tab's
+    // body holds the panel at a CONSISTENT height (no shrink/jump when switching Tool/Layer or tabs).
+    // R84 — EXACT height from editor_layout.ron (the RON is the single source of truth → "⟳ UI"
+    // applies instantly; egui's drag-resize memory would otherwise shadow a reloaded value).
+    egui::TopBottomPanel::top("hull_editor_tabs")
+        .resizable(false)
+        .exact_height(s.layout.tabs_panel_height)
         .show(ctx, |ui| {
-            // Pinned header (stays put): Tool + Layer (aligned) + the active-layer colour legend.
-            brush_header(ui, s, &cell_materials);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut s.tab, EditorTab::Design, "Design");
+                ui.selectable_value(&mut s.tab, EditorTab::Brush, "Brush");
+            });
             ui.separator();
-            // Scrolling body: the active tool's palette / options + Fill/Clear.
-            egui::ScrollArea::vertical()
-                .id_salt("brush_scroll")
-                .show(ui, |ui| {
-                    brush_options(ui, s, &cell_materials);
-                });
-        });
-
-    // ---- Left: metadata + brush ----
-    egui::SidePanel::left("hull_editor_meta")
-        .default_width(220.0)
-        .show(ctx, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("meta_scroll")
-                .show(ui, |ui| {
-                    ui.heading("Hull");
-                    ui.horizontal(|ui| {
-                        ui.label("Name");
-                        if ui.text_edit_singleline(&mut s.working.name).changed() {
-                            s.dirty = true;
-                        }
-                    });
-                    egui::ComboBox::from_label("Class")
-                        .selected_text(format!("{:?}", s.working.class))
-                        .show_ui(ui, |ui| {
-                            for c in ShipClass::ALL {
-                                ui.selectable_value(&mut s.working.class, c, format!("{c:?}"));
-                            }
+            match s.tab {
+                EditorTab::Design => {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink(false)
+                        .id_salt("design_scroll")
+                        .show(ui, |ui| {
+                            design_tab(ui, s);
                         });
-                    egui::ComboBox::from_label("Role")
-                        .selected_text(format!("{:?}", s.working.role))
-                        .show_ui(ui, |ui| {
-                            for r in ShipRole::ALL {
-                                ui.selectable_value(&mut s.working.role, r, format!("{r:?}"));
-                            }
+                }
+                EditorTab::Brush => {
+                    // R82 — Tool/Layer on the LEFT, the shape palette to their RIGHT (side by side).
+                    // R84 — the left column is WIDTH-CAPPED (the wrapped legend stays inside it), so the
+                    // palette can no longer be pushed off-screen.
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(s.layout.brush_left_width);
+                            brush_header(ui, s, &cell_materials);
                         });
-                    ui.separator();
-                    ui.label("Grid (cols × rows)");
-                    ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut s.pending_grid.0).range(1..=40));
-                        ui.label("×");
-                        ui.add(egui::DragValue::new(&mut s.pending_grid.1).range(1..=40));
+                        ui.separator();
+                        // Right: the active tool's palette / options + Fill/Clear (scrolls, fills the rest).
+                        egui::ScrollArea::vertical()
+                            .auto_shrink(false)
+                            .id_salt("brush_scroll")
+                            .show(ui, |ui| {
+                                brush_options(ui, s, &cell_materials);
+                            });
                     });
-                    // R61 — STAGED: editing the numbers above changes nothing until "Apply grid" (so a resize
-                    // never silently wipes the design); a shrink warns how many cells/slots it would drop.
-                    let (pc, pr) = s.pending_grid;
-                    if s.pending_grid != s.working.grid_dims {
-                        let drop_c = s
-                            .working
-                            .cells
-                            .iter()
-                            .filter(|c| c.coord.0 >= pc || c.coord.1 >= pr)
-                            .count();
-                        let drop_s = s
-                            .working
-                            .slots
-                            .iter()
-                            .filter(|sl| sl.coord.0 >= pc || sl.coord.1 >= pr)
-                            .count();
-                        if drop_c > 0 || drop_s > 0 {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(220, 90, 80),
-                                format!("⚠ Apply drops {drop_c} cells · {drop_s} slots"),
-                            );
-                        }
-                        if ui.button("Apply grid").clicked() {
-                            s.checkpoint();
-                            s.working.grid_dims = s.pending_grid;
-                            s.working.cells.retain(|c| c.coord.0 < pc && c.coord.1 < pr);
-                            s.working
-                                .slots
-                                .retain(|sl| sl.coord.0 < pc && sl.coord.1 < pr);
-                            if s.selected_cell.is_some_and(|c| c.0 >= pc || c.1 >= pr) {
-                                s.selected_cell = None;
-                            }
-                            s.dirty = true;
-                        }
-                    } else {
-                        ui.add_enabled(false, egui::Button::new("Apply grid"));
-                    }
-                    // R62 — shift the WHOLE design (cells + slots) to re-centre after a grid grow. Screen
-                    // orientation: ▲ = +row (up), ◀ = +col (port-left), per the nose-up / port-left grid.
-                    ui.label("Move design");
-                    ui.horizontal(|ui| {
-                        // R79 — text glyphs (◀▶ render in egui's font; ▲▼ render once a glyph font is
-                        // added — `assets/fonts/symbols.ttf`, loaded by `install_egui_fonts`). ◀ = +col
-                        // (port-left), ▲ = +row (up), per the nose-up / port-left grid.
-                        if ui.button("◀").clicked() {
-                            s.checkpoint();
-                            if !shift_design(s, 1, 0) {
-                                s.status = "shift blocked (edge)".into();
-                            }
-                        }
-                        if ui.button("▶").clicked() {
-                            s.checkpoint();
-                            if !shift_design(s, -1, 0) {
-                                s.status = "shift blocked (edge)".into();
-                            }
-                        }
-                        if ui.button("▲").clicked() {
-                            s.checkpoint();
-                            if !shift_design(s, 0, 1) {
-                                s.status = "shift blocked (edge)".into();
-                            }
-                        }
-                        if ui.button("▼").clicked() {
-                            s.checkpoint();
-                            if !shift_design(s, 0, -1) {
-                                s.status = "shift blocked (edge)".into();
-                            }
-                        }
-                        if ui.button("Auto-center").clicked() {
-                            s.checkpoint();
-                            auto_center(s);
-                        }
-                    });
-                    // R63 — mirror one screen-half onto the other across the centre line (cells + slots +
-                    // each cell's shape are reflected E↔W). Screen-left = high col (the grid is port-left).
-                    ui.label("Mirror across center");
-                    ui.horizontal(|ui| {
-                        if ui.button("◀ copy left→right").clicked() {
-                            s.checkpoint();
-                            mirror_design(s, true);
-                        }
-                        if ui.button("copy right→left ▶").clicked() {
-                            s.checkpoint();
-                            mirror_design(s, false);
-                        }
-                    });
-                    ui.separator();
-                    ui.label("Budgets");
-                    for (label, val, range) in [
-                        ("Power cap", &mut s.working.power_capacity, 0.0..=500.0),
-                        ("CPU cap", &mut s.working.cpu_capacity, 0.0..=500.0),
-                        ("Mass cap", &mut s.working.mass_capacity, 0.0..=2000.0),
-                        ("Base mass", &mut s.working.hull_base_mass, 0.0..=500.0),
-                    ] {
-                        ui.horizontal(|ui| {
-                            ui.label(label);
-                            ui.add(egui::Slider::new(val, range));
-                        });
-                    }
-                    // R77 — the Brush controls moved to the bottom panel under the grid (see
-                    // `brush_controls`); the left panel keeps just hull meta / grid / move / budgets.
-                    ui.separator();
-                    ui.label(format!(
-                        "{} cells · {} slots",
-                        s.working.cells.len(),
-                        s.working.slots.len()
-                    ));
-                });
+                }
+            }
         });
 
     // ---- Right: selected-cell + slots + 3-D preview ----
     egui::SidePanel::right("hull_editor_inspect")
-        .default_width(300.0)
+        .default_width(s.layout.inspect_panel_width)
         .show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("inspect_scroll")
                 .show(ui, |ui| {
                     // 3-D preview pane (render-to-texture); drag to orbit.
                     ui.heading("Preview");
-                    let size = egui::vec2(280.0, 280.0);
+                    let size = egui::vec2(s.layout.preview_px, s.layout.preview_px);
                     let resp = ui.add(
                         egui::Image::new(egui::load::SizedTexture::new(preview_tex, size))
                             .sense(egui::Sense::drag()),
@@ -741,12 +722,14 @@ fn hull_editor_ui(
                         ui.label(format!("({}, {})", coord.0, coord.1));
                         if let Some(idx) = s.working.cells.iter().position(|c| c.coord == coord) {
                             let mut shape = s.working.cells[idx].shape;
+                            let lay = s.layout;
                             if shape_palette(
                                 ui,
                                 "inspect",
                                 &mut shape,
                                 &mut s.palette_filter,
                                 &mut s.palette_search,
+                                lay,
                             ) {
                                 s.checkpoint();
                                 s.working.cells[idx].shape = shape;
@@ -763,7 +746,7 @@ fn hull_editor_ui(
                                 .map(|(i, h)| (hull_mat_color(i as u8), h.name.as_str()))
                                 .collect();
                             let mut hm = s.working.cells[idx].hull_material;
-                            if swatch_palette(ui, &mut hm, &hull_items) {
+                            if swatch_palette(ui, &mut hm, &hull_items, lay.icon_px) {
                                 s.checkpoint();
                                 s.working.cells[idx].hull_material = hm;
                                 s.dirty = true;
@@ -779,7 +762,7 @@ fn hull_editor_ui(
                                 .map(|(i, a)| (armor_mat_color(i as u8), a.name.as_str()))
                                 .collect();
                             let mut am = s.working.cells[idx].armor_material;
-                            if swatch_palette(ui, &mut am, &armor_items) {
+                            if swatch_palette(ui, &mut am, &armor_items, lay.icon_px) {
                                 s.checkpoint();
                                 s.working.cells[idx].armor_material = am;
                                 s.dirty = true;
@@ -798,7 +781,7 @@ fn hull_editor_ui(
                                 .iter()
                                 .find(|sl| sl.coord == coord)
                                 .map(|sl| sl.slot_type);
-                            if module_palette(ui, &mut module) {
+                            if module_palette(ui, &mut module, lay.icon_px) {
                                 s.checkpoint();
                                 set_cell_module(s, coord, module);
                             }
@@ -862,20 +845,20 @@ fn hull_editor_ui(
 /// and a single `click_and_drag` interaction lets Paint/Erase modes drag a swath across the grid.
 fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
     let (cols, rows) = s.working.grid_dims;
-    const CELL: f32 = 26.0;
-    let size = egui::vec2(cols as f32 * CELL, rows as f32 * CELL);
+    let cell_px = s.layout.grid_cell_px; // R84 — RON-tunable (editor_layout.ron)
+    let size = egui::vec2(cols as f32 * cell_px, rows as f32 * cell_px);
     let (canvas, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
     let painter = ui.painter_at(canvas);
 
     let cell_rect = |col: u16, row: u16| {
         // Port-left (high col on the LEFT) + nose-up (high row at the TOP).
-        let x = canvas.min.x + (cols - 1 - col) as f32 * CELL;
-        let y = canvas.min.y + (rows - 1 - row) as f32 * CELL;
-        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(CELL, CELL))
+        let x = canvas.min.x + (cols - 1 - col) as f32 * cell_px;
+        let y = canvas.min.y + (rows - 1 - row) as f32 * cell_px;
+        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(cell_px, cell_px))
     };
     let hovered = resp
         .hover_pos()
-        .and_then(|p| cell_at_pointer(canvas, p, (cols, rows), CELL));
+        .and_then(|p| cell_at_pointer(canvas, p, (cols, rows), cell_px));
 
     for row in 0..rows {
         for col in 0..cols {
@@ -978,7 +961,7 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
     {
         if let Some(coord) = resp
             .interact_pointer_pos()
-            .and_then(|p| cell_at_pointer(canvas, p, (cols, rows), CELL))
+            .and_then(|p| cell_at_pointer(canvas, p, (cols, rows), cell_px))
         {
             s.selected_cell = Some(coord);
             let layer = s.layer;
@@ -996,7 +979,7 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
     {
         if let Some(coord) = resp
             .interact_pointer_pos()
-            .and_then(|p| cell_at_pointer(canvas, p, (cols, rows), CELL))
+            .and_then(|p| cell_at_pointer(canvas, p, (cols, rows), cell_px))
         {
             s.selected_cell = Some(coord);
             match s.tool {
@@ -1099,6 +1082,158 @@ fn line_cells(a: (u16, u16), b: (u16, u16)) -> Vec<(u16, u16)> {
     out
 }
 
+/// R80/R83 — the "Design" tab (hull metadata + grid resize + Move/Mirror + budgets), extracted from the
+/// old left panel. R83 — the sections sit SIDE-BY-SIDE as top-aligned COLUMNS (Hull | Grid |
+/// Move & mirror | Budgets), each with its own header at the top of its column and its controls stacked
+/// beneath; on a very narrow window the row scrolls horizontally instead of mangling. Reads/writes `s`.
+fn design_tab(ui: &mut egui::Ui, s: &mut HullDesignSession) {
+    egui::ScrollArea::horizontal()
+        .id_salt("design_hscroll")
+        .show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                // --- Column 1: Hull metadata ---
+                ui.vertical(|ui| {
+                    ui.strong("Hull");
+                    ui.horizontal(|ui| {
+                        ui.label("Name");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut s.working.name)
+                                    .desired_width(s.layout.name_field_width),
+                            )
+                            .changed()
+                        {
+                            s.dirty = true;
+                        }
+                    });
+                    egui::ComboBox::from_label("Class")
+                        .selected_text(format!("{:?}", s.working.class))
+                        .show_ui(ui, |ui| {
+                            for c in ShipClass::ALL {
+                                ui.selectable_value(&mut s.working.class, c, format!("{c:?}"));
+                            }
+                        });
+                    egui::ComboBox::from_label("Role")
+                        .selected_text(format!("{:?}", s.working.role))
+                        .show_ui(ui, |ui| {
+                            for r in ShipRole::ALL {
+                                ui.selectable_value(&mut s.working.role, r, format!("{r:?}"));
+                            }
+                        });
+                });
+                ui.separator();
+                // --- Column 2: Grid resize (staged behind "Apply grid"; a shrink warns) ---
+                ui.vertical(|ui| {
+                    ui.strong("Grid");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut s.pending_grid.0).range(1..=40));
+                        ui.label("×");
+                        ui.add(egui::DragValue::new(&mut s.pending_grid.1).range(1..=40));
+                    });
+                    let (pc, pr) = s.pending_grid;
+                    if s.pending_grid != s.working.grid_dims {
+                        if ui.button("Apply grid").clicked() {
+                            s.checkpoint();
+                            s.working.grid_dims = s.pending_grid;
+                            s.working.cells.retain(|c| c.coord.0 < pc && c.coord.1 < pr);
+                            s.working
+                                .slots
+                                .retain(|sl| sl.coord.0 < pc && sl.coord.1 < pr);
+                            if s.selected_cell.is_some_and(|c| c.0 >= pc || c.1 >= pr) {
+                                s.selected_cell = None;
+                            }
+                            s.dirty = true;
+                        }
+                        let drop_c = s
+                            .working
+                            .cells
+                            .iter()
+                            .filter(|c| c.coord.0 >= pc || c.coord.1 >= pr)
+                            .count();
+                        let drop_s = s
+                            .working
+                            .slots
+                            .iter()
+                            .filter(|sl| sl.coord.0 >= pc || sl.coord.1 >= pr)
+                            .count();
+                        if drop_c > 0 || drop_s > 0 {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 90, 80),
+                                format!("⚠ Apply drops {drop_c} cells · {drop_s} slots"),
+                            );
+                        }
+                    } else {
+                        ui.add_enabled(false, egui::Button::new("Apply grid"));
+                    }
+                });
+                ui.separator();
+                // --- Column 3: Move (▲ = +row up, ◀ = +col port-left) & mirror (E↔W) ---
+                ui.vertical(|ui| {
+                    ui.strong("Move & mirror");
+                    ui.horizontal(|ui| {
+                        if ui.button("◀").clicked() {
+                            s.checkpoint();
+                            if !shift_design(s, 1, 0) {
+                                s.status = "shift blocked (edge)".into();
+                            }
+                        }
+                        if ui.button("▶").clicked() {
+                            s.checkpoint();
+                            if !shift_design(s, -1, 0) {
+                                s.status = "shift blocked (edge)".into();
+                            }
+                        }
+                        if ui.button("▲").clicked() {
+                            s.checkpoint();
+                            if !shift_design(s, 0, 1) {
+                                s.status = "shift blocked (edge)".into();
+                            }
+                        }
+                        if ui.button("▼").clicked() {
+                            s.checkpoint();
+                            if !shift_design(s, 0, -1) {
+                                s.status = "shift blocked (edge)".into();
+                            }
+                        }
+                        if ui.button("Auto-center").clicked() {
+                            s.checkpoint();
+                            auto_center(s);
+                        }
+                    });
+                    if ui.button("◀ copy left→right").clicked() {
+                        s.checkpoint();
+                        mirror_design(s, true);
+                    }
+                    if ui.button("copy right→left ▶").clicked() {
+                        s.checkpoint();
+                        mirror_design(s, false);
+                    }
+                });
+                ui.separator();
+                // --- Column 4: Budgets ---
+                ui.vertical(|ui| {
+                    ui.strong("Budgets");
+                    ui.spacing_mut().slider_width = s.layout.slider_width;
+                    for (label, val, range) in [
+                        ("Power cap", &mut s.working.power_capacity, 0.0..=500.0),
+                        ("CPU cap", &mut s.working.cpu_capacity, 0.0..=500.0),
+                        ("Mass cap", &mut s.working.mass_capacity, 0.0..=2000.0),
+                        ("Base mass", &mut s.working.hull_base_mass, 0.0..=500.0),
+                    ] {
+                        ui.add(egui::Slider::new(val, range).text(label));
+                    }
+                });
+            });
+        });
+    // --- Footer ---
+    ui.separator();
+    ui.label(format!(
+        "{} cells · {} slots",
+        s.working.cells.len(),
+        s.working.slots.len()
+    ));
+}
+
 /// R79 — the Brush panel's PINNED header (stays put while the palette scrolls): the Tool + Layer icon
 /// rows in an aligned `egui::Grid`, plus the colour LEGEND for the active layer (moved here from the old
 /// "Show:" toolbar). Reads/writes the [`HullDesignSession`].
@@ -1115,7 +1250,7 @@ fn brush_header(
             ui.label("Tool:");
             // R78 — drawn icons (Paint dab / Stamp square / Erase ✕ / Select marquee), hover = name.
             for tool in [Tool::Paint, Tool::Stamp, Tool::Erase, Tool::Select] {
-                if tool_icon(ui, tool, s.tool == tool) {
+                if tool_icon(ui, tool, s.tool == tool, s.layout.icon_px) {
                     s.tool = tool;
                 }
             }
@@ -1127,7 +1262,7 @@ fn brush_header(
                 (Layer::Armor, 2u8, "Armor material"),
                 (Layer::Module, 3u8, "Module (hardpoint)"),
             ] {
-                if layer_icon(ui, which, s.layer == layer, true, name) {
+                if layer_icon(ui, which, s.layer == layer, true, name, s.layout.icon_px) {
                     s.layer = layer;
                 }
             }
@@ -1140,7 +1275,9 @@ fn brush_header(
 /// the material swatches + names, Module = the hardpoint-type key. R79 moved it into the Brush panel (was
 /// the "Show:" toolbar's legend above the grid).
 fn brush_legend(ui: &mut egui::Ui, layer: Layer, cell_materials: &sim::fitting::CellMaterials) {
-    ui.horizontal(|ui| match layer {
+    // R84 — WRAPPED: the legend lives in the Brush tab's width-capped left column; one long row would
+    // blow the column width (it pushed the palette off-screen in R82/R83).
+    ui.horizontal_wrapped(|ui| match layer {
         Layer::Shape => {
             ui.weak("colour = shape / slot");
         }
@@ -1175,6 +1312,7 @@ fn brush_options(
 ) {
     // The active tool's options: Paint → the layer's icon palette (the brush); Stamp → presets;
     // Erase/Select → a one-line hint (they act on the active layer too).
+    let lay = s.layout;
     match s.tool {
         Tool::Paint => match s.layer {
             Layer::Shape => {
@@ -1185,6 +1323,7 @@ fn brush_options(
                     &mut s.brush,
                     &mut s.palette_filter,
                     &mut s.palette_search,
+                    lay,
                 );
             }
             Layer::Hull => {
@@ -1195,7 +1334,7 @@ fn brush_options(
                     .enumerate()
                     .map(|(i, h)| (hull_mat_color(i as u8), h.name.as_str()))
                     .collect();
-                swatch_palette(ui, &mut s.hull_material_brush, &items);
+                swatch_palette(ui, &mut s.hull_material_brush, &items, lay.icon_px);
             }
             Layer::Armor => {
                 ui.label("Armor material (click-drag to plate):");
@@ -1205,11 +1344,11 @@ fn brush_options(
                     .enumerate()
                     .map(|(i, a)| (armor_mat_color(i as u8), a.name.as_str()))
                     .collect();
-                swatch_palette(ui, &mut s.armor_material_brush, &items);
+                swatch_palette(ui, &mut s.armor_material_brush, &items, lay.icon_px);
             }
             Layer::Module => {
                 ui.label("Module type (click-drag to paint; — removes):");
-                module_palette(ui, &mut s.module_brush);
+                module_palette(ui, &mut s.module_brush, lay.icon_px);
             }
         },
         Tool::Stamp => {
@@ -1268,6 +1407,7 @@ fn shape_palette(
     current: &mut CellShape,
     filter: &mut Option<ShapeFamily>,
     search: &mut String,
+    lay: EditorLayout,
 ) -> bool {
     let before = *current;
     ui.push_id(id, |ui| {
@@ -1281,7 +1421,7 @@ fn shape_palette(
         // Name search.
         ui.horizontal(|ui| {
             ui.label("find");
-            ui.add(egui::TextEdit::singleline(search).desired_width(120.0));
+            ui.add(egui::TextEdit::singleline(search).desired_width(lay.search_width));
             if !search.is_empty() && ui.small_button("✕").clicked() {
                 search.clear();
             }
@@ -1317,7 +1457,7 @@ fn shape_palette(
                 subs.retain(|(_, cells, _)| cells.iter().any(Option::is_some));
             }
             if !subs.is_empty() {
-                visible.push((family_card_width(*f), label, subs));
+                visible.push((family_card_width(*f, lay.icon_px), label, subs));
             }
         }
         if visible.is_empty() {
@@ -1336,7 +1476,7 @@ fn shape_palette(
                 if !row.is_empty() && would > avail {
                     ui.horizontal(|ui| {
                         for c in &row {
-                            shape_card(ui, &c.1, &c.2, current);
+                            shape_card(ui, &c.1, &c.2, current, lay.icon_px);
                         }
                     });
                     row.clear();
@@ -1352,7 +1492,7 @@ fn shape_palette(
             if !row.is_empty() {
                 ui.horizontal(|ui| {
                     for c in &row {
-                        shape_card(ui, &c.1, &c.2, current);
+                        shape_card(ui, &c.1, &c.2, current, lay.icon_px);
                     }
                 });
             }
@@ -1361,11 +1501,10 @@ fn shape_palette(
     *current != before
 }
 
-/// R74 — one 26-px shape icon: the shape's real polygon on a dark swatch, `selected`-bordered,
-/// hover-named. Returns true on click. (Factored out of the R63 `shape_palette`.)
-fn shape_icon(ui: &mut egui::Ui, shape: CellShape, selected: bool) -> bool {
-    const ICON: f32 = 26.0;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ICON, ICON), egui::Sense::click());
+/// R74 — one shape icon (`px` square, R84 RON-tunable): the shape's real polygon on a dark swatch,
+/// `selected`-bordered, hover-named. Returns true on click.
+fn shape_icon(ui: &mut egui::Ui, shape: CellShape, selected: bool, px: f32) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(px, px), egui::Sense::click());
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 3.0, egui::Color32::from_rgb(30, 34, 42));
     p.add(egui::Shape::convex_polygon(
@@ -1382,12 +1521,11 @@ fn shape_icon(ui: &mut egui::Ui, shape: CellShape, selected: bool) -> bool {
     resp.on_hover_text(shape.label()).clicked()
 }
 
-/// R78 — a 26-px DRAWN tool icon (no font glyph → never tofu): a distinct primitive per [`Tool`] on a
-/// dark swatch, `selected`-bordered, hover-named. Returns true on click. (Paint = a dab, Stamp = a
+/// R78 — a DRAWN tool icon (`px` square; no font glyph → never tofu): a distinct primitive per [`Tool`]
+/// on a dark swatch, `selected`-bordered, hover-named. Returns true on click. (Paint = a dab, Stamp = a
 /// square, Erase = a red ✕, Select = a marquee outline.)
-fn tool_icon(ui: &mut egui::Ui, tool: Tool, selected: bool) -> bool {
-    const ICON: f32 = 26.0;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ICON, ICON), egui::Sense::click());
+fn tool_icon(ui: &mut egui::Ui, tool: Tool, selected: bool, px: f32) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(px, px), egui::Sense::click());
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 3.0, egui::Color32::from_rgb(30, 34, 42));
     let c = rect.center();
@@ -1440,6 +1578,7 @@ fn draw_compass(
     cells: &[Option<CellShape>],
     cols: usize,
     current: &mut CellShape,
+    px: f32,
 ) {
     ui.vertical(|ui| {
         for row in cells.chunks(cols) {
@@ -1447,12 +1586,12 @@ fn draw_compass(
                 for cell in row {
                     match cell {
                         Some(sh) => {
-                            if shape_icon(ui, *sh, *current == *sh) {
+                            if shape_icon(ui, *sh, *current == *sh, px) {
                                 *current = *sh;
                             }
                         }
                         None => {
-                            ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
+                            ui.allocate_exact_size(egui::vec2(px, px), egui::Sense::hover());
                         }
                     }
                 }
@@ -1470,6 +1609,7 @@ fn shape_card(
     family_label: &str,
     subs: &[(Option<&'static str>, Vec<Option<CellShape>>, usize)],
     current: &mut CellShape,
+    px: f32,
 ) {
     ui.group(|ui| {
         ui.vertical(|ui| {
@@ -1480,7 +1620,7 @@ fn shape_card(
                         if let Some(c) = caption {
                             ui.weak(*c);
                         }
-                        draw_compass(ui, cells, *cols, current);
+                        draw_compass(ui, cells, *cols, current, px);
                     });
                 }
             });
@@ -1496,9 +1636,10 @@ type FamilyCard = (
 );
 
 /// R78 — a generous UPPER-BOUND px width for a family's card (for manual row wrapping). Erring HIGH means
-/// rows wrap slightly early → cards never overflow the panel width.
-fn family_card_width(f: ShapeFamily) -> f32 {
-    match f {
+/// rows wrap slightly early → cards never overflow the panel width. R84 — scaled by the RON `icon_px`
+/// (the estimates were calibrated at 26-px icons).
+fn family_card_width(f: ShapeFamily, icon_px: f32) -> f32 {
+    let base = match f {
         ShapeFamily::Full | ShapeFamily::Octagon => 80.0,
         ShapeFamily::Half | ShapeFamily::Quarter | ShapeFamily::Chamfer => 95.0,
         ShapeFamily::Strip34
@@ -1509,7 +1650,8 @@ fn family_card_width(f: ShapeFamily) -> f32 {
         | ShapeFamily::Round => 120.0,
         // Slope/Wedge families render a "shallow" + a "steep" 2×2 side by side → widest.
         _ => 160.0,
-    }
+    };
+    base * (icon_px / 26.0).max(0.5)
 }
 
 /// R76 — a family's WYSIWYG layout: `(family name, compass(es))`, each compass `(caption, cells, cols)`
@@ -1585,18 +1727,18 @@ fn text_on(c: egui::Color32) -> egui::Color32 {
     }
 }
 
-/// R68 — draw one 26-px palette icon: a coloured swatch with a centred `glyph`, `selected`-bordered,
-/// `hover`-tooltipped. Returns true if it was clicked. The shared core of [`swatch_palette`] +
-/// [`module_palette`] (mirrors the icon styling of [`shape_palette`]).
+/// R68 — draw one palette icon (`px` square): a coloured swatch with a centred `glyph`,
+/// `selected`-bordered, `hover`-tooltipped. Returns true if it was clicked. The shared core of
+/// [`swatch_palette`] + [`module_palette`] (mirrors the icon styling of [`shape_palette`]).
 fn icon_swatch(
     ui: &mut egui::Ui,
     color: egui::Color32,
     glyph: &str,
     selected: bool,
     hover: &str,
+    px: f32,
 ) -> bool {
-    const ICON: f32 = 26.0;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ICON, ICON), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(px, px), egui::Sense::click());
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 3.0, color);
     p.text(
@@ -1657,14 +1799,20 @@ fn draw_layer_glyph(p: &egui::Painter, inner: egui::Rect, which: u8) {
 /// gives the yellow border; `enabled == false` greys it + ignores clicks (used for the brush Layer row
 /// when the tool isn't Paint). Hover shows `name`. Returns true if clicked. Shared by the "Show:" toolbar
 /// ([`show_view_icon`]) + the brush Layer row.
-fn layer_icon(ui: &mut egui::Ui, which: u8, selected: bool, enabled: bool, name: &str) -> bool {
-    const ICON: f32 = 26.0;
+fn layer_icon(
+    ui: &mut egui::Ui,
+    which: u8,
+    selected: bool,
+    enabled: bool,
+    name: &str,
+    px: f32,
+) -> bool {
     let sense = if enabled {
         egui::Sense::click()
     } else {
         egui::Sense::hover()
     };
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ICON, ICON), sense);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(px, px), sense);
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 3.0, egui::Color32::from_rgb(30, 34, 42));
     draw_layer_glyph(&p, rect.shrink(5.0), which);
@@ -1687,12 +1835,17 @@ fn layer_icon(ui: &mut egui::Ui, which: u8, selected: bool, enabled: bool, name:
 
 /// R68 — a compact palette of colour-SWATCH icons (hull/armor materials), each labelled by its id;
 /// sets `*current` (the material id) on click; returns true if it changed. `items[i] = (colour, name)`.
-fn swatch_palette(ui: &mut egui::Ui, current: &mut u8, items: &[(egui::Color32, &str)]) -> bool {
+fn swatch_palette(
+    ui: &mut egui::Ui,
+    current: &mut u8,
+    items: &[(egui::Color32, &str)],
+    px: f32,
+) -> bool {
     let before = *current;
     ui.horizontal_wrapped(|ui| {
         for (i, (color, name)) in items.iter().enumerate() {
             let label = format!("{i}: {name}");
-            if icon_swatch(ui, *color, &format!("{i}"), *current == i as u8, &label) {
+            if icon_swatch(ui, *color, &format!("{i}"), *current == i as u8, &label, px) {
                 *current = i as u8;
             }
         }
@@ -1702,7 +1855,7 @@ fn swatch_palette(ui: &mut egui::Ui, current: &mut u8, items: &[(egui::Color32, 
 
 /// R68 — the MODULE-type icon palette: a "—" (None = no slot) icon + one colour+letter swatch per
 /// [`HardpointType`]. Sets `*current` on click; returns true if it changed.
-fn module_palette(ui: &mut egui::Ui, current: &mut Option<HardpointType>) -> bool {
+fn module_palette(ui: &mut egui::Ui, current: &mut Option<HardpointType>, px: f32) -> bool {
     let before = *current;
     ui.horizontal_wrapped(|ui| {
         if icon_swatch(
@@ -1711,6 +1864,7 @@ fn module_palette(ui: &mut egui::Ui, current: &mut Option<HardpointType>) -> boo
             "—",
             current.is_none(),
             "None (no slot)",
+            px,
         ) {
             *current = None;
         }
@@ -1721,6 +1875,7 @@ fn module_palette(ui: &mut egui::Ui, current: &mut Option<HardpointType>) -> boo
                 slot_initial(ty),
                 *current == Some(ty),
                 &format!("{ty:?}"),
+                px,
             ) {
                 *current = Some(ty);
             }
