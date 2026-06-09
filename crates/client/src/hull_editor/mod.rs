@@ -76,6 +76,12 @@ pub struct HullDesignSession {
     mode: EditMode,
     selected_cell: Option<(u16, u16)>,
     selected_slot: Option<SlotId>,
+    /// R61 — staged grid size (the cols/rows fields edit this; "Apply grid" commits it so editing the
+    /// numbers never wipes the design until applied).
+    pending_grid: (u16, u16),
+    /// R61 — the last cell painted during a click-drag (so a held drag fills continuously without
+    /// re-painting the same cell, and a fast drag can line-fill between successive cells).
+    last_painted: Option<(u16, u16)>,
     status: String,
     /// Set on any edit → the 3-D preview rebuilds its mesh next frame.
     pub dirty: bool,
@@ -90,6 +96,7 @@ impl Default for HullDesignSession {
             .get(HULL_FIGHTER)
             .cloned()
             .unwrap_or_else(|| blank_hull(HULL_FIGHTER));
+        let pending_grid = working.grid_dims;
         Self {
             catalog,
             modules,
@@ -99,6 +106,8 @@ impl Default for HullDesignSession {
             mode: EditMode::Paint,
             selected_cell: None,
             selected_slot: None,
+            pending_grid,
+            last_painted: None,
             status: String::new(),
             dirty: true,
             orbit: (0.6, 0.5),
@@ -125,6 +134,7 @@ fn load_design_session(
     if let Some(h) = session.catalog.get(id).cloned() {
         session.working = h;
     }
+    session.pending_grid = session.working.grid_dims;
     session.selected_cell = None;
     session.selected_slot = None;
     session.dirty = true;
@@ -171,6 +181,7 @@ fn hull_editor_ui(
                 if let Some(h) = s.catalog.get(pick).cloned() {
                     s.working = h;
                     s.selected_hull = pick;
+                    s.pending_grid = s.working.grid_dims;
                     s.selected_cell = None;
                     s.selected_slot = None;
                     s.dirty = true;
@@ -180,6 +191,7 @@ fn hull_editor_ui(
                 let id = next_hull_id(&s.catalog);
                 s.working = blank_hull(id);
                 s.selected_hull = id;
+                s.pending_grid = s.working.grid_dims;
                 s.catalog.hulls.insert(id, s.working.clone());
                 s.selected_cell = None;
                 s.selected_slot = None;
@@ -230,22 +242,46 @@ fn hull_editor_ui(
             ui.separator();
             ui.label("Grid (cols × rows)");
             ui.horizontal(|ui| {
-                let mut cols = s.working.grid_dims.0;
-                let mut rows = s.working.grid_dims.1;
-                let c = ui.add(egui::DragValue::new(&mut cols).range(1..=40));
-                let r = ui.add(egui::DragValue::new(&mut rows).range(1..=40));
-                if c.changed() || r.changed() {
-                    s.working.grid_dims = (cols, rows);
-                    // Drop cells/slots now out of bounds.
-                    s.working
-                        .cells
-                        .retain(|cell| cell.coord.0 < cols && cell.coord.1 < rows);
+                ui.add(egui::DragValue::new(&mut s.pending_grid.0).range(1..=40));
+                ui.label("×");
+                ui.add(egui::DragValue::new(&mut s.pending_grid.1).range(1..=40));
+            });
+            // R61 — STAGED: editing the numbers above changes nothing until "Apply grid" (so a resize
+            // never silently wipes the design); a shrink warns how many cells/slots it would drop.
+            let (pc, pr) = s.pending_grid;
+            if s.pending_grid != s.working.grid_dims {
+                let drop_c = s
+                    .working
+                    .cells
+                    .iter()
+                    .filter(|c| c.coord.0 >= pc || c.coord.1 >= pr)
+                    .count();
+                let drop_s = s
+                    .working
+                    .slots
+                    .iter()
+                    .filter(|sl| sl.coord.0 >= pc || sl.coord.1 >= pr)
+                    .count();
+                if drop_c > 0 || drop_s > 0 {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 90, 80),
+                        format!("⚠ Apply drops {drop_c} cells · {drop_s} slots"),
+                    );
+                }
+                if ui.button("Apply grid").clicked() {
+                    s.working.grid_dims = s.pending_grid;
+                    s.working.cells.retain(|c| c.coord.0 < pc && c.coord.1 < pr);
                     s.working
                         .slots
-                        .retain(|sl| sl.coord.0 < cols && sl.coord.1 < rows);
+                        .retain(|sl| sl.coord.0 < pc && sl.coord.1 < pr);
+                    if s.selected_cell.is_some_and(|c| c.0 >= pc || c.1 >= pr) {
+                        s.selected_cell = None;
+                    }
                     s.dirty = true;
                 }
-            });
+            } else {
+                ui.add_enabled(false, egui::Button::new("Apply grid"));
+            }
             ui.separator();
             ui.label("Budgets");
             for (label, val, range) in [
@@ -266,13 +302,8 @@ fn hull_editor_ui(
                 ui.selectable_value(&mut s.mode, EditMode::Erase, "Erase");
                 ui.selectable_value(&mut s.mode, EditMode::Select, "Select");
             });
-            egui::ComboBox::from_label("Shape")
-                .selected_text(s.brush.label())
-                .show_ui(ui, |ui| {
-                    for sh in CellShape::ALL {
-                        ui.selectable_value(&mut s.brush, sh, sh.label());
-                    }
-                });
+            ui.label("Shape (click an icon)");
+            shape_palette(ui, &mut s.brush);
             ui.horizontal(|ui| {
                 if ui.button("Fill bounding box").clicked() {
                     fill_bounding_box(&mut s.working, s.brush);
@@ -315,14 +346,7 @@ fn hull_editor_ui(
                 ui.label(format!("({}, {})", coord.0, coord.1));
                 if let Some(idx) = s.working.cells.iter().position(|c| c.coord == coord) {
                     let mut shape = s.working.cells[idx].shape;
-                    egui::ComboBox::from_id_salt("cell_shape")
-                        .selected_text(shape.label())
-                        .show_ui(ui, |ui| {
-                            for sh in CellShape::ALL {
-                                ui.selectable_value(&mut shape, sh, sh.label());
-                            }
-                        });
-                    if shape != s.working.cells[idx].shape {
+                    if shape_palette(ui, &mut shape) {
                         s.working.cells[idx].shape = shape;
                         s.dirty = true;
                     }
@@ -391,53 +415,247 @@ fn hull_editor_ui(
     }
 }
 
-/// Draw the editable cell grid (nose-up / port-left, matching the fitting view + in-game).
+/// R61 — the editable cell grid as ONE painted CANVAS (nose-up / port-left, matching the fitting view +
+/// in-game): each present cell is drawn as its REAL `CellShape` polygon (so the design reads at a glance),
+/// and a single `click_and_drag` interaction lets Paint/Erase modes drag a swath across the grid.
 fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
     let (cols, rows) = s.working.grid_dims;
-    const CELL: f32 = 24.0;
-    egui::Grid::new("hull_grid")
-        .spacing(egui::vec2(2.0, 2.0))
-        .show(ui, |ui| {
-            for row in (0..rows).rev() {
-                for col in (0..cols).rev() {
-                    let coord = (col, row);
-                    let cell = s.working.cells.iter().find(|c| c.coord == coord).copied();
-                    let slot = s.working.slots.iter().find(|sl| sl.coord == coord).copied();
-                    let selected = s.selected_cell == Some(coord);
+    const CELL: f32 = 26.0;
+    let size = egui::vec2(cols as f32 * CELL, rows as f32 * CELL);
+    let (canvas, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    let painter = ui.painter_at(canvas);
 
-                    let (fill, text) = match (cell, slot) {
-                        (Some(_), Some(sl)) => {
-                            (slot_color(sl.slot_type), slot_initial(sl.slot_type))
-                        }
-                        (Some(c), None) => (shape_color(c.shape), shape_code(c.shape)),
-                        (None, _) => (egui::Color32::from_rgb(26, 30, 38), ""),
-                    };
-                    let mut btn = egui::Button::new(egui::RichText::new(text).size(10.0))
-                        .fill(fill)
-                        .min_size(egui::vec2(CELL, CELL));
-                    if selected {
-                        btn = btn.stroke(egui::Stroke::new(
-                            2.0,
-                            egui::Color32::from_rgb(240, 220, 80),
-                        ));
-                    }
-                    let resp = ui.add(btn);
-                    if resp.clicked() {
-                        s.selected_cell = Some(coord);
-                        match s.mode {
-                            EditMode::Paint => paint_cell(s, coord),
-                            EditMode::Erase => erase_cell(s, coord),
-                            EditMode::Select => {}
-                        }
-                    }
-                    if resp.secondary_clicked() {
-                        s.selected_cell = Some(coord);
-                        erase_cell(s, coord);
-                    }
+    let cell_rect = |col: u16, row: u16| {
+        // Port-left (high col on the LEFT) + nose-up (high row at the TOP).
+        let x = canvas.min.x + (cols - 1 - col) as f32 * CELL;
+        let y = canvas.min.y + (rows - 1 - row) as f32 * CELL;
+        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(CELL, CELL))
+    };
+    let hovered = resp
+        .hover_pos()
+        .and_then(|p| cell_at_pointer(canvas, p, (cols, rows), CELL));
+
+    for row in 0..rows {
+        for col in 0..cols {
+            let coord = (col, row);
+            let rect = cell_rect(col, row);
+            painter.rect_filled(rect.shrink(0.5), 2.0, egui::Color32::from_rgb(22, 26, 33));
+            if let Some(c) = s.working.cells.iter().find(|c| c.coord == coord).copied() {
+                let slot = s.working.slots.iter().find(|sl| sl.coord == coord).copied();
+                let fill = slot.map_or_else(|| shape_color(c.shape), |sl| slot_color(sl.slot_type));
+                painter.add(egui::Shape::convex_polygon(
+                    shape_poly_in_rect(c.shape, rect.shrink(1.5)),
+                    fill,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(15, 18, 22)),
+                ));
+                if let Some(sl) = slot {
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        slot_initial(sl.slot_type),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::BLACK,
+                    );
                 }
-                ui.end_row();
             }
+            if s.selected_cell == Some(coord) {
+                painter.rect_stroke(
+                    rect.shrink(0.5),
+                    2.0,
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 220, 80)),
+                    egui::StrokeKind::Inside,
+                );
+            } else if hovered == Some(coord) {
+                painter.rect_stroke(
+                    rect.shrink(0.5),
+                    2.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 130, 150)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+    }
+
+    // Right-click → erase one cell.
+    if resp.secondary_clicked() {
+        if let Some(coord) = resp
+            .hover_pos()
+            .and_then(|p| cell_at_pointer(canvas, p, (cols, rows), CELL))
+        {
+            s.selected_cell = Some(coord);
+            erase_cell(s, coord);
+        }
+    }
+    // Primary click / DRAG → paint / erase / select (line-filled between frames so a fast drag has no gaps).
+    if resp.dragged() || resp.clicked() {
+        if let Some(coord) = resp
+            .interact_pointer_pos()
+            .and_then(|p| cell_at_pointer(canvas, p, (cols, rows), CELL))
+        {
+            s.selected_cell = Some(coord);
+            match s.mode {
+                EditMode::Paint | EditMode::Erase => {
+                    let from = s.last_painted.unwrap_or(coord);
+                    for cc in line_cells(from, coord) {
+                        if matches!(s.mode, EditMode::Paint) {
+                            paint_cell(s, cc);
+                        } else {
+                            erase_cell(s, cc);
+                        }
+                    }
+                    s.last_painted = Some(coord);
+                }
+                EditMode::Select => {}
+            }
+        }
+    }
+    if !resp.dragged() {
+        s.last_painted = None;
+    }
+}
+
+/// Map a [`CellShape`]'s unit-cell polygon into a screen `rect`, using the editor orientation
+/// (`+col → LEFT`, `+row → UP`) so an icon / grid cell looks exactly like the painted hull cell.
+fn shape_poly_in_rect(shape: CellShape, rect: egui::Rect) -> Vec<egui::Pos2> {
+    shape
+        .corners(0, 0)
+        .iter()
+        .map(|p| {
+            egui::pos2(
+                rect.min.x + (1.0 - p.x) * rect.width(),
+                rect.min.y + (1.0 - p.y) * rect.height(),
+            )
+        })
+        .collect()
+}
+
+/// The grid cell under a pointer position (inverse of `cell_rect`), or `None` if outside.
+fn cell_at_pointer(
+    canvas: egui::Rect,
+    p: egui::Pos2,
+    grid: (u16, u16),
+    cell: f32,
+) -> Option<(u16, u16)> {
+    let (cols, rows) = grid;
+    if !canvas.contains(p) {
+        return None;
+    }
+    let sx = ((p.x - canvas.min.x) / cell).floor() as i32;
+    let sy = ((p.y - canvas.min.y) / cell).floor() as i32;
+    if sx < 0 || sy < 0 || sx >= cols as i32 || sy >= rows as i32 {
+        return None;
+    }
+    Some(((cols as i32 - 1 - sx) as u16, (rows as i32 - 1 - sy) as u16))
+}
+
+/// Cells along the line from `a` to `b` (Bresenham) — fills gaps when a fast drag skips cells.
+fn line_cells(a: (u16, u16), b: (u16, u16)) -> Vec<(u16, u16)> {
+    let (mut x0, mut y0) = (a.0 as i32, a.1 as i32);
+    let (x1, y1) = (b.0 as i32, b.1 as i32);
+    let (dx, dy) = ((x1 - x0).abs(), -(y1 - y0).abs());
+    let (sx, sy) = (if x0 < x1 { 1 } else { -1 }, if y0 < y1 { 1 } else { -1 });
+    let mut err = dx + dy;
+    let mut out = Vec::new();
+    loop {
+        out.push((x0 as u16, y0 as u16));
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+    out
+}
+
+/// R61 — a clickable PALETTE of shape ICONS (each drawn as its real polygon), grouped by family with
+/// orientations placed spatially. Sets `*current` on click; returns true if it changed.
+fn shape_palette(ui: &mut egui::Ui, current: &mut CellShape) -> bool {
+    use CellShape::*;
+    let before = *current;
+
+    fn icon(ui: &mut egui::Ui, cur: &mut CellShape, shape: CellShape) {
+        const ICON: f32 = 26.0;
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ICON, ICON), egui::Sense::click());
+        let selected = *cur == shape;
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, 3.0, egui::Color32::from_rgb(30, 34, 42));
+        p.add(egui::Shape::convex_polygon(
+            shape_poly_in_rect(shape, rect.shrink(3.0)),
+            shape_color(shape),
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(15, 18, 22)),
+        ));
+        let border = if selected {
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 220, 80))
+        } else {
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 66, 78))
+        };
+        p.rect_stroke(rect, 3.0, border, egui::StrokeKind::Inside);
+        if resp.on_hover_text(shape.label()).clicked() {
+            *cur = shape;
+        }
+    }
+    // A 2×2 corner block: NW NE / SW SE.
+    fn quad(
+        ui: &mut egui::Ui,
+        cur: &mut CellShape,
+        nw: CellShape,
+        ne: CellShape,
+        sw: CellShape,
+        se: CellShape,
+    ) {
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                icon(ui, cur, nw);
+                icon(ui, cur, ne);
+            });
+            ui.horizontal(|ui| {
+                icon(ui, cur, sw);
+                icon(ui, cur, se);
+            });
         });
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        ui.vertical(|ui| {
+            ui.small("Full");
+            icon(ui, current, Full);
+        });
+        ui.vertical(|ui| {
+            ui.small("Half");
+            quad(ui, current, HalfNW, HalfNE, HalfSW, HalfSE);
+        });
+        ui.vertical(|ui| {
+            ui.small("Quarter");
+            quad(ui, current, QuarterNW, QuarterNE, QuarterSW, QuarterSE);
+        });
+        ui.vertical(|ui| {
+            ui.small("Chamfer");
+            quad(ui, current, ChamferNW, ChamferNE, ChamferSW, ChamferSE);
+        });
+        ui.vertical(|ui| {
+            ui.small("Slope (corner · H/V)");
+            ui.horizontal(|ui| {
+                icon(ui, current, SlopeNWH);
+                icon(ui, current, SlopeNWV);
+                icon(ui, current, SlopeNEH);
+                icon(ui, current, SlopeNEV);
+            });
+            ui.horizontal(|ui| {
+                icon(ui, current, SlopeSWH);
+                icon(ui, current, SlopeSWV);
+                icon(ui, current, SlopeSEH);
+                icon(ui, current, SlopeSEV);
+            });
+        });
+    });
+    *current != before
 }
 
 /// Set the cell at `coord` to the brush shape (adding it if absent). Keeps `structural` consistent with
@@ -638,20 +856,6 @@ fn shape_color(shape: CellShape) -> egui::Color32 {
         QuarterSW | QuarterSE | QuarterNE | QuarterNW => egui::Color32::from_rgb(70, 140, 90),
         ChamferSW | ChamferSE | ChamferNE | ChamferNW => egui::Color32::from_rgb(170, 120, 60),
         _ => egui::Color32::from_rgb(130, 90, 160), // slopes
-    }
-}
-
-fn shape_code(shape: CellShape) -> &'static str {
-    use CellShape::*;
-    match shape {
-        Full => "",
-        HalfSW => "◣",
-        HalfSE => "◢",
-        HalfNE => "◥",
-        HalfNW => "◤",
-        QuarterSW | QuarterSE | QuarterNE | QuarterNW => "q",
-        ChamferSW | ChamferSE | ChamferNE | ChamferNW => "c",
-        _ => "s",
     }
 }
 
