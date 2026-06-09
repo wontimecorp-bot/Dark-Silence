@@ -14,7 +14,7 @@ use sim::damage::{
     default_resistance_matrix, PenetrationConfig, ResistanceMatrix, SalvageConfig, ShieldConfig,
     StatScalingConfig,
 };
-use sim::fitting::{HullCatalog, ModuleCatalog};
+use sim::fitting::{CellMaterials, HullCatalog, ModuleCatalog};
 use sim::{MiningTuning, SimTuning, Tuning};
 
 use crate::hud_bars::HudLayout;
@@ -124,6 +124,10 @@ pub struct DevSettings {
     /// R49 — live-tunable ship visuals (glow / flame / nav / accent / fill / bloom / hull shader).
     #[serde(default)]
     pub ship_visual: crate::ship_visuals::ShipVisualTuning,
+    /// R66 — the typed per-cell hull/armor materials catalog (light/heavy hull · light/medium/heavy
+    /// armor). Applied windowed-only; material 0/0 = byte-identical to the globals.
+    #[serde(default)]
+    pub cell_materials: CellMaterials,
 }
 
 impl Default for DevSettings {
@@ -139,6 +143,7 @@ impl Default for DevSettings {
             mining: MiningTuning::default(),
             starfield: StarfieldTuning::default(),
             ship_visual: crate::ship_visuals::ShipVisualTuning::default(),
+            cell_materials: CellMaterials::default(),
         }
     }
 }

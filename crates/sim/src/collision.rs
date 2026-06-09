@@ -21,8 +21,8 @@ use crate::damage::{
     Channel, DamageEvent, HitKind, ResistanceMatrix, Shields, Wreck, REACH,
 };
 use crate::fitting::{
-    center_or_anchor, layout_inertia_with, layout_mass_with, FitLayout, HullCatalog, ModuleCatalog,
-    CELL_WORLD_SIZE,
+    center_or_anchor, layout_inertia_with, layout_mass_with, CellMaterials, FitLayout, HullCatalog,
+    ModuleCatalog, CELL_WORLD_SIZE,
 };
 use crate::motion::{apply_angular_impulse, apply_linear_impulse};
 use crate::physics::{Physics, RapierPhysics, SweptHit};
@@ -688,11 +688,17 @@ pub fn fitted_damage_system(world: &mut World) {
             .copied()
             .unwrap_or_default()
             .struct_cell_mass;
+        // R66 — clone the materials catalog out before the immutable `ModuleCatalog`/`FitLayout`
+        // borrows (material 0/0 → byte-identical mass/inertia to before).
+        let materials = world
+            .get_resource::<CellMaterials>()
+            .cloned()
+            .unwrap_or_default();
         let mass_inertia = world.get_resource::<ModuleCatalog>().and_then(|modules| {
             world.get::<FitLayout>(target).map(|layout| {
                 (
-                    layout_mass_with(layout, modules, struct_cell_mass),
-                    layout_inertia_with(layout, modules, struct_cell_mass),
+                    layout_mass_with(layout, modules, struct_cell_mass, &materials),
+                    layout_inertia_with(layout, modules, struct_cell_mass, &materials),
                 )
             })
         });
@@ -1016,9 +1022,13 @@ pub fn structure_ram_system(world: &mut World) {
         .get_resource::<SimTuning>()
         .copied()
         .unwrap_or_default();
+    let materials = world
+        .get_resource::<CellMaterials>()
+        .cloned()
+        .unwrap_or_default();
     let ship_mass = world
         .get_resource::<ModuleCatalog>()
-        .map(|m| layout_mass_with(&layout, m, sim.struct_cell_mass))
+        .map(|m| layout_mass_with(&layout, m, sim.struct_cell_mass, &materials))
         .unwrap_or(1.0)
         .max(f32::MIN_POSITIVE);
 

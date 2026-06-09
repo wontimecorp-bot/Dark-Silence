@@ -15,7 +15,7 @@
 use bevy_ecs::prelude::*;
 
 use crate::components::{Destructible, Health, RenderScale};
-use crate::fitting::{build_layout_with, Fit, HullCatalog, HullId, ModuleCatalog};
+use crate::fitting::{build_layout_with, CellMaterials, Fit, HullCatalog, HullId, ModuleCatalog};
 
 /// Marker on a structure that should become a voxel carve-hull the first time it is damaged. Carries
 /// what [`voxelize_pending_system`] needs to build the hull: which catalog hull to use + the
@@ -58,7 +58,15 @@ pub fn voxelize_pending_system(
                 .remove::<(VoxelizeOnHit, PendingVoxelize)>();
             continue;
         };
-        let layout = build_layout_with(hull, &Fit::new(vox.hull), &modules, vox.cell_hp);
+        // Structures' cells are all material 0 (station/disc hulls), so the default catalog resolves
+        // material 0 → `vox.cell_hp` (no windowed override needed; only non-zero materials differ).
+        let layout = build_layout_with(
+            hull,
+            &Fit::new(vox.hull),
+            &modules,
+            vox.cell_hp,
+            &CellMaterials::default(),
+        );
         commands
             .entity(entity)
             .insert((layout, Destructible))

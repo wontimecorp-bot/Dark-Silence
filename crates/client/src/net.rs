@@ -262,6 +262,9 @@ fn setup_loopback_host(world: &mut World) {
         w.insert_resource(dev.salvage);
         w.insert_resource(dev.stat_scaling);
         w.insert_resource(dev.resistance);
+        // R66 — the typed per-cell hull/armor materials catalog (windowed-only; headless keeps the
+        // `ServerApp::new` default → bit-identical).
+        w.insert_resource(dev.cell_materials);
     }
 
     // R65 — merge the per-ship hull files (`assets/content/ships/*.ron`) into the catalog as a WINDOWED

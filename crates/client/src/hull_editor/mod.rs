@@ -59,6 +59,10 @@ enum EditMode {
     Select,
     /// R63 — stamp a multi-cell preset (round cap / cone / blade / needle) at the clicked anchor.
     Stamp,
+    /// R66 — paint the clicked cell's HULL (structural) material id (light/heavy hull).
+    HullMat,
+    /// R66 — paint the clicked cell's ARMOR material id (none/light/medium/heavy plating).
+    Armor,
 }
 
 /// R63/R64 — a family of related [`CellShape`]s, shown as one chip in the compact palette.
@@ -238,6 +242,9 @@ pub struct HullDesignSession {
     /// R63 — the selected multi-cell stamp + its direction (used in `Stamp` mode).
     stamp_kind: StampKind,
     stamp_dir: Dir,
+    /// R66 — the hull/armor material ids painted in `HullMat`/`Armor` mode.
+    hull_material_brush: u8,
+    armor_material_brush: u8,
     status: String,
     /// Set on any edit → the 3-D preview rebuilds its mesh next frame.
     pub dirty: bool,
@@ -266,6 +273,8 @@ impl Default for HullDesignSession {
             palette_family: ShapeFamily::Full,
             stamp_kind: StampKind::Blade5,
             stamp_dir: Dir::N,
+            hull_material_brush: 2,  // Heavy (so HullMat painting is visible)
+            armor_material_brush: 1, // Light
             status: String::new(),
             dirty: true,
             orbit: (0.6, 0.5),
@@ -303,6 +312,7 @@ fn hull_editor_ui(
     host: Option<NonSendMut<LoopbackHost>>,
     mut next_state: ResMut<NextState<HullDesignState>>,
     preview: Res<preview::PreviewTarget>,
+    materials: Option<Res<sim::fitting::CellMaterials>>,
 ) {
     // Register the preview render-target as an egui texture (must borrow `contexts` BEFORE `ctx_mut`).
     let preview_tex = contexts.image_id(&preview.image).unwrap_or_else(|| {
@@ -311,6 +321,8 @@ fn hull_editor_ui(
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
+    // R66 — the live materials catalog (windowed override or default), for the material brush names.
+    let cell_materials = materials.map(|m| m.clone()).unwrap_or_default();
     let s = &mut *session;
 
     // Intents collected in the panel closures, executed after (so the closures don't hold `host`).
@@ -506,7 +518,51 @@ fn hull_editor_ui(
                 ui.selectable_value(&mut s.mode, EditMode::Select, "Select");
                 ui.selectable_value(&mut s.mode, EditMode::Stamp, "Stamp");
             });
-            if s.mode == EditMode::Stamp {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut s.mode, EditMode::HullMat, "Hull mat");
+                ui.selectable_value(&mut s.mode, EditMode::Armor, "Armor");
+            });
+            if s.mode == EditMode::HullMat {
+                // R66 — pick a HULL material; click-drag the grid to paint it onto cells.
+                ui.label("Hull material (click-drag to paint):");
+                egui::ComboBox::from_id_salt("hull_mat_brush")
+                    .selected_text(mat_name(
+                        cell_materials
+                            .hull
+                            .get(s.hull_material_brush as usize)
+                            .map(|h| h.name.as_str()),
+                        s.hull_material_brush,
+                    ))
+                    .show_ui(ui, |ui| {
+                        for (i, h) in cell_materials.hull.iter().enumerate() {
+                            ui.selectable_value(
+                                &mut s.hull_material_brush,
+                                i as u8,
+                                format!("{i}: {}", h.name),
+                            );
+                        }
+                    });
+            } else if s.mode == EditMode::Armor {
+                // R66 — pick an ARMOR material; click-drag the grid to plate cells.
+                ui.label("Armor material (click-drag to paint):");
+                egui::ComboBox::from_id_salt("armor_mat_brush")
+                    .selected_text(mat_name(
+                        cell_materials
+                            .armor
+                            .get(s.armor_material_brush as usize)
+                            .map(|a| a.name.as_str()),
+                        s.armor_material_brush,
+                    ))
+                    .show_ui(ui, |ui| {
+                        for (i, a) in cell_materials.armor.iter().enumerate() {
+                            ui.selectable_value(
+                                &mut s.armor_material_brush,
+                                i as u8,
+                                format!("{i}: {}", a.name),
+                            );
+                        }
+                    });
+            } else if s.mode == EditMode::Stamp {
                 // R63 — multi-cell stamp: pick a preset + direction, click the grid to place it.
                 egui::ComboBox::from_id_salt("stamp_kind")
                     .selected_text(s.stamp_kind.label())
@@ -682,6 +738,23 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
                         egui::Color32::BLACK,
                     );
                 }
+                // R66 — material overlay: a hull-material tint dot (top-left) + an armor-material
+                // border so the painted hull/armor layout reads at a glance.
+                if c.hull_material > 0 {
+                    painter.circle_filled(
+                        rect.left_top() + egui::vec2(5.0, 5.0),
+                        3.0,
+                        hull_mat_color(c.hull_material),
+                    );
+                }
+                if c.armor_material > 0 {
+                    painter.rect_stroke(
+                        rect.shrink(2.0),
+                        2.0,
+                        egui::Stroke::new(2.0, armor_mat_color(c.armor_material)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
             }
             if s.selected_cell == Some(coord) {
                 painter.rect_stroke(
@@ -736,6 +809,18 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
                             paint_cell(s, cc);
                         } else {
                             erase_cell(s, cc);
+                        }
+                    }
+                    s.last_painted = Some(coord);
+                }
+                // R66 — paint a hull/armor MATERIAL onto cells along the drag.
+                EditMode::HullMat | EditMode::Armor => {
+                    let from = s.last_painted.unwrap_or(coord);
+                    for cc in line_cells(from, coord) {
+                        if matches!(s.mode, EditMode::HullMat) {
+                            paint_hull_material(s, cc);
+                        } else {
+                            paint_armor_material(s, cc);
                         }
                     }
                     s.last_painted = Some(coord);
@@ -869,6 +954,49 @@ fn paint_cell(s: &mut HullDesignSession, coord: (u16, u16)) {
             },
             structural: !has_slot,
             shape: s.brush,
+            hull_material: 0,
+            armor_material: 0,
+        });
+    }
+    s.dirty = true;
+}
+
+/// R66 — set the cell at `coord`'s HULL (structural) material to the brush (creating a Full
+/// structural cell if absent). A module cell can still carry a hull material (it's ignored for
+/// mass, but kept for round-tripping).
+fn paint_hull_material(s: &mut HullDesignSession, coord: (u16, u16)) {
+    let m = s.hull_material_brush;
+    if let Some(c) = s.working.cells.iter_mut().find(|c| c.coord == coord) {
+        c.hull_material = m;
+    } else {
+        let has_slot = s.working.slots.iter().any(|sl| sl.coord == coord);
+        s.working.cells.push(GridCell {
+            coord,
+            section: SectionId(10000),
+            structural: !has_slot,
+            shape: CellShape::Full,
+            hull_material: m,
+            armor_material: 0,
+        });
+    }
+    s.dirty = true;
+}
+
+/// R66 — set the cell at `coord`'s ARMOR material to the brush (creating a Full structural cell if
+/// absent, so you can plate the hull directly).
+fn paint_armor_material(s: &mut HullDesignSession, coord: (u16, u16)) {
+    let m = s.armor_material_brush;
+    if let Some(c) = s.working.cells.iter_mut().find(|c| c.coord == coord) {
+        c.armor_material = m;
+    } else {
+        let has_slot = s.working.slots.iter().any(|sl| sl.coord == coord);
+        s.working.cells.push(GridCell {
+            coord,
+            section: SectionId(10000),
+            structural: !has_slot,
+            shape: CellShape::Full,
+            hull_material: 0,
+            armor_material: m,
         });
     }
     s.dirty = true;
@@ -947,6 +1075,8 @@ fn mirror_design(s: &mut HullDesignSession, from_left: bool) {
                 section: c.section,
                 structural: c.structural,
                 shape: c.shape.mirror_x(),
+                hull_material: c.hull_material,
+                armor_material: c.armor_material,
             });
         }
     }
@@ -1057,6 +1187,8 @@ fn apply_stamp(s: &mut HullDesignSession, anchor: (u16, u16)) {
                 section: SectionId(10000),
                 structural: true,
                 shape,
+                hull_material: 0,
+                armor_material: 0,
             });
         }
     }
@@ -1076,6 +1208,8 @@ fn fill_bounding_box(hull: &mut Hull, brush: CellShape) {
                     section: SectionId(10000),
                     structural: true,
                     shape: brush,
+                    hull_material: 0,
+                    armor_material: 0,
                 });
             }
         }
@@ -1092,7 +1226,8 @@ fn slot_editor(ui: &mut egui::Ui, slot: &mut Slot) {
                 HardpointType::Thruster,
                 HardpointType::Weapon,
                 HardpointType::Shield,
-                HardpointType::Armor,
+                // R66 — Armor is no longer a hardpoint slot type; paint per-cell armor MATERIAL
+                // instead (the "Armor" brush mode). `HardpointType::Armor` stays vestigial elsewhere.
                 HardpointType::Sensor,
                 HardpointType::Utility,
             ] {
@@ -1257,6 +1392,33 @@ fn shape_color(shape: CellShape) -> egui::Color32 {
         QuarterSW | QuarterSE | QuarterNE | QuarterNW => egui::Color32::from_rgb(70, 140, 90),
         ChamferSW | ChamferSE | ChamferNE | ChamferNW => egui::Color32::from_rgb(170, 120, 60),
         _ => egui::Color32::from_rgb(130, 90, 160), // slopes
+    }
+}
+
+/// R66 — the brush picker label for a material id (`"{id}: {name}"`; `?` if out of range).
+fn mat_name(name: Option<&str>, id: u8) -> String {
+    match name {
+        Some(n) => format!("{id}: {n}"),
+        None => format!("{id}: ?"),
+    }
+}
+
+/// R66 — a HULL-material overlay tint (id-based ramp; 1 = Light blue-grey … darker = heavier).
+fn hull_mat_color(id: u8) -> egui::Color32 {
+    match id {
+        1 => egui::Color32::from_rgb(120, 180, 210), // Light
+        2 => egui::Color32::from_rgb(210, 150, 90),  // Heavy
+        _ => egui::Color32::from_rgb(200, 200, 120),
+    }
+}
+
+/// R66 — an ARMOR-material overlay border colour (id-based ramp; warmer = heavier plating).
+fn armor_mat_color(id: u8) -> egui::Color32 {
+    match id {
+        1 => egui::Color32::from_rgb(180, 200, 210), // Light
+        2 => egui::Color32::from_rgb(220, 200, 120), // Medium
+        3 => egui::Color32::from_rgb(235, 150, 70),  // Heavy
+        _ => egui::Color32::from_rgb(235, 110, 110),
     }
 }
 

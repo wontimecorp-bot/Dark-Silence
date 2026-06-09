@@ -709,6 +709,45 @@ fn armor_hp_soaks_absorbable_hits_but_spills_an_overwhelming_one() {
     );
 }
 
+/// R66 — typed PER-CELL armor RESISTS carving: painting a cell's `armor_material` adds plate
+/// thickness at the directional gate AND per-cell carve resistance, so the SAME shot carves
+/// strictly fewer cells on a Heavy-armoured hull than on a bare one. (The whole-ship `ArmorHp`
+/// module pool is orthogonal + untouched; no ship here carries one.) Armor material 0 (None) is
+/// byte-identical — every other carve test runs with no `CellMaterials` resource + cells at 0.
+#[test]
+fn per_cell_armor_resists_carving_more_than_a_bare_hull() {
+    use sim::fitting::CellMaterials;
+
+    // A strong, high-pen shot so both hulls carve (isolating the per-cell RESISTANCE, not the gate
+    // tier). The bare world carries no `CellMaterials` + every cell armor 0 → the existing path.
+    let strong = downward_shot(Channel::Em, 600.0, 200.0, 0.0);
+    let (mut bare, ship_b) = fitted_world(None, thin_entry_facet);
+    let out_bare = apply_damage(&mut bare, ship_b, strong);
+    assert!(
+        !out_bare.destroyed_cells.is_empty(),
+        "the bare hull carves cells from the strong shot (got {:?})",
+        out_bare.result
+    );
+
+    // The SAME shot on a hull whose every cell is Heavy-armoured carves STRICTLY FEWER cells: the
+    // raised plate (entry gate) + per-cell `carve_hp` (carve loop) eat more of the shot's budget.
+    let (mut armored, ship_a) = fitted_world(None, thin_entry_facet);
+    {
+        let mut layout = armored.get_mut::<FitLayout>(ship_a).unwrap();
+        for occ in layout.cells.values_mut() {
+            occ.armor_material = 3; // Heavy
+        }
+    }
+    armored.insert_resource(CellMaterials::default());
+    let out_armored = apply_damage(&mut armored, ship_a, strong);
+    assert!(
+        out_armored.destroyed_cells.len() < out_bare.destroyed_cells.len(),
+        "Heavy per-cell armor resists the carve: armoured {} cells < bare {} cells",
+        out_armored.destroyed_cells.len(),
+        out_bare.destroyed_cells.len()
+    );
+}
+
 // =================================================================================
 // US2 — emergent damage: per-module live health scales the derived ShipStats
 // (T024/T025). `derive_ship_stats` reads each module's `FitLayout` cell health, so a
@@ -956,6 +995,8 @@ fn corridor_layout() -> FitLayout {
                 depth,
                 structural: false,
                 shape: sim::fitting::CellShape::Full,
+                hull_material: 0,
+                armor_material: 0,
             },
         );
     }
@@ -1318,6 +1359,8 @@ fn one_module_layout(module_id: ModuleId, health: f32) -> FitLayout {
             depth: 0,
             structural: false,
             shape: sim::fitting::CellShape::Full,
+            hull_material: 0,
+            armor_material: 0,
         },
     );
     FitLayout {
@@ -1349,6 +1392,8 @@ fn clean_sever_yields_intact_through_kill_yields_scrap() {
         depth: 0,
         structural: false,
         shape: sim::fitting::CellShape::Full,
+        hull_material: 0,
+        armor_material: 0,
     };
     let exactly_at = CellOccupant {
         health: 20.0,
@@ -1461,6 +1506,8 @@ fn salvage_world(module_health: f32) -> (World, Entity, ModuleId) {
             depth: 0,
             structural: false,
             shape: sim::fitting::CellShape::Full,
+            hull_material: 0,
+            armor_material: 0,
         },
     );
     // The core cell (deepest; in the destroyed section). Empty/structural.
@@ -1473,6 +1520,8 @@ fn salvage_world(module_health: f32) -> (World, Entity, ModuleId) {
             depth: 1,
             structural: true,
             shape: sim::fitting::CellShape::Full,
+            hull_material: 0,
+            armor_material: 0,
         },
     );
     let layout = FitLayout {
@@ -3216,6 +3265,8 @@ fn spawn_offcenter_wing_wreck(w: &mut World) -> Entity {
                 depth,
                 structural: true,
                 shape: sim::fitting::CellShape::Full,
+                hull_material: 0,
+                armor_material: 0,
             },
         );
     }
@@ -3543,6 +3594,8 @@ fn spawn_thin_sliver_wreck(w: &mut World) -> Entity {
                 depth,
                 structural: true,
                 shape: sim::fitting::CellShape::Full,
+                hull_material: 0,
+                armor_material: 0,
             },
         );
     }
@@ -3785,6 +3838,8 @@ fn repro_targeting_bug_world() -> (World, Entity, Entity) {
                 depth,
                 structural: true,
                 shape: sim::fitting::CellShape::Full,
+                hull_material: 0,
+                armor_material: 0,
             },
         );
     }
@@ -3827,6 +3882,8 @@ fn repro_targeting_bug_world() -> (World, Entity, Entity) {
             depth: 0,
             structural: true,
             shape: sim::fitting::CellShape::Full,
+            hull_material: 0,
+            armor_material: 0,
         },
     );
     let chunk_layout = FitLayout {
@@ -3975,6 +4032,8 @@ fn spawn_offrow_wreck(w: &mut World) -> Entity {
                 depth,
                 structural: true,
                 shape: sim::fitting::CellShape::Full,
+                hull_material: 0,
+                armor_material: 0,
             },
         );
     }
@@ -4171,6 +4230,8 @@ fn spawn_drilled_wedge(w: &mut World) -> Entity {
                 depth,
                 structural: true,
                 shape: sim::fitting::CellShape::Full,
+                hull_material: 0,
+                armor_material: 0,
             },
         );
     }
@@ -4547,6 +4608,8 @@ fn spawn_bar_wreck(w: &mut World, cells: &[(u16, u16)]) -> Entity {
                 depth: 0,
                 structural: true,
                 shape: sim::fitting::CellShape::Full,
+                hull_material: 0,
+                armor_material: 0,
             },
         );
     }

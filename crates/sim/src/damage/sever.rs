@@ -522,6 +522,8 @@ mod tests {
                     depth,
                     structural: false,
                     shape: crate::fitting::CellShape::Full,
+                    hull_material: 0,
+                    armor_material: 0,
                 },
             );
         }

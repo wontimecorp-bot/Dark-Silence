@@ -34,6 +34,7 @@ use super::content::ModuleCatalog;
 use super::fit::Fit;
 use super::hull::{Hull, SlotId, CELL_WORLD_SIZE};
 use super::layout::{layout_mass_with, CellOccupant, FitLayout};
+use super::materials::CellMaterials;
 use super::module::{Module, ModuleKind, ModuleSpecifics};
 use crate::damage::{Channel, StatScalingConfig, DEFAULT_SHIELD_HP, DEFAULT_SHIELD_REGEN};
 use crate::tuning::{SimTuning, Tuning};
@@ -423,7 +424,14 @@ pub fn derive_ship_stats(
     catalog: &ModuleCatalog,
     layout: &FitLayout,
 ) -> ShipStats {
-    derive_ship_stats_with(hull, fit, catalog, layout, &SimTuning::default())
+    derive_ship_stats_with(
+        hull,
+        fit,
+        catalog,
+        layout,
+        &SimTuning::default(),
+        &CellMaterials::default(),
+    )
 }
 
 /// [`derive_ship_stats`] with the live [`SimTuning`] (Phase M6 / R42): the flight `total_mass` uses
@@ -437,6 +445,7 @@ pub fn derive_ship_stats_with(
     catalog: &ModuleCatalog,
     layout: &FitLayout,
     sim: &SimTuning,
+    materials: &CellMaterials,
 ) -> ShipStats {
     // Flight-feel constants the modules do not supply come from the demoted
     // `Tuning` baseline (HINT-002): the seed baseline fit reproduces these.
@@ -601,7 +610,8 @@ pub fn derive_ship_stats_with(
     // continuous as it erodes into a wreck. (The authored `hull.hull_base_mass` is no longer part
     // of the flight mass — it remains only the fitting-screen mass-**budget** axis.) Floored `> 0`
     // (INV-F14) — a no-cell layout never zeroes the flight denominator.
-    let total_mass = layout_mass_with(layout, catalog, sim.struct_cell_mass).max(f32::MIN_POSITIVE);
+    let total_mass =
+        layout_mass_with(layout, catalog, sim.struct_cell_mass, materials).max(f32::MIN_POSITIVE);
 
     ShipStats {
         thrust_force,

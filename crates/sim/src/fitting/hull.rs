@@ -949,6 +949,16 @@ pub struct GridCell {
     /// without it loads as `Full`. The sim treats `Full` byte-identically to before.
     #[serde(default)]
     pub shape: CellShape,
+    /// R66 — the cell's **hull (structural) material** id, into the [`CellMaterials`](super::materials::CellMaterials)
+    /// `hull` catalog (only meaningful for a structural cell). `0` = Standard (the live
+    /// `struct_cell_*` globals → byte-identical). `#[serde(default)]` → old RON loads as `0`.
+    #[serde(default)]
+    pub hull_material: u8,
+    /// R66 — the cell's **armor material** id, into the [`CellMaterials`](super::materials::CellMaterials)
+    /// `armor` catalog (plating on top of any cell). `0` = None (no plate → byte-identical).
+    /// `#[serde(default)]` → old RON loads as `0`.
+    #[serde(default)]
+    pub armor_material: u8,
 }
 
 impl GridCell {
@@ -960,6 +970,8 @@ impl GridCell {
             section,
             structural: false,
             shape: CellShape::Full,
+            hull_material: 0,
+            armor_material: 0,
         }
     }
 
@@ -972,6 +984,8 @@ impl GridCell {
             section,
             structural: true,
             shape: CellShape::Full,
+            hull_material: 0,
+            armor_material: 0,
         }
     }
 }

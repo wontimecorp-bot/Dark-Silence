@@ -1296,6 +1296,11 @@ fn dev_panel_ui(
         .get_resource::<ResistanceMatrix>()
         .copied()
         .unwrap_or_else(default_resistance_matrix);
+    // R66: the typed per-cell hull/armor materials catalog (edited by the "Cell materials" section).
+    let mut cell_materials = world
+        .get_resource::<sim::fitting::CellMaterials>()
+        .cloned()
+        .unwrap_or_default();
 
     // M6b: snapshot the LOCAL player ship's derived stats + live state (read-only). Resolve the
     // server entity from the client's wire `local_id`; gather into an owned struct so the egui
@@ -1749,6 +1754,93 @@ fn dev_panel_ui(
                             egui::Color32::YELLOW,
                             "tier order non ≤ over ≤ full violated (INV-D05)",
                         );
+                    }
+                });
+
+                // R66 — the typed per-cell HULL + ARMOR material catalog. Edits flow LIVE: HP/mass
+                // via the `designs_changed` → force_rederive path; the gate reads it each tick. id 0
+                // (Standard / None) is the byte-identical baseline (greyed); ids 1+ are editable.
+                egui::CollapsingHeader::new("Cell materials (hull + armor) — R66").show(ui, |ui| {
+                    ui.label("HULL materials (structural cells). id 0 = Standard (Sim consts):");
+                    let mut remove_hull: Option<usize> = None;
+                    for (i, h) in cell_materials.hull.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.monospace(format!("{i}"));
+                            ui.add_enabled(
+                                i > 0,
+                                egui::TextEdit::singleline(&mut h.name).desired_width(64.0),
+                            );
+                            ui.add_enabled(
+                                i > 0,
+                                egui::DragValue::new(&mut h.cell_hp).speed(0.1).prefix("hp "),
+                            );
+                            ui.add_enabled(
+                                i > 0,
+                                egui::DragValue::new(&mut h.mass).speed(0.02).prefix("mass "),
+                            );
+                            if i > 0 && ui.small_button("✕").clicked() {
+                                remove_hull = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove_hull {
+                        cell_materials.hull.remove(i);
+                    }
+                    if ui.button("+ hull material").clicked() {
+                        cell_materials.hull.push(sim::fitting::HullMaterialDef {
+                            name: "New".into(),
+                            cell_hp: 4.0,
+                            mass: 0.3,
+                        });
+                    }
+                    ui.separator();
+                    ui.label("ARMOR materials (plating). id 0 = None:");
+                    let mut remove_armor: Option<usize> = None;
+                    for (i, a) in cell_materials.armor.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.monospace(format!("{i}"));
+                            ui.add_enabled(
+                                i > 0,
+                                egui::TextEdit::singleline(&mut a.name).desired_width(56.0),
+                            );
+                            ui.add_enabled(
+                                i > 0,
+                                egui::DragValue::new(&mut a.thickness)
+                                    .speed(0.05)
+                                    .prefix("th "),
+                            )
+                            .on_hover_text("plate thickness → the ricochet/penetration gate");
+                            ui.add_enabled(
+                                i > 0,
+                                egui::DragValue::new(&mut a.multiplier).speed(0.02).prefix("×"),
+                            )
+                            .on_hover_text("material hardness multiplier on thickness");
+                            ui.add_enabled(
+                                i > 0,
+                                egui::DragValue::new(&mut a.carve_hp).speed(0.5).prefix("hp "),
+                            )
+                            .on_hover_text("extra carve resistance per cell");
+                            ui.add_enabled(
+                                i > 0,
+                                egui::DragValue::new(&mut a.mass).speed(0.05).prefix("m "),
+                            )
+                            .on_hover_text("extra mass per cell (agility tradeoff)");
+                            if i > 0 && ui.small_button("✕").clicked() {
+                                remove_armor = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove_armor {
+                        cell_materials.armor.remove(i);
+                    }
+                    if ui.button("+ armor material").clicked() {
+                        cell_materials.armor.push(sim::fitting::ArmorMaterialDef {
+                            name: "New".into(),
+                            thickness: 1.0,
+                            multiplier: 1.0,
+                            carve_hp: 20.0,
+                            mass: 1.0,
+                        });
                     }
                 });
 
@@ -2234,6 +2326,7 @@ fn dev_panel_ui(
                     mining,
                     starfield: *starfield,
                     ship_visual: *ship_visual,
+                    cell_materials: cell_materials.clone(),
                 };
                 state.save_status = match tuning_io::save_dev_settings(&dev) {
                     Ok(m) => m,
@@ -2286,7 +2379,9 @@ fn dev_panel_ui(
         // tick, so it needs no re-derive. Catalogs differing → live update for all ships.
         let designs_changed = world.get_resource::<ModuleCatalog>() != modules.as_ref()
             || world.get_resource::<HullCatalog>() != hulls.as_ref()
-            || world.get_resource::<SimTuning>() != Some(&sim);
+            || world.get_resource::<SimTuning>() != Some(&sim)
+            // R66 — a hull/armor material HP or mass edit needs a re-derive (the gate reads live).
+            || world.get_resource::<sim::fitting::CellMaterials>() != Some(&cell_materials);
         world.insert_resource(tuning);
         world.insert_resource(sim);
         world.insert_resource(pen);
@@ -2294,6 +2389,7 @@ fn dev_panel_ui(
         world.insert_resource(salvage);
         world.insert_resource(scaling);
         world.insert_resource(mining);
+        world.insert_resource(cell_materials);
         if let Some(m) = modules {
             world.insert_resource(m);
         }

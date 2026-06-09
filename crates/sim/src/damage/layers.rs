@@ -44,8 +44,8 @@ use super::sever::Wreck;
 use super::shields::shield_absorb;
 use crate::components::ArmorHp;
 use crate::fitting::{
-    resolve_hit, Cell, CellOccupant, Fit, FitLayout, HitResolution, Hull, HullCatalog,
-    ModuleCatalog, ModuleRef, SectionId,
+    resolve_hit, Cell, CellMaterials, CellOccupant, CellShape, Fit, FitLayout, HitResolution, Hull,
+    HullCatalog, ModuleCatalog, ModuleRef, SectionId,
 };
 use crate::physics::{Physics, RapierPhysics};
 
@@ -600,6 +600,78 @@ fn local_surface_normal(cells: &BTreeSet<Cell>, cell: Cell, radius: i32) -> (Vec
     (normal, present_count)
 }
 
+/// R66 — the outward surface normal of a **sub-shape** entry cell, derived from its REAL polygon
+/// face (so a wedge/slope cell deflects per its hypotenuse, not the blocky grid occupancy). It is
+/// the EXPOSED edge whose outward normal most faces the shooter (`-dir_n`): a non-axis (cut)
+/// polygon edge is always exposed (it faces the cut-out void); an axis edge on a cell boundary is
+/// exposed iff the grid neighbour across it is absent from `cells`. `None` when no exposed edge
+/// faces the shooter (the caller falls back to the occupancy normal). Pure + deterministic — one
+/// convex polygon's edges, no transcendentals. Only invoked for a non-`Full` cell (a `Full` cell
+/// uses [`local_surface_normal`] → byte-identical to before).
+fn shape_surface_normal(
+    shape: CellShape,
+    cell: Cell,
+    cells: &BTreeSet<Cell>,
+    dir_n: Vec2,
+) -> Option<Vec2> {
+    let corners = shape.corners(cell.0, cell.1); // CCW polygon in grid space (x = col, y = row)
+    let n = corners.len();
+    let mut best: Option<(f32, Vec2)> = None;
+    for i in 0..n {
+        let a = corners[i];
+        let b = corners[(i + 1) % n];
+        let edge = b - a;
+        if edge.length_squared() <= f32::EPSILON {
+            continue;
+        }
+        // CCW polygon → the OUTWARD normal of edge a→b is `(edge.y, -edge.x)`, normalized.
+        let normal = Vec2::new(edge.y, -edge.x).normalize_or_zero();
+        if normal.length_squared() <= f32::EPSILON {
+            continue;
+        }
+        // Exposed? An axis edge on a cell boundary → exposed iff its grid neighbour is absent; a
+        // diagonal/cut edge (no axis neighbour) faces the cut-out void → always exposed.
+        let exposed = match axis_boundary_neighbor(cell, a, b) {
+            Some(nbr) => !cells.contains(&nbr),
+            None => true,
+        };
+        if !exposed {
+            continue;
+        }
+        // The face the shot meets = the exposed edge most opposing the shot direction.
+        let facing = normal.dot(-dir_n);
+        if facing > 0.0 && best.is_none_or(|(bf, _)| facing > bf) {
+            best = Some((facing, normal));
+        }
+    }
+    best.map(|(_, n)| n)
+}
+
+/// The grid neighbour across an AXIS-aligned cell-boundary edge `a→b` of `cell` (grid-space
+/// endpoints), or `None` if the edge is diagonal / not on a cell boundary (a cut face, treated as
+/// exposed) or the neighbour is out of bounds. Used by [`shape_surface_normal`] to decide whether a
+/// sub-shape cell's axis edge is on the silhouette.
+fn axis_boundary_neighbor(cell: Cell, a: Vec2, b: Vec2) -> Option<Cell> {
+    let (c, r) = (cell.0 as f32, cell.1 as f32);
+    let eps = 1.0e-3;
+    if (a.x - b.x).abs() < eps {
+        // Vertical edge at x = a.x — left or right cell boundary.
+        if (a.x - c).abs() < eps {
+            return cell.0.checked_sub(1).map(|nc| (nc, cell.1));
+        } else if (a.x - (c + 1.0)).abs() < eps {
+            return Some((cell.0 + 1, cell.1));
+        }
+    } else if (a.y - b.y).abs() < eps {
+        // Horizontal edge at y = a.y — bottom or top cell boundary.
+        if (a.y - r).abs() < eps {
+            return cell.1.checked_sub(1).map(|nr| (cell.0, nr));
+        } else if (a.y - (r + 1.0)).abs() < eps {
+            return Some((cell.0, cell.1 + 1));
+        }
+    }
+    None
+}
+
 /// The legible "what happened" tag the HUD reads (FR-024, SC-005) — never numeric
 /// spam, advisory only (the server owns the authoritative mutation).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -742,6 +814,13 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
         .get_resource::<crate::tuning::SimTuning>()
         .copied()
         .unwrap_or_default();
+    // R66: the per-cell hull/armor materials catalog (the entry cell's armor drives the gate +
+    // carve). Absent (headless/determinism) → `Default`; an unarmored cell (material 0) → `+0`
+    // everywhere → byte-identical.
+    let materials = world
+        .get_resource::<CellMaterials>()
+        .cloned()
+        .unwrap_or_default();
 
     let channel = ev.channel;
 
@@ -762,7 +841,7 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
     // despawn, or a direct non-selection call with no crossing): the total-pipeline
     // `NoModule` edge (correct, never a panic). There is NO nearest-cell fallback: a shot
     // that crosses no cell is a clean miss, not a force-carve on the wrong/nearest cell.
-    let Some(&(entry_cell, _)) = path.first() else {
+    let Some(&(entry_cell, entry_occ)) = path.first() else {
         return no_module();
     };
 
@@ -834,8 +913,18 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
     // — a flank cell's true normal faces sideways while the radial points along the long axis,
     // so square-on flank hits spuriously ricocheted (Fix #8). The local normal is exact for
     // any shape and any carve state.
-    let (surface_normal, present_neighbors) =
+    let (occ_normal, present_neighbors) =
         local_surface_normal(&geom_cells, entry_cell, sim.smooth_normal_radius);
+    // R66 — a SUB-shape entry cell deflects per its REAL polygon face (the exposed edge most facing
+    // the shooter), so a wedge/slope armoured face deflects per its hypotenuse, not the blocky grid.
+    // A `Full` cell keeps the occupancy normal → byte-identical. The occupancy `present_neighbors`
+    // + the `buried` tunnel guard still gate ricochet eligibility for both (a thin shard / bored
+    // tunnel never spuriously ricochets, whatever the shape).
+    let surface_normal = if entry_occ.shape.is_full() {
+        occ_normal
+    } else {
+        shape_surface_normal(entry_occ.shape, entry_cell, &geom_cells, dir_n).unwrap_or(occ_normal)
+    };
     let cos_impact = if surface_normal.length_squared() <= f32::EPSILON {
         1.0 // no outward direction → treat as head-on
     } else {
@@ -856,8 +945,16 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
     // Mitigate at the Armor layer before the penetration tier applies.
     m *= 1.0 - layer_resist(&matrix, DefenseLayer::Armor, channel);
 
+    // R66 — the entry cell's painted ARMOR material raises the effective plate fed into the angle
+    // gate (`thickness·multiplier`), so a glancing shot RICOCHETS, a head-on low-pen shot
+    // NonPenetrates, and a strong shot still penetrates. The catalog multiplier is folded into the
+    // thickness term (passed with the section `facet.material`), so `resolve_penetration`/
+    // `effective_armor` are unchanged. Armor material 0 (None) → `+0` → identical call → byte-identical.
+    let cell_armor = materials.armor_params(entry_occ.armor_material);
+    let thickness = facet.thickness + cell_armor.thickness * cell_armor.multiplier;
+
     let pen = resolve_penetration(
-        facet.thickness,
+        thickness,
         angle,
         ev.penetration,
         ev.pen_size,
@@ -912,6 +1009,12 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
     // determinism/test ship carries none) the block is skipped → the headless path stays
     // byte-identical, and a test ship that does carry it is only hit by sub-armor shots (fully
     // soaked) → still byte-identical. Armor does not regenerate.
+    //
+    // R66 NOTE: this flat WHOLE-SHIP pool is the legacy armor-MODULE path; the new directional
+    // PER-CELL armor (the entry-cell thickness gate above + the per-cell `carve_hp` below) is
+    // additive and orthogonal. The seed ships still fit the old armor module (this pool), so it is
+    // KEPT byte-identical; new editor designs use per-cell armor instead. Fully retiring the armor
+    // module/slot is a separate follow-up (it touches the golden demo spawn + many tests).
     if let Some(mut armor) = world.get::<ArmorHp>(target).copied() {
         if armor.current > 0.0 {
             let absorbed = armor.current.min(m.max(0.0));
@@ -980,8 +1083,11 @@ pub fn apply_damage(world: &mut World, target: Entity, ev: DamageEvent) -> Damag
         }
         // The cell's live remaining health — the work needed to DESTROY it. An already-
         // dead cell (`health <= 0`, e.g. chipped to 0 by a prior shot) needs no work
-        // and is removed immediately.
-        let remaining = occ.health.max(0.0);
+        // and is removed immediately. R66 — a cell's painted armor adds carve resistance
+        // (`armor_params.carve_hp`), so even a penetrating shot eats more budget per armoured cell
+        // (head-on resistance + value for INTERIOR plating the entry gate never sees). Armor
+        // material 0 → `+0` → byte-identical.
+        let remaining = occ.health.max(0.0) + materials.armor_params(occ.armor_material).carve_hp;
         // Record the module attribution from the first module cell on the channel.
         if struck_ref.is_none() {
             if let Some(module_id) = occ.module {

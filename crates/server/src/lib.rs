@@ -530,6 +530,10 @@ impl ServerApp {
         world.insert_resource(ShieldConfig::default());
         world.insert_resource(StatScalingConfig::default());
         world.insert_resource(SalvageConfig::default());
+        // R66: the typed per-cell hull/armor materials catalog. `Default` (material 0/0 = the
+        // existing globals) → byte-identical for unmaterialed cells; a windowed override is applied
+        // later in the client's `setup_loopback_host` (never here), so headless stays default.
+        world.insert_resource(sim::fitting::CellMaterials::default());
         // Mining-skirmish combat rules (friendly-fire OFF by default). Harmless for every other
         // world: the faction gate is a no-op until a projectile carries a `ProjectileFaction`, which
         // only scenario shooters do — so determinism/botkit/Sandbox stay bit-identical.

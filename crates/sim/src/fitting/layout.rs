@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use super::content::{ModuleCatalog, STRUCT_CELL_MASS};
 use super::fit::{Fit, ModuleRef};
 use super::hull::{FiringArc, Hull, HullId, SlotId, CELL_WORLD_SIZE};
+use super::materials::CellMaterials;
 use crate::physics::{Physics, RapierPhysics};
 
 /// A grid cell coordinate `(col, row)` on the hull — the shared fitting / hit-map
@@ -84,6 +85,14 @@ pub struct CellOccupant {
     /// byte-identical to before.
     #[serde(default)]
     pub shape: super::CellShape,
+    /// R66 — the cell's **hull (structural) material** id (copied from its [`GridCell`]); drives the
+    /// structural base HP (at build) + mass via [`CellMaterials`]. `0` = Standard → byte-identical.
+    #[serde(default)]
+    pub hull_material: u8,
+    /// R66 — the cell's **armor material** id (copied from its [`GridCell`]); drives the directional
+    /// plate (the penetration gate), carve resistance, and mass via [`CellMaterials`]. `0` = None.
+    #[serde(default)]
+    pub armor_material: u8,
 }
 
 /// The full per-cell occupant + health map E007 consumes (contracts/fitting-api.md
@@ -173,27 +182,39 @@ fn cell_center(coord: Cell) -> Vec2 {
 /// projectile knockback, wreck drift, and inertia alike — so mass is continuous as a ship erodes
 /// into a wreck and reflects what the body is actually made of (a reactor cell outweighs plating).
 ///
-/// Uses the compile-time [`STRUCT_CELL_MASS`]; for the live-tunable path (the dev panel's
-/// `SimTuning.struct_cell_mass`) call [`cell_mass_with`].
+/// Uses the compile-time [`STRUCT_CELL_MASS`] + the default [`CellMaterials`]; for the live-tunable
+/// path (the dev panel's `SimTuning.struct_cell_mass` + a windowed materials catalog) call
+/// [`cell_mass_with`].
 pub fn cell_mass(occupant: &CellOccupant, modules: &ModuleCatalog) -> f32 {
-    cell_mass_with(occupant, modules, STRUCT_CELL_MASS)
+    cell_mass_with(
+        occupant,
+        modules,
+        STRUCT_CELL_MASS,
+        &CellMaterials::default(),
+    )
 }
 
-/// [`cell_mass`] with an explicit structural-cell mass (Phase M6 live tuning): a module cell
-/// weighs its module's mass; a structural / empty / dangling cell weighs `struct_cell_mass`.
+/// [`cell_mass`] with an explicit structural-cell mass + materials catalog (Phase M6 / R66 live
+/// tuning): a module cell weighs its module's mass; a structural / empty / dangling cell weighs its
+/// hull material's mass (id `0` → `struct_cell_mass`); plus the cell's armor material mass — all
+/// scaled by the sub-shape area. id `0/0` → `struct_cell_mass·area + 0` → byte-identical to before.
 pub fn cell_mass_with(
     occupant: &CellOccupant,
     modules: &ModuleCatalog,
     struct_cell_mass: f32,
+    materials: &CellMaterials,
 ) -> f32 {
+    // A module cell weighs its module; a structural/empty cell weighs its hull material
+    // (id 0 → the live struct_cell_mass — the existing path).
     let base = occupant
         .module
         .and_then(|m| modules.get(m))
         .map(|m| m.mass)
-        .unwrap_or(struct_cell_mass);
-    // R58 — a sub-shape cell (triangle) occupies less of the unit cell → proportionally less mass.
-    // `Full` → `area_factor() == 1.0` → byte-identical to before.
-    base * occupant.shape.area_factor()
+        .unwrap_or_else(|| materials.hull_mass(occupant.hull_material, struct_cell_mass));
+    // R66 — armor plating adds mass (id 0 → +0). R58 — a sub-shape cell (triangle) occupies less of
+    // the unit cell → proportionally less mass. `Full` + material 0/0 → byte-identical to before.
+    let armor_mass = materials.armor_params(occupant.armor_material).mass;
+    (base + armor_mass) * occupant.shape.area_factor()
 }
 
 /// A body's total inertial **mass** = Σ [`cell_mass`] over its current cells (Phase M5). The one
@@ -201,15 +222,20 @@ pub fn cell_mass_with(
 /// wreck drift, so a live ship and the wreck it becomes share the same mass basis (no jump on
 /// death). Deterministic; empty layout → `0`. Live-tunable variant: [`layout_mass_with`].
 pub fn layout_mass(layout: &FitLayout, modules: &ModuleCatalog) -> f32 {
-    layout_mass_with(layout, modules, STRUCT_CELL_MASS)
+    layout_mass_with(layout, modules, STRUCT_CELL_MASS, &CellMaterials::default())
 }
 
-/// [`layout_mass`] with an explicit structural-cell mass (Phase M6 live tuning).
-pub fn layout_mass_with(layout: &FitLayout, modules: &ModuleCatalog, struct_cell_mass: f32) -> f32 {
+/// [`layout_mass`] with an explicit structural-cell mass + materials catalog (Phase M6 / R66).
+pub fn layout_mass_with(
+    layout: &FitLayout,
+    modules: &ModuleCatalog,
+    struct_cell_mass: f32,
+    materials: &CellMaterials,
+) -> f32 {
     layout
         .cells
         .values()
-        .map(|o| cell_mass_with(o, modules, struct_cell_mass))
+        .map(|o| cell_mass_with(o, modules, struct_cell_mass, materials))
         .sum()
 }
 
@@ -219,29 +245,31 @@ pub fn layout_mass_with(layout: &FitLayout, modules: &ModuleCatalog, struct_cell
 /// `> 0` (a single-cell or massless body still divides safely). Deterministic. Live-tunable
 /// variant: [`layout_inertia_with`].
 pub fn layout_inertia(layout: &FitLayout, modules: &ModuleCatalog) -> f32 {
-    layout_inertia_with(layout, modules, STRUCT_CELL_MASS)
+    layout_inertia_with(layout, modules, STRUCT_CELL_MASS, &CellMaterials::default())
 }
 
-/// [`layout_inertia`] with an explicit structural-cell mass (Phase M6 live tuning).
+/// [`layout_inertia`] with an explicit structural-cell mass + materials catalog (Phase M6 / R66).
 pub fn layout_inertia_with(
     layout: &FitLayout,
     modules: &ModuleCatalog,
     struct_cell_mass: f32,
+    materials: &CellMaterials,
 ) -> f32 {
-    let total = layout_mass_with(layout, modules, struct_cell_mass);
+    let total = layout_mass_with(layout, modules, struct_cell_mass, materials);
     if total <= f32::MIN_POSITIVE {
         return f32::MIN_POSITIVE;
     }
     // Mass-weighted centre of mass in cell-space. R58 — a sub-shape cell's mass sits at its triangle
     // CENTROID, not the cell centre; `Full` → `centroid == cell_center` → byte-identical.
     let com = layout.cells.iter().fold(Vec2::ZERO, |acc, (&coord, occ)| {
-        acc + occ.shape.centroid(coord.0, coord.1) * cell_mass_with(occ, modules, struct_cell_mass)
+        acc + occ.shape.centroid(coord.0, coord.1)
+            * cell_mass_with(occ, modules, struct_cell_mass, materials)
     }) / total;
     let i_cellspace: f32 = layout
         .cells
         .iter()
         .map(|(&coord, occ)| {
-            cell_mass_with(occ, modules, struct_cell_mass)
+            cell_mass_with(occ, modules, struct_cell_mass, materials)
                 * (occ.shape.centroid(coord.0, coord.1) - com).length_squared()
         })
         .sum();
@@ -296,18 +324,26 @@ fn cell_depth(hull: &Hull, coord: Cell) -> u16 {
 /// reads structural cells. The dense grid therefore changes **no** combat outcome this
 /// phase — it only populates the per-cell health store for Phase 2 carving.
 pub fn build_layout(hull: &Hull, fit: &Fit, catalog: &ModuleCatalog) -> FitLayout {
-    build_layout_with(hull, fit, catalog, super::content::STRUCT_CELL_HP)
+    build_layout_with(
+        hull,
+        fit,
+        catalog,
+        super::content::STRUCT_CELL_HP,
+        &CellMaterials::default(),
+    )
 }
 
-/// [`build_layout`] with an explicit structural-cell HP (Phase M6 live tuning): structural filler
-/// cells are seeded with `struct_cell_hp` instead of the compile-time [`STRUCT_CELL_HP`]
-/// (`crate::fitting::content::STRUCT_CELL_HP`), so the dev panel can retune hull erosion + a
-/// re-derive rebuilds layouts at the new value.
+/// [`build_layout`] with an explicit structural-cell HP + materials catalog (Phase M6 / R66 live
+/// tuning): a structural filler cell is seeded with its **hull material's** HP (id `0` →
+/// `struct_cell_hp`, the existing path), so the dev panel can retune hull erosion (and per-material
+/// light/heavy hull) + a re-derive rebuilds layouts at the new value. The cell's `hull_material` /
+/// `armor_material` ids are copied onto its [`CellOccupant`] for the live mass / armor-gate lookups.
 pub fn build_layout_with(
     hull: &Hull,
     fit: &Fit,
     catalog: &ModuleCatalog,
     struct_cell_hp: f32,
+    materials: &CellMaterials,
 ) -> FitLayout {
     let mut cells: CellMap = BTreeMap::new();
 
@@ -315,9 +351,13 @@ pub fn build_layout_with(
         let coord = grid_cell.coord;
 
         let (slot_id, module_id, health) = if grid_cell.structural {
-            // A structural filler cell: no slot identity, seeded with the tunable
-            // structural HP so the dense body is carvable in Phase 2.
-            (SlotId(u32::MAX), None, struct_cell_hp)
+            // A structural filler cell: no slot identity, seeded with its hull material's HP
+            // (id 0 → the tunable struct_cell_hp — the existing path) so the dense body is carvable.
+            (
+                SlotId(u32::MAX),
+                None,
+                materials.hull_hp(grid_cell.hull_material, struct_cell_hp),
+            )
         } else {
             // A module cell: the slot sitting on it drives occupancy. Found positionally
             // so the map stays correct under any authoring.
@@ -345,6 +385,8 @@ pub fn build_layout_with(
                 depth: cell_depth(hull, coord),
                 structural: grid_cell.structural,
                 shape: grid_cell.shape,
+                hull_material: grid_cell.hull_material,
+                armor_material: grid_cell.armor_material,
             },
         );
     }
@@ -662,6 +704,8 @@ mod tests {
             depth: 0,
             structural: false,
             shape: crate::fitting::CellShape::Full,
+            hull_material: 0,
+            armor_material: 0,
         };
         assert_eq!(cell_mass(&module_cell, &modules), reactor_mass);
         // A structural / empty cell weighs the structural constant.
@@ -672,6 +716,8 @@ mod tests {
             depth: 0,
             structural: true,
             shape: crate::fitting::CellShape::Full,
+            hull_material: 0,
+            armor_material: 0,
         };
         assert_eq!(cell_mass(&struct_cell, &modules), STRUCT_CELL_MASS);
     }

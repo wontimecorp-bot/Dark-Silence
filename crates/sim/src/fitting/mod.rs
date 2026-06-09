@@ -37,6 +37,7 @@ pub mod content;
 pub mod fit;
 pub mod hull;
 pub mod layout;
+pub mod materials;
 pub mod module;
 pub mod stats;
 pub mod validate;
@@ -60,6 +61,7 @@ pub use layout::{
     layout_mass_with, module_at, resolve_hit, Cell, CellMap, CellOccupant, FitLayout,
     HitResolution,
 };
+pub use materials::{ArmorMaterialDef, ArmorParams, CellMaterials, HullMaterialDef, ARMOR_NONE};
 pub use module::{
     AmmoType, Axis, HardpointType, Module, ModuleId, ModuleKind, ModuleSpecifics, PropulsionType,
     SensorType, SlotSize, Violation, WeaponClass,
@@ -117,6 +119,9 @@ pub fn recompute_ship_stats_system(
     // which `set_changed`s every `Fit`) rebuilds layouts + stats at the live structural-cell
     // HP/mass. Absent (a minimal world) → the const defaults.
     sim: Option<Res<crate::tuning::SimTuning>>,
+    // R66: the per-cell hull/armor materials catalog (live structural HP/mass per hull material +
+    // armor mass). Absent (headless/determinism) → `Default` whose material 0/0 is byte-identical.
+    materials: Option<Res<CellMaterials>>,
     mut q: Query<
         (
             Entity,
@@ -132,6 +137,7 @@ pub fn recompute_ship_stats_system(
     >,
 ) {
     let sim = sim.map(|s| *s).unwrap_or_default();
+    let materials = materials.map(|m| m.clone()).unwrap_or_default();
     for (entity, fit, mut stats, mut layout, shields, armor, weapon_bank) in &mut q {
         let Some(hull) = hulls.get(fit.hull) else {
             // Unknown hull: cannot derive; leave the prior stats/layout untouched.
@@ -140,9 +146,9 @@ pub fn recompute_ship_stats_system(
         // A fit re-configure rebuilds the layout fresh (full health = repaired);
         // a layout-only change (damage) preserves the damaged health.
         if fit.is_changed() {
-            *layout = build_layout_with(hull, &fit, &modules, sim.struct_cell_hp);
+            *layout = build_layout_with(hull, &fit, &modules, sim.struct_cell_hp, &materials);
         }
-        *stats = derive_ship_stats_with(hull, &fit, &modules, &layout, &sim);
+        *stats = derive_ship_stats_with(hull, &fit, &modules, &layout, &sim, &materials);
 
         // R45 — derive the FULL alive-weapon list + maintain the per-weapon firing-state bank: each
         // surviving weapon slot keeps its cooldown/spool, a new weapon starts fresh, a removed one is
