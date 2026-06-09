@@ -48,37 +48,36 @@ impl Plugin for HullEditorPlugin {
     }
 }
 
-/// What a left-click on the grid does. R68 — the four LAYER modes (`Shape`/`Hull`/`Armor`/`Module`)
-/// each paint one layer, show that layer's icon palette, AND set the matching grid view; the rest are
-/// cell-level tools.
+/// R72 — the editing ACTION (the "tool"): WHAT a grid interaction does. Orthogonal to the active
+/// [`Layer`]. R73 — every tool now operates on the active layer: `Paint` SETS it, `Erase` CLEARS it,
+/// `Select` inspects; `Stamp` lays a multi-cell shape preset (shape-centric).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum EditMode {
-    /// Paint the brush SHAPE (the cell's footprint; the mandatory layer — adds the cell if absent).
-    Shape,
-    /// Paint the HULL (structural) material layer.
-    Hull,
-    /// Paint the ARMOR material layer (the "None" id clears plating).
-    Armor,
-    /// R68 — paint the MODULE (hardpoint slot) layer (the "—" brush removes the slot).
-    Module,
-    /// Remove the clicked cell (and any slot on it).
+enum Tool {
+    /// Set the active [`Layer`] on the cell(s) under the cursor (Shape → the brush shape, Hull/Armor →
+    /// the material brush, Module → the slot brush).
+    Paint,
+    /// R63 — stamp a multi-cell SHAPE preset (round cap / cone / blade / needle) at the anchor.
+    Stamp,
+    /// Clear the active [`Layer`] on the cell(s): Shape → delete the cell, Hull → Standard, Armor →
+    /// None, Module → remove the slot.
     Erase,
     /// Just select the clicked cell (inspect / edit in the right panel).
     Select,
-    /// R63 — stamp a multi-cell preset (round cap / cone / blade / needle) at the clicked anchor.
-    Stamp,
 }
 
-/// R67/R68 — what the grid cell FILL shows, so you can read each layer at a glance.
+/// R72/R73 — the per-cell LAYER. It is the SINGLE active-layer selection shared by BOTH the brush
+/// (what a tool acts on) AND the grid "Show:" view (what the grid is coloured by) — selecting it from
+/// either the Brush "Layer:" row or the "Show:" toolbar syncs the other. Shape + Hull are mandatory;
+/// Armor + Module optional (their palettes carry a "None" to clear them). Orthogonal to the [`Tool`].
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum GridView {
-    /// Cells coloured by their sub-cell shape / slot (the default authoring view).
+enum Layer {
+    /// The cell's sub-cell shape / slot footprint (the default authoring view).
     Shape,
-    /// Cells coloured by their HULL (structural) material.
-    HullMat,
-    /// Cells coloured by their ARMOR material.
-    ArmorMat,
-    /// R68 — cells coloured by their MODULE (hardpoint slot) type.
+    /// The HULL (structural) material.
+    Hull,
+    /// The ARMOR material.
+    Armor,
+    /// The MODULE (hardpoint slot) type.
     Module,
 }
 
@@ -243,9 +242,10 @@ pub struct HullDesignSession {
     working: Hull,
     /// Which catalog id `working` is (so apply/save write the right row).
     selected_hull: HullId,
-    /// The shape painted by left-click in `Paint` mode.
+    /// The shape painted by left-click in `Paint`+`Shape` mode.
     brush: CellShape,
-    mode: EditMode,
+    /// R72 — the editing ACTION (the tool). The LAYER it targets is the shared `layer` below.
+    tool: Tool,
     selected_cell: Option<(u16, u16)>,
     selected_slot: Option<SlotId>,
     /// R61 — staged grid size (the cols/rows fields edit this; "Apply grid" commits it so editing the
@@ -264,8 +264,9 @@ pub struct HullDesignSession {
     armor_material_brush: u8,
     /// R68 — the module type painted in `Module` mode (`None` removes the slot).
     module_brush: Option<HardpointType>,
-    /// R67 — what the grid cell fill shows (shape / hull material / armor material / module).
-    grid_view: GridView,
+    /// R72/R73 — the SINGLE active layer: both the brush paint TARGET and the grid "Show:" VIEW. The
+    /// Brush "Layer:" row and the "Show:" toolbar both edit this one field → they stay in sync.
+    layer: Layer,
     status: String,
     /// Set on any edit → the 3-D preview rebuilds its mesh next frame.
     pub dirty: bool,
@@ -286,7 +287,7 @@ impl Default for HullDesignSession {
             working,
             selected_hull: HULL_FIGHTER,
             brush: CellShape::Full,
-            mode: EditMode::Shape,
+            tool: Tool::Paint,
             selected_cell: None,
             selected_slot: None,
             pending_grid,
@@ -297,7 +298,7 @@ impl Default for HullDesignSession {
             hull_material_brush: 2,  // Heavy (so Hull painting is visible)
             armor_material_brush: 1, // Light
             module_brush: Some(HardpointType::Weapon),
-            grid_view: GridView::Shape,
+            layer: Layer::Shape,
             status: String::new(),
             dirty: true,
             orbit: (0.6, 0.5),
@@ -535,56 +536,65 @@ fn hull_editor_ui(
             }
             ui.separator();
             ui.heading("Brush");
-            // R68/R69 — LAYER selector: picks what you PAINT + which icon palette shows. R69 — this is
-            // INDEPENDENT of the "Show:" grid view below (a brush click no longer overrides the view).
-            // Shape + Hull are the mandatory layers; Armor + Module carry a "None" to clear them.
+            // R72/R73 — TWO axes: a TOOL (the action) + the active LAYER. EVERY tool acts on the layer
+            // (Paint sets it, Erase clears it, Select inspects; Stamp lays shapes). The Layer row is the
+            // SAME selection as the "Show:" view above the grid — editing either syncs the other.
             ui.horizontal(|ui| {
-                for (mode, name) in [
-                    (EditMode::Shape, "Shape"),
-                    (EditMode::Hull, "Hull"),
-                    (EditMode::Armor, "Armor"),
-                    (EditMode::Module, "Module"),
+                ui.label("Tool:");
+                ui.selectable_value(&mut s.tool, Tool::Paint, "Paint");
+                ui.selectable_value(&mut s.tool, Tool::Stamp, "Stamp");
+                ui.selectable_value(&mut s.tool, Tool::Erase, "Erase");
+                ui.selectable_value(&mut s.tool, Tool::Select, "Select");
+            });
+            // The active LAYER (icons echo the grid colouring) — always selectable; shared with "Show:".
+            ui.horizontal(|ui| {
+                ui.label("Layer:");
+                for (layer, which, name) in [
+                    (Layer::Shape, 0u8, "Shape"),
+                    (Layer::Hull, 1u8, "Hull material"),
+                    (Layer::Armor, 2u8, "Armor material"),
+                    (Layer::Module, 3u8, "Module (hardpoint)"),
                 ] {
-                    ui.selectable_value(&mut s.mode, mode, name);
+                    if layer_icon(ui, which, s.layer == layer, true, name) {
+                        s.layer = layer;
+                    }
                 }
             });
-            // Cell-level tools (Erase removes the cell; Select inspects; Stamp paints multi-cell shapes).
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut s.mode, EditMode::Stamp, "Stamp");
-                ui.selectable_value(&mut s.mode, EditMode::Erase, "Erase");
-                ui.selectable_value(&mut s.mode, EditMode::Select, "Select");
-            });
-            // R70 — the "Show:" grid-view selector + its legend moved to a toolbar ABOVE the grid
-            // (see the CentralPanel below): the view control now sits with the thing it shows, fully
-            // separate from this Brush block.
-            // The ACTIVE layer's ICON palette.
-            match s.mode {
-                EditMode::Hull => {
-                    ui.label("Hull material (click-drag to paint):");
-                    let items: Vec<(egui::Color32, &str)> = cell_materials
-                        .hull
-                        .iter()
-                        .enumerate()
-                        .map(|(i, h)| (hull_mat_color(i as u8), h.name.as_str()))
-                        .collect();
-                    swatch_palette(ui, &mut s.hull_material_brush, &items);
-                }
-                EditMode::Armor => {
-                    ui.label("Armor material (click-drag to plate):");
-                    let items: Vec<(egui::Color32, &str)> = cell_materials
-                        .armor
-                        .iter()
-                        .enumerate()
-                        .map(|(i, a)| (armor_mat_color(i as u8), a.name.as_str()))
-                        .collect();
-                    swatch_palette(ui, &mut s.armor_material_brush, &items);
-                }
-                EditMode::Module => {
-                    ui.label("Module type (click-drag to paint; — removes):");
-                    module_palette(ui, &mut s.module_brush);
-                }
-                EditMode::Stamp => {
-                    // R63 — multi-cell stamp: pick a preset + direction, click the grid to place it.
+            // The active tool's options: Paint → the layer's icon palette (the brush); Stamp → presets;
+            // Erase/Select → a one-line hint (they act on the active layer too).
+            match s.tool {
+                Tool::Paint => match s.layer {
+                    Layer::Shape => {
+                        ui.label("Shape (click an icon)");
+                        shape_palette(ui, &mut s.brush, &mut s.palette_family);
+                    }
+                    Layer::Hull => {
+                        ui.label("Hull material (click-drag to paint):");
+                        let items: Vec<(egui::Color32, &str)> = cell_materials
+                            .hull
+                            .iter()
+                            .enumerate()
+                            .map(|(i, h)| (hull_mat_color(i as u8), h.name.as_str()))
+                            .collect();
+                        swatch_palette(ui, &mut s.hull_material_brush, &items);
+                    }
+                    Layer::Armor => {
+                        ui.label("Armor material (click-drag to plate):");
+                        let items: Vec<(egui::Color32, &str)> = cell_materials
+                            .armor
+                            .iter()
+                            .enumerate()
+                            .map(|(i, a)| (armor_mat_color(i as u8), a.name.as_str()))
+                            .collect();
+                        swatch_palette(ui, &mut s.armor_material_brush, &items);
+                    }
+                    Layer::Module => {
+                        ui.label("Module type (click-drag to paint; — removes):");
+                        module_palette(ui, &mut s.module_brush);
+                    }
+                },
+                Tool::Stamp => {
+                    // R63 — multi-cell stamp (Shape layer): pick a preset + direction, click to place.
                     egui::ComboBox::from_id_salt("stamp_kind")
                         .selected_text(s.stamp_kind.label())
                         .show_ui(ui, |ui| {
@@ -601,10 +611,16 @@ fn hull_editor_ui(
                     });
                     ui.small("click the grid to stamp");
                 }
-                // Shape (also the Erase / Select default).
-                _ => {
-                    ui.label("Shape (click an icon)");
-                    shape_palette(ui, &mut s.brush, &mut s.palette_family);
+                Tool::Erase => {
+                    ui.weak(match s.layer {
+                        Layer::Shape => "click / drag to DELETE cells",
+                        Layer::Hull => "click / drag to reset hull → Standard",
+                        Layer::Armor => "click / drag to remove armor",
+                        Layer::Module => "click / drag to remove the slot",
+                    });
+                }
+                Tool::Select => {
+                    ui.weak("click a cell to inspect / edit it");
                 }
             }
             ui.horizontal(|ui| {
@@ -732,40 +748,35 @@ fn hull_editor_ui(
 
     // ---- Center: the cell-grid painter ----
     egui::CentralPanel::default().show(ctx, |ui| {
-        // R70/R71 — "Show:" view toolbar ABOVE the grid (the view control sits with the thing it shows,
-        // fully independent of the left-panel Brush). R71 — the options are ICONS that echo each view's
-        // grid colouring.
+        // R70/R71 — "Show:" view toolbar ABOVE the grid (the view control sits with the thing it shows).
+        // R71 — the options are ICONS that echo each layer's grid colouring. R73 — this is the SAME
+        // `layer` selection as the Brush "Layer:" row (editing either syncs the other).
         ui.horizontal(|ui| {
             ui.label("Show:");
-            for v in [
-                GridView::Shape,
-                GridView::HullMat,
-                GridView::ArmorMat,
-                GridView::Module,
-            ] {
-                if show_view_icon(ui, v, s.grid_view) {
-                    s.grid_view = v;
+            for v in [Layer::Shape, Layer::Hull, Layer::Armor, Layer::Module] {
+                if show_view_icon(ui, v, s.layer) {
+                    s.layer = v;
                 }
             }
         });
         // R71 — a colour legend for the active view, ALWAYS rendered as a SINGLE row (non-wrapping) so
         // the toolbar height — and thus the grid's position — stays CONSTANT when switching views (the
         // legend no longer appears/disappears). Shapes view shows a hint instead of material colours.
-        ui.horizontal(|ui| match s.grid_view {
-            GridView::Shape => {
+        ui.horizontal(|ui| match s.layer {
+            Layer::Shape => {
                 ui.weak("colour = shape / slot");
             }
-            GridView::HullMat => {
+            Layer::Hull => {
                 for (i, h) in cell_materials.hull.iter().enumerate() {
                     material_legend_row(ui, hull_mat_color(i as u8), &format!("{i}: {}", h.name));
                 }
             }
-            GridView::ArmorMat => {
+            Layer::Armor => {
                 for (i, a) in cell_materials.armor.iter().enumerate() {
                     material_legend_row(ui, armor_mat_color(i as u8), &format!("{i}: {}", a.name));
                 }
             }
-            GridView::Module => {
+            Layer::Module => {
                 for ty in MODULE_TYPES {
                     material_legend_row(
                         ui,
@@ -822,14 +833,14 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
             if let Some(c) = s.working.cells.iter().find(|c| c.coord == coord).copied() {
                 let slot = s.working.slots.iter().find(|sl| sl.coord == coord).copied();
                 // R67 — the cell FILL follows the active grid view (shape / hull mat / armor mat).
-                let fill = match s.grid_view {
-                    GridView::Shape => {
+                let fill = match s.layer {
+                    Layer::Shape => {
                         slot.map_or_else(|| shape_color(c.shape), |sl| slot_color(sl.slot_type))
                     }
-                    GridView::HullMat => hull_mat_color(c.hull_material),
-                    GridView::ArmorMat => armor_mat_color(c.armor_material),
+                    Layer::Hull => hull_mat_color(c.hull_material),
+                    Layer::Armor => armor_mat_color(c.armor_material),
                     // R68 — Module view: colour by the slot type (structural cells = neutral grey).
-                    GridView::Module => slot.map_or(egui::Color32::from_rgb(60, 66, 78), |sl| {
+                    Layer::Module => slot.map_or(egui::Color32::from_rgb(60, 66, 78), |sl| {
                         slot_color(sl.slot_type)
                     }),
                 };
@@ -850,10 +861,8 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
                 // R66/R67/R68 — material overlay: a hull-material tint dot (top-left) + an armor-material
                 // border. Drawn as a HINT in every view EXCEPT the one where that layer is the fill
                 // (so HullMat view drops the dot, ArmorMat view drops the border; Shape/Module show both).
-                let show_hull_dot =
-                    !matches!(s.grid_view, GridView::HullMat) && c.hull_material > 0;
-                let show_armor_border =
-                    !matches!(s.grid_view, GridView::ArmorMat) && c.armor_material > 0;
+                let show_hull_dot = !matches!(s.layer, Layer::Hull) && c.hull_material > 0;
+                let show_armor_border = !matches!(s.layer, Layer::Armor) && c.armor_material > 0;
                 if show_hull_dot {
                     painter.circle_filled(
                         rect.left_top() + egui::vec2(5.0, 5.0),
@@ -898,9 +907,10 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
         ),
     );
 
-    // R67 — Right-click / DRAG → erase a swath (line-filled between frames so a fast drag has no
-    // gaps), matching left-drag paint. Reuses the `last_painted` tracker (only one button drags at a
-    // time; the `!resp.dragged()` reset below clears it between drags).
+    // R67/R73 — Right-click / DRAG → erase a swath (line-filled so a fast drag has no gaps), matching
+    // left-drag paint. R73 — it clears the ACTIVE LAYER (same as the Erase tool), so right-drag while
+    // viewing Hull resets hull, on Shape deletes cells, etc. Reuses the `last_painted` tracker (only one
+    // button drags at a time; the `!resp.dragged()` reset below clears it between drags).
     if resp.dragged_by(egui::PointerButton::Secondary)
         || resp.clicked_by(egui::PointerButton::Secondary)
     {
@@ -909,9 +919,10 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
             .and_then(|p| cell_at_pointer(canvas, p, (cols, rows), CELL))
         {
             s.selected_cell = Some(coord);
+            let layer = s.layer;
             let from = s.last_painted.unwrap_or(coord);
             for cc in line_cells(from, coord) {
-                erase_cell(s, cc);
+                erase_layer(s, cc, layer);
             }
             s.last_painted = Some(coord);
         }
@@ -926,33 +937,38 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
             .and_then(|p| cell_at_pointer(canvas, p, (cols, rows), CELL))
         {
             s.selected_cell = Some(coord);
-            match s.mode {
-                // R68 — every paint-layer mode + Erase line-fills its action along the drag.
-                EditMode::Shape
-                | EditMode::Hull
-                | EditMode::Armor
-                | EditMode::Module
-                | EditMode::Erase => {
+            match s.tool {
+                // R72 — Paint applies the active LAYER along the drag; Erase removes whole cells.
+                Tool::Paint => {
+                    let layer = s.layer;
                     let from = s.last_painted.unwrap_or(coord);
                     for cc in line_cells(from, coord) {
-                        match s.mode {
-                            EditMode::Shape => paint_cell(s, cc),
-                            EditMode::Hull => paint_hull_material(s, cc),
-                            EditMode::Armor => paint_armor_material(s, cc),
-                            EditMode::Module => paint_module(s, cc),
-                            EditMode::Erase => erase_cell(s, cc),
-                            _ => {}
+                        match layer {
+                            Layer::Shape => paint_cell(s, cc),
+                            Layer::Hull => paint_hull_material(s, cc),
+                            Layer::Armor => paint_armor_material(s, cc),
+                            Layer::Module => paint_module(s, cc),
                         }
                     }
                     s.last_painted = Some(coord);
                 }
+                // R73 — Erase CLEARS the active layer (Shape → delete cell; Hull → Standard; Armor →
+                // None; Module → remove slot).
+                Tool::Erase => {
+                    let layer = s.layer;
+                    let from = s.last_painted.unwrap_or(coord);
+                    for cc in line_cells(from, coord) {
+                        erase_layer(s, cc, layer);
+                    }
+                    s.last_painted = Some(coord);
+                }
                 // Stamp places on a fresh CLICK only (a drag mustn't re-stamp every frame).
-                EditMode::Stamp => {
+                Tool::Stamp => {
                     if resp.clicked_by(egui::PointerButton::Primary) {
                         apply_stamp(s, coord);
                     }
                 }
-                EditMode::Select => {}
+                Tool::Select => {}
             }
         }
     }
@@ -1111,24 +1127,32 @@ fn icon_swatch(
 /// R71 — a "Show:" grid-view toggle ICON (26px), drawn to ECHO that view's grid colouring (a shape
 /// polygon / a hull swatch / an armor border / a module letter). Selected-highlighted + hover-named.
 /// Returns true if clicked.
-fn show_view_icon(ui: &mut egui::Ui, view: GridView, current: GridView) -> bool {
-    const ICON: f32 = 26.0;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ICON, ICON), egui::Sense::click());
-    let p = ui.painter_at(rect);
-    p.rect_filled(rect, 3.0, egui::Color32::from_rgb(30, 34, 42));
-    let inner = rect.shrink(5.0);
-    match view {
-        GridView::Shape => {
+fn show_view_icon(ui: &mut egui::Ui, view: Layer, current: Layer) -> bool {
+    let (which, name) = match view {
+        Layer::Shape => (0u8, "Shapes / slots"),
+        Layer::Hull => (1, "Hull material"),
+        Layer::Armor => (2, "Armor material"),
+        Layer::Module => (3, "Modules"),
+    };
+    layer_icon(ui, which, view == current, true, name)
+}
+
+/// R72 — draw the representative glyph for a LAYER `which` (`0`=Shape, `1`=Hull, `2`=Armor, `3`=Module)
+/// into `inner`, echoing how that layer colours the grid (a chamfer polygon / a hull swatch / an armor
+/// border / a module "M"). Shared by [`show_view_icon`] (the "Show:" toolbar) + [`layer_icon`].
+fn draw_layer_glyph(p: &egui::Painter, inner: egui::Rect, which: u8) {
+    match which {
+        0 => {
             p.add(egui::Shape::convex_polygon(
                 shape_poly_in_rect(CellShape::ChamferNE, inner),
                 shape_color(CellShape::ChamferNE),
                 egui::Stroke::NONE,
             ));
         }
-        GridView::HullMat => {
+        1 => {
             p.rect_filled(inner, 2.0, hull_mat_color(2));
         }
-        GridView::ArmorMat => {
+        2 => {
             p.rect_filled(inner, 2.0, egui::Color32::from_rgb(50, 56, 66));
             p.rect_stroke(
                 inner,
@@ -1137,11 +1161,11 @@ fn show_view_icon(ui: &mut egui::Ui, view: GridView, current: GridView) -> bool 
                 egui::StrokeKind::Inside,
             );
         }
-        GridView::Module => {
+        _ => {
             let c = slot_color(HardpointType::Weapon);
             p.rect_filled(inner, 2.0, c);
             p.text(
-                rect.center(),
+                inner.center(),
                 egui::Align2::CENTER_CENTER,
                 "M",
                 egui::FontId::proportional(11.0),
@@ -1149,13 +1173,32 @@ fn show_view_icon(ui: &mut egui::Ui, view: GridView, current: GridView) -> bool 
             );
         }
     }
-    let name = match view {
-        GridView::Shape => "Shapes / slots",
-        GridView::HullMat => "Hull material",
-        GridView::ArmorMat => "Armor material",
-        GridView::Module => "Modules",
+}
+
+/// R72 — a clickable 26-px LAYER icon (`which` `0..3`) echoing that layer's grid colouring. `selected`
+/// gives the yellow border; `enabled == false` greys it + ignores clicks (used for the brush Layer row
+/// when the tool isn't Paint). Hover shows `name`. Returns true if clicked. Shared by the "Show:" toolbar
+/// ([`show_view_icon`]) + the brush Layer row.
+fn layer_icon(ui: &mut egui::Ui, which: u8, selected: bool, enabled: bool, name: &str) -> bool {
+    const ICON: f32 = 26.0;
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
     };
-    let stroke = if view == current {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ICON, ICON), sense);
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 3.0, egui::Color32::from_rgb(30, 34, 42));
+    draw_layer_glyph(&p, rect.shrink(5.0), which);
+    if !enabled {
+        // Grey veil so a disabled (non-Paint) layer icon reads as inactive.
+        p.rect_filled(
+            rect,
+            3.0,
+            egui::Color32::from_rgba_unmultiplied(20, 22, 28, 160),
+        );
+    }
+    let stroke = if selected {
         egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 220, 80))
     } else {
         egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 66, 78))
@@ -1277,6 +1320,32 @@ fn erase_cell(s: &mut HullDesignSession, coord: (u16, u16)) {
     s.working.cells.retain(|c| c.coord != coord);
     s.working.slots.retain(|sl| sl.coord != coord);
     s.dirty = true;
+}
+
+/// R73 — clear the active LAYER at `coord`: `Shape` → delete the whole cell; `Hull` → reset to Standard
+/// (id 0); `Armor` → None (id 0); `Module` → remove the slot. No-op when the cell/slot is absent (so it
+/// never spuriously creates a cell).
+fn erase_layer(s: &mut HullDesignSession, coord: (u16, u16), layer: Layer) {
+    match layer {
+        Layer::Shape => erase_cell(s, coord),
+        Layer::Hull => {
+            if let Some(c) = s.working.cells.iter_mut().find(|c| c.coord == coord) {
+                c.hull_material = 0;
+                s.dirty = true;
+            }
+        }
+        Layer::Armor => {
+            if let Some(c) = s.working.cells.iter_mut().find(|c| c.coord == coord) {
+                c.armor_material = 0;
+                s.dirty = true;
+            }
+        }
+        Layer::Module => {
+            if s.working.slots.iter().any(|sl| sl.coord == coord) {
+                set_cell_module(s, coord, None);
+            }
+        }
+    }
 }
 
 /// R68 — set / retype / remove the MODULE (hardpoint slot) at `coord`. `Some(type)` adds a slot (with
