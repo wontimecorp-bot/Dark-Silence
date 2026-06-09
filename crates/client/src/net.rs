@@ -71,8 +71,9 @@ use crate::render_sync::{
     ShieldChild, ShipDamageFx, ShipHull, ShipThrottle,
 };
 use crate::scene::{
-    build_hull_mesh, build_hull_mesh_beveled, build_hull_mesh_contour, build_module_overlay_mesh,
-    build_ship_fixtures, FixtureRole, RenderAssets, CELL_SIZE, DETAIL_MAX_CELLS,
+    build_hull_mesh, build_hull_mesh_beveled, build_hull_mesh_contour, build_hull_mesh_shaped,
+    build_module_overlay_mesh, build_ship_fixtures, FixtureRole, RenderAssets, CELL_SIZE,
+    DETAIL_MAX_CELLS,
 };
 
 /// The loopback solo-play host: the embedded authoritative [`ServerApp`] plus the
@@ -1013,18 +1014,25 @@ fn sync_ship_hull(
                 // R58 — the beveled combat builder also needs each cell's SHAPE (full / corner triangle).
                 let cell_shapes: Vec<(u16, u16, sim::fitting::CellShape)> =
                     e.cells.iter().map(|c| (c.col, c.row, c.shape)).collect();
+                // R59 — the per-cell voxel (module-colour) builder also honours SHAPE: kind + shape.
+                let cell_kind_shapes: Vec<(u16, u16, u8, sim::fitting::CellShape)> = e
+                    .cells
+                    .iter()
+                    .map(|c| (c.col, c.row, c.kind, c.shape))
+                    .collect();
                 // The runtime toggles pick the look: smoothed rounded contour (Fix #11 M2) vs the
                 // blocky per-cell voxel mesh. Both share the same `center`-relative local frame, so the
                 // child sits identically under the parent transform either way. R55/R58 — the combat look
                 // is ONE BEVELED solid (`build_hull_mesh_beveled`, live `style`, honouring sub-cell SHAPES)
-                // on ship-sized hulls (the cell-count cap keeps it off any large hull). The module-colour
-                // view paints per-cell vertex colours via `build_hull_mesh` (white-base material).
+                // on ship-sized hulls (the cell-count cap keeps it off any large hull). R59 — the
+                // module-colour (C) view paints per-cell vertex colours via `build_hull_mesh_shaped`, which
+                // now also renders the real sub-cell polygons (triangles) instead of squares.
                 let raw_mesh = if contour {
                     build_hull_mesh_contour(&cell_tuples, CELL_SIZE, center)
                 } else if use_ext && cell_tuples.len() <= DETAIL_MAX_CELLS {
                     build_hull_mesh_beveled(&cell_shapes, CELL_SIZE, center, style)
                 } else {
-                    build_hull_mesh(&cell_tuples, CELL_SIZE, center, module_color)
+                    build_hull_mesh_shaped(&cell_kind_shapes, CELL_SIZE, center, module_color)
                 };
                 let mesh = meshes.add(raw_mesh);
                 let child = if use_ext {

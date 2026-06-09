@@ -21,7 +21,7 @@ use bevy_ecs::prelude::{Entity, With};
 use glam::Vec2;
 use server::ServerApp;
 use sim::components::{AngularVelocity, Faction, Heading, Position, Ship, Velocity};
-use sim::fitting::{FitLayout, GridCell, Hull, HullCatalog, HULL_FIGHTER};
+use sim::fitting::{CellShape, FitLayout, GridCell, Hull, HullCatalog, HULL_FIGHTER};
 
 const TICK_MS_30HZ: f64 = 1000.0 / 30.0; // 33.33 ms
 const TICK_MS_60HZ: f64 = 1000.0 / 60.0; // 16.67 ms
@@ -35,10 +35,13 @@ fn main() {
     // R57 — pin the formation (re-anchor each ship's pose every tick) so recoil/knockback/spin can't
     // scatter the head-on grind → a sustained, reproducible WORST-CASE engagement. `--no-pin` = free drift.
     let pin = !args.iter().any(|a| a == "--no-pin");
+    // R59 — `--shaped` rewrites every STRUCTURAL cell to a triangle (`HalfNE`) so ~90% of the hull runs
+    // the sub-shape polygon hitbox/mass path → isolates the polygon-vs-circle per-cell cost vs all-`Full`.
+    let shaped = args.iter().any(|a| a == "--shaped");
 
     println!("=== Dark Silence fleet stress (R57) ===");
     println!(
-        "densify k={densify} (cells/ship ×{kk})  warmup={warmup} ticks  timed={ticks} ticks/run  pin={pin}",
+        "densify k={densify} (cells/ship ×{kk})  warmup={warmup} ticks  timed={ticks} ticks/run  pin={pin}  shaped={shaped}",
         kk = densify as u32 * densify as u32
     );
     println!(
@@ -62,7 +65,7 @@ fn main() {
     let mut max_30 = 0u32;
     let mut max_60 = 0u32;
     for &n in &sweep {
-        let r = run_one(n, densify, warmup, ticks, pin);
+        let r = run_one(n, densify, warmup, ticks, pin, shaped);
         if r.mean_ms <= TICK_MS_30HZ {
             max_30 = max_30.max(n);
         }
@@ -105,28 +108,33 @@ struct RunResult {
     p99_ms: f64,
 }
 
-fn run_one(n: u32, densify: u16, warmup: u32, ticks: u32, pin: bool) -> RunResult {
+fn run_one(n: u32, densify: u16, warmup: u32, ticks: u32, pin: bool, shaped: bool) -> RunResult {
     let (mut server, _t) = ServerApp::loopback();
 
-    // Optionally swap the fighter hull for a k×-densified copy (k² cells) before spawning.
+    // Optionally swap the fighter hull for a k×-densified and/or all-triangle (`--shaped`) copy before
+    // spawning, to measure the finer-cell / polygon-hitbox cost. Default (k=1, !shaped) uses the seed hull.
     let orig = server
         .world()
         .resource::<HullCatalog>()
         .get(HULL_FIGHTER)
         .cloned()
         .expect("seed catalog has the fighter hull");
-    let cells_per_ship = if densify > 1 {
-        let dense = densify_hull(&orig, densify);
-        let len = dense.cells.len();
+    let mut hull = if densify > 1 {
+        densify_hull(&orig, densify)
+    } else {
+        orig.clone()
+    };
+    if shaped {
+        shape_structural_cells(&mut hull);
+    }
+    let cells_per_ship = hull.cells.len();
+    if densify > 1 || shaped {
         server
             .world_mut()
             .resource_mut::<HullCatalog>()
             .hulls
-            .insert(HULL_FIGHTER, dense);
-        len
-    } else {
-        orig.cells.len()
-    };
+            .insert(HULL_FIGHTER, hull);
+    }
 
     // Two facing lines at close range: Red at -GAP facing +X, Blue at +GAP facing -X, paired by row so
     // each shot crosses into an enemy (maximal weapon-fire + collision + CARVE load → real attrition).
@@ -240,6 +248,17 @@ fn densify_hull(orig: &Hull, k: u16) -> Hull {
         })
         .collect();
     dense
+}
+
+/// R59 — rewrite every STRUCTURAL `Full` cell to a triangle (`HalfNE`) so ~90% of the hull runs the
+/// sub-shape polygon hitbox/mass path. Module cells stay `Full` (they carry the slots). Isolates the
+/// polygon-vs-circle per-cell cost when compared against the default all-`Full` run.
+fn shape_structural_cells(hull: &mut Hull) {
+    for c in &mut hull.cells {
+        if c.structural && c.shape == CellShape::Full {
+            c.shape = CellShape::HalfNE;
+        }
+    }
 }
 
 fn budget_str(mean: f64, budget: f64) -> String {

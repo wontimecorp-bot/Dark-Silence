@@ -124,6 +124,24 @@ pub enum CellShape {
     QuarterSE,
     QuarterNE,
     QuarterNW,
+    /// R59 — corner CHAMFER (pentagon, area 0.875): the full square with the named corner cut by a
+    /// 0.5×0.5 sliver. A subtle bevel for softening a corner without losing a cell-half.
+    ChamferSW,
+    ChamferSE,
+    ChamferNE,
+    ChamferNW,
+    /// R59 — shallow 2:1 SLOPE (right-trapezoid, area 0.75): the cell minus a right-triangle whose right
+    /// angle is at the named corner, with the LONG leg (1.0) along the H(orizontal, col/x) or V(ertical,
+    /// row/y) edge from that corner and the SHORT leg (0.5) up the adjacent edge — a gentle ramp for
+    /// tapering a hull edge without the hard 45° of a `Half`.
+    SlopeSWH,
+    SlopeSWV,
+    SlopeSEH,
+    SlopeSEV,
+    SlopeNEH,
+    SlopeNEV,
+    SlopeNWH,
+    SlopeNWV,
 }
 
 impl CellShape {
@@ -142,6 +160,52 @@ impl CellShape {
             CellShape::QuarterSE => vec![p(1.0, 0.0), p(1.0, 0.5), p(0.5, 0.0)],
             CellShape::QuarterNE => vec![p(1.0, 1.0), p(0.5, 1.0), p(1.0, 0.5)],
             CellShape::QuarterNW => vec![p(0.0, 1.0), p(0.0, 0.5), p(0.5, 1.0)],
+            // R59 chamfers (pentagons, CCW) — the named corner replaced by its two 0.5-along-edge points.
+            CellShape::ChamferSW => {
+                vec![
+                    p(0.5, 0.0),
+                    p(1.0, 0.0),
+                    p(1.0, 1.0),
+                    p(0.0, 1.0),
+                    p(0.0, 0.5),
+                ]
+            }
+            CellShape::ChamferSE => {
+                vec![
+                    p(0.0, 0.0),
+                    p(0.5, 0.0),
+                    p(1.0, 0.5),
+                    p(1.0, 1.0),
+                    p(0.0, 1.0),
+                ]
+            }
+            CellShape::ChamferNE => {
+                vec![
+                    p(0.0, 0.0),
+                    p(1.0, 0.0),
+                    p(1.0, 0.5),
+                    p(0.5, 1.0),
+                    p(0.0, 1.0),
+                ]
+            }
+            CellShape::ChamferNW => {
+                vec![
+                    p(0.0, 0.0),
+                    p(1.0, 0.0),
+                    p(1.0, 1.0),
+                    p(0.5, 1.0),
+                    p(0.0, 0.5),
+                ]
+            }
+            // R59 slopes (right-trapezoids, CCW) — the cell minus the long-leg corner triangle.
+            CellShape::SlopeSWH => vec![p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0), p(0.0, 0.5)],
+            CellShape::SlopeSWV => vec![p(0.5, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::SlopeSEH => vec![p(0.0, 0.0), p(1.0, 0.5), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::SlopeSEV => vec![p(0.0, 0.0), p(0.5, 0.0), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::SlopeNEH => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 0.5), p(0.0, 1.0)],
+            CellShape::SlopeNEV => vec![p(0.0, 0.0), p(1.0, 0.0), p(0.5, 1.0), p(0.0, 1.0)],
+            CellShape::SlopeNWH => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 0.5)],
+            CellShape::SlopeNWV => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.5, 1.0)],
         }
     }
 
@@ -154,19 +218,66 @@ impl CellShape {
             | CellShape::QuarterSE
             | CellShape::QuarterNE
             | CellShape::QuarterNW => 0.125,
+            CellShape::ChamferSW
+            | CellShape::ChamferSE
+            | CellShape::ChamferNE
+            | CellShape::ChamferNW => 0.875,
+            CellShape::SlopeSWH
+            | CellShape::SlopeSWV
+            | CellShape::SlopeSEH
+            | CellShape::SlopeSEV
+            | CellShape::SlopeNEH
+            | CellShape::SlopeNEV
+            | CellShape::SlopeNWH
+            | CellShape::SlopeNWV => 0.75,
         }
     }
 
-    /// Centroid in GRID space — the mean of the polygon corners (a triangle's centroid; the square's
-    /// centre). For `Full` this is exactly `(c+0.5, r+0.5)`, so mass/COM stay byte-identical.
+    /// Centroid in GRID space (the mass-weighted centre). For `Full` + the corner TRIANGLES the corner
+    /// mean IS the exact centroid (kept verbatim → R58 mass/COM stays BYTE-IDENTICAL); for the R59
+    /// pentagons/trapezoids the corner mean is NOT the centroid, so those use the area-weighted shoelace
+    /// centroid. `Full` is `(c+0.5, r+0.5)`.
     pub fn centroid(self, c: u16, r: u16) -> Vec2 {
         let pts = self.corners(c, r);
-        pts.iter().fold(Vec2::ZERO, |a, &p| a + p) / pts.len() as f32
+        match self {
+            // Triangles + the square: corner mean = exact centroid (unchanged from R58).
+            CellShape::Full
+            | CellShape::HalfSW
+            | CellShape::HalfSE
+            | CellShape::HalfNE
+            | CellShape::HalfNW
+            | CellShape::QuarterSW
+            | CellShape::QuarterSE
+            | CellShape::QuarterNE
+            | CellShape::QuarterNW => pts.iter().fold(Vec2::ZERO, |a, &p| a + p) / pts.len() as f32,
+            // R59 pentagons/trapezoids: area-weighted polygon centroid.
+            _ => polygon_centroid(&pts),
+        }
     }
 
     pub fn is_full(self) -> bool {
         matches!(self, CellShape::Full)
     }
+}
+
+/// R59 — the area-weighted centroid of a (CCW) convex polygon, via the shoelace formula
+/// `C = (1/(3·Σcross))·Σ (P_i+P_{i+1})·cross_i`. Used for the chamfer/slope shapes whose corner mean is
+/// not their centroid. Falls back to the corner mean for a degenerate (zero-area) ring.
+fn polygon_centroid(pts: &[Vec2]) -> Vec2 {
+    let n = pts.len();
+    let mut cross_sum = 0.0_f32;
+    let mut acc = Vec2::ZERO;
+    for i in 0..n {
+        let p = pts[i];
+        let q = pts[(i + 1) % n];
+        let cross = p.x * q.y - q.x * p.y;
+        cross_sum += cross;
+        acc += (p + q) * cross;
+    }
+    if cross_sum.abs() < 1.0e-12 {
+        return pts.iter().fold(Vec2::ZERO, |a, &p| a + p) / n as f32;
+    }
+    acc / (3.0 * cross_sum)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -424,6 +535,46 @@ mod tests {
                     is_weapon_mount: true,
                 },
             ],
+        }
+    }
+
+    /// R58/R59 — every `CellShape`'s polygon is CCW, its shoelace area equals its `area_factor` (the mass
+    /// weight), and its `centroid` lands inside the polygon. Guards the chamfer/slope corner lists.
+    #[test]
+    fn cell_shape_polygons_are_consistent() {
+        use CellShape::*;
+        let all = [
+            Full, HalfSW, HalfSE, HalfNE, HalfNW, QuarterSW, QuarterSE, QuarterNE, QuarterNW,
+            ChamferSW, ChamferSE, ChamferNE, ChamferNW, SlopeSWH, SlopeSWV, SlopeSEH, SlopeSEV,
+            SlopeNEH, SlopeNEV, SlopeNWH, SlopeNWV,
+        ];
+        for s in all {
+            let pts = s.corners(2, 3);
+            let n = pts.len();
+            // Shoelace signed area: CCW ⇒ positive, and its magnitude is the cell-area fraction.
+            let a2: f32 = (0..n)
+                .map(|i| {
+                    let (p, q) = (pts[i], pts[(i + 1) % n]);
+                    p.x * q.y - q.x * p.y
+                })
+                .sum();
+            let area = a2 / 2.0;
+            assert!(area > 0.0, "{s:?}: corners must be CCW (area {area})");
+            assert!(
+                (area - s.area_factor()).abs() < 1.0e-5,
+                "{s:?}: shoelace area {area} != area_factor {}",
+                s.area_factor()
+            );
+            // The centroid must be inside the convex polygon (left of every CCW edge).
+            let c = s.centroid(2, 3);
+            for i in 0..n {
+                let (a, b) = (pts[i], pts[(i + 1) % n]);
+                let cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+                assert!(
+                    cross > -1.0e-5,
+                    "{s:?}: centroid {c:?} outside edge {a:?}->{b:?}"
+                );
+            }
         }
     }
 

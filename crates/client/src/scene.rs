@@ -520,7 +520,106 @@ pub fn build_hull_mesh(
     // whole surface uses the uniform hull material. Phase 2 replaces this with a real
     // breach predicate and per-exposed-cell coloring.
     let exposed = |_col: u16, _row: u16| -> bool { false };
-    build_hull_mesh_with(cells, cell_size, center, exposed, module_color)
+    build_hull_mesh_with(cells, cell_size, center, exposed, module_color, |_, _| {
+        sim::fitting::CellShape::Full
+    })
+}
+
+/// R59 — [`build_hull_mesh`] honouring each cell's [`CellShape`] for the module-colour / per-cell voxel
+/// INSPECTION view (the **C** toggle): a sub-shape cell renders as its real triangle/pentagon/trapezoid
+/// (matching the combat beveled view + the carve hitbox), while `Full` cells stay the exact square box
+/// (byte-identical to [`build_hull_mesh`]). The kind/colour + neighbour culling are unchanged.
+pub fn build_hull_mesh_shaped(
+    cells: &[(u16, u16, u8, sim::fitting::CellShape)],
+    cell_size: f32,
+    center: Vec2,
+    module_color: bool,
+) -> Mesh {
+    let shapes: std::collections::HashMap<(u16, u16), sim::fitting::CellShape> =
+        cells.iter().map(|&(c, r, _, s)| ((c, r), s)).collect();
+    let kinds: Vec<(u16, u16, u8)> = cells.iter().map(|&(c, r, k, _)| (c, r, k)).collect();
+    let exposed = |_col: u16, _row: u16| -> bool { false };
+    build_hull_mesh_with(&kinds, cell_size, center, exposed, module_color, |c, r| {
+        shapes
+            .get(&(c, r))
+            .copied()
+            .unwrap_or(sim::fitting::CellShape::Full)
+    })
+}
+
+/// R59 — emit one SUB-SHAPE cell (triangle / chamfer pentagon / slope trapezoid) into the per-cell
+/// voxel mesh: its [`CellShape`](sim::fitting::CellShape) polygon as a coloured TOP face at `z=+half`
+/// plus a side wall down each polygon edge (the hypotenuse shows the cut; the cut region is absent).
+/// The grid→local axis SWAP (row→x, col→y) reverses winding, so the local ring is flipped back to CCW
+/// for a `+Z` top. `Full` cells never reach here — the caller keeps the exact legacy box for them.
+#[allow(clippy::too_many_arguments)]
+fn push_shaped_cell(
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+    shape: sim::fitting::CellShape,
+    col: u16,
+    row: u16,
+    cell_size: f32,
+    center: Vec2,
+    half: f32,
+    color: [f32; 4],
+) {
+    // Map each GRID-space corner (x=col, y=row) to the hull-local frame (row→x forward, col→y lateral) —
+    // the SAME swap `build_hull_mesh_beveled` uses, so the C-view polygon aligns with the combat view.
+    let mut ring: Vec<[f32; 2]> = shape
+        .corners(col, row)
+        .iter()
+        .map(|g| [(g.y - center.y) * cell_size, (g.x - center.x) * cell_size])
+        .collect();
+    if ring.len() < 3 {
+        return;
+    }
+    // The x/y swap flips orientation (grid-CCW → local-CW); flip back to CCW so the top faces +Z.
+    let area2: f32 = (0..ring.len())
+        .map(|i| {
+            let a = ring[i];
+            let b = ring[(i + 1) % ring.len()];
+            a[0] * b[1] - b[0] * a[1]
+        })
+        .sum();
+    if area2 < 0.0 {
+        ring.reverse();
+    }
+    // Top face (triangle fan) at z = +half, normal +Z.
+    let base = positions.len() as u32;
+    for &[x, y] in &ring {
+        positions.push([x, y, half]);
+        normals.push([0.0, 0.0, 1.0]);
+        uvs.push([x * HULL_UV_TILE, y * HULL_UV_TILE]);
+        colors.push(color);
+    }
+    for i in 1..ring.len() as u32 - 1 {
+        indices.extend_from_slice(&[base, base + i, base + i + 1]);
+    }
+    // A side wall down each polygon edge; outward normal `(d.y, -d.x)` for the CCW ring.
+    for i in 0..ring.len() {
+        let a = ring[i];
+        let b = ring[(i + 1) % ring.len()];
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let len = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1.0e-6);
+        let normal = [d[1] / len, -d[0] / len, 0.0];
+        let wbase = positions.len() as u32;
+        for &corner in &[
+            [a[0], a[1], 0.0],
+            [b[0], b[1], 0.0],
+            [b[0], b[1], half],
+            [a[0], a[1], half],
+        ] {
+            positions.push(corner);
+            normals.push(normal);
+            uvs.push([corner[0] * HULL_UV_TILE, corner[1] * HULL_UV_TILE]);
+            colors.push(color);
+        }
+        indices.extend_from_slice(&[wbase, wbase + 1, wbase + 2, wbase, wbase + 2, wbase + 3]);
+    }
 }
 
 /// [`build_hull_mesh`] with an explicit `exposed(col, row)` predicate — the Phase-2
@@ -547,6 +646,7 @@ fn build_hull_mesh_with(
     center: Vec2,
     exposed: impl Fn(u16, u16) -> bool,
     module_color: bool,
+    shape_of: impl Fn(u16, u16) -> sim::fitting::CellShape,
 ) -> Mesh {
     let half = HULL_THICKNESS;
 
@@ -597,6 +697,27 @@ fn build_hull_mesh_with(
         } else {
             [1.0, 1.0, 1.0, 1.0]
         };
+
+        // R59 — a SUB-SHAPE cell renders as its real polygon (the C/module view now matches the combat
+        // view + the hitbox); `Full` falls through to the exact legacy box below → byte-identical.
+        let shape = shape_of(col, row);
+        if !shape.is_full() {
+            push_shaped_cell(
+                &mut positions,
+                &mut normals,
+                &mut uvs,
+                &mut colors,
+                &mut indices,
+                shape,
+                col,
+                row,
+                cell_size,
+                center,
+                half,
+                cell_color,
+            );
+            continue;
+        }
 
         // Cell centre in the local frame: row→forward(+X), col→lateral(+Y), measured
         // from `center` (cell-space): `center.y` is the row origin (forward), `center.x`
@@ -2439,6 +2560,79 @@ mod contour_tests {
             colors.into_iter().next().unwrap(),
             [1000, 1000, 1000, 1000],
             "the single color is white"
+        );
+    }
+
+    /// Positions of a mesh as a flat `Vec<[f32;3]>` (for equality checks).
+    fn positions_of(mesh: &Mesh) -> Vec<[f32; 3]> {
+        match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
+            Some(bevy::mesh::VertexAttributeValues::Float32x3(p)) => p.clone(),
+            _ => panic!("no positions"),
+        }
+    }
+
+    /// Count of vertices whose normal points +Z (the cell TOP face).
+    fn top_face_verts(mesh: &Mesh) -> usize {
+        match mesh.attribute(Mesh::ATTRIBUTE_NORMAL) {
+            Some(bevy::mesh::VertexAttributeValues::Float32x3(n)) => {
+                n.iter().filter(|nv| nv[2] > 0.5).count()
+            }
+            _ => panic!("no normals"),
+        }
+    }
+
+    #[test]
+    fn shaped_voxel_builder_keeps_full_identical_and_renders_real_polygons() {
+        use sim::fitting::CellShape;
+        let center = Vec2::new(1.0, 1.0);
+        // A `Full` cell via the shaped builder is BYTE-IDENTICAL to the legacy box builder.
+        let legacy = build_hull_mesh(&[(0u16, 0u16, 0u8)], 0.32, center, false);
+        let shaped_full =
+            build_hull_mesh_shaped(&[(0u16, 0u16, 0u8, CellShape::Full)], 0.32, center, false);
+        assert_eq!(
+            positions_of(&legacy),
+            positions_of(&shaped_full),
+            "Full cells must render identically via the shaped builder"
+        );
+        assert_eq!(
+            top_face_verts(&shaped_full),
+            4,
+            "a Full top face is a square (4 verts)"
+        );
+        // A HalfNE (triangle) cell has a 3-vertex top face → fewer verts than the square box.
+        let half =
+            build_hull_mesh_shaped(&[(0u16, 0u16, 0u8, CellShape::HalfNE)], 0.32, center, false);
+        assert_eq!(
+            top_face_verts(&half),
+            3,
+            "a HalfNE top face is one triangle (3 verts)"
+        );
+        assert!(
+            positions_of(&half).len() < positions_of(&shaped_full).len(),
+            "a triangle cell has fewer vertices than a full square box"
+        );
+        // A ChamferNE (pentagon) top face has 5 vertices; a SlopeNEH (trapezoid) has 4.
+        let cham = build_hull_mesh_shaped(
+            &[(0u16, 0u16, 0u8, CellShape::ChamferNE)],
+            0.32,
+            center,
+            false,
+        );
+        assert_eq!(
+            top_face_verts(&cham),
+            5,
+            "a chamfer top face is a pentagon (5 verts)"
+        );
+        let slope = build_hull_mesh_shaped(
+            &[(0u16, 0u16, 0u8, CellShape::SlopeNEH)],
+            0.32,
+            center,
+            false,
+        );
+        assert_eq!(
+            top_face_verts(&slope),
+            4,
+            "a slope top face is a trapezoid (4 verts)"
         );
     }
 
