@@ -1094,38 +1094,46 @@ fn shape_palette(
                 search.clear();
             }
         });
-        // Matching shapes (family filter ∩ name search), grouped by family.
+        // R76 — render each family as a compact CARD: the family name ONCE, then a WYSIWYG compass where
+        // an icon's slot = where its mass is DRAWN (= where it paints). Search nulls non-matching cells
+        // (keeping the structural blanks); a family with nothing left is skipped.
         let q = search.trim().to_lowercase();
         let fams: Vec<ShapeFamily> = match *filter {
             Some(f) => vec![f],
             None => ShapeFamily::ALL.to_vec(),
         };
-        let mut matching: Vec<CellShape> = Vec::new();
-        for f in fams {
-            for sh in f.shapes() {
-                if q.is_empty()
-                    || format!("{} {}", f.label(), sh.label())
-                        .to_lowercase()
-                        .contains(&q)
-                {
-                    matching.push(sh);
-                }
-            }
-        }
-        if matching.is_empty() {
-            ui.weak("no shapes match");
-            return;
-        }
+        let mut any = false;
         egui::ScrollArea::vertical()
-            .max_height(168.0)
+            .max_height(260.0)
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    for shape in matching {
-                        if shape_icon(ui, shape, *current == shape) {
-                            *current = shape;
+                    for f in &fams {
+                        let (label, mut subs) = family_layout(*f);
+                        if !q.is_empty() {
+                            for (_, cells, _) in subs.iter_mut() {
+                                for c in cells.iter_mut() {
+                                    if let Some(sh) = *c {
+                                        if !format!("{} {}", f.label(), sh.label())
+                                            .to_lowercase()
+                                            .contains(&q)
+                                        {
+                                            *c = None;
+                                        }
+                                    }
+                                }
+                            }
+                            subs.retain(|(_, cells, _)| cells.iter().any(Option::is_some));
                         }
+                        if subs.is_empty() {
+                            continue;
+                        }
+                        any = true;
+                        shape_card(ui, &label, &subs, current);
                     }
                 });
+                if !any {
+                    ui.weak("no shapes match");
+                }
             });
     });
     *current != before
@@ -1150,6 +1158,116 @@ fn shape_icon(ui: &mut egui::Ui, shape: CellShape, selected: bool) -> bool {
     };
     p.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
     resp.on_hover_text(shape.label()).clicked()
+}
+
+/// R75/R76 — draw one compass: `cells.chunks(cols)` rows of slots — `Some(sh)` → a clickable
+/// [`shape_icon`] (sets `*current` on click), `None` → a fixed blank 26-px slot so an icon's POSITION
+/// encodes its direction (the slot = where the shape's mass is drawn = where it paints on the grid).
+fn draw_compass(
+    ui: &mut egui::Ui,
+    cells: &[Option<CellShape>],
+    cols: usize,
+    current: &mut CellShape,
+) {
+    ui.vertical(|ui| {
+        for row in cells.chunks(cols) {
+            ui.horizontal(|ui| {
+                for cell in row {
+                    match cell {
+                        Some(sh) => {
+                            if shape_icon(ui, *sh, *current == *sh) {
+                                *current = *sh;
+                            }
+                        }
+                        None => {
+                            ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// R76 — one family's CARD: a `ui.group` (a `Frame` that shrinks to content → compact, no full-width
+/// sprawl) titled with the family name ONCE, then each compass in `subs` side by side. Slope/Wedge get a
+/// "shallow" + a "steep" compass under that one name (the family title is what tells the steep groups
+/// apart). Sets `*current` on click (tracked by the caller's `before` diff).
+fn shape_card(
+    ui: &mut egui::Ui,
+    family_label: &str,
+    subs: &[(Option<&'static str>, Vec<Option<CellShape>>, usize)],
+    current: &mut CellShape,
+) {
+    ui.group(|ui| {
+        ui.vertical(|ui| {
+            ui.strong(family_label);
+            ui.horizontal(|ui| {
+                for (caption, cells, cols) in subs {
+                    ui.vertical(|ui| {
+                        if let Some(c) = caption {
+                            ui.weak(*c);
+                        }
+                        draw_compass(ui, cells, *cols, current);
+                    });
+                }
+            });
+        });
+    });
+}
+
+/// R76 — a family's WYSIWYG layout: `(family name, compass(es))`, each compass `(caption, cells, cols)`
+/// row-major. An icon's slot = where its mass is DRAWN — the editor draws up = North, left = East (the
+/// grid's port-left / nose-up view) — so corners are TL=NE TR=NW BL=SE BR=SW; edges N-top / S-bottom /
+/// E-left / W-right; Slope/Wedge = a "shallow" + a "steep" compass; Full/Octagon = a single icon.
+fn family_layout(
+    f: ShapeFamily,
+) -> (
+    String,
+    Vec<(Option<&'static str>, Vec<Option<CellShape>>, usize)>,
+) {
+    let s = f.shapes();
+    let g = |i: usize| Some(s[i]);
+    let subs = match f {
+        // No direction → a single icon.
+        ShapeFamily::Full | ShapeFamily::Octagon => vec![(None, vec![g(0)], 1)],
+        // Corner (shapes() = NW NE SW SE) → one 2×2: TL=NE TR=NW / BL=SE BR=SW.
+        ShapeFamily::Half | ShapeFamily::Quarter | ShapeFamily::Chamfer => {
+            vec![(None, vec![g(1), g(0), g(3), g(2)], 2)]
+        }
+        // Corner + shallow/steep (shapes() = NW-H NW-V NE-H NE-V SW-H SW-V SE-H SE-V) → two 2×2 (NE NW / SE SW).
+        ShapeFamily::Slope
+        | ShapeFamily::Slope3
+        | ShapeFamily::Slope4
+        | ShapeFamily::Wedge2
+        | ShapeFamily::Wedge3
+        | ShapeFamily::Wedge4 => vec![
+            (Some("shallow"), vec![g(2), g(0), g(6), g(4)], 2), // H
+            (Some("steep"), vec![g(3), g(1), g(7), g(5)], 2),   // V
+        ],
+        // Edge (shapes() = N S E W) → an N/S/E/W cross (3-wide; E left, W right; centre + corners blank).
+        ShapeFamily::Strip34
+        | ShapeFamily::Strip12
+        | ShapeFamily::Strip14
+        | ShapeFamily::Strip18
+        | ShapeFamily::Point
+        | ShapeFamily::Round => vec![(
+            None,
+            vec![
+                None,
+                g(0),
+                None, // . N .
+                g(2),
+                None,
+                g(3), // E . W
+                None,
+                g(1),
+                None, // . S .
+            ],
+            3,
+        )],
+    };
+    (f.label().to_string(), subs)
 }
 
 /// R66 — the hardpoint types selectable as a module (Armor removed in R66 — it's a per-cell material).
