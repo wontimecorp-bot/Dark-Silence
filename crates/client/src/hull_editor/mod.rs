@@ -14,8 +14,8 @@ mod preview;
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 use sim::fitting::{
-    CellShape, GridCell, HardpointType, Hull, HullCatalog, HullId, ModuleCatalog, SectionId,
-    ShipClass, ShipRole, Slot, SlotId, SlotSize, HULL_FIGHTER,
+    CellShape, GridCell, HardpointType, Hull, HullCatalog, HullId, SectionId, ShipClass, ShipRole,
+    Slot, SlotId, SlotSize, HULL_FIGHTER,
 };
 
 use crate::net::LoopbackHost;
@@ -218,8 +218,6 @@ enum Dir {
 pub struct HullDesignSession {
     /// The live hull catalog (cloned on enter); the working hull is committed back into it on apply/save.
     catalog: HullCatalog,
-    /// The module catalog (for the save round-trip; the editor authors no modules).
-    modules: ModuleCatalog,
     /// The hull currently being edited.
     working: Hull,
     /// Which catalog id `working` is (so apply/save write the right row).
@@ -249,7 +247,7 @@ pub struct HullDesignSession {
 
 impl Default for HullDesignSession {
     fn default() -> Self {
-        let (modules, catalog) = sim::fitting::seed_catalogs();
+        let (_, catalog) = sim::fitting::seed_catalogs();
         let working = catalog
             .get(HULL_FIGHTER)
             .cloned()
@@ -257,7 +255,6 @@ impl Default for HullDesignSession {
         let pending_grid = working.grid_dims;
         Self {
             catalog,
-            modules,
             working,
             selected_hull: HULL_FIGHTER,
             brush: CellShape::Full,
@@ -284,9 +281,6 @@ fn load_design_session(
 ) {
     if let Some(host) = host {
         let w = host.server.world();
-        if let Some(m) = w.get_resource::<ModuleCatalog>() {
-            session.modules = m.clone();
-        }
         if let Some(h) = w.get_resource::<HullCatalog>() {
             session.catalog = h.clone();
         }
@@ -322,6 +316,7 @@ fn hull_editor_ui(
     // Intents collected in the panel closures, executed after (so the closures don't hold `host`).
     let mut do_apply = false;
     let mut do_save = false;
+    let mut do_save_new = false;
     let mut do_close = false;
 
     // ---- Top bar: hull selector + actions + status ----
@@ -340,6 +335,11 @@ fn hull_editor_ui(
                 });
             if pick != s.selected_hull {
                 if let Some(h) = s.catalog.get(pick).cloned() {
+                    // R65 — commit the current edits into the in-memory catalog BEFORE switching, so
+                    // unsaved work survives a switch-and-switch-back (disk save still needs the button).
+                    let mut cur = s.working.clone();
+                    normalize_hull(&mut cur);
+                    s.catalog.hulls.insert(s.selected_hull, cur);
                     s.working = h;
                     s.selected_hull = pick;
                     s.pending_grid = s.working.grid_dims;
@@ -363,8 +363,19 @@ fn hull_editor_ui(
             if ui.button("Apply to live").clicked() {
                 do_apply = true;
             }
-            if ui.button("Save → ships.ron").clicked() {
+            if ui
+                .button("Save → ship file")
+                .on_hover_text("Write THIS ship to its own assets/content/ships/<id>_<name>.ron")
+                .clicked()
+            {
                 do_save = true;
+            }
+            if ui
+                .button("Save as NEW ship")
+                .on_hover_text("Save the current design as a brand-new ship (fresh id) — keeps the original file")
+                .clicked()
+            {
+                do_save_new = true;
             }
             if ui.button("Close").clicked() {
                 do_close = true;
@@ -624,6 +635,8 @@ fn hull_editor_ui(
         s.status = apply_to_live(host, s);
     } else if do_save {
         s.status = save_design(s);
+    } else if do_save_new {
+        s.status = save_as_new(s);
     }
 }
 
@@ -1135,8 +1148,32 @@ fn save_design(s: &mut HullDesignSession) -> String {
     }
     let mut hull = s.working.clone();
     normalize_hull(&mut hull);
-    s.catalog.hulls.insert(s.selected_hull, hull);
-    match crate::tuning_io::save_catalogs(Some(&s.modules), Some(&s.catalog)) {
+    s.catalog.hulls.insert(s.selected_hull, hull.clone());
+    // R65 — write ONLY this ship's own file (not the whole catalog).
+    match crate::tuning_io::save_ship(&hull) {
+        Ok(m) => m,
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+/// R65 — save the working design as a BRAND-NEW ship (fresh id + "(copy)" name) to its own file,
+/// leaving the original ship's file untouched. Selects the new ship.
+fn save_as_new(s: &mut HullDesignSession) -> String {
+    let id = next_hull_id(&s.catalog);
+    let mut hull = s.working.clone();
+    hull.id = id;
+    if hull.name.trim().is_empty() {
+        hull.name = "New Hull".to_string();
+    }
+    hull.name = format!("{} (copy)", hull.name);
+    if let Err(e) = validate_design(&hull) {
+        return format!("Can't save — {e}");
+    }
+    normalize_hull(&mut hull);
+    s.working = hull.clone();
+    s.selected_hull = id;
+    s.catalog.hulls.insert(id, hull.clone());
+    match crate::tuning_io::save_ship(&hull) {
         Ok(m) => m,
         Err(e) => format!("save failed: {e}"),
     }

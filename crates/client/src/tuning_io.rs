@@ -39,6 +39,67 @@ fn content_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("assets/content"))
 }
 
+/// R65 — the per-ship hull-design directory (`assets/content/ships/`). Each `*.ron` is ONE serialized
+/// [`Hull`](sim::fitting::Hull), so the editor saves a single ship without rewriting the whole catalog.
+fn ships_dir() -> PathBuf {
+    content_dir().join("ships")
+}
+
+/// R65 — load every per-ship hull file from `ships/` (one `Hull` each). Unparseable files are skipped
+/// with a logged warning; an absent dir yields an empty vec. Sorted for a deterministic merge order.
+pub fn load_ship_files() -> Vec<sim::fitting::Hull> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(ships_dir()) else {
+        return out;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "ron"))
+        .collect();
+    paths.sort();
+    for p in paths {
+        match std::fs::read_to_string(&p) {
+            Ok(s) => match ron::from_str::<sim::fitting::Hull>(&s) {
+                Ok(h) => out.push(h),
+                Err(e) => eprintln!("[content] skipping {}: {e}", p.display()),
+            },
+            Err(e) => eprintln!("[content] cannot read {}: {e}", p.display()),
+        }
+    }
+    out
+}
+
+/// R65 — save ONE hull to its own `ships/<id>_<name>.ron` (creating the dir). Any existing `<id>_*.ron`
+/// (e.g. from a previous name) is removed first so a rename never orphans a file. Returns a short status.
+pub fn save_ship(hull: &sim::fitting::Hull) -> Result<String, String> {
+    let dir = ships_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let prefix = format!("{}_", hull.id.0);
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for p in entries.flatten().map(|e| e.path()) {
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with(&prefix) && name.ends_with(".ron") {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+    }
+    let slug: String = hull
+        .name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let path = dir.join(format!("{}_{}.ron", hull.id.0, slug));
+    let body = ron::ser::to_string_pretty(hull, ron::ser::PrettyConfig::default())
+        .map_err(|e| format!("serialize hull: {e}"))?;
+    std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(format!(
+        "wrote ships/{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+    ))
+}
+
 /// Refinement 39/41/44 — the windowed-client dev override: ALL the dev-panel-tuned **sim tuning**
 /// (loaded into the embedded server world WINDOWED-ONLY — never `ServerApp::new`, so headless
 /// determinism is untouched) + the client starfield.

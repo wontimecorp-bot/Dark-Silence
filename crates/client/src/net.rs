@@ -264,6 +264,23 @@ fn setup_loopback_host(world: &mut World) {
         w.insert_resource(dev.resistance);
     }
 
+    // R65 — merge the per-ship hull files (`assets/content/ships/*.ron`) into the catalog as a WINDOWED
+    // overlay (each overrides a built-in by id or adds a new hull). Done HERE, not in `ServerApp::new`,
+    // so the headless determinism/demo/harness worlds never read the user-mutable dir → bit-identical.
+    {
+        let ships = crate::tuning_io::load_ship_files();
+        if !ships.is_empty() {
+            if let Some(mut cat) = server
+                .world_mut()
+                .get_resource_mut::<sim::fitting::HullCatalog>()
+            {
+                for h in ships {
+                    cat.hulls.insert(h.id, h);
+                }
+            }
+        }
+    }
+
     // Populate the authoritative world with the selected scenario BEFORE the handshake
     // tick below, so its entities exist the first time `capture_render_state` reads the
     // server world. `Scenario::Sandbox` reproduces the original demo (practice dummies +
