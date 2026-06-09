@@ -48,24 +48,28 @@ impl Plugin for HullEditorPlugin {
     }
 }
 
-/// What a left-click on the grid does.
+/// What a left-click on the grid does. R68 — the four LAYER modes (`Shape`/`Hull`/`Armor`/`Module`)
+/// each paint one layer, show that layer's icon palette, AND set the matching grid view; the rest are
+/// cell-level tools.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EditMode {
-    /// Set the clicked cell's shape to the brush (adding the cell if absent).
-    Paint,
+    /// Paint the brush SHAPE (the cell's footprint; the mandatory layer — adds the cell if absent).
+    Shape,
+    /// Paint the HULL (structural) material layer.
+    Hull,
+    /// Paint the ARMOR material layer (the "None" id clears plating).
+    Armor,
+    /// R68 — paint the MODULE (hardpoint slot) layer (the "—" brush removes the slot).
+    Module,
     /// Remove the clicked cell (and any slot on it).
     Erase,
     /// Just select the clicked cell (inspect / edit in the right panel).
     Select,
     /// R63 — stamp a multi-cell preset (round cap / cone / blade / needle) at the clicked anchor.
     Stamp,
-    /// R66 — paint the clicked cell's HULL (structural) material id (light/heavy hull).
-    HullMat,
-    /// R66 — paint the clicked cell's ARMOR material id (none/light/medium/heavy plating).
-    Armor,
 }
 
-/// R67 — what the grid cell FILL shows, so you can read the hull vs armor material layout at a glance.
+/// R67/R68 — what the grid cell FILL shows, so you can read each layer at a glance.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GridView {
     /// Cells coloured by their sub-cell shape / slot (the default authoring view).
@@ -74,6 +78,8 @@ enum GridView {
     HullMat,
     /// Cells coloured by their ARMOR material.
     ArmorMat,
+    /// R68 — cells coloured by their MODULE (hardpoint slot) type.
+    Module,
 }
 
 /// R63/R64 — a family of related [`CellShape`]s, shown as one chip in the compact palette.
@@ -253,10 +259,12 @@ pub struct HullDesignSession {
     /// R63 — the selected multi-cell stamp + its direction (used in `Stamp` mode).
     stamp_kind: StampKind,
     stamp_dir: Dir,
-    /// R66 — the hull/armor material ids painted in `HullMat`/`Armor` mode.
+    /// R66 — the hull/armor material ids painted in `Hull`/`Armor` mode.
     hull_material_brush: u8,
     armor_material_brush: u8,
-    /// R67 — what the grid cell fill shows (shape / hull material / armor material).
+    /// R68 — the module type painted in `Module` mode (`None` removes the slot).
+    module_brush: Option<HardpointType>,
+    /// R67 — what the grid cell fill shows (shape / hull material / armor material / module).
     grid_view: GridView,
     status: String,
     /// Set on any edit → the 3-D preview rebuilds its mesh next frame.
@@ -278,7 +286,7 @@ impl Default for HullDesignSession {
             working,
             selected_hull: HULL_FIGHTER,
             brush: CellShape::Full,
-            mode: EditMode::Paint,
+            mode: EditMode::Shape,
             selected_cell: None,
             selected_slot: None,
             pending_grid,
@@ -286,8 +294,9 @@ impl Default for HullDesignSession {
             palette_family: ShapeFamily::Full,
             stamp_kind: StampKind::Blade5,
             stamp_dir: Dir::N,
-            hull_material_brush: 2,  // Heavy (so HullMat painting is visible)
+            hull_material_brush: 2,  // Heavy (so Hull painting is visible)
             armor_material_brush: 1, // Light
+            module_brush: Some(HardpointType::Weapon),
             grid_view: GridView::Shape,
             status: String::new(),
             dirty: true,
@@ -526,123 +535,77 @@ fn hull_editor_ui(
             }
             ui.separator();
             ui.heading("Brush");
+            // R68/R69 — LAYER selector: picks what you PAINT + which icon palette shows. R69 — this is
+            // INDEPENDENT of the "Show:" grid view below (a brush click no longer overrides the view).
+            // Shape + Hull are the mandatory layers; Armor + Module carry a "None" to clear them.
             ui.horizontal(|ui| {
-                // R67 — clicking a shape mode also shows the SHAPE view (auto-switch).
                 for (mode, name) in [
-                    (EditMode::Paint, "Paint"),
-                    (EditMode::Erase, "Erase"),
-                    (EditMode::Select, "Select"),
-                    (EditMode::Stamp, "Stamp"),
+                    (EditMode::Shape, "Shape"),
+                    (EditMode::Hull, "Hull"),
+                    (EditMode::Armor, "Armor"),
+                    (EditMode::Module, "Module"),
                 ] {
-                    if ui.selectable_value(&mut s.mode, mode, name).clicked() {
-                        s.grid_view = GridView::Shape;
-                    }
+                    ui.selectable_value(&mut s.mode, mode, name);
                 }
             });
+            // Cell-level tools (Erase removes the cell; Select inspects; Stamp paints multi-cell shapes).
             ui.horizontal(|ui| {
-                // R67 — clicking a material mode also shows the matching MATERIAL view.
-                if ui
-                    .selectable_value(&mut s.mode, EditMode::HullMat, "Hull mat")
-                    .clicked()
-                {
-                    s.grid_view = GridView::HullMat;
-                }
-                if ui
-                    .selectable_value(&mut s.mode, EditMode::Armor, "Armor")
-                    .clicked()
-                {
-                    s.grid_view = GridView::ArmorMat;
-                }
+                ui.selectable_value(&mut s.mode, EditMode::Stamp, "Stamp");
+                ui.selectable_value(&mut s.mode, EditMode::Erase, "Erase");
+                ui.selectable_value(&mut s.mode, EditMode::Select, "Select");
             });
-            // R67 — the grid colour LAYER (overrides the per-mode auto-switch above).
-            ui.horizontal(|ui| {
-                ui.label("Show:");
-                ui.selectable_value(&mut s.grid_view, GridView::Shape, "Shapes");
-                ui.selectable_value(&mut s.grid_view, GridView::HullMat, "Hull mat");
-                ui.selectable_value(&mut s.grid_view, GridView::ArmorMat, "Armor mat");
-            });
-            // R67 — legend for the active material view (colour swatch → material name).
-            match s.grid_view {
-                GridView::HullMat => {
-                    for (i, h) in cell_materials.hull.iter().enumerate() {
-                        material_legend_row(
-                            ui,
-                            hull_mat_color(i as u8),
-                            &format!("{i}: {}", h.name),
-                        );
-                    }
+            // R70 — the "Show:" grid-view selector + its legend moved to a toolbar ABOVE the grid
+            // (see the CentralPanel below): the view control now sits with the thing it shows, fully
+            // separate from this Brush block.
+            // The ACTIVE layer's ICON palette.
+            match s.mode {
+                EditMode::Hull => {
+                    ui.label("Hull material (click-drag to paint):");
+                    let items: Vec<(egui::Color32, &str)> = cell_materials
+                        .hull
+                        .iter()
+                        .enumerate()
+                        .map(|(i, h)| (hull_mat_color(i as u8), h.name.as_str()))
+                        .collect();
+                    swatch_palette(ui, &mut s.hull_material_brush, &items);
                 }
-                GridView::ArmorMat => {
-                    for (i, a) in cell_materials.armor.iter().enumerate() {
-                        material_legend_row(
-                            ui,
-                            armor_mat_color(i as u8),
-                            &format!("{i}: {}", a.name),
-                        );
-                    }
+                EditMode::Armor => {
+                    ui.label("Armor material (click-drag to plate):");
+                    let items: Vec<(egui::Color32, &str)> = cell_materials
+                        .armor
+                        .iter()
+                        .enumerate()
+                        .map(|(i, a)| (armor_mat_color(i as u8), a.name.as_str()))
+                        .collect();
+                    swatch_palette(ui, &mut s.armor_material_brush, &items);
                 }
-                GridView::Shape => {}
-            }
-            if s.mode == EditMode::HullMat {
-                // R66 — pick a HULL material; click-drag the grid to paint it onto cells.
-                ui.label("Hull material (click-drag to paint):");
-                egui::ComboBox::from_id_salt("hull_mat_brush")
-                    .selected_text(mat_name(
-                        cell_materials
-                            .hull
-                            .get(s.hull_material_brush as usize)
-                            .map(|h| h.name.as_str()),
-                        s.hull_material_brush,
-                    ))
-                    .show_ui(ui, |ui| {
-                        for (i, h) in cell_materials.hull.iter().enumerate() {
-                            ui.selectable_value(
-                                &mut s.hull_material_brush,
-                                i as u8,
-                                format!("{i}: {}", h.name),
-                            );
-                        }
+                EditMode::Module => {
+                    ui.label("Module type (click-drag to paint; — removes):");
+                    module_palette(ui, &mut s.module_brush);
+                }
+                EditMode::Stamp => {
+                    // R63 — multi-cell stamp: pick a preset + direction, click the grid to place it.
+                    egui::ComboBox::from_id_salt("stamp_kind")
+                        .selected_text(s.stamp_kind.label())
+                        .show_ui(ui, |ui| {
+                            for k in StampKind::ALL {
+                                ui.selectable_value(&mut s.stamp_kind, k, k.label());
+                            }
+                        });
+                    ui.horizontal(|ui| {
+                        ui.label("Dir");
+                        ui.selectable_value(&mut s.stamp_dir, Dir::N, "N");
+                        ui.selectable_value(&mut s.stamp_dir, Dir::E, "E");
+                        ui.selectable_value(&mut s.stamp_dir, Dir::S, "S");
+                        ui.selectable_value(&mut s.stamp_dir, Dir::W, "W");
                     });
-            } else if s.mode == EditMode::Armor {
-                // R66 — pick an ARMOR material; click-drag the grid to plate cells.
-                ui.label("Armor material (click-drag to paint):");
-                egui::ComboBox::from_id_salt("armor_mat_brush")
-                    .selected_text(mat_name(
-                        cell_materials
-                            .armor
-                            .get(s.armor_material_brush as usize)
-                            .map(|a| a.name.as_str()),
-                        s.armor_material_brush,
-                    ))
-                    .show_ui(ui, |ui| {
-                        for (i, a) in cell_materials.armor.iter().enumerate() {
-                            ui.selectable_value(
-                                &mut s.armor_material_brush,
-                                i as u8,
-                                format!("{i}: {}", a.name),
-                            );
-                        }
-                    });
-            } else if s.mode == EditMode::Stamp {
-                // R63 — multi-cell stamp: pick a preset + direction, click the grid to place it.
-                egui::ComboBox::from_id_salt("stamp_kind")
-                    .selected_text(s.stamp_kind.label())
-                    .show_ui(ui, |ui| {
-                        for k in StampKind::ALL {
-                            ui.selectable_value(&mut s.stamp_kind, k, k.label());
-                        }
-                    });
-                ui.horizontal(|ui| {
-                    ui.label("Dir");
-                    ui.selectable_value(&mut s.stamp_dir, Dir::N, "N");
-                    ui.selectable_value(&mut s.stamp_dir, Dir::E, "E");
-                    ui.selectable_value(&mut s.stamp_dir, Dir::S, "S");
-                    ui.selectable_value(&mut s.stamp_dir, Dir::W, "W");
-                });
-                ui.small("click the grid to stamp");
-            } else {
-                ui.label("Shape (click an icon)");
-                shape_palette(ui, &mut s.brush, &mut s.palette_family);
+                    ui.small("click the grid to stamp");
+                }
+                // Shape (also the Erase / Select default).
+                _ => {
+                    ui.label("Shape (click an icon)");
+                    shape_palette(ui, &mut s.brush, &mut s.palette_family);
+                }
             }
             ui.horizontal(|ui| {
                 if ui.button("Fill bounding box").clicked() {
@@ -690,58 +653,33 @@ fn hull_editor_ui(
                         s.working.cells[idx].shape = shape;
                         s.dirty = true;
                     }
-                    // R67 — this cell's HULL + ARMOR materials (editable, with the chosen stats).
+                    // R68 — this cell's full layer STACK as icon palettes (matching the brush palettes),
+                    // each editing the selected cell directly + showing the chosen entry's stats.
                     ui.separator();
+                    ui.label("Hull material");
+                    let hull_items: Vec<(egui::Color32, &str)> = cell_materials
+                        .hull
+                        .iter()
+                        .enumerate()
+                        .map(|(i, h)| (hull_mat_color(i as u8), h.name.as_str()))
+                        .collect();
                     let mut hm = s.working.cells[idx].hull_material;
-                    ui.horizontal(|ui| {
-                        ui.label("Hull mat");
-                        egui::ComboBox::from_id_salt("sel_hull_mat")
-                            .selected_text(mat_name(
-                                cell_materials
-                                    .hull
-                                    .get(hm as usize)
-                                    .map(|h| h.name.as_str()),
-                                hm,
-                            ))
-                            .show_ui(ui, |ui| {
-                                for (i, h) in cell_materials.hull.iter().enumerate() {
-                                    ui.selectable_value(
-                                        &mut hm,
-                                        i as u8,
-                                        format!("{i}: {}", h.name),
-                                    );
-                                }
-                            });
-                    });
-                    if hm != s.working.cells[idx].hull_material {
+                    if swatch_palette(ui, &mut hm, &hull_items) {
                         s.working.cells[idx].hull_material = hm;
                         s.dirty = true;
                     }
                     if let Some(h) = cell_materials.hull.get(hm as usize) {
                         ui.small(format!("hp {:.1} · mass {:.2}", h.cell_hp, h.mass));
                     }
+                    ui.label("Armor material");
+                    let armor_items: Vec<(egui::Color32, &str)> = cell_materials
+                        .armor
+                        .iter()
+                        .enumerate()
+                        .map(|(i, a)| (armor_mat_color(i as u8), a.name.as_str()))
+                        .collect();
                     let mut am = s.working.cells[idx].armor_material;
-                    ui.horizontal(|ui| {
-                        ui.label("Armor mat");
-                        egui::ComboBox::from_id_salt("sel_armor_mat")
-                            .selected_text(mat_name(
-                                cell_materials
-                                    .armor
-                                    .get(am as usize)
-                                    .map(|a| a.name.as_str()),
-                                am,
-                            ))
-                            .show_ui(ui, |ui| {
-                                for (i, a) in cell_materials.armor.iter().enumerate() {
-                                    ui.selectable_value(
-                                        &mut am,
-                                        i as u8,
-                                        format!("{i}: {}", a.name),
-                                    );
-                                }
-                            });
-                    });
-                    if am != s.working.cells[idx].armor_material {
+                    if swatch_palette(ui, &mut am, &armor_items) {
                         s.working.cells[idx].armor_material = am;
                         s.dirty = true;
                     }
@@ -751,26 +689,20 @@ fn hull_editor_ui(
                             a.thickness, a.multiplier, a.carve_hp, a.mass
                         ));
                     }
-                    // Slot on this cell?
+                    // R68 — Module: pick a hardpoint type as icons (— = none); size/facing edited below.
+                    ui.label("Module");
+                    let mut module = s
+                        .working
+                        .slots
+                        .iter()
+                        .find(|sl| sl.coord == coord)
+                        .map(|sl| sl.slot_type);
+                    if module_palette(ui, &mut module) {
+                        set_cell_module(s, coord, module);
+                    }
                     if let Some(sidx) = s.working.slots.iter().position(|sl| sl.coord == coord) {
-                        ui.separator();
                         ui.label(format!("Slot #{}", s.working.slots[sidx].id.0));
                         slot_editor(ui, &mut s.working.slots[sidx]);
-                        if ui.button("Remove slot").clicked() {
-                            s.working.slots.remove(sidx);
-                            s.dirty = true;
-                        }
-                    } else if ui.button("Add slot here").clicked() {
-                        let id = next_slot_id(&s.working);
-                        s.working.slots.push(Slot {
-                            id,
-                            slot_type: HardpointType::Weapon,
-                            size: SlotSize::Small,
-                            coord,
-                            facing: 0.0,
-                            is_weapon_mount: true,
-                        });
-                        s.dirty = true;
                     }
                 } else {
                     ui.label("(empty — paint a cell here)");
@@ -800,6 +732,50 @@ fn hull_editor_ui(
 
     // ---- Center: the cell-grid painter ----
     egui::CentralPanel::default().show(ctx, |ui| {
+        // R70/R71 — "Show:" view toolbar ABOVE the grid (the view control sits with the thing it shows,
+        // fully independent of the left-panel Brush). R71 — the options are ICONS that echo each view's
+        // grid colouring.
+        ui.horizontal(|ui| {
+            ui.label("Show:");
+            for v in [
+                GridView::Shape,
+                GridView::HullMat,
+                GridView::ArmorMat,
+                GridView::Module,
+            ] {
+                if show_view_icon(ui, v, s.grid_view) {
+                    s.grid_view = v;
+                }
+            }
+        });
+        // R71 — a colour legend for the active view, ALWAYS rendered as a SINGLE row (non-wrapping) so
+        // the toolbar height — and thus the grid's position — stays CONSTANT when switching views (the
+        // legend no longer appears/disappears). Shapes view shows a hint instead of material colours.
+        ui.horizontal(|ui| match s.grid_view {
+            GridView::Shape => {
+                ui.weak("colour = shape / slot");
+            }
+            GridView::HullMat => {
+                for (i, h) in cell_materials.hull.iter().enumerate() {
+                    material_legend_row(ui, hull_mat_color(i as u8), &format!("{i}: {}", h.name));
+                }
+            }
+            GridView::ArmorMat => {
+                for (i, a) in cell_materials.armor.iter().enumerate() {
+                    material_legend_row(ui, armor_mat_color(i as u8), &format!("{i}: {}", a.name));
+                }
+            }
+            GridView::Module => {
+                for ty in MODULE_TYPES {
+                    material_legend_row(
+                        ui,
+                        slot_color(ty),
+                        &format!("{}  {:?}", slot_initial(ty), ty),
+                    );
+                }
+            }
+        });
+        ui.separator();
         egui::ScrollArea::both().show(ui, |ui| {
             draw_grid(ui, s);
         });
@@ -852,6 +828,10 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
                     }
                     GridView::HullMat => hull_mat_color(c.hull_material),
                     GridView::ArmorMat => armor_mat_color(c.armor_material),
+                    // R68 — Module view: colour by the slot type (structural cells = neutral grey).
+                    GridView::Module => slot.map_or(egui::Color32::from_rgb(60, 66, 78), |sl| {
+                        slot_color(sl.slot_type)
+                    }),
                 };
                 painter.add(egui::Shape::convex_polygon(
                     shape_poly_in_rect(c.shape, rect.shrink(1.5)),
@@ -867,14 +847,13 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
                         egui::Color32::BLACK,
                     );
                 }
-                // R66/R67 — material overlay: a hull-material tint dot (top-left) + an armor-material
-                // border. Drawn as a HINT only when that layer is NOT already the fill view (so the
-                // Shape view shows both, the HullMat view keeps the armor border, the ArmorMat view
-                // keeps the hull dot).
-                let show_hull_dot = matches!(s.grid_view, GridView::Shape | GridView::ArmorMat)
-                    && c.hull_material > 0;
-                let show_armor_border = matches!(s.grid_view, GridView::Shape | GridView::HullMat)
-                    && c.armor_material > 0;
+                // R66/R67/R68 — material overlay: a hull-material tint dot (top-left) + an armor-material
+                // border. Drawn as a HINT in every view EXCEPT the one where that layer is the fill
+                // (so HullMat view drops the dot, ArmorMat view drops the border; Shape/Module show both).
+                let show_hull_dot =
+                    !matches!(s.grid_view, GridView::HullMat) && c.hull_material > 0;
+                let show_armor_border =
+                    !matches!(s.grid_view, GridView::ArmorMat) && c.armor_material > 0;
                 if show_hull_dot {
                     painter.circle_filled(
                         rect.left_top() + egui::vec2(5.0, 5.0),
@@ -948,25 +927,21 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
         {
             s.selected_cell = Some(coord);
             match s.mode {
-                EditMode::Paint | EditMode::Erase => {
+                // R68 — every paint-layer mode + Erase line-fills its action along the drag.
+                EditMode::Shape
+                | EditMode::Hull
+                | EditMode::Armor
+                | EditMode::Module
+                | EditMode::Erase => {
                     let from = s.last_painted.unwrap_or(coord);
                     for cc in line_cells(from, coord) {
-                        if matches!(s.mode, EditMode::Paint) {
-                            paint_cell(s, cc);
-                        } else {
-                            erase_cell(s, cc);
-                        }
-                    }
-                    s.last_painted = Some(coord);
-                }
-                // R66 — paint a hull/armor MATERIAL onto cells along the drag.
-                EditMode::HullMat | EditMode::Armor => {
-                    let from = s.last_painted.unwrap_or(coord);
-                    for cc in line_cells(from, coord) {
-                        if matches!(s.mode, EditMode::HullMat) {
-                            paint_hull_material(s, cc);
-                        } else {
-                            paint_armor_material(s, cc);
+                        match s.mode {
+                            EditMode::Shape => paint_cell(s, cc),
+                            EditMode::Hull => paint_hull_material(s, cc),
+                            EditMode::Armor => paint_armor_material(s, cc),
+                            EditMode::Module => paint_module(s, cc),
+                            EditMode::Erase => erase_cell(s, cc),
+                            _ => {}
                         }
                     }
                     s.last_painted = Some(coord);
@@ -1084,6 +1059,155 @@ fn shape_palette(ui: &mut egui::Ui, current: &mut CellShape, family: &mut ShapeF
     *current != before
 }
 
+/// R66 — the hardpoint types selectable as a module (Armor removed in R66 — it's a per-cell material).
+const MODULE_TYPES: [HardpointType; 6] = [
+    HardpointType::Reactor,
+    HardpointType::Thruster,
+    HardpointType::Weapon,
+    HardpointType::Shield,
+    HardpointType::Sensor,
+    HardpointType::Utility,
+];
+
+/// R68 — a readable text colour (black/white) for a glyph drawn ON a coloured swatch.
+fn text_on(c: egui::Color32) -> egui::Color32 {
+    if c.r() as u32 + c.g() as u32 + c.b() as u32 > 380 {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    }
+}
+
+/// R68 — draw one 26-px palette icon: a coloured swatch with a centred `glyph`, `selected`-bordered,
+/// `hover`-tooltipped. Returns true if it was clicked. The shared core of [`swatch_palette`] +
+/// [`module_palette`] (mirrors the icon styling of [`shape_palette`]).
+fn icon_swatch(
+    ui: &mut egui::Ui,
+    color: egui::Color32,
+    glyph: &str,
+    selected: bool,
+    hover: &str,
+) -> bool {
+    const ICON: f32 = 26.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ICON, ICON), egui::Sense::click());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 3.0, color);
+    p.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::proportional(11.0),
+        text_on(color),
+    );
+    let stroke = if selected {
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 220, 80))
+    } else {
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 66, 78))
+    };
+    p.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+    resp.on_hover_text(hover).clicked()
+}
+
+/// R71 — a "Show:" grid-view toggle ICON (26px), drawn to ECHO that view's grid colouring (a shape
+/// polygon / a hull swatch / an armor border / a module letter). Selected-highlighted + hover-named.
+/// Returns true if clicked.
+fn show_view_icon(ui: &mut egui::Ui, view: GridView, current: GridView) -> bool {
+    const ICON: f32 = 26.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ICON, ICON), egui::Sense::click());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 3.0, egui::Color32::from_rgb(30, 34, 42));
+    let inner = rect.shrink(5.0);
+    match view {
+        GridView::Shape => {
+            p.add(egui::Shape::convex_polygon(
+                shape_poly_in_rect(CellShape::ChamferNE, inner),
+                shape_color(CellShape::ChamferNE),
+                egui::Stroke::NONE,
+            ));
+        }
+        GridView::HullMat => {
+            p.rect_filled(inner, 2.0, hull_mat_color(2));
+        }
+        GridView::ArmorMat => {
+            p.rect_filled(inner, 2.0, egui::Color32::from_rgb(50, 56, 66));
+            p.rect_stroke(
+                inner,
+                2.0,
+                egui::Stroke::new(3.0, armor_mat_color(3)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        GridView::Module => {
+            let c = slot_color(HardpointType::Weapon);
+            p.rect_filled(inner, 2.0, c);
+            p.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "M",
+                egui::FontId::proportional(11.0),
+                text_on(c),
+            );
+        }
+    }
+    let name = match view {
+        GridView::Shape => "Shapes / slots",
+        GridView::HullMat => "Hull material",
+        GridView::ArmorMat => "Armor material",
+        GridView::Module => "Modules",
+    };
+    let stroke = if view == current {
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 220, 80))
+    } else {
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 66, 78))
+    };
+    p.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+    resp.on_hover_text(name).clicked()
+}
+
+/// R68 — a compact palette of colour-SWATCH icons (hull/armor materials), each labelled by its id;
+/// sets `*current` (the material id) on click; returns true if it changed. `items[i] = (colour, name)`.
+fn swatch_palette(ui: &mut egui::Ui, current: &mut u8, items: &[(egui::Color32, &str)]) -> bool {
+    let before = *current;
+    ui.horizontal_wrapped(|ui| {
+        for (i, (color, name)) in items.iter().enumerate() {
+            let label = format!("{i}: {name}");
+            if icon_swatch(ui, *color, &format!("{i}"), *current == i as u8, &label) {
+                *current = i as u8;
+            }
+        }
+    });
+    *current != before
+}
+
+/// R68 — the MODULE-type icon palette: a "—" (None = no slot) icon + one colour+letter swatch per
+/// [`HardpointType`]. Sets `*current` on click; returns true if it changed.
+fn module_palette(ui: &mut egui::Ui, current: &mut Option<HardpointType>) -> bool {
+    let before = *current;
+    ui.horizontal_wrapped(|ui| {
+        if icon_swatch(
+            ui,
+            egui::Color32::from_rgb(40, 44, 52),
+            "—",
+            current.is_none(),
+            "None (no slot)",
+        ) {
+            *current = None;
+        }
+        for ty in MODULE_TYPES {
+            if icon_swatch(
+                ui,
+                slot_color(ty),
+                slot_initial(ty),
+                *current == Some(ty),
+                &format!("{ty:?}"),
+            ) {
+                *current = Some(ty);
+            }
+        }
+    });
+    *current != before
+}
+
 /// Set the cell at `coord` to the brush shape (adding it if absent). Keeps `structural` consistent with
 /// the slot list (a cell becomes a module cell only when it carries a slot).
 fn paint_cell(s: &mut HullDesignSession, coord: (u16, u16)) {
@@ -1153,6 +1277,57 @@ fn erase_cell(s: &mut HullDesignSession, coord: (u16, u16)) {
     s.working.cells.retain(|c| c.coord != coord);
     s.working.slots.retain(|sl| sl.coord != coord);
     s.dirty = true;
+}
+
+/// R68 — set / retype / remove the MODULE (hardpoint slot) at `coord`. `Some(type)` adds a slot (with
+/// sensible defaults for a new one) or retypes an existing one and marks the cell a module cell;
+/// `None` removes any slot and reverts the cell to structural. Ensures a cell exists first (creates a
+/// Full / Standard structural cell). The shared core of [`paint_module`] + the inspector's module edit.
+fn set_cell_module(s: &mut HullDesignSession, coord: (u16, u16), ty: Option<HardpointType>) {
+    if !s.working.cells.iter().any(|c| c.coord == coord) {
+        s.working.cells.push(GridCell {
+            coord,
+            section: SectionId(10000),
+            structural: true,
+            shape: CellShape::Full,
+            hull_material: 0,
+            armor_material: 0,
+        });
+    }
+    match ty {
+        Some(t) => {
+            if let Some(sl) = s.working.slots.iter_mut().find(|sl| sl.coord == coord) {
+                sl.slot_type = t; // retype; keep size/facing/weapon-mount
+            } else {
+                let id = next_slot_id(&s.working);
+                s.working.slots.push(Slot {
+                    id,
+                    slot_type: t,
+                    size: SlotSize::Small,
+                    coord,
+                    facing: 0.0,
+                    is_weapon_mount: t == HardpointType::Weapon,
+                });
+            }
+        }
+        None => s.working.slots.retain(|sl| sl.coord != coord),
+    }
+    // Keep the cell's `structural` flag + section in sync with whether a slot now sits on it.
+    let has_slot = s.working.slots.iter().any(|sl| sl.coord == coord);
+    if let Some(c) = s.working.cells.iter_mut().find(|c| c.coord == coord) {
+        c.structural = !has_slot;
+        c.section = if has_slot {
+            SectionId(coord.0 as u32 * 1000 + coord.1 as u32)
+        } else {
+            SectionId(10000)
+        };
+    }
+    s.dirty = true;
+}
+
+/// R68 — paint the module brush onto `coord` (the `Module` paint layer).
+fn paint_module(s: &mut HullDesignSession, coord: (u16, u16)) {
+    set_cell_module(s, coord, s.module_brush);
 }
 
 /// R62 — translate EVERY cell + slot by `(dc, dr)`. Returns false (no-op) if any would leave the grid,
@@ -1364,22 +1539,7 @@ fn fill_bounding_box(hull: &mut Hull, brush: CellShape) {
 
 /// Edit a slot's type / size / facing / weapon-mount in place.
 fn slot_editor(ui: &mut egui::Ui, slot: &mut Slot) {
-    egui::ComboBox::from_id_salt("slot_type")
-        .selected_text(format!("{:?}", slot.slot_type))
-        .show_ui(ui, |ui| {
-            for t in [
-                HardpointType::Reactor,
-                HardpointType::Thruster,
-                HardpointType::Weapon,
-                HardpointType::Shield,
-                // R66 — Armor is no longer a hardpoint slot type; paint per-cell armor MATERIAL
-                // instead (the "Armor" brush mode). `HardpointType::Armor` stays vestigial elsewhere.
-                HardpointType::Sensor,
-                HardpointType::Utility,
-            ] {
-                ui.selectable_value(&mut slot.slot_type, t, format!("{t:?}"));
-            }
-        });
+    // R68 — the slot TYPE is now picked by the `module_palette` icons; this editor covers the rest.
     egui::ComboBox::from_id_salt("slot_size")
         .selected_text(format!("{:?}", slot.size))
         .show_ui(ui, |ui| {
@@ -1538,14 +1698,6 @@ fn shape_color(shape: CellShape) -> egui::Color32 {
         QuarterSW | QuarterSE | QuarterNE | QuarterNW => egui::Color32::from_rgb(70, 140, 90),
         ChamferSW | ChamferSE | ChamferNE | ChamferNW => egui::Color32::from_rgb(170, 120, 60),
         _ => egui::Color32::from_rgb(130, 90, 160), // slopes
-    }
-}
-
-/// R66 — the brush picker label for a material id (`"{id}: {name}"`; `?` if out of range).
-fn mat_name(name: Option<&str>, id: u8) -> String {
-    match name {
-        Some(n) => format!("{id}: {n}"),
-        None => format!("{id}: ?"),
     }
 }
 
