@@ -209,6 +209,52 @@ pub enum CellShape {
     RoundW,
     /// R62 — OCTAGON (area 0.875): all four corners 1/4-chamfered — a fully-rounded cell (pod / dome).
     Octagon,
+    /// R64 — thin-triangle WEDGE: the SKINNY complement of a `Slope` (the diagonal sliver left when the
+    /// fat part is cut away). A right triangle with one full leg (1.0) + a short leg `k` — `Wedge2*`
+    /// k=1/2 (area 1/4), `Wedge3*` k=1/3 (area 1/6), `Wedge4*` k=1/4 (area 1/8). 8 slope orientations.
+    /// These are the slim triangles to STACK for a thin sharp blade / wing.
+    Wedge2SWH,
+    Wedge2SWV,
+    Wedge2SEH,
+    Wedge2SEV,
+    Wedge2NEH,
+    Wedge2NEV,
+    Wedge2NWH,
+    Wedge2NWV,
+    Wedge3SWH,
+    Wedge3SWV,
+    Wedge3SEH,
+    Wedge3SEV,
+    Wedge3NEH,
+    Wedge3NEV,
+    Wedge3NWH,
+    Wedge3NWV,
+    Wedge4SWH,
+    Wedge4SWV,
+    Wedge4SEH,
+    Wedge4SEV,
+    Wedge4NEH,
+    Wedge4NEV,
+    Wedge4NWH,
+    Wedge4NWV,
+    /// R64 — edge STRIP: a thin rectangular band covering one cell EDGE to thickness `t` (`34`=3/4,
+    /// `12`=1/2, `14`=1/4, `18`=1/8; area = `t`). For thin walls / panel ribs / blade shafts.
+    StripN34,
+    StripN12,
+    StripN14,
+    StripN18,
+    StripS34,
+    StripS12,
+    StripS14,
+    StripS18,
+    StripE34,
+    StripE12,
+    StripE14,
+    StripE18,
+    StripW34,
+    StripW12,
+    StripW14,
+    StripW18,
 }
 
 impl CellShape {
@@ -339,6 +385,48 @@ impl CellShape {
                 p(0.0, 0.75),
                 p(0.0, 0.25),
             ],
+            // R64 wedges (thin triangles, CCW) — the complement of the same-name `Slope`, short leg `k`.
+            CellShape::Wedge2SWH => vec![p(0.0, 0.0), p(1.0, 0.0), p(0.0, 0.5)],
+            CellShape::Wedge2SWV => vec![p(0.0, 0.0), p(0.5, 0.0), p(0.0, 1.0)],
+            CellShape::Wedge2SEH => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 0.5)],
+            CellShape::Wedge2SEV => vec![p(0.5, 0.0), p(1.0, 0.0), p(1.0, 1.0)],
+            CellShape::Wedge2NEH => vec![p(1.0, 0.5), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::Wedge2NEV => vec![p(1.0, 0.0), p(1.0, 1.0), p(0.5, 1.0)],
+            CellShape::Wedge2NWH => vec![p(0.0, 0.5), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::Wedge2NWV => vec![p(0.0, 0.0), p(0.5, 1.0), p(0.0, 1.0)],
+            CellShape::Wedge3SWH => vec![p(0.0, 0.0), p(1.0, 0.0), p(0.0, 1.0 / 3.0)],
+            CellShape::Wedge3SWV => vec![p(0.0, 0.0), p(1.0 / 3.0, 0.0), p(0.0, 1.0)],
+            CellShape::Wedge3SEH => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0 / 3.0)],
+            CellShape::Wedge3SEV => vec![p(2.0 / 3.0, 0.0), p(1.0, 0.0), p(1.0, 1.0)],
+            CellShape::Wedge3NEH => vec![p(1.0, 2.0 / 3.0), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::Wedge3NEV => vec![p(1.0, 0.0), p(1.0, 1.0), p(2.0 / 3.0, 1.0)],
+            CellShape::Wedge3NWH => vec![p(0.0, 2.0 / 3.0), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::Wedge3NWV => vec![p(0.0, 0.0), p(1.0 / 3.0, 1.0), p(0.0, 1.0)],
+            CellShape::Wedge4SWH => vec![p(0.0, 0.0), p(1.0, 0.0), p(0.0, 0.25)],
+            CellShape::Wedge4SWV => vec![p(0.0, 0.0), p(0.25, 0.0), p(0.0, 1.0)],
+            CellShape::Wedge4SEH => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 0.25)],
+            CellShape::Wedge4SEV => vec![p(0.75, 0.0), p(1.0, 0.0), p(1.0, 1.0)],
+            CellShape::Wedge4NEH => vec![p(1.0, 0.75), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::Wedge4NEV => vec![p(1.0, 0.0), p(1.0, 1.0), p(0.75, 1.0)],
+            CellShape::Wedge4NWH => vec![p(0.0, 0.75), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::Wedge4NWV => vec![p(0.0, 0.0), p(0.25, 1.0), p(0.0, 1.0)],
+            // R64 strips (edge rectangles, CCW) — thickness `t` along the named edge.
+            CellShape::StripN34 => vec![p(0.0, 0.25), p(1.0, 0.25), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::StripN12 => vec![p(0.0, 0.5), p(1.0, 0.5), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::StripN14 => vec![p(0.0, 0.75), p(1.0, 0.75), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::StripN18 => vec![p(0.0, 0.875), p(1.0, 0.875), p(1.0, 1.0), p(0.0, 1.0)],
+            CellShape::StripS34 => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 0.75), p(0.0, 0.75)],
+            CellShape::StripS12 => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 0.5), p(0.0, 0.5)],
+            CellShape::StripS14 => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 0.25), p(0.0, 0.25)],
+            CellShape::StripS18 => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 0.125), p(0.0, 0.125)],
+            CellShape::StripE34 => vec![p(0.25, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.25, 1.0)],
+            CellShape::StripE12 => vec![p(0.5, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.5, 1.0)],
+            CellShape::StripE14 => vec![p(0.75, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.75, 1.0)],
+            CellShape::StripE18 => vec![p(0.875, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.875, 1.0)],
+            CellShape::StripW34 => vec![p(0.0, 0.0), p(0.75, 0.0), p(0.75, 1.0), p(0.0, 1.0)],
+            CellShape::StripW12 => vec![p(0.0, 0.0), p(0.5, 0.0), p(0.5, 1.0), p(0.0, 1.0)],
+            CellShape::StripW14 => vec![p(0.0, 0.0), p(0.25, 0.0), p(0.25, 1.0), p(0.0, 1.0)],
+            CellShape::StripW18 => vec![p(0.0, 0.0), p(0.125, 0.0), p(0.125, 1.0), p(0.0, 1.0)],
         }
     }
 
@@ -382,6 +470,46 @@ impl CellShape {
             CellShape::PointN | CellShape::PointS | CellShape::PointE | CellShape::PointW => 0.5,
             CellShape::RoundN | CellShape::RoundS | CellShape::RoundE | CellShape::RoundW => 0.9375,
             CellShape::Octagon => 0.875,
+            CellShape::Wedge2SWH
+            | CellShape::Wedge2SWV
+            | CellShape::Wedge2SEH
+            | CellShape::Wedge2SEV
+            | CellShape::Wedge2NEH
+            | CellShape::Wedge2NEV
+            | CellShape::Wedge2NWH
+            | CellShape::Wedge2NWV => 0.25,
+            CellShape::Wedge3SWH
+            | CellShape::Wedge3SWV
+            | CellShape::Wedge3SEH
+            | CellShape::Wedge3SEV
+            | CellShape::Wedge3NEH
+            | CellShape::Wedge3NEV
+            | CellShape::Wedge3NWH
+            | CellShape::Wedge3NWV => 1.0 / 6.0,
+            CellShape::Wedge4SWH
+            | CellShape::Wedge4SWV
+            | CellShape::Wedge4SEH
+            | CellShape::Wedge4SEV
+            | CellShape::Wedge4NEH
+            | CellShape::Wedge4NEV
+            | CellShape::Wedge4NWH
+            | CellShape::Wedge4NWV => 0.125,
+            CellShape::StripN34
+            | CellShape::StripS34
+            | CellShape::StripE34
+            | CellShape::StripW34 => 0.75,
+            CellShape::StripN12
+            | CellShape::StripS12
+            | CellShape::StripE12
+            | CellShape::StripW12 => 0.5,
+            CellShape::StripN14
+            | CellShape::StripS14
+            | CellShape::StripE14
+            | CellShape::StripW14 => 0.25,
+            CellShape::StripN18
+            | CellShape::StripS18
+            | CellShape::StripE18
+            | CellShape::StripW18 => 0.125,
         }
     }
 
@@ -411,8 +539,8 @@ impl CellShape {
         matches!(self, CellShape::Full)
     }
 
-    /// R60/R62 — every shape, in a stable order (for editor palette / iteration).
-    pub const ALL: [CellShape; 46] = [
+    /// R60/R62/R64 — every shape, in a stable order (for editor palette / iteration).
+    pub const ALL: [CellShape; 86] = [
         CellShape::Full,
         CellShape::HalfSW,
         CellShape::HalfSE,
@@ -459,6 +587,46 @@ impl CellShape {
         CellShape::RoundE,
         CellShape::RoundW,
         CellShape::Octagon,
+        CellShape::Wedge2SWH,
+        CellShape::Wedge2SWV,
+        CellShape::Wedge2SEH,
+        CellShape::Wedge2SEV,
+        CellShape::Wedge2NEH,
+        CellShape::Wedge2NEV,
+        CellShape::Wedge2NWH,
+        CellShape::Wedge2NWV,
+        CellShape::Wedge3SWH,
+        CellShape::Wedge3SWV,
+        CellShape::Wedge3SEH,
+        CellShape::Wedge3SEV,
+        CellShape::Wedge3NEH,
+        CellShape::Wedge3NEV,
+        CellShape::Wedge3NWH,
+        CellShape::Wedge3NWV,
+        CellShape::Wedge4SWH,
+        CellShape::Wedge4SWV,
+        CellShape::Wedge4SEH,
+        CellShape::Wedge4SEV,
+        CellShape::Wedge4NEH,
+        CellShape::Wedge4NEV,
+        CellShape::Wedge4NWH,
+        CellShape::Wedge4NWV,
+        CellShape::StripN34,
+        CellShape::StripN12,
+        CellShape::StripN14,
+        CellShape::StripN18,
+        CellShape::StripS34,
+        CellShape::StripS12,
+        CellShape::StripS14,
+        CellShape::StripS18,
+        CellShape::StripE34,
+        CellShape::StripE12,
+        CellShape::StripE14,
+        CellShape::StripE18,
+        CellShape::StripW34,
+        CellShape::StripW12,
+        CellShape::StripW14,
+        CellShape::StripW18,
     ];
 
     /// R60 — a short human label for the editor dropdown / per-cell glyph.
@@ -477,30 +645,31 @@ impl CellShape {
             CellShape::ChamferSE => "Chamfer SE",
             CellShape::ChamferNE => "Chamfer NE",
             CellShape::ChamferNW => "Chamfer NW",
-            CellShape::SlopeSWH => "Slope SW-H",
-            CellShape::SlopeSWV => "Slope SW-V",
-            CellShape::SlopeSEH => "Slope SE-H",
-            CellShape::SlopeSEV => "Slope SE-V",
-            CellShape::SlopeNEH => "Slope NE-H",
-            CellShape::SlopeNEV => "Slope NE-V",
-            CellShape::SlopeNWH => "Slope NW-H",
-            CellShape::SlopeNWV => "Slope NW-V",
-            CellShape::Slope3SWH => "Slope3 SW-H",
-            CellShape::Slope3SWV => "Slope3 SW-V",
-            CellShape::Slope3SEH => "Slope3 SE-H",
-            CellShape::Slope3SEV => "Slope3 SE-V",
-            CellShape::Slope3NEH => "Slope3 NE-H",
-            CellShape::Slope3NEV => "Slope3 NE-V",
-            CellShape::Slope3NWH => "Slope3 NW-H",
-            CellShape::Slope3NWV => "Slope3 NW-V",
-            CellShape::Slope4SWH => "Slope4 SW-H",
-            CellShape::Slope4SWV => "Slope4 SW-V",
-            CellShape::Slope4SEH => "Slope4 SE-H",
-            CellShape::Slope4SEV => "Slope4 SE-V",
-            CellShape::Slope4NEH => "Slope4 NE-H",
-            CellShape::Slope4NEV => "Slope4 NE-V",
-            CellShape::Slope4NWH => "Slope4 NW-H",
-            CellShape::Slope4NWV => "Slope4 NW-V",
+            // H = shallow (rise:run 1:2), V = steep (2:1).
+            CellShape::SlopeSWH => "Slope SW 1:2",
+            CellShape::SlopeSWV => "Slope SW 2:1",
+            CellShape::SlopeSEH => "Slope SE 1:2",
+            CellShape::SlopeSEV => "Slope SE 2:1",
+            CellShape::SlopeNEH => "Slope NE 1:2",
+            CellShape::SlopeNEV => "Slope NE 2:1",
+            CellShape::SlopeNWH => "Slope NW 1:2",
+            CellShape::SlopeNWV => "Slope NW 2:1",
+            CellShape::Slope3SWH => "Slope SW 1:3",
+            CellShape::Slope3SWV => "Slope SW 3:1",
+            CellShape::Slope3SEH => "Slope SE 1:3",
+            CellShape::Slope3SEV => "Slope SE 3:1",
+            CellShape::Slope3NEH => "Slope NE 1:3",
+            CellShape::Slope3NEV => "Slope NE 3:1",
+            CellShape::Slope3NWH => "Slope NW 1:3",
+            CellShape::Slope3NWV => "Slope NW 3:1",
+            CellShape::Slope4SWH => "Slope SW 1:4",
+            CellShape::Slope4SWV => "Slope SW 4:1",
+            CellShape::Slope4SEH => "Slope SE 1:4",
+            CellShape::Slope4SEV => "Slope SE 4:1",
+            CellShape::Slope4NEH => "Slope NE 1:4",
+            CellShape::Slope4NEV => "Slope NE 4:1",
+            CellShape::Slope4NWH => "Slope NW 1:4",
+            CellShape::Slope4NWV => "Slope NW 4:1",
             CellShape::PointN => "Point N",
             CellShape::PointS => "Point S",
             CellShape::PointE => "Point E",
@@ -510,6 +679,237 @@ impl CellShape {
             CellShape::RoundE => "Round E",
             CellShape::RoundW => "Round W",
             CellShape::Octagon => "Octagon",
+            CellShape::Wedge2SWH => "Wedge 1:2 SW-H",
+            CellShape::Wedge2SWV => "Wedge 1:2 SW-V",
+            CellShape::Wedge2SEH => "Wedge 1:2 SE-H",
+            CellShape::Wedge2SEV => "Wedge 1:2 SE-V",
+            CellShape::Wedge2NEH => "Wedge 1:2 NE-H",
+            CellShape::Wedge2NEV => "Wedge 1:2 NE-V",
+            CellShape::Wedge2NWH => "Wedge 1:2 NW-H",
+            CellShape::Wedge2NWV => "Wedge 1:2 NW-V",
+            CellShape::Wedge3SWH => "Wedge 1:3 SW-H",
+            CellShape::Wedge3SWV => "Wedge 1:3 SW-V",
+            CellShape::Wedge3SEH => "Wedge 1:3 SE-H",
+            CellShape::Wedge3SEV => "Wedge 1:3 SE-V",
+            CellShape::Wedge3NEH => "Wedge 1:3 NE-H",
+            CellShape::Wedge3NEV => "Wedge 1:3 NE-V",
+            CellShape::Wedge3NWH => "Wedge 1:3 NW-H",
+            CellShape::Wedge3NWV => "Wedge 1:3 NW-V",
+            CellShape::Wedge4SWH => "Wedge 1:4 SW-H",
+            CellShape::Wedge4SWV => "Wedge 1:4 SW-V",
+            CellShape::Wedge4SEH => "Wedge 1:4 SE-H",
+            CellShape::Wedge4SEV => "Wedge 1:4 SE-V",
+            CellShape::Wedge4NEH => "Wedge 1:4 NE-H",
+            CellShape::Wedge4NEV => "Wedge 1:4 NE-V",
+            CellShape::Wedge4NWH => "Wedge 1:4 NW-H",
+            CellShape::Wedge4NWV => "Wedge 1:4 NW-V",
+            CellShape::StripN34 => "Strip N 3/4",
+            CellShape::StripN12 => "Strip N 1/2",
+            CellShape::StripN14 => "Strip N 1/4",
+            CellShape::StripN18 => "Strip N 1/8",
+            CellShape::StripS34 => "Strip S 3/4",
+            CellShape::StripS12 => "Strip S 1/2",
+            CellShape::StripS14 => "Strip S 1/4",
+            CellShape::StripS18 => "Strip S 1/8",
+            CellShape::StripE34 => "Strip E 3/4",
+            CellShape::StripE12 => "Strip E 1/2",
+            CellShape::StripE14 => "Strip E 1/4",
+            CellShape::StripE18 => "Strip E 1/8",
+            CellShape::StripW34 => "Strip W 3/4",
+            CellShape::StripW12 => "Strip W 1/2",
+            CellShape::StripW14 => "Strip W 1/4",
+            CellShape::StripW18 => "Strip W 1/8",
+        }
+    }
+
+    /// R63 — reflect the shape across the VERTICAL axis (swap East↔West). Used by the editor's mirror
+    /// tool so a mirrored cell's geometry flips correctly. An involution (`mirror_x ∘ mirror_x = id`).
+    pub fn mirror_x(self) -> CellShape {
+        use CellShape::*;
+        match self {
+            Full => Full,
+            Octagon => Octagon,
+            HalfSW => HalfSE,
+            HalfSE => HalfSW,
+            HalfNE => HalfNW,
+            HalfNW => HalfNE,
+            QuarterSW => QuarterSE,
+            QuarterSE => QuarterSW,
+            QuarterNE => QuarterNW,
+            QuarterNW => QuarterNE,
+            ChamferSW => ChamferSE,
+            ChamferSE => ChamferSW,
+            ChamferNE => ChamferNW,
+            ChamferNW => ChamferNE,
+            SlopeSWH => SlopeSEH,
+            SlopeSEH => SlopeSWH,
+            SlopeSWV => SlopeSEV,
+            SlopeSEV => SlopeSWV,
+            SlopeNEH => SlopeNWH,
+            SlopeNWH => SlopeNEH,
+            SlopeNEV => SlopeNWV,
+            SlopeNWV => SlopeNEV,
+            Slope3SWH => Slope3SEH,
+            Slope3SEH => Slope3SWH,
+            Slope3SWV => Slope3SEV,
+            Slope3SEV => Slope3SWV,
+            Slope3NEH => Slope3NWH,
+            Slope3NWH => Slope3NEH,
+            Slope3NEV => Slope3NWV,
+            Slope3NWV => Slope3NEV,
+            Slope4SWH => Slope4SEH,
+            Slope4SEH => Slope4SWH,
+            Slope4SWV => Slope4SEV,
+            Slope4SEV => Slope4SWV,
+            Slope4NEH => Slope4NWH,
+            Slope4NWH => Slope4NEH,
+            Slope4NEV => Slope4NWV,
+            Slope4NWV => Slope4NEV,
+            PointN => PointN,
+            PointS => PointS,
+            PointE => PointW,
+            PointW => PointE,
+            RoundN => RoundN,
+            RoundS => RoundS,
+            RoundE => RoundW,
+            RoundW => RoundE,
+            // R64 wedges mirror like slopes (SW↔SE, NE↔NW per H/V); strips: N/S fixed, E↔W.
+            Wedge2SWH => Wedge2SEH,
+            Wedge2SEH => Wedge2SWH,
+            Wedge2SWV => Wedge2SEV,
+            Wedge2SEV => Wedge2SWV,
+            Wedge2NEH => Wedge2NWH,
+            Wedge2NWH => Wedge2NEH,
+            Wedge2NEV => Wedge2NWV,
+            Wedge2NWV => Wedge2NEV,
+            Wedge3SWH => Wedge3SEH,
+            Wedge3SEH => Wedge3SWH,
+            Wedge3SWV => Wedge3SEV,
+            Wedge3SEV => Wedge3SWV,
+            Wedge3NEH => Wedge3NWH,
+            Wedge3NWH => Wedge3NEH,
+            Wedge3NEV => Wedge3NWV,
+            Wedge3NWV => Wedge3NEV,
+            Wedge4SWH => Wedge4SEH,
+            Wedge4SEH => Wedge4SWH,
+            Wedge4SWV => Wedge4SEV,
+            Wedge4SEV => Wedge4SWV,
+            Wedge4NEH => Wedge4NWH,
+            Wedge4NWH => Wedge4NEH,
+            Wedge4NEV => Wedge4NWV,
+            Wedge4NWV => Wedge4NEV,
+            StripN34 => StripN34,
+            StripN12 => StripN12,
+            StripN14 => StripN14,
+            StripN18 => StripN18,
+            StripS34 => StripS34,
+            StripS12 => StripS12,
+            StripS14 => StripS14,
+            StripS18 => StripS18,
+            StripE34 => StripW34,
+            StripW34 => StripE34,
+            StripE12 => StripW12,
+            StripW12 => StripE12,
+            StripE14 => StripW14,
+            StripW14 => StripE14,
+            StripE18 => StripW18,
+            StripW18 => StripE18,
+        }
+    }
+
+    /// R63 — rotate the shape 90° CLOCKWISE (corner NE→SE→SW→NW→NE; slope long-leg axis H↔V;
+    /// Point/Round N→E→S→W). Used to orient stamps by direction. `rotate_cw` applied 4× is the identity.
+    pub fn rotate_cw(self) -> CellShape {
+        use CellShape::*;
+        match self {
+            Full => Full,
+            Octagon => Octagon,
+            HalfNE => HalfSE,
+            HalfSE => HalfSW,
+            HalfSW => HalfNW,
+            HalfNW => HalfNE,
+            QuarterNE => QuarterSE,
+            QuarterSE => QuarterSW,
+            QuarterSW => QuarterNW,
+            QuarterNW => QuarterNE,
+            ChamferNE => ChamferSE,
+            ChamferSE => ChamferSW,
+            ChamferSW => ChamferNW,
+            ChamferNW => ChamferNE,
+            // Slope: corner rotates CW AND the long-leg axis swaps (H↔V).
+            SlopeNEH => SlopeSEV,
+            SlopeSEV => SlopeSWH,
+            SlopeSWH => SlopeNWV,
+            SlopeNWV => SlopeNEH,
+            SlopeSEH => SlopeSWV,
+            SlopeSWV => SlopeNWH,
+            SlopeNWH => SlopeNEV,
+            SlopeNEV => SlopeSEH,
+            Slope3NEH => Slope3SEV,
+            Slope3SEV => Slope3SWH,
+            Slope3SWH => Slope3NWV,
+            Slope3NWV => Slope3NEH,
+            Slope3SEH => Slope3SWV,
+            Slope3SWV => Slope3NWH,
+            Slope3NWH => Slope3NEV,
+            Slope3NEV => Slope3SEH,
+            Slope4NEH => Slope4SEV,
+            Slope4SEV => Slope4SWH,
+            Slope4SWH => Slope4NWV,
+            Slope4NWV => Slope4NEH,
+            Slope4SEH => Slope4SWV,
+            Slope4SWV => Slope4NWH,
+            Slope4NWH => Slope4NEV,
+            Slope4NEV => Slope4SEH,
+            PointN => PointE,
+            PointE => PointS,
+            PointS => PointW,
+            PointW => PointN,
+            RoundN => RoundE,
+            RoundE => RoundS,
+            RoundS => RoundW,
+            RoundW => RoundN,
+            // R64 wedges rotate like slopes (corner CW + H↔V); strips: N→E→S→W.
+            Wedge2NEH => Wedge2SEV,
+            Wedge2SEV => Wedge2SWH,
+            Wedge2SWH => Wedge2NWV,
+            Wedge2NWV => Wedge2NEH,
+            Wedge2SEH => Wedge2SWV,
+            Wedge2SWV => Wedge2NWH,
+            Wedge2NWH => Wedge2NEV,
+            Wedge2NEV => Wedge2SEH,
+            Wedge3NEH => Wedge3SEV,
+            Wedge3SEV => Wedge3SWH,
+            Wedge3SWH => Wedge3NWV,
+            Wedge3NWV => Wedge3NEH,
+            Wedge3SEH => Wedge3SWV,
+            Wedge3SWV => Wedge3NWH,
+            Wedge3NWH => Wedge3NEV,
+            Wedge3NEV => Wedge3SEH,
+            Wedge4NEH => Wedge4SEV,
+            Wedge4SEV => Wedge4SWH,
+            Wedge4SWH => Wedge4NWV,
+            Wedge4NWV => Wedge4NEH,
+            Wedge4SEH => Wedge4SWV,
+            Wedge4SWV => Wedge4NWH,
+            Wedge4NWH => Wedge4NEV,
+            Wedge4NEV => Wedge4SEH,
+            StripN34 => StripE34,
+            StripE34 => StripS34,
+            StripS34 => StripW34,
+            StripW34 => StripN34,
+            StripN12 => StripE12,
+            StripE12 => StripS12,
+            StripS12 => StripW12,
+            StripW12 => StripN12,
+            StripN14 => StripE14,
+            StripE14 => StripS14,
+            StripS14 => StripW14,
+            StripW14 => StripN14,
+            StripN18 => StripE18,
+            StripE18 => StripS18,
+            StripS18 => StripW18,
+            StripW18 => StripN18,
         }
     }
 }
@@ -823,6 +1223,61 @@ mod tests {
                     "{s:?}: centroid {c:?} outside edge {a:?}->{b:?}"
                 );
             }
+        }
+    }
+
+    /// R63 — `mirror_x` reflects the polygon across `x = c+0.5` (and is an involution); `rotate_cw`
+    /// rotates it 90° CW about the cell centre (4× = identity). Both preserve area. Verified
+    /// GEOMETRICALLY by comparing the transformed corner SET to the actual reflected/rotated corners.
+    #[test]
+    fn cell_shape_mirror_and_rotate_are_geometric() {
+        // A rounded multiset key for a Vec<Vec2> (order/winding-independent vertex comparison).
+        let key = |pts: &[Vec2]| {
+            let mut v: Vec<(i32, i32)> = pts
+                .iter()
+                .map(|p| ((p.x * 48.0).round() as i32, (p.y * 48.0).round() as i32))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        let (c, r) = (2u16, 3u16);
+        let (cx, cy) = (c as f32 + 0.5, r as f32 + 0.5);
+        for s in CellShape::ALL {
+            // mirror_x: reflect each corner about x = cx.
+            let reflected: Vec<Vec2> = s
+                .corners(c, r)
+                .iter()
+                .map(|p| Vec2::new(2.0 * cx - p.x, p.y))
+                .collect();
+            assert_eq!(
+                key(&reflected),
+                key(&s.mirror_x().corners(c, r)),
+                "{s:?}: mirror_x polygon mismatch"
+            );
+            assert_eq!(
+                s.mirror_x().mirror_x(),
+                s,
+                "{s:?}: mirror_x not an involution"
+            );
+            assert!((s.mirror_x().area_factor() - s.area_factor()).abs() < 1.0e-6);
+
+            // rotate_cw: (x,y) → (cx + (y-cy), cy - (x-cx)) about the cell centre.
+            let rotated: Vec<Vec2> = s
+                .corners(c, r)
+                .iter()
+                .map(|p| Vec2::new(cx + (p.y - cy), cy - (p.x - cx)))
+                .collect();
+            assert_eq!(
+                key(&rotated),
+                key(&s.rotate_cw().corners(c, r)),
+                "{s:?}: rotate_cw polygon mismatch"
+            );
+            assert_eq!(
+                s.rotate_cw().rotate_cw().rotate_cw().rotate_cw(),
+                s,
+                "{s:?}: rotate_cw 4× != identity"
+            );
+            assert!((s.rotate_cw().area_factor() - s.area_factor()).abs() < 1.0e-6);
         }
     }
 

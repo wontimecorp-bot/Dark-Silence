@@ -57,6 +57,159 @@ enum EditMode {
     Erase,
     /// Just select the clicked cell (inspect / edit in the right panel).
     Select,
+    /// R63 — stamp a multi-cell preset (round cap / cone / blade / needle) at the clicked anchor.
+    Stamp,
+}
+
+/// R63/R64 — a family of related [`CellShape`]s, shown as one chip in the compact palette.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShapeFamily {
+    Full,
+    Half,
+    Quarter,
+    Chamfer,
+    Slope,
+    Slope3,
+    Slope4,
+    Wedge2,
+    Wedge3,
+    Wedge4,
+    Strip34,
+    Strip12,
+    Strip14,
+    Strip18,
+    Point,
+    Round,
+    Octagon,
+}
+
+impl ShapeFamily {
+    const ALL: [ShapeFamily; 17] = [
+        ShapeFamily::Full,
+        ShapeFamily::Half,
+        ShapeFamily::Quarter,
+        ShapeFamily::Chamfer,
+        ShapeFamily::Slope,
+        ShapeFamily::Slope3,
+        ShapeFamily::Slope4,
+        ShapeFamily::Wedge2,
+        ShapeFamily::Wedge3,
+        ShapeFamily::Wedge4,
+        ShapeFamily::Strip34,
+        ShapeFamily::Strip12,
+        ShapeFamily::Strip14,
+        ShapeFamily::Strip18,
+        ShapeFamily::Point,
+        ShapeFamily::Round,
+        ShapeFamily::Octagon,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            ShapeFamily::Full => "Full",
+            ShapeFamily::Half => "Half",
+            ShapeFamily::Quarter => "Quarter",
+            ShapeFamily::Chamfer => "Chamfer",
+            // FAT trapezoids (a near-full cell with a corner shaved).
+            ShapeFamily::Slope => "Slope 1:2",
+            ShapeFamily::Slope3 => "Slope 1:3",
+            ShapeFamily::Slope4 => "Slope 1:4",
+            // THIN triangles (the skinny complement of the slope).
+            ShapeFamily::Wedge2 => "Wedge 1:2",
+            ShapeFamily::Wedge3 => "Wedge 1:3",
+            ShapeFamily::Wedge4 => "Wedge 1:4",
+            ShapeFamily::Strip34 => "Strip 3/4",
+            ShapeFamily::Strip12 => "Strip 1/2",
+            ShapeFamily::Strip14 => "Strip 1/4",
+            ShapeFamily::Strip18 => "Strip 1/8",
+            ShapeFamily::Point => "Point",
+            ShapeFamily::Round => "Round",
+            ShapeFamily::Octagon => "Octagon",
+        }
+    }
+    /// The shapes (orientations) in this family.
+    fn shapes(self) -> Vec<CellShape> {
+        use CellShape::*;
+        match self {
+            ShapeFamily::Full => vec![Full],
+            ShapeFamily::Half => vec![HalfNW, HalfNE, HalfSW, HalfSE],
+            ShapeFamily::Quarter => vec![QuarterNW, QuarterNE, QuarterSW, QuarterSE],
+            ShapeFamily::Chamfer => vec![ChamferNW, ChamferNE, ChamferSW, ChamferSE],
+            ShapeFamily::Slope => vec![
+                SlopeNWH, SlopeNWV, SlopeNEH, SlopeNEV, SlopeSWH, SlopeSWV, SlopeSEH, SlopeSEV,
+            ],
+            ShapeFamily::Slope3 => vec![
+                Slope3NWH, Slope3NWV, Slope3NEH, Slope3NEV, Slope3SWH, Slope3SWV, Slope3SEH,
+                Slope3SEV,
+            ],
+            ShapeFamily::Slope4 => vec![
+                Slope4NWH, Slope4NWV, Slope4NEH, Slope4NEV, Slope4SWH, Slope4SWV, Slope4SEH,
+                Slope4SEV,
+            ],
+            ShapeFamily::Wedge2 => vec![
+                Wedge2NWH, Wedge2NWV, Wedge2NEH, Wedge2NEV, Wedge2SWH, Wedge2SWV, Wedge2SEH,
+                Wedge2SEV,
+            ],
+            ShapeFamily::Wedge3 => vec![
+                Wedge3NWH, Wedge3NWV, Wedge3NEH, Wedge3NEV, Wedge3SWH, Wedge3SWV, Wedge3SEH,
+                Wedge3SEV,
+            ],
+            ShapeFamily::Wedge4 => vec![
+                Wedge4NWH, Wedge4NWV, Wedge4NEH, Wedge4NEV, Wedge4SWH, Wedge4SWV, Wedge4SEH,
+                Wedge4SEV,
+            ],
+            ShapeFamily::Strip34 => vec![StripN34, StripS34, StripE34, StripW34],
+            ShapeFamily::Strip12 => vec![StripN12, StripS12, StripE12, StripW12],
+            ShapeFamily::Strip14 => vec![StripN14, StripS14, StripE14, StripW14],
+            ShapeFamily::Strip18 => vec![StripN18, StripS18, StripE18, StripW18],
+            ShapeFamily::Point => vec![PointN, PointS, PointE, PointW],
+            ShapeFamily::Round => vec![RoundN, RoundS, RoundE, RoundW],
+            ShapeFamily::Octagon => vec![Octagon],
+        }
+    }
+}
+
+/// R63 — a multi-cell stamp preset (canonical orientation points +row / North).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StampKind {
+    Blade5,
+    Blade7,
+    Needle,
+    Cone3,
+    Cone5,
+    RoundCap3,
+    RoundCap5,
+}
+
+impl StampKind {
+    const ALL: [StampKind; 7] = [
+        StampKind::Blade5,
+        StampKind::Blade7,
+        StampKind::Needle,
+        StampKind::Cone3,
+        StampKind::Cone5,
+        StampKind::RoundCap3,
+        StampKind::RoundCap5,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            StampKind::Blade5 => "Blade (5)",
+            StampKind::Blade7 => "Blade (7)",
+            StampKind::Needle => "Needle",
+            StampKind::Cone3 => "Cone (3)",
+            StampKind::Cone5 => "Cone (5)",
+            StampKind::RoundCap3 => "Round cap (3)",
+            StampKind::RoundCap5 => "Round cap (5)",
+        }
+    }
+}
+
+/// R63 — the stamp direction (where the end points). `N` = canonical (+row).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dir {
+    N,
+    E,
+    S,
+    W,
 }
 
 /// The editor's working state — a COPY of the live hull catalog plus the hull being edited. Nothing
@@ -82,6 +235,11 @@ pub struct HullDesignSession {
     /// R61 — the last cell painted during a click-drag (so a held drag fills continuously without
     /// re-painting the same cell, and a fast drag can line-fill between successive cells).
     last_painted: Option<(u16, u16)>,
+    /// R63 — the family shown in the compact shape palette.
+    palette_family: ShapeFamily,
+    /// R63 — the selected multi-cell stamp + its direction (used in `Stamp` mode).
+    stamp_kind: StampKind,
+    stamp_dir: Dir,
     status: String,
     /// Set on any edit → the 3-D preview rebuilds its mesh next frame.
     pub dirty: bool,
@@ -108,6 +266,9 @@ impl Default for HullDesignSession {
             selected_slot: None,
             pending_grid,
             last_painted: None,
+            palette_family: ShapeFamily::Full,
+            stamp_kind: StampKind::Blade5,
+            stamp_dir: Dir::N,
             status: String::new(),
             dirty: true,
             orbit: (0.6, 0.5),
@@ -302,6 +463,17 @@ fn hull_editor_ui(
                     auto_center(s);
                 }
             });
+            // R63 — mirror one screen-half onto the other across the centre line (cells + slots +
+            // each cell's shape are reflected E↔W). Screen-left = high col (the grid is port-left).
+            ui.label("Mirror across center");
+            ui.horizontal(|ui| {
+                if ui.button("◀ copy left→right").clicked() {
+                    mirror_design(s, true);
+                }
+                if ui.button("copy right→left ▶").clicked() {
+                    mirror_design(s, false);
+                }
+            });
             ui.separator();
             ui.label("Budgets");
             for (label, val, range) in [
@@ -321,9 +493,29 @@ fn hull_editor_ui(
                 ui.selectable_value(&mut s.mode, EditMode::Paint, "Paint");
                 ui.selectable_value(&mut s.mode, EditMode::Erase, "Erase");
                 ui.selectable_value(&mut s.mode, EditMode::Select, "Select");
+                ui.selectable_value(&mut s.mode, EditMode::Stamp, "Stamp");
             });
-            ui.label("Shape (click an icon)");
-            shape_palette(ui, &mut s.brush);
+            if s.mode == EditMode::Stamp {
+                // R63 — multi-cell stamp: pick a preset + direction, click the grid to place it.
+                egui::ComboBox::from_id_salt("stamp_kind")
+                    .selected_text(s.stamp_kind.label())
+                    .show_ui(ui, |ui| {
+                        for k in StampKind::ALL {
+                            ui.selectable_value(&mut s.stamp_kind, k, k.label());
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    ui.label("Dir");
+                    ui.selectable_value(&mut s.stamp_dir, Dir::N, "N");
+                    ui.selectable_value(&mut s.stamp_dir, Dir::E, "E");
+                    ui.selectable_value(&mut s.stamp_dir, Dir::S, "S");
+                    ui.selectable_value(&mut s.stamp_dir, Dir::W, "W");
+                });
+                ui.small("click the grid to stamp");
+            } else {
+                ui.label("Shape (click an icon)");
+                shape_palette(ui, &mut s.brush, &mut s.palette_family);
+            }
             ui.horizontal(|ui| {
                 if ui.button("Fill bounding box").clicked() {
                     fill_bounding_box(&mut s.working, s.brush);
@@ -366,7 +558,7 @@ fn hull_editor_ui(
                 ui.label(format!("({}, {})", coord.0, coord.1));
                 if let Some(idx) = s.working.cells.iter().position(|c| c.coord == coord) {
                     let mut shape = s.working.cells[idx].shape;
-                    if shape_palette(ui, &mut shape) {
+                    if shape_palette(ui, &mut shape, &mut s.palette_family) {
                         s.working.cells[idx].shape = shape;
                         s.dirty = true;
                     }
@@ -496,6 +688,16 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
         }
     }
 
+    // R63 — faint vertical CENTER LINE (the bilateral-symmetry / mirror axis), drawn over the cells.
+    let cx = canvas.center().x;
+    painter.line_segment(
+        [egui::pos2(cx, canvas.min.y), egui::pos2(cx, canvas.max.y)],
+        egui::Stroke::new(
+            1.5,
+            egui::Color32::from_rgba_unmultiplied(230, 230, 255, 70),
+        ),
+    );
+
     // Right-click → erase one cell.
     if resp.secondary_clicked() {
         if let Some(coord) = resp
@@ -524,6 +726,12 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
                         }
                     }
                     s.last_painted = Some(coord);
+                }
+                // Stamp places on a fresh CLICK only (a drag mustn't re-stamp every frame).
+                EditMode::Stamp => {
+                    if resp.clicked() {
+                        apply_stamp(s, coord);
+                    }
                 }
                 EditMode::Select => {}
             }
@@ -594,138 +802,40 @@ fn line_cells(a: (u16, u16), b: (u16, u16)) -> Vec<(u16, u16)> {
     out
 }
 
-/// R61 — a clickable PALETTE of shape ICONS (each drawn as its real polygon), grouped by family with
-/// orientations placed spatially. Sets `*current` on click; returns true if it changed.
-fn shape_palette(ui: &mut egui::Ui, current: &mut CellShape) -> bool {
-    use CellShape::*;
+/// R63 — a COMPACT shape palette: a wrapped row of FAMILY chips, then only the SELECTED family's
+/// orientation icons (each drawn as its real polygon). Keeps the panel narrow regardless of shape count.
+/// Sets `*current` on click; returns true if it changed.
+fn shape_palette(ui: &mut egui::Ui, current: &mut CellShape, family: &mut ShapeFamily) -> bool {
     let before = *current;
-
-    fn icon(ui: &mut egui::Ui, cur: &mut CellShape, shape: CellShape) {
-        const ICON: f32 = 26.0;
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ICON, ICON), egui::Sense::click());
-        let selected = *cur == shape;
-        let p = ui.painter_at(rect);
-        p.rect_filled(rect, 3.0, egui::Color32::from_rgb(30, 34, 42));
-        p.add(egui::Shape::convex_polygon(
-            shape_poly_in_rect(shape, rect.shrink(3.0)),
-            shape_color(shape),
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(15, 18, 22)),
-        ));
-        let border = if selected {
-            egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 220, 80))
-        } else {
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 66, 78))
-        };
-        p.rect_stroke(rect, 3.0, border, egui::StrokeKind::Inside);
-        if resp.on_hover_text(shape.label()).clicked() {
-            *cur = shape;
-        }
-    }
-    // A 2×2 corner block: NW NE / SW SE.
-    fn quad(
-        ui: &mut egui::Ui,
-        cur: &mut CellShape,
-        nw: CellShape,
-        ne: CellShape,
-        sw: CellShape,
-        se: CellShape,
-    ) {
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                icon(ui, cur, nw);
-                icon(ui, cur, ne);
-            });
-            ui.horizontal(|ui| {
-                icon(ui, cur, sw);
-                icon(ui, cur, se);
-            });
-        });
-    }
-
+    // Family chips.
     ui.horizontal_wrapped(|ui| {
-        ui.vertical(|ui| {
-            ui.small("Full");
-            icon(ui, current, Full);
-        });
-        ui.vertical(|ui| {
-            ui.small("Half");
-            quad(ui, current, HalfNW, HalfNE, HalfSW, HalfSE);
-        });
-        ui.vertical(|ui| {
-            ui.small("Quarter");
-            quad(ui, current, QuarterNW, QuarterNE, QuarterSW, QuarterSE);
-        });
-        ui.vertical(|ui| {
-            ui.small("Chamfer");
-            quad(ui, current, ChamferNW, ChamferNE, ChamferSW, ChamferSE);
-        });
-        ui.vertical(|ui| {
-            ui.small("Slope 2:1 (corner · H/V)");
-            ui.horizontal(|ui| {
-                icon(ui, current, SlopeNWH);
-                icon(ui, current, SlopeNWV);
-                icon(ui, current, SlopeNEH);
-                icon(ui, current, SlopeNEV);
-            });
-            ui.horizontal(|ui| {
-                icon(ui, current, SlopeSWH);
-                icon(ui, current, SlopeSWV);
-                icon(ui, current, SlopeSEH);
-                icon(ui, current, SlopeSEV);
-            });
-        });
-        ui.vertical(|ui| {
-            ui.small("Slope 3:1");
-            ui.horizontal(|ui| {
-                icon(ui, current, Slope3NWH);
-                icon(ui, current, Slope3NWV);
-                icon(ui, current, Slope3NEH);
-                icon(ui, current, Slope3NEV);
-            });
-            ui.horizontal(|ui| {
-                icon(ui, current, Slope3SWH);
-                icon(ui, current, Slope3SWV);
-                icon(ui, current, Slope3SEH);
-                icon(ui, current, Slope3SEV);
-            });
-        });
-        ui.vertical(|ui| {
-            ui.small("Slope 4:1");
-            ui.horizontal(|ui| {
-                icon(ui, current, Slope4NWH);
-                icon(ui, current, Slope4NWV);
-                icon(ui, current, Slope4NEH);
-                icon(ui, current, Slope4NEV);
-            });
-            ui.horizontal(|ui| {
-                icon(ui, current, Slope4SWH);
-                icon(ui, current, Slope4SWV);
-                icon(ui, current, Slope4SEH);
-                icon(ui, current, Slope4SEV);
-            });
-        });
-        ui.vertical(|ui| {
-            ui.small("Point (tip)");
-            ui.horizontal(|ui| {
-                icon(ui, current, PointN);
-                icon(ui, current, PointS);
-                icon(ui, current, PointE);
-                icon(ui, current, PointW);
-            });
-        });
-        ui.vertical(|ui| {
-            ui.small("Round (cap)");
-            ui.horizontal(|ui| {
-                icon(ui, current, RoundN);
-                icon(ui, current, RoundS);
-                icon(ui, current, RoundE);
-                icon(ui, current, RoundW);
-            });
-        });
-        ui.vertical(|ui| {
-            ui.small("Octagon");
-            icon(ui, current, Octagon);
-        });
+        for f in ShapeFamily::ALL {
+            ui.selectable_value(family, f, f.label());
+        }
+    });
+    // The selected family's orientation icons.
+    ui.horizontal_wrapped(|ui| {
+        for shape in family.shapes() {
+            const ICON: f32 = 26.0;
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(ICON, ICON), egui::Sense::click());
+            let selected = *current == shape;
+            let p = ui.painter_at(rect);
+            p.rect_filled(rect, 3.0, egui::Color32::from_rgb(30, 34, 42));
+            p.add(egui::Shape::convex_polygon(
+                shape_poly_in_rect(shape, rect.shrink(3.0)),
+                shape_color(shape),
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(15, 18, 22)),
+            ));
+            let stroke = if selected {
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 220, 80))
+            } else {
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 66, 78))
+            };
+            p.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+            if resp.on_hover_text(shape.label()).clicked() {
+                *current = shape;
+            }
+        }
     });
     *current != before
 }
@@ -796,6 +906,148 @@ fn auto_center(s: &mut HullDesignSession) {
     let dc = (cols as i32 - (max_c - min_c + 1) as i32) / 2 - min_c as i32;
     let dr = (rows as i32 - (max_r - min_r + 1) as i32) / 2 - min_r as i32;
     shift_design(s, dc, dr);
+}
+
+/// R63 — make the design bilaterally symmetric across the vertical centre line: keep the cells/slots on
+/// one SCREEN half (`from_left` → the screen-left = high-col half) and reflect them onto the other half
+/// (`col → cols-1-col`, shape `→ mirror_x()`, slots get fresh ids). The centre column maps to itself.
+fn mirror_design(s: &mut HullDesignSession, from_left: bool) {
+    let cols = s.working.grid_dims.0 as i32;
+    let partner = |c: u16| (cols - 1 - c as i32) as u16;
+    // A cell is on the MASTER half if its col is on the chosen screen side of the axis (or on it).
+    // Screen-left = high col (the grid is port-left), so `from_left` keeps `col >= partner(col)`.
+    let on_master = |c: u16| {
+        let pc = partner(c);
+        if from_left {
+            c >= pc
+        } else {
+            c <= pc
+        }
+    };
+    s.working.cells.retain(|c| on_master(c.coord.0));
+    s.working.slots.retain(|sl| on_master(sl.coord.0));
+    for c in s.working.cells.clone() {
+        let pc = partner(c.coord.0);
+        if pc != c.coord.0 {
+            s.working.cells.push(GridCell {
+                coord: (pc, c.coord.1),
+                section: c.section,
+                structural: c.structural,
+                shape: c.shape.mirror_x(),
+            });
+        }
+    }
+    let mut next = next_slot_id(&s.working).0;
+    for sl in s.working.slots.clone() {
+        let pc = partner(sl.coord.0);
+        if pc != sl.coord.0 {
+            let mut nsl = sl;
+            nsl.id = SlotId(next);
+            next += 1;
+            nsl.coord = (pc, sl.coord.1);
+            s.working.slots.push(nsl);
+        }
+    }
+    s.selected_cell = None;
+    s.dirty = true;
+}
+
+/// R63 — a multi-cell STAMP's per-cell pattern in the CANONICAL orientation (pointing +row / North,
+/// anchor `(0,0)` at the base centre). Offsets are `(dcol, drow)`; `apply_stamp` rotates them by `dir`.
+fn stamp_cells(kind: StampKind) -> Vec<(i32, i32, CellShape)> {
+    use CellShape::*;
+    match kind {
+        // A long slim sharp triangle: 3-wide base → 45° converge → 1-wide shaft → Point tip.
+        StampKind::Blade5 => vec![
+            (-1, 0, Full),
+            (0, 0, Full),
+            (1, 0, Full),
+            (-1, 1, HalfNE),
+            (0, 1, Full),
+            (1, 1, HalfNW),
+            (0, 2, Full),
+            (0, 3, Full),
+            (0, 4, PointN),
+        ],
+        StampKind::Blade7 => vec![
+            (-1, 0, Full),
+            (0, 0, Full),
+            (1, 0, Full),
+            (-1, 1, HalfNE),
+            (0, 1, Full),
+            (1, 1, HalfNW),
+            (0, 2, Full),
+            (0, 3, Full),
+            (0, 4, Full),
+            (0, 5, Full),
+            (0, 6, PointN),
+        ],
+        // A 1-wide pointed spike.
+        StampKind::Needle => vec![(0, 0, Full), (0, 1, Full), (0, 2, PointN)],
+        // Cones: a wide base converging to a Point apex.
+        StampKind::Cone3 => vec![
+            (-1, 0, HalfNE),
+            (0, 0, Full),
+            (1, 0, HalfNW),
+            (0, 1, PointN),
+        ],
+        StampKind::Cone5 => vec![
+            (-2, 0, HalfNE),
+            (-1, 0, Full),
+            (0, 0, Full),
+            (1, 0, Full),
+            (2, 0, HalfNW),
+            (-1, 1, HalfNE),
+            (0, 1, Full),
+            (1, 1, HalfNW),
+            (0, 2, PointN),
+        ],
+        // Round caps: a rounded front edge.
+        StampKind::RoundCap3 => vec![(-1, 0, ChamferNW), (0, 0, RoundN), (1, 0, ChamferNE)],
+        StampKind::RoundCap5 => vec![
+            (-2, 0, HalfNW),
+            (-1, 0, ChamferNW),
+            (0, 0, RoundN),
+            (1, 0, ChamferNE),
+            (2, 0, HalfNE),
+        ],
+    }
+}
+
+/// R63 — paint the selected stamp (oriented by `stamp_dir`) at the clicked `anchor`. Out-of-bounds
+/// cells are skipped; in-bounds cells are added/overwritten with the (rotated) shape.
+fn apply_stamp(s: &mut HullDesignSession, anchor: (u16, u16)) {
+    let turns = match s.stamp_dir {
+        Dir::N => 0,
+        Dir::E => 1,
+        Dir::S => 2,
+        Dir::W => 3,
+    };
+    let (cols, rows) = s.working.grid_dims;
+    for (dc0, dr0, shape0) in stamp_cells(s.stamp_kind) {
+        // Rotate the offset + the shape `turns` times CW (a CW turn maps (dc,dr) → (dr,-dc)).
+        let (mut dc, mut dr, mut shape) = (dc0, dr0, shape0);
+        for _ in 0..turns {
+            (dc, dr) = (dr, -dc);
+            shape = shape.rotate_cw();
+        }
+        let (nc, nr) = (anchor.0 as i32 + dc, anchor.1 as i32 + dr);
+        if nc < 0 || nr < 0 || nc >= cols as i32 || nr >= rows as i32 {
+            continue;
+        }
+        let coord = (nc as u16, nr as u16);
+        if let Some(c) = s.working.cells.iter_mut().find(|c| c.coord == coord) {
+            c.shape = shape;
+        } else {
+            s.working.cells.push(GridCell {
+                coord,
+                section: SectionId(10000),
+                structural: true,
+                shape,
+            });
+        }
+    }
+    s.dirty = true;
 }
 
 /// Paint every in-bounds coord with the brush shape (a quick way to start a solid block).

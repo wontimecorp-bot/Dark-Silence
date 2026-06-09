@@ -1428,9 +1428,9 @@ fn signed_area2(pts: &[Vec2]) -> f32 {
 /// quarter junctions may have minor artifacts — a later refinement.)
 fn cell_boundary_loops_shaped(cells: &[(u16, u16, sim::fitting::CellShape)]) -> Vec<Vec<Vec2>> {
     use std::collections::{HashMap, HashSet};
-    // R58/R62 — quantize endpoints to a 1/12 grid (LCM of 2,3,4) so half-cell (½), 4:1-slope (¼,¾) and
-    // 3:1-slope (⅓,⅔) vertices all map to DISTINCT integers ({0,3,4,6,8,9,12}) for exact edge linking.
-    let key = |v: Vec2| ((v.x * 12.0).round() as i32, (v.y * 12.0).round() as i32);
+    // R58/R62/R64 — quantize endpoints to a 1/24 grid (LCM of 2,3,4,8) so half (½), thirds (⅓,⅔),
+    // quarters (¼,¾) AND the R64 strip eighths (⅛,⅞) all map to DISTINCT integers for exact edge linking.
+    let key = |v: Vec2| ((v.x * 24.0).round() as i32, (v.y * 24.0).round() as i32);
 
     // All directed CCW polygon edges + a set of their (start,end) keys for the reverse test.
     let mut edges: Vec<(Vec2, Vec2)> = Vec::new();
