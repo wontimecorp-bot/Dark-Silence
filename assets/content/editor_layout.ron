@@ -1,9 +1,9 @@
-// R84 — hull-editor UI sizes/positions. Edit + click the editor's "⟳ UI" button (or close + F8)
-// to apply — no rebuild. Missing fields fall back to code defaults.
+// R84 — hull-editor UI sizes/positions. Edit + click the editor's "Load UI" button (or close + F8)
+// to apply — no rebuild; "Save UI" writes the live values back. Missing fields fall back to defaults.
 (
     // The top Design|Brush tabbed panel's height (px). Sized so the Brush tab shows ~one full
     // row of shape cards plus a peek of the next.
-    tabs_panel_height: 190.0,
+    tabs_panel_height: 230.0,
     // The Brush tab's LEFT column width (Tool/Layer + the wrapped legend).
     brush_left_width: 210.0,
     // The right inspector panel's default width.
@@ -20,4 +20,8 @@
     slider_width: 150.0,
     // The shape-palette search box width.
     search_width: 120.0,
+    // The grid panel's background colour (r, g, b) — behind/around the grid canvas.
+    grid_panel_bg: (10, 11, 14),
+    // The EMPTY grid cell fill (r, g, b) — present cells draw their layer colour on top.
+    grid_empty_cell: (34, 39, 48),
 )

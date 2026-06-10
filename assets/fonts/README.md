@@ -17,8 +17,8 @@ Swap a face by dropping a `.ttf` and updating `LABEL_FONT` / `MONO_FONT` in `fon
 Rajdhani weights (Bold/Light/Regular/SemiBold) are available for future emphasis. Future
 title/faction/brand faces: add fields to `FontAssets`.
 
-## egui glyph fallback — `assets/fonts/symbols.ttf` (Refinement 77)
-The dev **hull editor** + **dev panel** (egui) need symbol glyphs (`▲ ▼ ◀ ▶ → ↳ …`) that egui's bundled
+## egui glyph fallback — `assets/fonts/symbols.ttf` (Refinement 77/87)
+The dev **hull editor** + **dev panel** (egui) need symbol glyphs (`▲ ▼ ◀ ▶ ⭯ ⭮ …`) that egui's bundled
 font lacks (they'd render as tofu boxes). `install_egui_fonts` (`crates/client/src/hull_editor/mod.rs`)
 loads `assets/fonts/symbols.ttf` once via `std::fs` and registers it as an egui **fallback** (used only
 for glyphs the body font is missing). It's optional — absent → a one-time log + the glyphs stay boxes;
@@ -26,10 +26,13 @@ the build/tests are unaffected.
 
 | File | Role | Font | License |
 |------|------|------|---------|
-| `symbols.ttf` | egui glyph fallback (arrows / geometric shapes in the editor + dev panel) | any glyph-rich TTF — recommended **DejaVu Sans** | (DejaVu) public-domain-ish / Bitstream Vera |
+| `symbols.ttf` | egui glyph fallback (arrows / geometric shapes in the editor + dev panel) | **Noto Sans Symbols 2** (`NotoSansSymbols2-Regular.ttf`, R87) | SIL OFL 1.1 — same as the HUD fonts; safe to commit/ship |
 
-Drop any TTF that covers the arrows/shapes there as `symbols.ttf` (DejaVu Sans, Noto Sans, Segoe UI
-Symbol, …).
+Notes (R87, verified against the character maps): font WEIGHTS/widths share identical character
+coverage — one Regular per family is all that matters. Base **Noto Sans** has NONE of these symbols
+(text family); **Noto Sans Symbols 2** has the triangles/`✕`/`⭯⭮` (not `→ ↶ ↷ ⟳ 💾` — the editor uses
+`⭯⭮` for undo/redo and plain text for Load UI / Save UI); **Noto Sans Symbols** (1) has `→` only. The
+`Noto_Sans*` source folders here are NOT read by code — only `symbols.ttf` is loaded.
 
 ## Icons — `assets/icons/`
 HUD icons are **PNG images** (rendered as Bevy `ImageNode`s, tinted + pulsed) — simple + efficient

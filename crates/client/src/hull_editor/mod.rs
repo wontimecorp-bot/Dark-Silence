@@ -136,7 +136,7 @@ enum EditorTab {
 
 /// R84 — ALL the hull-editor UI sizes/positions, loaded from `assets/content/editor_layout.ron` so they
 /// can be tuned by editing the file (no rebuild): reloaded on every editor open (F8) and via the title
-/// bar's "⟳ UI" button. Missing fields fall back to the defaults (`#[serde(default)]`); a missing FILE
+/// bar's "Load UI" button. Missing fields fall back to the defaults (`#[serde(default)]`); a missing FILE
 /// is written out as an editable template.
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -160,12 +160,16 @@ struct EditorLayout {
     slider_width: f32,
     /// The shape-palette search box width.
     search_width: f32,
+    /// R86 — the grid panel's background colour `(r, g, b)` (behind/around the grid canvas).
+    grid_panel_bg: [u8; 3],
+    /// R86 — the EMPTY grid cell fill `(r, g, b)` (present cells draw their layer colour on top).
+    grid_empty_cell: [u8; 3],
 }
 
 impl Default for EditorLayout {
     fn default() -> Self {
         Self {
-            tabs_panel_height: 190.0,
+            tabs_panel_height: 230.0,
             brush_left_width: 210.0,
             inspect_panel_width: 300.0,
             preview_px: 280.0,
@@ -174,8 +178,15 @@ impl Default for EditorLayout {
             name_field_width: 140.0,
             slider_width: 150.0,
             search_width: 120.0,
+            grid_panel_bg: [10, 11, 14],
+            grid_empty_cell: [34, 39, 48],
         }
     }
+}
+
+/// R86 — an `EditorLayout` `(r, g, b)` triple as an egui colour.
+fn col3(c: [u8; 3]) -> egui::Color32 {
+    egui::Color32::from_rgb(c[0], c[1], c[2])
 }
 
 /// R84 — load `editor_layout.ron` from the content dir; absent → write the DEFAULT out as an editable
@@ -194,11 +205,32 @@ fn load_editor_layout() -> EditorLayout {
             let def = EditorLayout::default();
             if let Ok(text) = ron::ser::to_string_pretty(&def, ron::ser::PrettyConfig::default()) {
                 if std::fs::write(&path, text).is_ok() {
-                    info!("wrote default {} (edit + \"⟳ UI\" to tune)", path.display());
+                    info!(
+                        "wrote default {} (edit + \"Load UI\" to tune)",
+                        path.display()
+                    );
                 }
             }
             def
         }
+    }
+}
+
+/// R86 — write the CURRENT editor-UI sizes back to `editor_layout.ron` (the "Save UI" button), so live
+/// tweaks — e.g. a Ctrl+wheel-zoomed grid — persist. Returns the status line to show.
+fn save_editor_layout(layout: &EditorLayout) -> String {
+    let path = crate::tuning_io::content_dir().join("editor_layout.ron");
+    match ron::ser::to_string_pretty(layout, ron::ser::PrettyConfig::default()) {
+        Ok(body) => {
+            let text = format!(
+                "// Hull-editor UI sizes/colours. Edit + \"Load UI\" (or close + F8) to apply; \"Save UI\" rewrites it.\n{body}"
+            );
+            match std::fs::write(&path, text) {
+                Ok(()) => format!("saved {}", path.display()),
+                Err(e) => format!("save FAILED: {e}"),
+            }
+        }
+        Err(e) => format!("save FAILED (serialize): {e}"),
     }
 }
 
@@ -369,7 +401,7 @@ pub struct HullDesignSession {
     tool: Tool,
     /// R80 — the active top-panel tab (Design / Brush).
     tab: EditorTab,
-    /// R84 — the RON-tunable UI sizes (`editor_layout.ron`), reloaded on editor open + "⟳ UI".
+    /// R84 — the RON-tunable UI sizes (`editor_layout.ron`), reloaded on editor open + "Load UI".
     layout: EditorLayout,
     selected_cell: Option<(u16, u16)>,
     selected_slot: Option<SlotId>,
@@ -614,47 +646,54 @@ fn hull_editor_ui(
                 do_save_new = true;
             }
             ui.separator();
-            // R79/R80 — undo / redo glyph icons (↶ / ↷; render with a glyph font, else boxes). Also
-            // Ctrl+Z / Ctrl+Y, wired below.
+            // R79/R80/R87 — undo / redo glyph icons (⭯ / ⭮ — covered by the Noto Sans Symbols 2
+            // fallback installed at assets/fonts/symbols.ttf). Also Ctrl+Z / Ctrl+Y, wired below.
             if ui
-                .add_enabled(!s.undo.is_empty(), egui::Button::new("↶"))
+                .add_enabled(!s.undo.is_empty(), egui::Button::new("⭯"))
                 .on_hover_text("Undo (Ctrl+Z)")
                 .clicked()
             {
                 s.undo();
             }
             if ui
-                .add_enabled(!s.redo.is_empty(), egui::Button::new("↷"))
+                .add_enabled(!s.redo.is_empty(), egui::Button::new("⭮"))
                 .on_hover_text("Redo (Ctrl+Y / Ctrl+Shift+Z)")
                 .clicked()
             {
                 s.redo();
             }
-            // R84 — re-read editor_layout.ron live (edit the file → click → the sizes apply).
+            // R84/R87 — re-read editor_layout.ron live (edit the file → click → the sizes apply).
             if ui
-                .button("⟳ UI")
+                .button("Load UI")
                 .on_hover_text("Reload assets/content/editor_layout.ron (UI sizes)")
                 .clicked()
             {
                 s.layout = load_editor_layout();
                 s.status = "UI layout reloaded".into();
             }
-            // R80 — Close ✕ pinned to the FAR RIGHT of the title bar.
+            // R86/R87 — persist the CURRENT UI sizes (incl. a Ctrl+wheel-zoomed grid) back to the RON.
+            if ui
+                .button("Save UI")
+                .on_hover_text("Save the current UI sizes to assets/content/editor_layout.ron")
+                .clicked()
+            {
+                s.status = save_editor_layout(&s.layout);
+            }
+            // R80 — Close ✕ pinned to the FAR RIGHT of the title bar. R85 — the status renders INLINE
+            // on this same row (left of ✕) so a message appearing never adds a line / shifts the panels.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("✕").on_hover_text("Close").clicked() {
                     do_close = true;
                 }
+                ui.weak(&s.status);
             });
         });
-        if !s.status.is_empty() {
-            ui.label(&s.status);
-        }
     });
 
     // ---- Top: a TABBED panel — Design (hull/grid/move/mirror/budgets) | Brush (tool/layer/palette) ----
     // R80 — replaces the left side panel + the R79 brush top panel. `auto_shrink(false)` on each tab's
     // body holds the panel at a CONSISTENT height (no shrink/jump when switching Tool/Layer or tabs).
-    // R84 — EXACT height from editor_layout.ron (the RON is the single source of truth → "⟳ UI"
+    // R84 — EXACT height from editor_layout.ron (the RON is the single source of truth → "Load UI"
     // applies instantly; egui's drag-resize memory would otherwise shadow a reloaded value).
     egui::TopBottomPanel::top("hull_editor_tabs")
         .resizable(false)
@@ -675,16 +714,19 @@ fn hull_editor_ui(
                         });
                 }
                 EditorTab::Brush => {
-                    // R82 — Tool/Layer on the LEFT, the shape palette to their RIGHT (side by side).
-                    // R84 — the left column is WIDTH-CAPPED (the wrapped legend stays inside it), so the
-                    // palette can no longer be pushed off-screen.
-                    ui.horizontal_top(|ui| {
-                        ui.vertical(|ui| {
-                            ui.set_width(s.layout.brush_left_width);
+                    // R82/R85 — Tool/Layer on the LEFT, the shape palette to their RIGHT. R85 — done
+                    // with NESTED `show_inside` panels: `ui.horizontal_top` gives children a region only
+                    // ~one row TALL, so the R82–R84 ScrollArea inside it was a sliver — its content
+                    // (chips/search) overflowed + got clipped at the panel bottom, and the icon cards
+                    // were drawn below the clip line, unreachable by scroll. Nested panels give REAL
+                    // bounded rects → the palette fills + scrolls correctly.
+                    egui::SidePanel::left("brush_left_inside")
+                        .resizable(false)
+                        .exact_width(s.layout.brush_left_width)
+                        .show_inside(ui, |ui| {
                             brush_header(ui, s, &cell_materials);
                         });
-                        ui.separator();
-                        // Right: the active tool's palette / options + Fill/Clear (scrolls, fills the rest).
+                    egui::CentralPanel::default().show_inside(ui, |ui| {
                         egui::ScrollArea::vertical()
                             .auto_shrink(false)
                             .id_salt("brush_scroll")
@@ -819,13 +861,26 @@ fn hull_editor_ui(
         });
 
     // ---- Center: the cell-grid painter ----
-    egui::CentralPanel::default().show(ctx, |ui| {
-        // R79 — just the grid now: the "Show:" toolbar was removed (the Brush "Layer:" row IS the view)
-        // and its colour legend moved into the top Brush panel (`brush_legend`).
-        egui::ScrollArea::both().show(ui, |ui| {
-            draw_grid(ui, s);
+    // R86 — the panel behind the grid uses a CONFIGURABLE near-black fill (editor_layout.ron
+    // `grid_panel_bg`) so the lighter grid cells stand out.
+    let grid_frame = egui::Frame::central_panel(&ctx.style()).fill(col3(s.layout.grid_panel_bg));
+    egui::CentralPanel::default()
+        .frame(grid_frame)
+        .show(ctx, |ui| {
+            // R79 — just the grid now: the "Show:" toolbar was removed (the Brush "Layer:" row IS the view)
+            // and its colour legend moved into the top Brush panel (`brush_legend`).
+            // R85 — the grid canvas is CENTERED width-wise in the viewport (left-padded by half the slack);
+            // when it's wider than the viewport the pad is 0 and it scrolls exactly as before.
+            let avail_w = ui.available_width();
+            egui::ScrollArea::both().show(ui, |ui| {
+                let grid_w = s.working.grid_dims.0 as f32 * s.layout.grid_cell_px;
+                let pad = ((avail_w - grid_w) * 0.5).max(0.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(pad);
+                    draw_grid(ui, s);
+                });
+            });
         });
-    });
 
     // ---- Execute deferred intents (need `host`) ----
     if do_close {
@@ -860,11 +915,20 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
         .hover_pos()
         .and_then(|p| cell_at_pointer(canvas, p, (cols, rows), cell_px));
 
+    // R86 — Ctrl+wheel (or pinch) over the grid ZOOMS the cell size (egui's `zoom_delta` channel, so a
+    // plain wheel still scrolls the surrounding ScrollArea). "Save UI" persists the zoomed size.
+    if resp.hovered() {
+        let zoom = ui.input(|i| i.zoom_delta());
+        if zoom != 1.0 {
+            s.layout.grid_cell_px = (s.layout.grid_cell_px * zoom).clamp(8.0, 80.0);
+        }
+    }
+
     for row in 0..rows {
         for col in 0..cols {
             let coord = (col, row);
             let rect = cell_rect(col, row);
-            painter.rect_filled(rect.shrink(0.5), 2.0, egui::Color32::from_rgb(22, 26, 33));
+            painter.rect_filled(rect.shrink(0.5), 2.0, col3(s.layout.grid_empty_cell));
             if let Some(c) = s.working.cells.iter().find(|c| c.coord == coord).copied() {
                 let slot = s.working.slots.iter().find(|sl| sl.coord == coord).copied();
                 // R67 — the cell FILL follows the active grid view (shape / hull mat / armor mat).
@@ -1316,7 +1380,7 @@ fn brush_options(
     match s.tool {
         Tool::Paint => match s.layer {
             Layer::Shape => {
-                ui.label("Shape (filter / search, then click an icon)");
+                // (R85 — no header label: every px of panel height goes to the chips + icon cards.)
                 shape_palette(
                     ui,
                     "brush",
