@@ -1617,19 +1617,21 @@ fn shape_palette(
 ) -> bool {
     let before = *current;
     ui.push_id(id, |ui| {
-        // Filter chips: All + each family.
+        // R91 — ONE wrapped row: the FIND box first (top-left), then the family filter chips
+        // (All + each family) flowing after/under it.
         ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(search)
+                    .desired_width(lay.search_width)
+                    .hint_text("find"),
+            );
+            if !search.is_empty() && ui.small_button("✕").clicked() {
+                search.clear();
+            }
+            ui.add_space(6.0);
             ui.selectable_value(filter, None, "All");
             for f in ShapeFamily::ALL {
                 ui.selectable_value(filter, Some(f), f.label());
-            }
-        });
-        // Name search.
-        ui.horizontal(|ui| {
-            ui.label("find");
-            ui.add(egui::TextEdit::singleline(search).desired_width(lay.search_width));
-            if !search.is_empty() && ui.small_button("✕").clicked() {
-                search.clear();
             }
         });
         // R76 — render each family as a compact CARD: the family name ONCE, then a WYSIWYG compass where
