@@ -178,17 +178,18 @@ pub struct ModuleId(pub u32);
 pub enum ModuleSpecifics {
     /// Reactor: contributes only `power_gen` (on [`Module`]); no extra params.
     Reactor,
-    /// Thruster: sums into total thrust/torque (against total mass).
+    /// Thruster — R92: ONE jet force along the mount SLOT's authored `facing` (body frame). The
+    /// derive-time "flight computer" projects every jet onto the six control channels
+    /// (forward / reverse / strafe-port / strafe-starboard / turn-CCW / turn-CW), with torque =
+    /// `r × F` about the mass CoM — so PLACEMENT + FACING are the whole behavior (a main drive is a
+    /// big aft-facing jet; an RCS block is a small one at an extremity). The old authored
+    /// `turn_torque`/`strafe_force` fields are retired (serde ignores them in old RONs).
     Thruster {
-        /// Propulsion role tag (main drive / maneuver / RCS) — categorizes the module
-        /// (Phase C); the numbers below differentiate behavior.
+        /// Propulsion role tag (main drive / maneuver / RCS) — categorization/UI only (a future
+        /// exposure rule may gate on it; the physics comes from force + facing + placement).
         propulsion: PropulsionType,
-        /// Forward thrust force contribution (`> 0`).
+        /// The jet's thrust force along its slot facing (`> 0`).
         thrust_force: f32,
-        /// Angular drive torque contribution (`> 0`).
-        turn_torque: f32,
-        /// Lateral (strafe) thrust contribution (`>= 0`).
-        strafe_force: f32,
     },
     /// Weapon: populates the `Weapon` component fire params (FR-016). Refinement 42 — authored from
     /// REAL ballistic specs (`caliber_mm` / `muzzle_velocity_ms` / `rpm`); the game DERIVES the
@@ -261,6 +262,19 @@ pub enum ModuleSpecifics {
         range: f32,
         /// Angular/positional resolution (`> 0`; higher = finer).
         resolution: f32,
+    },
+    /// R92 — energy storage (capacitor / battery — the catalog differentiates size/mass): adds flat
+    /// capacity to the ship's energy pool. With a dead reactor the stored charge persists (regen 0)
+    /// and drains as used — you fight on the stores until they're empty.
+    EnergyStore {
+        /// Added energy-pool capacity (`>= 0`), health-scaled at derive time.
+        capacity: f32,
+    },
+    /// R92 — cargo hold volume. v1 derives the ship's `cargo_capacity` stat (displayed in fitting);
+    /// pickup/loot gameplay consumes it in a later round.
+    CargoBay {
+        /// Cargo volume contribution (`>= 0`), health-scaled at derive time.
+        volume: f32,
     },
     /// Utility: generic seam; no flight/weapon contribution this epic.
     Utility,

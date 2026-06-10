@@ -246,8 +246,9 @@ fn seed_modules() -> ModuleCatalog {
             hardpoint_size: SlotSize::Small,
             specifics: ModuleSpecifics::Reactor,
         },
-        // thruster_basic — + thrust/torque (speed/agility); cost axes = power_draw
-        // + mass. Thrust 15/6/9 UNCHANGED (two of them sum to the E002 30/12/18).
+        // thruster_basic — a jet force along its slot facing (R92: turn/strafe come from
+        // PLACEMENT + FACING via the flight computer, not authored fields); cost axes =
+        // power_draw + mass.
         Module {
             id: MODULE_THRUSTER_BASIC,
             name: "Thruster".to_string(),
@@ -263,8 +264,6 @@ fn seed_modules() -> ModuleCatalog {
             specifics: ModuleSpecifics::Thruster {
                 propulsion: PropulsionType::MainDrive,
                 thrust_force: 15.0,
-                turn_torque: 6.0,
-                strafe_force: 9.0,
             },
         },
         // autocannon — weapon fire params (damage); dominant cost axis = cpu_draw
@@ -351,8 +350,9 @@ fn seed_modules() -> ModuleCatalog {
             hardpoint_size: SlotSize::Small,
             specifics: ModuleSpecifics::Utility,
         },
-        // baseline_thruster — the flight-feel reference (HINT-002): supplies the
-        // full `Tuning::default()` thrust/torque/strafe (30/12/18) in one module.
+        // baseline_thruster — the flight-feel reference (HINT-002): supplies the full
+        // `Tuning::default()` forward thrust (30) in one module (R92 — reverse/strafe/turn now come
+        // from the SimTuning baselines + jet placement, so this authors only the forward force).
         // Phase M5: flight `total_mass` is now the SUM of the body's cells, and the
         // baseline hull is a single module cell with no structural filler, so this
         // module's mass IS the baseline fit's total mass — set to `1.0` so
@@ -373,8 +373,6 @@ fn seed_modules() -> ModuleCatalog {
             specifics: ModuleSpecifics::Thruster {
                 propulsion: PropulsionType::MainDrive,
                 thrust_force: 30.0,
-                turn_torque: 12.0,
-                strafe_force: 18.0,
             },
         },
     ];
@@ -869,8 +867,9 @@ mod tests {
         // thruster (HINT-002) — 7 module rows in total.
         assert_eq!(
             modules.len(),
-            21,
-            "6 archetypes + baseline thruster + 11 Phase C4 rows + 3 R42 ballistic guns (MG/HMG/Gatling)"
+            24,
+            "6 archetypes + baseline thruster + 11 Phase C4 rows + 3 R42 ballistic guns \
+             (MG/HMG/Gatling) + 3 R92 utilities (Capacitor/Battery Bank/Cargo Bay)"
         );
         assert!(modules.get(MODULE_BASELINE_THRUSTER).is_some());
         assert_eq!(hulls.len(), 2, "expected the fighter + corvette seed hulls");

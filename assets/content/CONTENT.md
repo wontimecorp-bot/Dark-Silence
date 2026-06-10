@@ -41,14 +41,24 @@ Universal fields on every module:
 Per-kind `specifics`:
 
 - **`Reactor`** — no extra params (contributes `power_gen`).
-- **`Thruster( propulsion, thrust_force, turn_torque, strafe_force )`** — `propulsion` is a tag
-  (`MainDrive`/`Maneuver`/`Rcs`); derivation **sums** thrust/torque/strafe across all thrusters, so
-  an engine + an RCS unit combine automatically. The numbers, not the tag, differentiate them.
+- **`Thruster( propulsion, thrust_force )`** — **R92: one JET FORCE along the mount SLOT's authored
+  `facing`** (body frame: 0 = pushes the ship forward). The derive-time "flight computer" projects
+  every jet onto six control channels (forward / reverse / strafe-port / strafe-starboard /
+  turn-CCW / turn-CW); a jet's TURN contribution = `r × F` about the mass CoM × the SimTuning
+  `thruster_lever_scale` — so **placement + facing are the behavior** (an aft-mounted big jet is a
+  main drive; small jets at the extremities are RCS). `propulsion` (`MainDrive`/`Maneuver`/`Rcs`)
+  is a tag/UI label. SimTuning `baseline_turn/strafe/reverse` give every hull built-in maneuvering
+  authority so a jet-less axis stays flyable; `thruster_inertia_scale` feeds the layout's REAL
+  moment (`Σ m·r²` about the CoM) into turn responsiveness.
 - **`Shield( shield_hp, regen )`** — health-scaled into the ship's shield pool.
 - **`Armor( armor_value )`** — summed into the armor pool capacity.
 - **`Sensor( sensor_type, range, resolution )`** — `Radar`/`Lidar`/`Thermal`/`Em`/`Gravimetric`.
   Detection gameplay (AOI/signatures) is a later feature; this is the data shape. No seed hull has a
   Sensor hardpoint yet, so these are catalog-only until a hull authors a Sensor slot.
+- **`EnergyStore( capacity )`** — R92: flat energy-pool capacity (capacitors/batteries), health-
+  scaled. With a dead reactor the stored charge persists (regen 0) and drains as used.
+- **`CargoBay( volume )`** — R92: cargo hold volume → the ship's `cargo_capacity` stat (display
+  now; pickup gameplay later), health-scaled.
 - **`Utility`** — generic seam; no flight/weapon contribution yet.
 - **`Weapon( … )`** — see the weapon model below.
 
@@ -59,7 +69,9 @@ Per-kind `specifics`:
 **Propulsion variants** `10` Ion Drive · `11` Maneuvering Thrusters · `12` RCS Quad ·
 **Sensors** `13` Short-Range Radar · `14` Long-Range Array · `15` Passive EM ·
 **Weapons** `16` Vulcan · `17` Cannon · `18` Missile Launcher · `19` Plasma Cannon ·
-`20` Ion Cannon · `21` Machine Gun · `22` Heavy Machine Gun · `23` Gatling Gun.
+`20` Ion Cannon · `21` Machine Gun · `22` Heavy Machine Gun · `23` Gatling Gun ·
+**R92 utilities** `24` Capacitor (store 25, light) · `25` Battery Bank (store 80, heavy) ·
+`26` Cargo Bay (volume 50).
 
 ---
 

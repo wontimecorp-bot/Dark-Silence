@@ -33,7 +33,9 @@ use serde::{Deserialize, Serialize};
 use super::content::ModuleCatalog;
 use super::fit::Fit;
 use super::hull::{Hull, SlotId, CELL_WORLD_SIZE};
-use super::layout::{layout_mass_with, CellOccupant, FitLayout};
+use super::layout::{
+    layout_com_with, layout_inertia_with, layout_mass_with, CellOccupant, FitLayout,
+};
 use super::materials::CellMaterials;
 use super::module::{Module, ModuleKind, ModuleSpecifics};
 use crate::damage::{Channel, StatScalingConfig, DEFAULT_SHIELD_HP, DEFAULT_SHIELD_REGEN};
@@ -260,21 +262,28 @@ pub fn derive_weapons(
 /// floored `> 0` so flight is always finite (INV-F07, FR-017).
 #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ShipStats {
-    /// Main-drive forward thrust force (`>= THRUST_FLOOR > 0`); Σ thruster thrust.
+    /// FORWARD channel (`>= THRUST_FLOOR > 0`): Σ jet force projected onto +nose (R92).
     pub thrust_force: f32,
-    /// Reverse (retro) thrust force (`> 0`); a fraction of forward thrust.
+    /// REVERSE (retro) channel (`> 0`): Σ retro-facing jet force + the baseline retro authority
+    /// (R92 — no retro jets means the baseline is all you have → flip-and-burn).
     pub reverse_force: f32,
-    /// Lateral RCS (strafe) thrust force (`>= STRAFE_FLOOR > 0`); Σ thruster strafe.
-    pub strafe_force: f32,
+    /// STRAFE-PORT channel (`>= STRAFE_FLOOR > 0`): Σ port-facing jet force + baseline (R92).
+    pub strafe_port: f32,
+    /// STRAFE-STARBOARD channel (`>= STRAFE_FLOOR > 0`): Σ starboard-facing force + baseline (R92).
+    pub strafe_starboard: f32,
     /// Total ship mass (`>= hull_base_mass > 0`); `hull_base_mass + Σ module.mass`.
     pub total_mass: f32,
     /// Linear drag coefficient (`> 0`); emergent top speed = `thrust_force / linear_drag`.
     pub linear_drag: f32,
-    /// Angular drive torque (`>= TORQUE_FLOOR > 0`); Σ thruster torque.
-    pub turn_torque: f32,
-    /// Angular drag (`> 0`); emergent max turn rate = `turn_torque / angular_drag`.
+    /// TURN-CCW channel (`>= TORQUE_FLOOR > 0`): Σ max(0, r × F) · lever_scale + baseline (R92 —
+    /// torque about the mass CoM, so jet PLACEMENT is the authority).
+    pub turn_ccw: f32,
+    /// TURN-CW channel (`>= TORQUE_FLOOR > 0`): Σ max(0, −(r × F)) · lever_scale + baseline (R92).
+    pub turn_cw: f32,
+    /// Angular drag (`> 0`); emergent max turn rate = `turn / angular_drag`.
     pub angular_drag: f32,
-    /// Angular inertia / moment (`> 0`); how quickly the turn rate responds.
+    /// Angular inertia / moment (`> 0`); how quickly the turn rate responds. R92 — the REAL layout
+    /// moment: `Tuning.angular_inertia + layout_inertia (Σ m·r² about the CoM) · inertia_scale`.
     pub angular_inertia: f32,
     /// Fraction of translational thrust diverted at full turn input (`0..=1`).
     pub turn_power_share: f32,
@@ -304,6 +313,13 @@ pub struct ShipStats {
     /// with generator damage). Falls back to [`crate::damage::DEFAULT_SHIELD_REGEN`] with no shield
     /// module. Synced into [`crate::damage::Shields`]`::regen_rate` by `recompute_ship_stats_system`.
     pub shield_regen: f32,
+    /// R92 — flat energy-pool capacity from fitted **EnergyStore** modules (capacitors/batteries):
+    /// `Σ capacity · health_factor`. Added to `Energy.max`; with a dead reactor the stored charge
+    /// persists (regen 0) and drains as used.
+    pub energy_store: f32,
+    /// R92 — cargo hold volume from fitted **CargoBay** modules: `Σ volume · health_factor`.
+    /// v1 = a derived/displayed stat; pickup gameplay consumes it later.
+    pub cargo_capacity: f32,
     /// `true` iff at least one weapon module is installed (FR-016). When `false`
     /// the ship cannot fire and [`ShipStats::weapon`] is `None`.
     pub can_fire: bool,
@@ -319,10 +335,10 @@ impl ShipStats {
         self.thrust_force / self.linear_drag
     }
 
-    /// Emergent maximum turn rate (rad/s) = `turn_torque / angular_drag` (mirrors
-    /// [`Tuning::max_turn_rate`]).
+    /// Emergent maximum turn rate (rad/s) = the STRONGER turn channel `/ angular_drag` (mirrors
+    /// [`Tuning::max_turn_rate`]; R92 — the channels can be asymmetric).
     pub fn max_turn_rate(&self) -> f32 {
-        self.turn_torque / self.angular_drag
+        self.turn_ccw.max(self.turn_cw) / self.angular_drag
     }
 
     /// INV-F07/F14: every denominator the flight model divides by is strictly
@@ -334,14 +350,18 @@ impl ShipStats {
             && self.thrust_force >= THRUST_FLOOR
             && self.reverse_force.is_finite()
             && self.reverse_force > 0.0
-            && self.strafe_force.is_finite()
-            && self.strafe_force >= STRAFE_FLOOR
+            && self.strafe_port.is_finite()
+            && self.strafe_port >= STRAFE_FLOOR
+            && self.strafe_starboard.is_finite()
+            && self.strafe_starboard >= STRAFE_FLOOR
             && self.total_mass.is_finite()
             && self.total_mass > 0.0
             && self.linear_drag.is_finite()
             && self.linear_drag > 0.0
-            && self.turn_torque.is_finite()
-            && self.turn_torque >= TORQUE_FLOOR
+            && self.turn_ccw.is_finite()
+            && self.turn_ccw >= TORQUE_FLOOR
+            && self.turn_cw.is_finite()
+            && self.turn_cw >= TORQUE_FLOOR
             && self.angular_drag.is_finite()
             && self.angular_drag > 0.0
             && self.angular_inertia.is_finite()
@@ -454,9 +474,18 @@ pub fn derive_ship_stats_with(
     // hardcoded literal), keeping the signature locked while honoring INV-D13.
     let cfg = StatScalingConfig::default();
 
-    let mut thrust_force = 0.0_f32;
-    let mut turn_torque = 0.0_f32;
-    let mut strafe_force = 0.0_f32;
+    // R92 — the six facing-resolved control channels (the "flight computer"): every jet's force is
+    // projected per channel below; the SimTuning baselines (the hull's built-in maneuvering jets)
+    // seed reverse/strafe/turn so a design with no jets on an axis stays flyable.
+    let mut thrust_fwd = 0.0_f32;
+    let mut thrust_rev = sim.baseline_reverse_force.max(0.0);
+    let mut strafe_port = sim.baseline_strafe_force.max(0.0);
+    let mut strafe_starboard = sim.baseline_strafe_force.max(0.0);
+    let mut turn_ccw = sim.baseline_turn_torque.max(0.0);
+    let mut turn_cw = sim.baseline_turn_torque.max(0.0);
+    // R92 — jet torque is about the layout's MASS CoM (cell space; recomputed every re-derive, so a
+    // carved hull's shifted CoM updates the lever arms automatically).
+    let com = layout_com_with(layout, catalog, sim.struct_cell_mass, materials);
     let mut power_gen = 0.0_f32;
     let mut power_draw = 0.0_f32;
     let mut cpu_draw = 0.0_f32;
@@ -474,6 +503,9 @@ pub fn derive_ship_stats_with(
     let mut shield_max = 0.0_f32;
     let mut shield_regen = 0.0_f32;
     let mut has_shield_module = false;
+    // R92 — energy stores (capacitors/batteries) + cargo volume, both health-scaled.
+    let mut energy_store = 0.0_f32;
+    let mut cargo_capacity = 0.0_f32;
     let mut weapon: Option<WeaponProfile> = None;
 
     // Iterate by SlotId (BTreeMap order) so derivation is deterministic — the
@@ -519,16 +551,41 @@ pub fn derive_ship_stats_with(
 
         match module.specifics {
             ModuleSpecifics::Thruster {
-                thrust_force: t,
-                turn_torque: tq,
-                strafe_force: s,
+                thrust_force: jet_force,
                 .. // `propulsion` tag is categorization only — not used in derivation.
             } => {
-                // Thruster outputs scale with health (FR-012): a battered drive
-                // gives less thrust/torque/strafe; a destroyed one (hf == 0) none.
-                thrust_force += t * hf;
-                turn_torque += tq * hf;
-                strafe_force += s * hf;
+                // R92 — the facing-resolved "flight computer": this jet's force vector points along
+                // its SLOT's authored facing (body frame: +x = nose, +y = port — the muzzle
+                // convention), applied AT its cell. Project onto the six channels; torque is the 2D
+                // cross `r × F` about the mass CoM (world units), so PLACEMENT is the authority.
+                // Health-scales like every thruster output (FR-012).
+                let f = jet_force * hf;
+                if f > 0.0 {
+                    let facing = hull
+                        .slots
+                        .iter()
+                        .find(|sl| sl.id == *slot_id)
+                        .map(|sl| sl.facing)
+                        .unwrap_or(0.0);
+                    let dir = Vec2::from_angle(facing);
+                    thrust_fwd += f * dir.x.max(0.0);
+                    thrust_rev += f * (-dir.x).max(0.0);
+                    strafe_port += f * dir.y.max(0.0);
+                    strafe_starboard += f * (-dir.y).max(0.0);
+                    // The jet's body-frame position relative to the CoM (cell space → body axes:
+                    // x = row − com.y, y = col − com.x; × CELL_WORLD_SIZE → world units).
+                    if let Some((cell, occ)) = layout
+                        .cells
+                        .iter()
+                        .find(|(_, o)| o.slot == *slot_id && o.module.is_some())
+                    {
+                        let centroid = occ.shape.centroid(cell.0, cell.1);
+                        let r = Vec2::new(centroid.y - com.y, centroid.x - com.x) * CELL_WORLD_SIZE;
+                        let tau = (r.x * dir.y - r.y * dir.x) * f * sim.thruster_lever_scale;
+                        turn_ccw += tau.max(0.0);
+                        turn_cw += (-tau).max(0.0);
+                    }
+                }
             }
             // First *alive* weapon module by deterministic slot order populates the
             // fire profile (FR-013/016): a destroyed weapon (hf == 0) is skipped so
@@ -588,6 +645,15 @@ pub fn derive_ship_stats_with(
                 shield_max += shield_hp * hf;
                 shield_regen += regen * hf;
             }
+            // R92 — energy storage (capacitor/battery): flat pool capacity, health-scaled (a shot-up
+            // battery holds less; a carved-off one is gone).
+            ModuleSpecifics::EnergyStore { capacity } => {
+                energy_store += capacity * hf;
+            }
+            // R92 — cargo hold volume, health-scaled.
+            ModuleSpecifics::CargoBay { volume } => {
+                cargo_capacity += volume * hf;
+            }
             _ => {}
         }
     }
@@ -600,10 +666,13 @@ pub fn derive_ship_stats_with(
         shield_regen = DEFAULT_SHIELD_REGEN;
     }
 
-    // Graceful floors (FR-017, INV-F07): never zero a denominator or a drive.
-    let thrust_force = thrust_force.max(THRUST_FLOOR);
-    let turn_torque = turn_torque.max(TORQUE_FLOOR);
-    let strafe_force = strafe_force.max(STRAFE_FLOOR);
+    // Graceful floors (FR-017, INV-F07): never zero a denominator or a drive (per channel, R92).
+    let thrust_force = thrust_fwd.max(THRUST_FLOOR);
+    let reverse_force = thrust_rev.max(THRUST_FLOOR * REVERSE_FRACTION);
+    let strafe_port = strafe_port.max(STRAFE_FLOOR);
+    let strafe_starboard = strafe_starboard.max(STRAFE_FLOOR);
+    let turn_ccw = turn_ccw.max(TORQUE_FLOOR);
+    let turn_cw = turn_cw.max(TORQUE_FLOOR);
     // Phase M5 — **mass is the sum of the body's cells** ([`layout_mass`]): each module cell
     // weighs its module's mass, each structural cell `STRUCT_CELL_MASS`. This is the SAME mass
     // basis the projectile-impulse + wreck drift use (`fitted_damage_system`), so a ship's mass is
@@ -613,15 +682,23 @@ pub fn derive_ship_stats_with(
     let total_mass =
         layout_mass_with(layout, catalog, sim.struct_cell_mass, materials).max(f32::MIN_POSITIVE);
 
+    // R92 — the REAL moment of inertia: the legacy base responsiveness + the layout's Σ m·r² about
+    // the CoM (so spread-out mass turns sluggishly), live-scaled by `thruster_inertia_scale`.
+    let angular_inertia = base.angular_inertia
+        + layout_inertia_with(layout, catalog, sim.struct_cell_mass, materials)
+            * sim.thruster_inertia_scale.max(0.0);
+
     ShipStats {
         thrust_force,
-        reverse_force: thrust_force * REVERSE_FRACTION,
-        strafe_force,
+        reverse_force,
+        strafe_port,
+        strafe_starboard,
         total_mass,
         linear_drag: base.linear_drag,
-        turn_torque,
+        turn_ccw,
+        turn_cw,
         angular_drag: base.angular_drag,
-        angular_inertia: base.angular_inertia,
+        angular_inertia,
         turn_power_share: base.turn_power_share,
         // Refinement 20: RUNTIME power generation comes ONLY from the working, core-connected
         // reactor cells (`power_gen`, already health-scaled + dropped for any reactor cell carved
@@ -636,6 +713,8 @@ pub fn derive_ship_stats_with(
         armor_value,
         shield_max,
         shield_regen,
+        energy_store,
+        cargo_capacity,
         can_fire: weapon.is_some(),
         weapon,
     }
@@ -732,13 +811,20 @@ mod tests {
         let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
         let t = Tuning::default();
         assert!((stats.thrust_force - t.thrust_force).abs() < 1e-4);
+        // R92 — reverse/strafe/turn come from the SimTuning BASELINES (the baseline hull is a single
+        // module cell → zero lever arm, zero extra inertia), whose defaults equal the legacy Tuning
+        // trio — so the flight-feel guard still holds exactly.
         assert!((stats.reverse_force - t.reverse_force).abs() < 1e-4);
-        assert!((stats.strafe_force - t.strafe_force).abs() < 1e-4);
+        assert!((stats.strafe_port - t.strafe_force).abs() < 1e-4);
+        assert!((stats.strafe_starboard - t.strafe_force).abs() < 1e-4);
         assert!((stats.total_mass - t.mass).abs() < 1e-4);
-        assert!((stats.turn_torque - t.turn_torque).abs() < 1e-4);
+        assert!((stats.turn_ccw - t.turn_torque).abs() < 1e-4);
+        assert!((stats.turn_cw - t.turn_torque).abs() < 1e-4);
         assert_eq!(stats.linear_drag, t.linear_drag);
         assert_eq!(stats.angular_drag, t.angular_drag);
-        assert_eq!(stats.angular_inertia, t.angular_inertia);
+        // R92 — the single-cell baseline layout has ~zero moment about its own centroid, so the
+        // derived inertia collapses to the legacy base constant (within f32).
+        assert!((stats.angular_inertia - t.angular_inertia).abs() < 1e-4);
         assert_eq!(stats.turn_power_share, t.turn_power_share);
         assert!((stats.top_speed() - t.top_speed()).abs() < 1e-3);
         assert!((stats.max_turn_rate() - t.max_turn_rate()).abs() < 1e-3);
@@ -871,8 +957,134 @@ mod tests {
         let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
         assert!(stats.is_finite_and_floored());
         assert_eq!(stats.thrust_force, THRUST_FLOOR);
-        assert_eq!(stats.turn_torque, TORQUE_FLOOR);
+        // R92 — no jets: forward collapses to the floor, but the hull's BUILT-IN baseline
+        // maneuvering authority (SimTuning) keeps the turn channels alive (flyable, not mobile).
+        let sim = SimTuning::default();
+        assert_eq!(stats.turn_ccw, sim.baseline_turn_torque);
+        assert_eq!(stats.turn_cw, sim.baseline_turn_torque);
         assert!(!stats.can_fire);
         assert!(stats.weapon.is_none());
+    }
+
+    /// R92 — a jet OFF the CoM axis feeds exactly one turn channel: placement IS the authority
+    /// (the channels go asymmetric), and the lever contribution sits on top of the baseline.
+    #[test]
+    fn jet_placement_drives_the_turn_channels() {
+        use crate::fitting::content::{HULL_FIGHTER, MODULE_THRUSTER_BASIC};
+        use crate::fitting::SlotId;
+        let (modules, hulls) = seed_catalogs();
+        let hull = hulls.get(HULL_FIGHTER).unwrap().clone();
+        let mut fit = Fit::new(hull.id);
+        // The fighter's thruster slot sits a column off the centreline → a real lever arm.
+        fit.install_raw(SlotId(1), MODULE_THRUSTER_BASIC);
+        let layout = build_layout(&hull, &fit, &modules);
+        let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
+        let sim = SimTuning::default();
+        // One off-axis forward jet → torque flows into ONE direction only; the other side stays at
+        // the baseline. Asymmetric authority is the point.
+        let max = stats.turn_ccw.max(stats.turn_cw);
+        let min = stats.turn_ccw.min(stats.turn_cw);
+        assert!(
+            max > sim.baseline_turn_torque + 1e-3,
+            "the off-axis jet must add lever torque on one side (ccw {} cw {})",
+            stats.turn_ccw,
+            stats.turn_cw
+        );
+        assert!((min - sim.baseline_turn_torque).abs() < 1e-3);
+    }
+
+    /// R92 — facing resolves the jet's channel: rotate the same thruster's slot to face AFT and its
+    /// force moves from the forward channel to the reverse channel.
+    #[test]
+    fn retro_facing_jet_fills_the_reverse_channel() {
+        use crate::fitting::content::{HULL_FIGHTER, MODULE_THRUSTER_BASIC};
+        use crate::fitting::SlotId;
+        let (modules, hulls) = seed_catalogs();
+        let mut hull = hulls.get(HULL_FIGHTER).unwrap().clone();
+        let slot = hull
+            .slots
+            .iter_mut()
+            .find(|sl| sl.id == SlotId(1))
+            .expect("fighter thruster slot");
+        slot.facing = std::f32::consts::PI; // retro: thrust pushes AFT
+        let mut fit = Fit::new(hull.id);
+        fit.install_raw(SlotId(1), MODULE_THRUSTER_BASIC);
+        let layout = build_layout(&hull, &fit, &modules);
+        let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
+        let sim = SimTuning::default();
+        assert_eq!(stats.thrust_force, THRUST_FLOOR, "no forward jets → floor");
+        assert!(
+            stats.reverse_force > sim.baseline_reverse_force + 1e-3,
+            "the retro jet must add to the reverse channel ({})",
+            stats.reverse_force
+        );
+    }
+
+    /// R92 — a real multi-cell layout carries a real moment of inertia: the fighter's derived
+    /// `angular_inertia` exceeds the legacy base constant (mass spread out turns slower), while the
+    /// single-cell baseline collapses to the base (asserted in `baseline_fit_reproduces_…`).
+    #[test]
+    fn spread_mass_raises_angular_inertia() {
+        use crate::fitting::content::HULL_FIGHTER;
+        let (modules, hulls) = seed_catalogs();
+        let hull = hulls.get(HULL_FIGHTER).unwrap().clone();
+        let fit = Fit::new(hull.id);
+        let layout = build_layout(&hull, &fit, &modules);
+        let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
+        assert!(stats.angular_inertia > Tuning::default().angular_inertia + 1e-3);
+    }
+
+    /// R92 — EnergyStore + CargoBay derive health-scaled capacity: full at full health, GONE when
+    /// the module's cell is carved off the layout.
+    #[test]
+    fn energy_store_and_cargo_derive_health_scaled() {
+        use crate::fitting::content::HULL_FIGHTER;
+        use crate::fitting::{HardpointType, ModuleId, Slot, SlotId, SlotSize};
+        let (modules, hulls) = seed_catalogs();
+        let mut hull = hulls.get(HULL_FIGHTER).unwrap().clone();
+        // Author two Utility slots on existing STRUCTURAL cells (the editor's normal path) — picked
+        // from the hull data so the test is silhouette-agnostic.
+        let taken: Vec<(u16, u16)> = hull.slots.iter().map(|s| s.coord).collect();
+        let mut free = hull
+            .cells
+            .iter()
+            .map(|c| c.coord)
+            .filter(|c| !taken.contains(c));
+        let c1 = free.next().expect("a free structural cell");
+        let c2 = free.next().expect("a second free structural cell");
+        // A slot cell is non-structural (the editor's `set_cell_module` flips this when placing).
+        for cell in hull.cells.iter_mut() {
+            if cell.coord == c1 || cell.coord == c2 {
+                cell.structural = false;
+            }
+        }
+        hull.slots.push(Slot {
+            id: SlotId(98),
+            slot_type: HardpointType::Utility,
+            size: SlotSize::Small,
+            coord: c1,
+            facing: 0.0,
+            is_weapon_mount: false,
+        });
+        hull.slots.push(Slot {
+            id: SlotId(99),
+            slot_type: HardpointType::Utility,
+            size: SlotSize::Small,
+            coord: c2,
+            facing: 0.0,
+            is_weapon_mount: false,
+        });
+        let mut fit = Fit::new(hull.id);
+        fit.install_raw(SlotId(98), ModuleId(25)); // Battery Bank (capacity 80)
+        fit.install_raw(SlotId(99), ModuleId(26)); // Cargo Bay (volume 50)
+        let mut layout = build_layout(&hull, &fit, &modules);
+        let stats = derive_ship_stats(&hull, &fit, &modules, &layout);
+        assert!((stats.energy_store - 80.0).abs() < 1e-3);
+        assert!((stats.cargo_capacity - 50.0).abs() < 1e-3);
+        // Carve the battery's cell off → its stored capacity is gone; the cargo bay survives.
+        layout.cells.retain(|coord, _| *coord != c1);
+        let carved = derive_ship_stats(&hull, &fit, &modules, &layout);
+        assert_eq!(carved.energy_store, 0.0);
+        assert!((carved.cargo_capacity - 50.0).abs() < 1e-3);
     }
 }

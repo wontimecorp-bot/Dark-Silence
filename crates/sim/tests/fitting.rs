@@ -706,7 +706,9 @@ mod stats_phase4 {
 
         assert!(stats.is_finite_and_floored());
         assert!(stats.thrust_force > 0.0 && stats.thrust_force.is_finite());
-        assert!(stats.turn_torque > 0.0 && stats.turn_torque.is_finite());
+        // R92 — directional turn channels (baseline authority keeps a jet-less hull rotatable).
+        assert!(stats.turn_ccw > 0.0 && stats.turn_ccw.is_finite());
+        assert!(stats.turn_cw > 0.0 && stats.turn_cw.is_finite());
         assert!(stats.total_mass >= hull.hull_base_mass && stats.total_mass > 0.0);
         assert!(stats.top_speed().is_finite() && stats.max_turn_rate().is_finite());
         assert!(!stats.can_fire);
@@ -726,16 +728,24 @@ mod stats_phase4 {
         let t = Tuning::default();
 
         assert!((stats.thrust_force - t.thrust_force).abs() < 1e-4, "thrust");
+        // R92 — reverse/strafe/turn now come from the SimTuning BASELINES (defaults = the legacy
+        // Tuning trio) since the single-cell baseline hull has zero lever arms; the guard holds.
         assert!(
             (stats.reverse_force - t.reverse_force).abs() < 1e-4,
             "reverse"
         );
-        assert!((stats.strafe_force - t.strafe_force).abs() < 1e-4, "strafe");
+        assert!((stats.strafe_port - t.strafe_force).abs() < 1e-4, "strafe");
+        assert!(
+            (stats.strafe_starboard - t.strafe_force).abs() < 1e-4,
+            "strafe"
+        );
         assert!((stats.total_mass - t.mass).abs() < 1e-4, "mass");
-        assert!((stats.turn_torque - t.turn_torque).abs() < 1e-4, "torque");
+        assert!((stats.turn_ccw - t.turn_torque).abs() < 1e-4, "torque");
+        assert!((stats.turn_cw - t.turn_torque).abs() < 1e-4, "torque");
         assert_eq!(stats.linear_drag, t.linear_drag);
         assert_eq!(stats.angular_drag, t.angular_drag);
-        assert_eq!(stats.angular_inertia, t.angular_inertia);
+        // R92 — the single-cell baseline layout adds ~zero real moment → the base constant (f32).
+        assert!((stats.angular_inertia - t.angular_inertia).abs() < 1e-4);
         assert_eq!(stats.turn_power_share, t.turn_power_share);
         // The emergent caps match the E002 intended values exactly.
         assert!((stats.top_speed() - t.top_speed()).abs() < 1e-3);

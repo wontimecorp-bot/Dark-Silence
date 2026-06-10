@@ -248,6 +248,26 @@ pub fn layout_inertia(layout: &FitLayout, modules: &ModuleCatalog) -> f32 {
     layout_inertia_with(layout, modules, STRUCT_CELL_MASS, &CellMaterials::default())
 }
 
+/// R92 — the layout's **mass-weighted centre of mass** in CELL space (`x` = col axis, `y` = row
+/// axis). R58 — a sub-shape cell's mass sits at its polygon CENTROID (`Full` → the cell centre).
+/// Shared by [`layout_inertia_with`] and the thruster lever-arm derivation (`derive_ship_stats`).
+/// A massless/empty layout returns `Vec2::ZERO` (callers floor the dependent quantities).
+pub fn layout_com_with(
+    layout: &FitLayout,
+    modules: &ModuleCatalog,
+    struct_cell_mass: f32,
+    materials: &CellMaterials,
+) -> Vec2 {
+    let total = layout_mass_with(layout, modules, struct_cell_mass, materials);
+    if total <= f32::MIN_POSITIVE {
+        return Vec2::ZERO;
+    }
+    layout.cells.iter().fold(Vec2::ZERO, |acc, (&coord, occ)| {
+        acc + occ.shape.centroid(coord.0, coord.1)
+            * cell_mass_with(occ, modules, struct_cell_mass, materials)
+    }) / total
+}
+
 /// [`layout_inertia`] with an explicit structural-cell mass + materials catalog (Phase M6 / R66).
 pub fn layout_inertia_with(
     layout: &FitLayout,
@@ -259,12 +279,8 @@ pub fn layout_inertia_with(
     if total <= f32::MIN_POSITIVE {
         return f32::MIN_POSITIVE;
     }
-    // Mass-weighted centre of mass in cell-space. R58 — a sub-shape cell's mass sits at its triangle
-    // CENTROID, not the cell centre; `Full` → `centroid == cell_center` → byte-identical.
-    let com = layout.cells.iter().fold(Vec2::ZERO, |acc, (&coord, occ)| {
-        acc + occ.shape.centroid(coord.0, coord.1)
-            * cell_mass_with(occ, modules, struct_cell_mass, materials)
-    }) / total;
+    // Mass-weighted centre of mass in cell-space (R92 — factored into `layout_com_with`).
+    let com = layout_com_with(layout, modules, struct_cell_mass, materials);
     let i_cellspace: f32 = layout
         .cells
         .iter()

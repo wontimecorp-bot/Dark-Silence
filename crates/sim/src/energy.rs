@@ -32,8 +32,10 @@ pub fn energy_system(
     let dt = dt.0;
     let sim = sim.map(|s| *s).unwrap_or_default();
     for (mut energy, mut heat, stats, intent) in &mut q {
-        // Energy capacity + gross regen track the live reactor output.
-        energy.max = (stats.power_supply * sim.energy_capacity_secs).max(0.0);
+        // Energy capacity + gross regen track the live reactor output. R92 — fitted energy STORES
+        // (capacitors/batteries) add flat capacity: with a dead reactor `max` = the stores and
+        // `regen` = 0, so the pool persists and drains as used — you fight on the stored charge.
+        energy.max = (stats.power_supply * sim.energy_capacity_secs + stats.energy_store).max(0.0);
         energy.regen = stats.power_supply.max(0.0);
         // Active thrust drain (proportional to pilot input, scaled by the turn-power share so a hard
         // turn that already saps translational thrust also costs less energy).

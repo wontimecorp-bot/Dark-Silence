@@ -28,25 +28,32 @@ use glam::Vec2;
 struct FlightParams {
     thrust_force: f32,
     reverse_force: f32,
-    strafe_force: f32,
+    // R92 — directional channels (the unfitted Tuning fallback fills both sides of each pair with
+    // the SAME constant, so the sign-pick below is byte-identical to the old single-field math).
+    strafe_port: f32,
+    strafe_starboard: f32,
     mass: f32,
     linear_drag: f32,
-    turn_torque: f32,
+    turn_ccw: f32,
+    turn_cw: f32,
     angular_drag: f32,
     angular_inertia: f32,
     turn_power_share: f32,
 }
 
 impl FlightParams {
-    /// Fallback source: the global [`Tuning`] (unfitted ships — E001/E002/E003).
+    /// Fallback source: the global [`Tuning`] (unfitted ships — E001/E002/E003). SYMMETRIC channels
+    /// (both sides = the same constant) → bit-identical to the pre-R92 single-field behavior.
     fn from_tuning(t: &Tuning) -> Self {
         Self {
             thrust_force: t.thrust_force,
             reverse_force: t.reverse_force,
-            strafe_force: t.strafe_force,
+            strafe_port: t.strafe_force,
+            strafe_starboard: t.strafe_force,
             mass: t.mass,
             linear_drag: t.linear_drag,
-            turn_torque: t.turn_torque,
+            turn_ccw: t.turn_torque,
+            turn_cw: t.turn_torque,
             angular_drag: t.angular_drag,
             angular_inertia: t.angular_inertia,
             turn_power_share: t.turn_power_share,
@@ -58,19 +65,41 @@ impl FlightParams {
         Self {
             thrust_force: s.thrust_force,
             reverse_force: s.reverse_force,
-            strafe_force: s.strafe_force,
+            strafe_port: s.strafe_port,
+            strafe_starboard: s.strafe_starboard,
             mass: s.total_mass,
             linear_drag: s.linear_drag,
-            turn_torque: s.turn_torque,
+            turn_ccw: s.turn_ccw,
+            turn_cw: s.turn_cw,
             angular_drag: s.angular_drag,
             angular_inertia: s.angular_inertia,
             turn_power_share: s.turn_power_share,
         }
     }
 
-    /// Emergent max turn rate (decoupled mode), mirroring [`Tuning::max_turn_rate`].
-    fn max_turn_rate(&self) -> f32 {
-        self.turn_torque / self.angular_drag
+    /// R92 — the torque channel for a signed turn input (`> 0` = CCW, `< 0` = CW; `0` → CCW, which
+    /// multiplies by the zero input anyway).
+    fn turn_torque_for(&self, turn_input: f32) -> f32 {
+        if turn_input >= 0.0 {
+            self.turn_ccw
+        } else {
+            self.turn_cw
+        }
+    }
+
+    /// R92 — the strafe channel for a signed strafe input (`> 0` = port/left, `< 0` = starboard).
+    fn strafe_force_for(&self, strafe_input: f32) -> f32 {
+        if strafe_input >= 0.0 {
+            self.strafe_port
+        } else {
+            self.strafe_starboard
+        }
+    }
+
+    /// Emergent max turn rate (decoupled mode), mirroring [`Tuning::max_turn_rate`] — the channel
+    /// for the CURRENT input sign so asymmetric authority holds in decoupled mode too.
+    fn max_turn_rate_for(&self, turn_input: f32) -> f32 {
+        self.turn_torque_for(turn_input) / self.angular_drag
     }
 }
 
@@ -230,14 +259,16 @@ fn step_ship_motion(
         } else {
             p.reverse_force
         };
-    let strafe_force = p.strafe_force * boost;
+    // R92 — the strafe/turn channels are picked by input SIGN (directional jets); the unfitted
+    // Tuning fallback fills both sides identically, so its math is unchanged.
+    let strafe_force = p.strafe_force_for(intent.strafe) * boost;
 
     let accel = match *assist {
         FlightAssist::On => {
             omega.0 = step_angular(
                 omega.0,
                 intent.turn,
-                p.turn_torque,
+                p.turn_torque_for(intent.turn),
                 p.angular_drag,
                 p.angular_inertia,
                 dt,
@@ -251,7 +282,7 @@ fn step_ship_motion(
         }
         FlightAssist::Off => {
             // Decoupled: instant rotation, no drag (free Newtonian drift).
-            omega.0 = intent.turn * p.max_turn_rate();
+            omega.0 = intent.turn * p.max_turn_rate_for(intent.turn);
             heading.0 += omega.0 * dt;
             let thrust =
                 nose * (intent.forward * fwd_force) + left * (intent.strafe * strafe_force);

@@ -29,8 +29,6 @@
             specifics: Thruster(
                 propulsion: MainDrive,
                 thrust_force: 60.0,
-                turn_torque: 6.0,
-                strafe_force: 9.0,
             ),
         ),
         (3): (
@@ -120,8 +118,6 @@
             specifics: Thruster(
                 propulsion: MainDrive,
                 thrust_force: 40.0,
-                turn_torque: 2.0,
-                strafe_force: 0.0,
             ),
         ),
         (11): (
@@ -138,9 +134,7 @@
             hardpoint_size: Small,
             specifics: Thruster(
                 propulsion: Maneuver,
-                thrust_force: 2.0,
-                turn_torque: 16.0,
-                strafe_force: 4.0,
+                thrust_force: 16.0,
             ),
         ),
         (12): (
@@ -157,9 +151,7 @@
             hardpoint_size: Small,
             specifics: Thruster(
                 propulsion: Rcs,
-                thrust_force: 1.0,
-                turn_torque: 6.0,
-                strafe_force: 18.0,
+                thrust_force: 18.0,
             ),
         ),
         (13): (
@@ -428,6 +420,54 @@
                 range_units: 1100.0,
             ),
         ),
+        (24): (
+            id: (24),
+            name: "Capacitor",
+            kind: Utility,
+            power_gen: 0.0,
+            power_draw: 0.5,
+            cpu_draw: 1.0,
+            mass: 0.8,
+            heat: 0.2,
+            health_max: 10.0,
+            hardpoint_type: Utility,
+            hardpoint_size: Small,
+            specifics: EnergyStore(
+                capacity: 25.0,
+            ),
+        ),
+        (25): (
+            id: (25),
+            name: "Battery Bank",
+            kind: Utility,
+            power_gen: 0.0,
+            power_draw: 0.5,
+            cpu_draw: 1.0,
+            mass: 4.0,
+            heat: 0.2,
+            health_max: 18.0,
+            hardpoint_type: Utility,
+            hardpoint_size: Small,
+            specifics: EnergyStore(
+                capacity: 80.0,
+            ),
+        ),
+        (26): (
+            id: (26),
+            name: "Cargo Bay",
+            kind: Utility,
+            power_gen: 0.0,
+            power_draw: 0.5,
+            cpu_draw: 0.5,
+            mass: 3.0,
+            heat: 0.0,
+            health_max: 20.0,
+            hardpoint_type: Utility,
+            hardpoint_size: Small,
+            specifics: CargoBay(
+                volume: 50.0,
+            ),
+        ),
         (100): (
             id: (100),
             name: "Baseline Thruster",
@@ -443,8 +483,6 @@
             specifics: Thruster(
                 propulsion: MainDrive,
                 thrust_force: 30.0,
-                turn_torque: 12.0,
-                strafe_force: 18.0,
             ),
         ),
     },

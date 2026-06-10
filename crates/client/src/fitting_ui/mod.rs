@@ -205,6 +205,16 @@ fn fitting_screen_ui(
                 stats.total_mass - baseline.total_mass,
                 if stats.can_fire { "ARMED" } else { "NO WEAPON" },
             ));
+            // R92 — energy stores (capacitors/batteries) + cargo, when fitted.
+            if stats.energy_store > 0.0 || stats.cargo_capacity > 0.0 {
+                ui.label(format!(
+                    "E-STORE {:.0} ({:+.0})    CARGO {:.0} ({:+.0})",
+                    stats.energy_store,
+                    stats.energy_store - baseline.energy_store,
+                    stats.cargo_capacity,
+                    stats.cargo_capacity - baseline.cargo_capacity,
+                ));
+            }
             ui.separator();
             ui.columns(2, |cols| {
                 cols[0].label("SHIP — click a slot");

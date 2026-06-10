@@ -764,9 +764,8 @@ struct EquipmentRow {
 struct EquipTotals {
     count: usize,
     mass: f32,
+    // R92 — thrusters author ONE jet force; turn/strafe are placement-derived (no nominal sums).
     thrust: f32,
-    torque: f32,
-    strafe: f32,
     power_gen: f32,
     power_draw: f32,
     cpu_draw: f32,
@@ -800,17 +799,12 @@ fn build_equipment(fit: &Fit, catalog: Option<&ModuleCatalog>) -> (Vec<Equipment
         let mut stats: Vec<(StatId, String)> = vec![(StatId::Mass, fmt(StatId::Mass, m.mass))];
         if let ModuleSpecifics::Thruster {
             thrust_force,
-            turn_torque,
-            strafe_force,
             .. // Phase C `propulsion` tag — not surfaced in the readout.
         } = &m.specifics
         {
+            // R92 — a thruster authors ONE jet force; turn/strafe now come from placement+facing.
             t.thrust += *thrust_force;
-            t.strafe += *strafe_force;
-            t.torque += *turn_torque;
             stats.push((StatId::Thrust, fmt(StatId::Thrust, *thrust_force)));
-            stats.push((StatId::Strafe, fmt(StatId::Strafe, *strafe_force)));
-            stats.push((StatId::Torque, fmt(StatId::Torque, *turn_torque)));
         }
         stats.push((StatId::PowerGen, fmt(StatId::PowerGen, m.power_gen)));
         stats.push((StatId::PowerDraw, fmt(StatId::PowerDraw, m.power_draw)));
@@ -842,10 +836,14 @@ fn build_equipment(fit: &Fit, catalog: Option<&ModuleCatalog>) -> (Vec<Equipment
                 }
             }
             // Phase C: Sensor shows only its common cost rows (range/resolution have no StatId yet).
+            // R92 — EnergyStore/CargoBay likewise show only the common rows here (their one stat is
+            // edited in the Module Designs section + reflected in the derived ShipStats).
             ModuleSpecifics::Thruster { .. }
             | ModuleSpecifics::Reactor
             | ModuleSpecifics::Utility
-            | ModuleSpecifics::Sensor { .. } => {}
+            | ModuleSpecifics::Sensor { .. }
+            | ModuleSpecifics::EnergyStore { .. }
+            | ModuleSpecifics::CargoBay { .. } => {}
         }
         rows.push(EquipmentRow {
             slot: slot.0,
@@ -1122,8 +1120,15 @@ fn render_ship_stats(ui: &mut egui::Ui, r: &ShipReadout) {
         (StatId::Mass, fmt(StatId::Mass, s.total_mass)),
         (StatId::Thrust, fmt(StatId::Thrust, s.thrust_force)),
         (StatId::Reverse, fmt(StatId::Reverse, s.reverse_force)),
-        (StatId::Strafe, fmt(StatId::Strafe, s.strafe_force)),
-        (StatId::Torque, fmt(StatId::Torque, s.turn_torque)),
+        // R92 — directional channels: show the weaker side of each pair (the limiting authority).
+        (
+            StatId::Strafe,
+            fmt(StatId::Strafe, s.strafe_port.min(s.strafe_starboard)),
+        ),
+        (
+            StatId::Torque,
+            fmt(StatId::Torque, s.turn_ccw.min(s.turn_cw)),
+        ),
         (StatId::TopSpeed, fmt(StatId::TopSpeed, s.top_speed())),
         (StatId::TurnRate, fmt(StatId::TurnRate, s.max_turn_rate())),
         (
@@ -1220,9 +1225,9 @@ fn render_ship_stats(ui: &mut egui::Ui, r: &ShipReadout) {
         ui,
         vec![
             (StatId::Mass, fmt(StatId::Mass, t.mass)),
+            // R92 — only the jet force is authored per thruster; turn/strafe are placement-derived
+            // (see the Applied block above for the live channels).
             (StatId::Thrust, fmt(StatId::Thrust, t.thrust)),
-            (StatId::Strafe, fmt(StatId::Strafe, t.strafe)),
-            (StatId::Torque, fmt(StatId::Torque, t.torque)),
             (StatId::PowerGen, fmt(StatId::PowerGen, t.power_gen)),
             (StatId::PowerDraw, fmt(StatId::PowerDraw, t.power_draw)),
             (StatId::Cpu, fmt(StatId::Cpu, t.cpu_draw)),
@@ -1621,6 +1626,23 @@ fn dev_panel_ui(
                         0.0..=0.01,
                     );
                     ui.separator();
+                    ui.label(
+                        egui::RichText::new(
+                            "R92 rotation physics — jets resolve by placement + facing",
+                        )
+                        .strong(),
+                    );
+                    slider(ui, "lever scale", &mut sim.thruster_lever_scale, 0.0..=5.0)
+                        .on_hover_text("R92 — torque per (jet force × world-unit lever arm from the CoM). 0 = placement doesn't matter; higher = extremity-mounted jets dominate turning.");
+                    slider(ui, "inertia scale", &mut sim.thruster_inertia_scale, 0.0..=0.2)
+                        .on_hover_text("R92 — angular inertia per unit of the layout's REAL moment (Σ m·r² about the CoM). Higher = spread-out/heavy designs turn sluggishly.");
+                    slider(ui, "baseline turn", &mut sim.baseline_turn_torque, 0.0..=40.0)
+                        .on_hover_text("R92 — the hull's built-in maneuvering-jet TURN authority (both directions); placed jets add on top.");
+                    slider(ui, "baseline strafe", &mut sim.baseline_strafe_force, 0.0..=40.0)
+                        .on_hover_text("R92 — built-in STRAFE authority (both sides); side-facing jets add on top.");
+                    slider(ui, "baseline reverse", &mut sim.baseline_reverse_force, 0.0..=40.0)
+                        .on_hover_text("R92 — built-in RETRO authority; without forward-facing jets this is your only brake (flip-and-burn!).");
+                    ui.separator();
                     slider(
                         ui,
                         label(StatId::PenPerDamage),
@@ -1952,15 +1974,12 @@ fn dev_panel_ui(
                                                 // → cpu → hp → [weapon | shield | armor].
                                                 slider(ui, label(StatId::Mass), &mut m.mass, 0.0..=80.0);
                                                 if let ModuleSpecifics::Thruster {
-                                                    thrust_force,
-                                                    turn_torque,
-                                                    strafe_force,
-                                                    ..
+                                                    thrust_force, ..
                                                 } = &mut m.specifics
                                                 {
-                                                    slider(ui, label(StatId::Thrust), thrust_force, 0.0..=60.0);
-                                                    slider(ui, label(StatId::Strafe), strafe_force, 0.0..=40.0);
-                                                    slider(ui, label(StatId::Torque), turn_torque, 0.0..=40.0);
+                                                    // R92 — ONE jet force; turn/strafe come from the
+                                                    // slot's placement + facing (the flight computer).
+                                                    slider(ui, label(StatId::Thrust), thrust_force, 0.0..=80.0);
                                                 }
                                                 slider(ui, label(StatId::PowerGen), &mut m.power_gen, 0.0..=100.0);
                                                 slider(ui, label(StatId::PowerDraw), &mut m.power_draw, 0.0..=50.0);
@@ -1991,6 +2010,15 @@ fn dev_panel_ui(
                                                         slider(ui, label(StatId::SpinUp), spin_up_time, 0.0..=3.0);
                                                         slider(ui, label(StatId::DispersionDeg), dispersion_deg, 0.0..=5.0);
                                                         slider(ui, label(StatId::RangeUnits), range_units, 100.0..=3000.0);
+                                                    }
+                                                    // R92 — energy stores + cargo bays.
+                                                    ModuleSpecifics::EnergyStore { capacity } => {
+                                                        slider(ui, "energy capacity", capacity, 0.0..=300.0)
+                                                            .on_hover_text("R92 — flat energy-pool capacity this store adds (health-scaled live; persists when the reactor dies).");
+                                                    }
+                                                    ModuleSpecifics::CargoBay { volume } => {
+                                                        slider(ui, "cargo volume", volume, 0.0..=500.0)
+                                                            .on_hover_text("R92 — cargo hold volume this bay adds (health-scaled live).");
                                                     }
                                                     ModuleSpecifics::Thruster { .. }
                                                     | ModuleSpecifics::Reactor

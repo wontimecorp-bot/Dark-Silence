@@ -121,6 +121,7 @@ impl Tuning {
 /// single source of truth. Editing a field is **solo / server-authoritative only** (a networked
 /// client has no authority over server tuning, and divergent tuning would break reconciliation).
 #[derive(Resource, Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)] // R92 — older saved RONs (dev settings) missing newer fields fall back per-field.
 pub struct SimTuning {
     /// Structural (filler-plating) cell hit points — hull erosion rate (`STRUCT_CELL_HP`).
     pub struct_cell_hp: f32,
@@ -182,6 +183,21 @@ pub struct SimTuning {
     pub projectile_density: f32,
     /// R42 — damage per joule of muzzle KE (`damage = ½ · mass · muzzle_velocity_ms² · this`).
     pub damage_per_joule: f32,
+    // --- Refinement 92: facing-resolved thruster physics (the "flight computer") ---
+    /// R92 — torque per (force · world-unit lever arm): a thruster's turn contribution is
+    /// `|r × F| · this`, where `r` is its cell's offset from the mass CoM. Placement IS the torque.
+    pub thruster_lever_scale: f32,
+    /// R92 — angular inertia per unit of the layout's real moment (`Σ m·r²`):
+    /// `angular_inertia = Tuning.angular_inertia + layout_inertia · this`. Spread mass turns slower.
+    pub thruster_inertia_scale: f32,
+    /// R92 — the hull's built-in maneuvering-jet TURN authority (added to both turn channels), so
+    /// every design stays flyable; placed thrusters add on top.
+    pub baseline_turn_torque: f32,
+    /// R92 — built-in STRAFE authority (added to both lateral channels).
+    pub baseline_strafe_force: f32,
+    /// R92 — built-in RETRO authority (added to the reverse channel; no retro jets → this is all
+    /// you have → flip-and-burn).
+    pub baseline_reverse_force: f32,
 }
 
 impl Default for SimTuning {
@@ -225,6 +241,15 @@ impl Default for SimTuning {
             projectile_density: 0.03 / (30.0 * 30.0 * 30.0),
             // KE → damage: 30 mm autocannon (½·0.03·1000²·this) → ~12 damage (today's value).
             damage_per_joule: 0.0008,
+            // R92 facing-resolved thruster physics — calibrated against the SEED FIGHTER (one
+            // 30-force thruster ~1.6 u aft / ~0.3 u port of the CoM): lever torque ≈ 30·0.3·1.0 ≈ 10
+            // (vs. the old flat 12) on top of the baseline; baselines = the legacy Tuning trio so a
+            // jet-less axis feels like today. All live-tunable in the dev panel.
+            thruster_lever_scale: 1.0,
+            thruster_inertia_scale: 0.015,
+            baseline_turn_torque: 12.0,
+            baseline_strafe_force: 18.0,
+            baseline_reverse_force: 15.0,
         }
     }
 }
