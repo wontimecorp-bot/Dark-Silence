@@ -743,7 +743,7 @@ fn hull_editor_ui(
                         .auto_shrink(false)
                         .id_salt("design_scroll")
                         .show(ui, |ui| {
-                            design_tab(ui, s, &cell_materials, hp_fb, mass_fb);
+                            design_tab(ui, s);
                         });
                 }
                 EditorTab::Brush => {
@@ -900,21 +900,30 @@ fn hull_editor_ui(
     egui::CentralPanel::default()
         .frame(grid_frame)
         .show(ctx, |ui| {
-            // R88 — the active layer's colour LEGEND sits at the top of the grid panel, above the ship
-            // (it keys the grid's colours). A single wrapped row → near-constant height.
-            brush_legend(ui, s.layer, &cell_materials);
-            ui.separator();
-            // R85 — the grid canvas is CENTERED width-wise in the viewport (left-padded by half the slack);
-            // when it's wider than the viewport the pad is 0 and it scrolls exactly as before.
-            let avail_w = ui.available_width();
-            egui::ScrollArea::both().show(ui, |ui| {
-                let grid_w = s.working.grid_dims.0 as f32 * s.layout.grid_cell_px;
-                let pad = ((avail_w - grid_w) * 0.5).max(0.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(pad);
-                    draw_grid(ui, s);
-                });
+            // R90 — the LIVE design stats pinned as the grid panel's FOOTER (nested inside-panel; the
+            // inner CentralPanel below takes the rest — same show_inside pattern as the Brush tab).
+            egui::TopBottomPanel::bottom("grid_stats_footer").show_inside(ui, |ui| {
+                ui.label(design_stats_line(s, &cell_materials, hp_fb, mass_fb));
             });
+            egui::CentralPanel::default()
+                .frame(grid_frame)
+                .show_inside(ui, |ui| {
+                    // R88 — the active layer's colour LEGEND sits at the top of the grid panel, above the
+                    // ship (it keys the grid's colours). A single wrapped row → near-constant height.
+                    brush_legend(ui, s.layer, &cell_materials);
+                    ui.separator();
+                    // R85 — the grid canvas is CENTERED width-wise in the viewport (left-padded by half the
+                    // slack); when it's wider than the viewport the pad is 0 and it scrolls as before.
+                    let avail_w = ui.available_width();
+                    egui::ScrollArea::both().show(ui, |ui| {
+                        let grid_w = s.working.grid_dims.0 as f32 * s.layout.grid_cell_px;
+                        let pad = ((avail_w - grid_w) * 0.5).max(0.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(pad);
+                            draw_grid(ui, s);
+                        });
+                    });
+                });
         });
 
     // ---- Execute deferred intents (need `host`) ----
@@ -1265,13 +1274,37 @@ fn line_cells(a: (u16, u16), b: (u16, u16)) -> Vec<(u16, u16)> {
 /// old left panel. R83 — the sections sit SIDE-BY-SIDE as top-aligned COLUMNS (Hull | Grid |
 /// Move & mirror | Budgets), each with its own header at the top of its column and its controls stacked
 /// beneath; on a very narrow window the row scrolls horizontally instead of mangling. Reads/writes `s`.
-fn design_tab(
-    ui: &mut egui::Ui,
-    s: &mut HullDesignSession,
+/// R88/R90 — the LIVE design stats line (shown at the bottom of the GRID panel): cells/slots counts +
+/// mass/HP from the painted materials, mirroring the sim's cell-mass formula ((hull-or-module + armor)
+/// × shape area; `cell_mass_with`). Module mass/HP depends on the FITTED modules (not the hull design)
+/// → excluded, hence the `~`. Material id 0 = the live struct-cell fallbacks from the host's SimTuning.
+fn design_stats_line(
+    s: &HullDesignSession,
     cell_materials: &sim::fitting::CellMaterials,
     hp_fb: f32,
     mass_fb: f32,
-) {
+) -> String {
+    let mut mass = s.working.hull_base_mass;
+    let mut hp = 0.0f32;
+    for c in &s.working.cells {
+        let area = c.shape.area_factor();
+        let armor = cell_materials.armor_params(c.armor_material).mass;
+        let has_slot = s.working.slots.iter().any(|sl| sl.coord == c.coord);
+        if has_slot {
+            mass += armor * area; // the module's own mass comes from the fit — not counted
+        } else {
+            mass += (cell_materials.hull_mass(c.hull_material, mass_fb) + armor) * area;
+            hp += cell_materials.hull_hp(c.hull_material, hp_fb);
+        }
+    }
+    format!(
+        "{} cells · {} slots · mass ~{mass:.1} (base+hull+armor, no modules) · hull HP ~{hp:.0}",
+        s.working.cells.len(),
+        s.working.slots.len()
+    )
+}
+
+fn design_tab(ui: &mut egui::Ui, s: &mut HullDesignSession) {
     egui::ScrollArea::horizontal()
         .id_salt("design_hscroll")
         .show(ui, |ui| {
@@ -1411,29 +1444,7 @@ fn design_tab(
             });
         });
     // --- Footer ---
-    // R88 — LIVE design stats from the painted materials, mirroring the sim's cell-mass formula
-    // ((hull-or-module + armor) × shape area; `cell_mass_with`). Module mass/HP depends on the FITTED
-    // modules (not the hull design) → excluded, hence the `~`. Material id 0 = the live struct-cell
-    // fallbacks read from the embedded server's SimTuning.
-    let mut mass = s.working.hull_base_mass;
-    let mut hp = 0.0f32;
-    for c in &s.working.cells {
-        let area = c.shape.area_factor();
-        let armor = cell_materials.armor_params(c.armor_material).mass;
-        let has_slot = s.working.slots.iter().any(|sl| sl.coord == c.coord);
-        if has_slot {
-            mass += armor * area; // the module's own mass comes from the fit — not counted
-        } else {
-            mass += (cell_materials.hull_mass(c.hull_material, mass_fb) + armor) * area;
-            hp += cell_materials.hull_hp(c.hull_material, hp_fb);
-        }
-    }
-    ui.separator();
-    ui.label(format!(
-        "{} cells · {} slots · mass ~{mass:.1} (base+hull+armor, no modules) · hull HP ~{hp:.0}",
-        s.working.cells.len(),
-        s.working.slots.len()
-    ));
+    // (R90 — the live stats line moved to the bottom of the GRID panel; see `design_stats_line`.)
 }
 
 /// R79 — the Brush panel's PINNED header (stays put while the palette scrolls): the Tool + Layer icon
@@ -1724,29 +1735,106 @@ fn tool_icon(ui: &mut egui::Ui, tool: Tool, selected: bool, px: f32) -> bool {
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 3.0, egui::Color32::from_rgb(30, 34, 42));
     let c = rect.center();
-    let r = rect.width() * 0.28;
+    // R89/R90 — skeuomorphic glyphs (all sizes relative to the rect so `icon_px` scaling holds).
+    let u = rect.width();
     match tool {
         Tool::Paint => {
-            p.circle_filled(c, r, egui::Color32::from_rgb(90, 200, 240));
+            // R90 — a PAINT ROLLER (side view): a paint-blue roller cylinder on top, a thin frame arm
+            // from its right end down + in, and a stubby handle below.
+            p.rect_filled(
+                egui::Rect::from_center_size(
+                    c + egui::vec2(-u * 0.04, -u * 0.20),
+                    egui::vec2(u * 0.54, u * 0.20),
+                ),
+                u * 0.06,
+                egui::Color32::from_rgb(90, 200, 240),
+            );
+            let frame = egui::Stroke::new(u * 0.05, egui::Color32::from_rgb(190, 195, 205));
+            p.line_segment(
+                [
+                    c + egui::vec2(u * 0.26, -u * 0.14),
+                    c + egui::vec2(u * 0.26, u * 0.02),
+                ],
+                frame,
+            );
+            p.line_segment(
+                [
+                    c + egui::vec2(u * 0.26, u * 0.02),
+                    c + egui::vec2(u * 0.10, u * 0.08),
+                ],
+                frame,
+            );
+            p.line_segment(
+                [
+                    c + egui::vec2(u * 0.10, u * 0.08),
+                    c + egui::vec2(u * 0.10, u * 0.32),
+                ],
+                egui::Stroke::new(u * 0.12, egui::Color32::from_rgb(150, 120, 90)),
+            );
         }
         Tool::Stamp => {
+            // A rubber stamper (side view): knob on top, stem, wide base.
+            let col = egui::Color32::from_rgb(210, 180, 100);
+            p.circle_filled(c + egui::vec2(0.0, -u * 0.20), u * 0.13, col);
             p.rect_filled(
-                egui::Rect::from_center_size(c, egui::vec2(r * 1.9, r * 1.9)),
+                egui::Rect::from_center_size(
+                    c + egui::vec2(0.0, u * 0.0),
+                    egui::vec2(u * 0.16, u * 0.28),
+                ),
                 1.0,
-                egui::Color32::from_rgb(210, 180, 100),
+                col,
+            );
+            p.rect_filled(
+                egui::Rect::from_center_size(
+                    c + egui::vec2(0.0, u * 0.22),
+                    egui::vec2(u * 0.60, u * 0.16),
+                ),
+                1.0,
+                col,
             );
         }
         Tool::Erase => {
-            let red = egui::Stroke::new(2.5, egui::Color32::from_rgb(230, 90, 90));
-            p.line_segment([c + egui::vec2(-r, -r), c + egui::vec2(r, r)], red);
-            p.line_segment([c + egui::vec2(-r, r), c + egui::vec2(r, -r)], red);
+            // R90 — a rubber ERASER: a pink block tilted 45° with a light "felt" tip on the lower-left
+            // end, leaving an erased streak beneath. (Tilt axis d, half-width normal n.)
+            let d = egui::vec2(u * 0.20, -u * 0.20);
+            let n = egui::vec2(u * 0.10, u * 0.10);
+            p.add(egui::Shape::convex_polygon(
+                vec![c - d - n, c + d - n, c + d + n, c - d + n],
+                egui::Color32::from_rgb(235, 130, 145),
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 44, 52)),
+            ));
+            p.add(egui::Shape::convex_polygon(
+                vec![c - d - n, c - d * 0.45 - n, c - d * 0.45 + n, c - d + n],
+                egui::Color32::from_rgb(225, 228, 235),
+                egui::Stroke::NONE,
+            ));
+            p.line_segment(
+                [
+                    c + egui::vec2(-u * 0.34, u * 0.34),
+                    c + egui::vec2(-u * 0.06, u * 0.36),
+                ],
+                egui::Stroke::new(u * 0.05, egui::Color32::from_rgb(120, 130, 150)),
+            );
         }
         Tool::Select => {
-            p.rect_stroke(
-                egui::Rect::from_center_size(c, egui::vec2(r * 2.0, r * 2.0)),
-                1.0,
-                egui::Stroke::new(1.5, egui::Color32::from_rgb(200, 210, 220)),
-                egui::StrokeKind::Inside,
+            // A mouse-cursor arrow: pointer head (convex triangle, tip upper-left) + a short tail
+            // toward lower-right (two shapes — the classic pointer outline isn't convex).
+            let fill = egui::Color32::from_rgb(225, 230, 240);
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    c + egui::vec2(-u * 0.20, -u * 0.32), // tip
+                    c + egui::vec2(-u * 0.20, u * 0.18),
+                    c + egui::vec2(u * 0.18, u * 0.04),
+                ],
+                fill,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 44, 52)),
+            ));
+            p.line_segment(
+                [
+                    c + egui::vec2(-u * 0.04, u * 0.06),
+                    c + egui::vec2(u * 0.14, u * 0.32),
+                ],
+                egui::Stroke::new(u * 0.10, fill),
             );
         }
     }
