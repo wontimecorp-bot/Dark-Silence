@@ -560,6 +560,15 @@ fn hull_editor_ui(
     };
     // R66 — the live materials catalog (windowed override or default), for the material brush names.
     let cell_materials = materials.map(|m| m.clone()).unwrap_or_default();
+    // R88 — the LIVE struct-cell fallbacks (material id 0 = these) for the Design-tab stats readout.
+    let (hp_fb, mass_fb) = host
+        .as_ref()
+        .and_then(|h| h.server.world().get_resource::<sim::SimTuning>())
+        .map(|t| (t.struct_cell_hp, t.struct_cell_mass))
+        .unwrap_or_else(|| {
+            let d = sim::SimTuning::default();
+            (d.struct_cell_hp, d.struct_cell_mass)
+        });
     let s = &mut *session;
 
     // R79 — Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) undo / redo. Gated on `!wants_keyboard_input` so Ctrl+Z
@@ -579,6 +588,30 @@ fn hull_editor_ui(
         if redo {
             s.redo();
         }
+        // R88 — tool/layer hotkeys (gated like undo/redo so typing in Name/search is unaffected):
+        // Q/W/E/R = Paint/Stamp/Erase/Select, 1–4 = Shape/Hull/Armor/Module.
+        ctx.input(|i| {
+            for (key, tool) in [
+                (egui::Key::Q, Tool::Paint),
+                (egui::Key::W, Tool::Stamp),
+                (egui::Key::E, Tool::Erase),
+                (egui::Key::R, Tool::Select),
+            ] {
+                if i.key_pressed(key) {
+                    s.tool = tool;
+                }
+            }
+            for (key, layer) in [
+                (egui::Key::Num1, Layer::Shape),
+                (egui::Key::Num2, Layer::Hull),
+                (egui::Key::Num3, Layer::Armor),
+                (egui::Key::Num4, Layer::Module),
+            ] {
+                if i.key_pressed(key) {
+                    s.layer = layer;
+                }
+            }
+        });
     }
 
     // Intents collected in the panel closures, executed after (so the closures don't hold `host`).
@@ -710,7 +743,7 @@ fn hull_editor_ui(
                         .auto_shrink(false)
                         .id_salt("design_scroll")
                         .show(ui, |ui| {
-                            design_tab(ui, s);
+                            design_tab(ui, s, &cell_materials, hp_fb, mass_fb);
                         });
                 }
                 EditorTab::Brush => {
@@ -724,7 +757,7 @@ fn hull_editor_ui(
                         .resizable(false)
                         .exact_width(s.layout.brush_left_width)
                         .show_inside(ui, |ui| {
-                            brush_header(ui, s, &cell_materials);
+                            brush_header(ui, s);
                         });
                     egui::CentralPanel::default().show_inside(ui, |ui| {
                         egui::ScrollArea::vertical()
@@ -867,8 +900,10 @@ fn hull_editor_ui(
     egui::CentralPanel::default()
         .frame(grid_frame)
         .show(ctx, |ui| {
-            // R79 — just the grid now: the "Show:" toolbar was removed (the Brush "Layer:" row IS the view)
-            // and its colour legend moved into the top Brush panel (`brush_legend`).
+            // R88 — the active layer's colour LEGEND sits at the top of the grid panel, above the ship
+            // (it keys the grid's colours). A single wrapped row → near-constant height.
+            brush_legend(ui, s.layer, &cell_materials);
+            ui.separator();
             // R85 — the grid canvas is CENTERED width-wise in the viewport (left-padded by half the slack);
             // when it's wider than the viewport the pad is 0 and it scrolls exactly as before.
             let avail_w = ui.available_width();
@@ -1005,6 +1040,86 @@ fn draw_grid(ui: &mut egui::Ui, s: &mut HullDesignSession) {
             egui::Color32::from_rgba_unmultiplied(230, 230, 255, 70),
         ),
     );
+
+    // R88 — GHOST preview: show what a click would do at the hovered cell (~45% alpha) — the brush
+    // shape / material tint / the WHOLE oriented stamp footprint / an erase mark.
+    if let Some(h) = hovered {
+        let rect = cell_rect(h.0, h.1);
+        match s.tool {
+            Tool::Paint => match s.layer {
+                Layer::Shape => {
+                    painter.add(egui::Shape::convex_polygon(
+                        shape_poly_in_rect(s.brush, rect.shrink(1.5)),
+                        shape_color(s.brush).gamma_multiply(0.45),
+                        egui::Stroke::NONE,
+                    ));
+                }
+                Layer::Hull => {
+                    painter.rect_filled(
+                        rect.shrink(1.5),
+                        2.0,
+                        hull_mat_color(s.hull_material_brush).gamma_multiply(0.45),
+                    );
+                }
+                Layer::Armor => {
+                    painter.rect_stroke(
+                        rect.shrink(2.0),
+                        2.0,
+                        egui::Stroke::new(
+                            2.0,
+                            armor_mat_color(s.armor_material_brush).gamma_multiply(0.6),
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                Layer::Module => match s.module_brush {
+                    Some(ty) => {
+                        painter.rect_filled(
+                            rect.shrink(1.5),
+                            2.0,
+                            slot_color(ty).gamma_multiply(0.45),
+                        );
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            slot_initial(ty),
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140),
+                        );
+                    }
+                    None => {
+                        painter.rect_filled(
+                            rect.shrink(1.5),
+                            2.0,
+                            egui::Color32::from_rgba_unmultiplied(20, 22, 28, 110),
+                        );
+                    }
+                },
+            },
+            Tool::Stamp => {
+                for (dc, dr, shape) in oriented_stamp_cells(s.stamp_kind, s.stamp_dir) {
+                    let (nc, nr) = (h.0 as i32 + dc, h.1 as i32 + dr);
+                    if nc < 0 || nr < 0 || nc >= cols as i32 || nr >= rows as i32 {
+                        continue;
+                    }
+                    let r = cell_rect(nc as u16, nr as u16);
+                    painter.add(egui::Shape::convex_polygon(
+                        shape_poly_in_rect(shape, r.shrink(1.5)),
+                        shape_color(shape).gamma_multiply(0.45),
+                        egui::Stroke::NONE,
+                    ));
+                }
+            }
+            Tool::Erase => {
+                painter.rect_filled(
+                    rect.shrink(0.5),
+                    2.0,
+                    egui::Color32::from_rgba_unmultiplied(230, 90, 90, 70),
+                );
+            }
+            Tool::Select => {} // the hover outline above already shows the target
+        }
+    }
 
     // R79 — snapshot ONCE at the start of an editing gesture (drag/click), so one undo = one stroke.
     // Covers every grid edit: paint / erase / material / module / stamp. Select (primary) never edits.
@@ -1150,7 +1265,13 @@ fn line_cells(a: (u16, u16), b: (u16, u16)) -> Vec<(u16, u16)> {
 /// old left panel. R83 — the sections sit SIDE-BY-SIDE as top-aligned COLUMNS (Hull | Grid |
 /// Move & mirror | Budgets), each with its own header at the top of its column and its controls stacked
 /// beneath; on a very narrow window the row scrolls horizontally instead of mangling. Reads/writes `s`.
-fn design_tab(ui: &mut egui::Ui, s: &mut HullDesignSession) {
+fn design_tab(
+    ui: &mut egui::Ui,
+    s: &mut HullDesignSession,
+    cell_materials: &sim::fitting::CellMaterials,
+    hp_fb: f32,
+    mass_fb: f32,
+) {
     egui::ScrollArea::horizontal()
         .id_salt("design_hscroll")
         .show(ui, |ui| {
@@ -1290,24 +1411,37 @@ fn design_tab(ui: &mut egui::Ui, s: &mut HullDesignSession) {
             });
         });
     // --- Footer ---
+    // R88 — LIVE design stats from the painted materials, mirroring the sim's cell-mass formula
+    // ((hull-or-module + armor) × shape area; `cell_mass_with`). Module mass/HP depends on the FITTED
+    // modules (not the hull design) → excluded, hence the `~`. Material id 0 = the live struct-cell
+    // fallbacks read from the embedded server's SimTuning.
+    let mut mass = s.working.hull_base_mass;
+    let mut hp = 0.0f32;
+    for c in &s.working.cells {
+        let area = c.shape.area_factor();
+        let armor = cell_materials.armor_params(c.armor_material).mass;
+        let has_slot = s.working.slots.iter().any(|sl| sl.coord == c.coord);
+        if has_slot {
+            mass += armor * area; // the module's own mass comes from the fit — not counted
+        } else {
+            mass += (cell_materials.hull_mass(c.hull_material, mass_fb) + armor) * area;
+            hp += cell_materials.hull_hp(c.hull_material, hp_fb);
+        }
+    }
     ui.separator();
     ui.label(format!(
-        "{} cells · {} slots",
+        "{} cells · {} slots · mass ~{mass:.1} (base+hull+armor, no modules) · hull HP ~{hp:.0}",
         s.working.cells.len(),
         s.working.slots.len()
     ));
 }
 
 /// R79 — the Brush panel's PINNED header (stays put while the palette scrolls): the Tool + Layer icon
-/// rows in an aligned `egui::Grid`, plus the colour LEGEND for the active layer (moved here from the old
-/// "Show:" toolbar). Reads/writes the [`HullDesignSession`].
-fn brush_header(
-    ui: &mut egui::Ui,
-    s: &mut HullDesignSession,
-    cell_materials: &sim::fitting::CellMaterials,
-) {
+/// rows in an aligned `egui::Grid`. (R88 — the colour legend moved out, above the grid.)
+/// Reads/writes the [`HullDesignSession`].
+fn brush_header(ui: &mut egui::Ui, s: &mut HullDesignSession) {
     // R72/R73 — two axes: a TOOL (the action) + the active LAYER (also the grid view, R73). R79 — the
-    // Grid aligns the "Tool:" / "Layer:" labels + their icon columns.
+    // Grid aligns the "Tool:" / "Layer:" labels + their icon columns. R88 — hotkeys in the hover names.
     egui::Grid::new("brush_tools_layer")
         .spacing(egui::vec2(4.0, 4.0))
         .show(ui, |ui| {
@@ -1321,10 +1455,10 @@ fn brush_header(
             ui.end_row();
             ui.label("Layer:");
             for (layer, which, name) in [
-                (Layer::Shape, 0u8, "Shape"),
-                (Layer::Hull, 1u8, "Hull material"),
-                (Layer::Armor, 2u8, "Armor material"),
-                (Layer::Module, 3u8, "Module (hardpoint)"),
+                (Layer::Shape, 0u8, "Shape (1)"),
+                (Layer::Hull, 1u8, "Hull material (2)"),
+                (Layer::Armor, 2u8, "Armor material (3)"),
+                (Layer::Module, 3u8, "Module / hardpoint (4)"),
             ] {
                 if layer_icon(ui, which, s.layer == layer, true, name, s.layout.icon_px) {
                     s.layer = layer;
@@ -1332,15 +1466,12 @@ fn brush_header(
             }
             ui.end_row();
         });
-    brush_legend(ui, s.layer, cell_materials);
 }
 
-/// R71/R79 — the colour LEGEND for the active layer view (a single row): Shapes = a hint, Hull/Armor =
-/// the material swatches + names, Module = the hardpoint-type key. R79 moved it into the Brush panel (was
-/// the "Show:" toolbar's legend above the grid).
+/// R71/R79/R88 — the colour LEGEND for the active layer view (a single wrapped row): Shapes = a hint,
+/// Hull/Armor = the material swatches + names, Module = the hardpoint-type key. R88 — shown at the TOP
+/// of the GRID panel, above the ship (it keys the grid's colours, so it lives with the grid).
 fn brush_legend(ui: &mut egui::Ui, layer: Layer, cell_materials: &sim::fitting::CellMaterials) {
-    // R84 — WRAPPED: the legend lives in the Brush tab's width-capped left column; one long row would
-    // blow the column width (it pushed the palette off-screen in R82/R83).
     ui.horizontal_wrapped(|ui| match layer {
         Layer::Shape => {
             ui.weak("colour = shape / slot");
@@ -1626,10 +1757,10 @@ fn tool_icon(ui: &mut egui::Ui, tool: Tool, selected: bool, px: f32) -> bool {
     };
     p.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
     let name = match tool {
-        Tool::Paint => "Paint",
-        Tool::Stamp => "Stamp",
-        Tool::Erase => "Erase",
-        Tool::Select => "Select",
+        Tool::Paint => "Paint (Q)",
+        Tool::Stamp => "Stamp (W)",
+        Tool::Erase => "Erase (E)",
+        Tool::Select => "Select (R)",
     };
     resp.on_hover_text(name).clicked()
 }
@@ -2246,21 +2377,30 @@ fn stamp_cells(kind: StampKind) -> Vec<(i32, i32, CellShape)> {
 
 /// R63 — paint the selected stamp (oriented by `stamp_dir`) at the clicked `anchor`. Out-of-bounds
 /// cells are skipped; in-bounds cells are added/overwritten with the (rotated) shape.
-fn apply_stamp(s: &mut HullDesignSession, anchor: (u16, u16)) {
-    let turns = match s.stamp_dir {
+/// R88 — the stamp's per-cell pattern ROTATED to `dir` (factored out of [`apply_stamp`] so the hover
+/// GHOST can preview the exact oriented footprint). A CW turn maps `(dc, dr) → (dr, -dc)`.
+fn oriented_stamp_cells(kind: StampKind, dir: Dir) -> Vec<(i32, i32, CellShape)> {
+    let turns = match dir {
         Dir::N => 0,
         Dir::E => 1,
         Dir::S => 2,
         Dir::W => 3,
     };
+    stamp_cells(kind)
+        .into_iter()
+        .map(|(mut dc, mut dr, mut shape)| {
+            for _ in 0..turns {
+                (dc, dr) = (dr, -dc);
+                shape = shape.rotate_cw();
+            }
+            (dc, dr, shape)
+        })
+        .collect()
+}
+
+fn apply_stamp(s: &mut HullDesignSession, anchor: (u16, u16)) {
     let (cols, rows) = s.working.grid_dims;
-    for (dc0, dr0, shape0) in stamp_cells(s.stamp_kind) {
-        // Rotate the offset + the shape `turns` times CW (a CW turn maps (dc,dr) → (dr,-dc)).
-        let (mut dc, mut dr, mut shape) = (dc0, dr0, shape0);
-        for _ in 0..turns {
-            (dc, dr) = (dr, -dc);
-            shape = shape.rotate_cw();
-        }
+    for (dc, dr, shape) in oriented_stamp_cells(s.stamp_kind, s.stamp_dir) {
         let (nc, nr) = (anchor.0 as i32 + dc, anchor.1 as i32 + dr);
         if nc < 0 || nr < 0 || nc >= cols as i32 || nr >= rows as i32 {
             continue;
