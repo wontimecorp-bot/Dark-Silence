@@ -813,6 +813,81 @@ mod stats_phase4 {
         );
     }
 
+    /// R93 — a control-fitted ship with no LIVE control source (canopy shot off, no FC) ignores pilot
+    /// thrust and coasts frictionlessly (constant velocity), like a wreck. (The control flags are set
+    /// directly on a baseline-derived stats — `ShipStats` has public fields — to test the gate in
+    /// isolation.)
+    #[test]
+    fn derelict_ship_ignores_intent_and_coasts() {
+        let (modules, _) = seed_catalogs();
+        let layout = build_layout(&baseline_hull(), &baseline_fit(), &modules);
+        let mut stats = derive_ship_stats(&baseline_hull(), &baseline_fit(), &modules, &layout);
+        stats.control_fitted = true;
+        stats.has_control = false; // derelict
+
+        let mut w = World::new();
+        w.insert_resource(Tuning::default());
+        w.insert_resource(FixedDt(DT));
+        let ship = spawn_fitted_ship(&mut w, stats);
+        w.get_mut::<Velocity>(ship).unwrap().0 = Vec2::new(5.0, 0.0); // initial drift
+        w.get_mut::<ShipIntent>(ship).unwrap().forward = 1.0; // full thrust command (must be ignored)
+        let v0 = w.get::<Velocity>(ship).unwrap().0;
+
+        let mut sched = flight_schedule();
+        for _ in 0..60 {
+            sched.run(&mut w);
+        }
+        let v1 = w.get::<Velocity>(ship).unwrap().0;
+        assert!(
+            (v1 - v0).length() < 1e-4,
+            "derelict coasts at constant velocity (thrust + drag both ignored), got {v1:?}"
+        );
+        let pos = w.get::<Position>(ship).unwrap().0;
+        assert!(
+            (pos - v0 * (DT * 60.0)).length() < 1e-3,
+            "derelict moved by its inherited velocity only, got {pos:?}"
+        );
+    }
+
+    /// R93 — a control-fitted, no-Flight-Computer (cockpit-only) ship cannot strafe: a pure strafe
+    /// command produces no motion, while the same ship WITH strafe authority slides laterally.
+    #[test]
+    fn cockpit_only_ship_cannot_strafe() {
+        let (modules, _) = seed_catalogs();
+        let layout = build_layout(&baseline_hull(), &baseline_fit(), &modules);
+        let base = derive_ship_stats(&baseline_hull(), &baseline_fit(), &modules, &layout);
+
+        // Cockpit-only: control_fitted + has_control but no strafe authority.
+        let mut gated = base;
+        gated.control_fitted = true;
+        gated.has_control = true;
+        gated.can_strafe = false;
+        // With a Flight Computer: strafe allowed.
+        let mut able = base;
+        able.control_fitted = true;
+        able.has_control = true;
+        able.can_strafe = true;
+
+        let run_strafe = |stats: ShipStats| -> f32 {
+            let mut w = World::new();
+            w.insert_resource(Tuning::default());
+            w.insert_resource(FixedDt(DT));
+            let ship = spawn_fitted_ship(&mut w, stats);
+            w.get_mut::<ShipIntent>(ship).unwrap().strafe = 1.0;
+            let mut sched = flight_schedule();
+            for _ in 0..60 {
+                sched.run(&mut w);
+            }
+            w.get::<Position>(ship).unwrap().0.length()
+        };
+
+        assert!(run_strafe(gated) < 1e-3, "cockpit-only ship cannot strafe");
+        assert!(
+            run_strafe(able) > 1.0,
+            "with a Flight Computer the same ship strafes"
+        );
+    }
+
     #[test]
     fn recompute_system_rederives_stats_when_fit_changes() {
         // INV-F08: mutating a ship's Fit re-derives its ShipStats in the

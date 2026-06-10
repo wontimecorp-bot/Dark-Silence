@@ -867,9 +867,11 @@ mod tests {
         // thruster (HINT-002) — 7 module rows in total.
         assert_eq!(
             modules.len(),
-            24,
+            29,
             "6 archetypes + baseline thruster + 11 Phase C4 rows + 3 R42 ballistic guns \
-             (MG/HMG/Gatling) + 3 R92 utilities (Capacitor/Battery Bank/Cargo Bay)"
+             (MG/HMG/Gatling) + 3 R92 utilities (Capacitor/Battery Bank/Cargo Bay) \
+             + 4 R93 control modules (Cockpit/Flight Computer I+II/Reaction Wheel) \
+             + 1 R94 Control Relay"
         );
         assert!(modules.get(MODULE_BASELINE_THRUSTER).is_some());
         assert_eq!(hulls.len(), 2, "expected the fighter + corvette seed hulls");

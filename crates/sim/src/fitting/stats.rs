@@ -38,6 +38,10 @@ use super::layout::{
 };
 use super::materials::CellMaterials;
 use super::module::{Module, ModuleKind, ModuleSpecifics};
+use crate::components::{
+    ThrusterControls, CTRL_ALL, CTRL_FORWARD, CTRL_REVERSE, CTRL_STRAFE_PORT,
+    CTRL_STRAFE_STARBOARD, CTRL_TURN_CCW, CTRL_TURN_CW,
+};
 use crate::damage::{Channel, StatScalingConfig, DEFAULT_SHIELD_HP, DEFAULT_SHIELD_REGEN};
 use crate::tuning::{SimTuning, Tuning};
 
@@ -320,6 +324,19 @@ pub struct ShipStats {
     /// R92 — cargo hold volume from fitted **CargoBay** modules: `Σ volume · health_factor`.
     /// v1 = a derived/displayed stat; pickup gameplay consumes it later.
     pub cargo_capacity: f32,
+    /// R93 — a **Cockpit** or **FlightComputer** is FITTED (slot assigned, alive or dead). When
+    /// `false` (every legacy/golden ship, which fit none) control is UNGATED — full input, today's
+    /// behaviour. When `true`, the flags below govern control and a dead control source → derelict.
+    pub control_fitted: bool,
+    /// R93 — at least one LIVE (`hf > 0`) Cockpit or Flight Computer. `control_fitted && !has_control`
+    /// → DERELICT: pilot input ignored, free Newtonian drift (no thrust, no dampers).
+    pub has_control: bool,
+    /// R93 — a live Flight Computer tier `>= 1` → strafe authority. `control_fitted && !can_strafe`
+    /// (cockpit-only) → the strafe input is zeroed (a basic mover: forward + turn only).
+    pub can_strafe: bool,
+    /// R93 — a live Flight Computer tier `>= 2` → diagonal-direction keys. Derived now; the input
+    /// layer (keybinds) + the assist features consume it in a later round.
+    pub can_diagonal: bool,
     /// `true` iff at least one weapon module is installed (FR-016). When `false`
     /// the ship cannot fire and [`ShipStats::weapon`] is `None`.
     pub can_fire: bool,
@@ -451,6 +468,7 @@ pub fn derive_ship_stats(
         layout,
         &SimTuning::default(),
         &CellMaterials::default(),
+        None,
     )
 }
 
@@ -466,6 +484,9 @@ pub fn derive_ship_stats_with(
     layout: &FitLayout,
     sim: &SimTuning,
     materials: &CellMaterials,
+    // R94 — the per-thruster control masks (manual allocation via a Control Relay). `None` (every
+    // legacy/golden ship + the const wrapper) → all channels enabled = today's full projection.
+    thruster_controls: Option<&ThrusterControls>,
 ) -> ShipStats {
     // Flight-feel constants the modules do not supply come from the demoted
     // `Tuning` baseline (HINT-002): the seed baseline fit reproduces these.
@@ -495,6 +516,12 @@ pub fn derive_ship_stats_with(
     let mut continuous_draw = 0.0_f32;
     // Phase F: nominal armor capacity — Σ over fitted Armor modules (a capacity, summed flat).
     let mut armor_value = 0.0_f32;
+    // R93 — control-source flags (opt-in: false unless a Cockpit/FlightComputer is fitted, so every
+    // legacy/golden ship that fits none stays fully controllable, today's behaviour).
+    let mut control_fitted = false;
+    let mut has_control = false;
+    let mut can_strafe = false;
+    let mut can_diagonal = false;
     // Refinement 10: shield capacity/regen from the fitted Shield generator — health-scaled (a
     // damaged generator degrades, a carved one zeroes). `has_shield_module` distinguishes "no
     // generator fitted" (→ the default fallback, like `seed_defense_layers`) from "generator fitted
@@ -507,6 +534,33 @@ pub fn derive_ship_stats_with(
     let mut energy_store = 0.0_f32;
     let mut cargo_capacity = 0.0_f32;
     let mut weapon: Option<WeaponProfile> = None;
+
+    // R94 — health-factor lookup for a slot's installed module (a carved/severed/destroyed cell →
+    // `0`); shared by the control-allocator pre-scan + the main loop.
+    let hf_of = |slot_id: &SlotId, module: &Module| -> f32 {
+        layout
+            .cells
+            .values()
+            .find(|o| o.slot == *slot_id && o.module.is_some())
+            .map(|occ| health_factor(occ, module, &cfg))
+            .unwrap_or(0.0)
+    };
+
+    // R94 — pick the active control allocator BEFORE the thruster projection: a live **Flight
+    // Computer** uses the FULL geometric projection (auto); a live **Control Relay** with no FC
+    // applies the player's per-thruster channel masks (manual). `use_mask` gates the thruster arm.
+    let (mut fc_live, mut relay_live) = (false, false);
+    for (slot_id, module_id) in fit.assignments.iter() {
+        let Some(m) = catalog.get(*module_id) else {
+            continue;
+        };
+        match m.specifics {
+            ModuleSpecifics::FlightComputer { .. } if hf_of(slot_id, m) > 0.0 => fc_live = true,
+            ModuleSpecifics::ControlRelay if hf_of(slot_id, m) > 0.0 => relay_live = true,
+            _ => {}
+        }
+    }
+    let use_mask = relay_live && !fc_live;
 
     // Iterate by SlotId (BTreeMap order) so derivation is deterministic — the
     // first *alive* weapon module by slot wins when several are fitted (Principle II).
@@ -526,12 +580,7 @@ pub fn derive_ship_stats_with(
         // module that has no built cell at all (an impossible state post-`build_layout`,
         // which authors a cell per slot) likewise contributes nothing, keeping
         // derivation total.
-        let hf = layout
-            .cells
-            .values()
-            .find(|o| o.slot == *slot_id && o.module.is_some())
-            .map(|occ| health_factor(occ, module, &cfg))
-            .unwrap_or(0.0);
+        let hf = hf_of(slot_id, module);
 
         // Universal budget costs apply on every kind and are NOT scaled by health
         // (a damaged module still draws power+cpu, INV-D13). Mass is no longer summed
@@ -568,10 +617,26 @@ pub fn derive_ship_stats_with(
                         .map(|sl| sl.facing)
                         .unwrap_or(0.0);
                     let dir = Vec2::from_angle(facing);
-                    thrust_fwd += f * dir.x.max(0.0);
-                    thrust_rev += f * (-dir.x).max(0.0);
-                    strafe_port += f * dir.y.max(0.0);
-                    strafe_starboard += f * (-dir.y).max(0.0);
+                    // R94 — the per-thruster control MASK (manual allocation): bites only when a
+                    // Control Relay is the live allocator (no FC). Otherwise `CTRL_ALL` → every
+                    // channel admitted = the full geometric projection (today's behaviour).
+                    let mask = if use_mask {
+                        thruster_controls.map_or(CTRL_ALL, |tc| tc.for_slot(*slot_id))
+                    } else {
+                        CTRL_ALL
+                    };
+                    if mask & CTRL_FORWARD != 0 {
+                        thrust_fwd += f * dir.x.max(0.0);
+                    }
+                    if mask & CTRL_REVERSE != 0 {
+                        thrust_rev += f * (-dir.x).max(0.0);
+                    }
+                    if mask & CTRL_STRAFE_PORT != 0 {
+                        strafe_port += f * dir.y.max(0.0);
+                    }
+                    if mask & CTRL_STRAFE_STARBOARD != 0 {
+                        strafe_starboard += f * (-dir.y).max(0.0);
+                    }
                     // The jet's body-frame position relative to the CoM (cell space → body axes:
                     // x = row − com.y, y = col − com.x; × CELL_WORLD_SIZE → world units).
                     if let Some((cell, occ)) = layout
@@ -582,8 +647,12 @@ pub fn derive_ship_stats_with(
                         let centroid = occ.shape.centroid(cell.0, cell.1);
                         let r = Vec2::new(centroid.y - com.y, centroid.x - com.x) * CELL_WORLD_SIZE;
                         let tau = (r.x * dir.y - r.y * dir.x) * f * sim.thruster_lever_scale;
-                        turn_ccw += tau.max(0.0);
-                        turn_cw += (-tau).max(0.0);
+                        if mask & CTRL_TURN_CCW != 0 {
+                            turn_ccw += tau.max(0.0);
+                        }
+                        if mask & CTRL_TURN_CW != 0 {
+                            turn_cw += (-tau).max(0.0);
+                        }
                     }
                 }
             }
@@ -654,6 +723,44 @@ pub fn derive_ship_stats_with(
             ModuleSpecifics::CargoBay { volume } => {
                 cargo_capacity += volume * hf;
             }
+            // R93 — a fitted Cockpit opts the ship into the control-source model; alive → a live
+            // control source (basic fly + turn).
+            ModuleSpecifics::Cockpit => {
+                control_fitted = true;
+                if hf > 0.0 {
+                    has_control = true;
+                }
+            }
+            // R93 — a fitted Flight Computer: also a control source (automated brain), and its live
+            // tier grants strafe (≥1) / diagonal (≥2).
+            ModuleSpecifics::FlightComputer { tier } => {
+                control_fitted = true;
+                if hf > 0.0 {
+                    has_control = true;
+                    if tier >= 1 {
+                        can_strafe = true;
+                    }
+                    if tier >= 2 {
+                        can_diagonal = true;
+                    }
+                }
+            }
+            // R93 — a reaction wheel / CMG: placement-FREE torque to BOTH turn channels (no lever
+            // arm, no thrust/strafe), health-scaled.
+            ModuleSpecifics::ReactionWheel { torque } => {
+                let t = torque * hf;
+                turn_ccw += t;
+                turn_cw += t;
+            }
+            // R94 — a Control Relay: the MANUAL allocator. A control source that unlocks strafe; the
+            // per-thruster masks it enables are applied in the thruster arm above (gated on `use_mask`).
+            ModuleSpecifics::ControlRelay => {
+                control_fitted = true;
+                if hf > 0.0 {
+                    has_control = true;
+                    can_strafe = true;
+                }
+            }
             _ => {}
         }
     }
@@ -715,6 +822,10 @@ pub fn derive_ship_stats_with(
         shield_regen,
         energy_store,
         cargo_capacity,
+        control_fitted,
+        has_control,
+        can_strafe,
+        can_diagonal,
         can_fire: weapon.is_some(),
         weapon,
     }
@@ -1086,5 +1197,233 @@ mod tests {
         let carved = derive_ship_stats(&hull, &fit, &modules, &layout);
         assert_eq!(carved.energy_store, 0.0);
         assert!((carved.cargo_capacity - 50.0).abs() < 1e-3);
+    }
+
+    /// R93 test helper — author one Utility slot per `(slot, module)` on a free structural cell of
+    /// the fighter and fit that module there. Returns the catalog + hull + fit + layout + the slot
+    /// coords (for carving).
+    #[allow(clippy::type_complexity)]
+    fn fighter_with_utilities(
+        mods: &[(crate::fitting::SlotId, crate::fitting::ModuleId)],
+    ) -> (ModuleCatalog, Hull, Fit, FitLayout, Vec<(u16, u16)>) {
+        use crate::fitting::content::HULL_FIGHTER;
+        use crate::fitting::{HardpointType, Slot, SlotSize};
+        let (modules, hulls) = seed_catalogs();
+        let mut hull = hulls.get(HULL_FIGHTER).unwrap().clone();
+        let taken: Vec<(u16, u16)> = hull.slots.iter().map(|s| s.coord).collect();
+        let free: Vec<(u16, u16)> = hull
+            .cells
+            .iter()
+            .map(|c| c.coord)
+            .filter(|c| !taken.contains(c))
+            .collect();
+        let mut fit = Fit::new(hull.id);
+        let mut coords = Vec::new();
+        for (i, (slot, module)) in mods.iter().enumerate() {
+            let c = free[i];
+            for cell in hull.cells.iter_mut() {
+                if cell.coord == c {
+                    cell.structural = false;
+                }
+            }
+            hull.slots.push(Slot {
+                id: *slot,
+                slot_type: HardpointType::Utility,
+                size: SlotSize::Small,
+                coord: c,
+                facing: 0.0,
+                is_weapon_mount: false,
+            });
+            fit.install_raw(*slot, *module);
+            coords.push(c);
+        }
+        let layout = build_layout(&hull, &fit, &modules);
+        (modules, hull, fit, layout, coords)
+    }
+
+    /// R93 — a reaction wheel adds its torque to BOTH turn channels, regardless of placement (no
+    /// lever arm), health-scaled.
+    #[test]
+    fn reaction_wheel_adds_placement_free_turn_authority() {
+        use crate::fitting::{ModuleId, SlotId};
+        let (m0, h0, f0, l0, _) = fighter_with_utilities(&[]);
+        let base = derive_ship_stats(&h0, &f0, &m0, &l0);
+        let (m1, h1, f1, l1, _) = fighter_with_utilities(&[(SlotId(98), ModuleId(30))]); // Reaction Wheel (8)
+        let w = derive_ship_stats(&h1, &f1, &m1, &l1);
+        assert!(
+            (w.turn_ccw - base.turn_ccw - 8.0).abs() < 1e-3,
+            "ccw += torque"
+        );
+        assert!(
+            (w.turn_cw - base.turn_cw - 8.0).abs() < 1e-3,
+            "cw += torque"
+        );
+    }
+
+    /// R93 — Cockpit/Flight Computer set the control flags; a bare ship (no control module) stays
+    /// UNGATED (`control_fitted == false`) — backward-compat with every legacy/golden ship.
+    #[test]
+    fn cockpit_and_flight_computer_set_control_flags() {
+        use crate::fitting::{ModuleId, SlotId};
+        let (m0, h0, f0, l0, _) = fighter_with_utilities(&[]);
+        let bare = derive_ship_stats(&h0, &f0, &m0, &l0);
+        assert!(
+            !bare.control_fitted,
+            "no control module → ungated (legacy default)"
+        );
+
+        let (m1, h1, f1, l1, _) = fighter_with_utilities(&[(SlotId(98), ModuleId(27))]); // Cockpit
+        let c = derive_ship_stats(&h1, &f1, &m1, &l1);
+        assert!(c.control_fitted && c.has_control && !c.can_strafe && !c.can_diagonal);
+
+        let (m2, h2, f2, l2, _) = fighter_with_utilities(&[(SlotId(98), ModuleId(28))]); // FC I
+        let fc1 = derive_ship_stats(&h2, &f2, &m2, &l2);
+        assert!(fc1.control_fitted && fc1.has_control && fc1.can_strafe && !fc1.can_diagonal);
+
+        let (m3, h3, f3, l3, _) = fighter_with_utilities(&[(SlotId(98), ModuleId(29))]); // FC II
+        let fc2 = derive_ship_stats(&h3, &f3, &m3, &l3);
+        assert!(fc2.control_fitted && fc2.has_control && fc2.can_strafe && fc2.can_diagonal);
+    }
+
+    /// R93 — a cockpit-fitted ship whose cockpit cell is carved off keeps `control_fitted` (the slot
+    /// is still assigned) but loses `has_control` → DERELICT.
+    #[test]
+    fn carved_cockpit_makes_the_ship_derelict() {
+        use crate::fitting::{ModuleId, SlotId};
+        let (m, h, f, mut l, coords) = fighter_with_utilities(&[(SlotId(98), ModuleId(27))]);
+        let alive = derive_ship_stats(&h, &f, &m, &l);
+        assert!(alive.control_fitted && alive.has_control);
+        l.cells.retain(|coord, _| *coord != coords[0]); // carve the cockpit cell
+        let dead = derive_ship_stats(&h, &f, &m, &l);
+        assert!(
+            dead.control_fitted && !dead.has_control,
+            "fitted a cockpit but no live control source survives → derelict"
+        );
+    }
+
+    /// R94 — a Control Relay is a control source that unlocks strafe (the manual allocator).
+    #[test]
+    fn control_relay_is_a_control_source_that_unlocks_strafe() {
+        use crate::fitting::{ModuleId, SlotId};
+        let (m, h, f, l, _) = fighter_with_utilities(&[(SlotId(98), ModuleId(31))]); // Control Relay
+        let s = derive_ship_stats(&h, &f, &m, &l);
+        assert!(s.control_fitted && s.has_control && s.can_strafe && !s.can_diagonal);
+    }
+
+    /// R94 test helper — a fighter with one OFF-AXIS thruster (facing 45° → feeds forward + strafe-port
+    /// + a little turn) and an optional control-allocator module fitted to a Utility slot.
+    fn fighter_thruster_and_allocator(
+        allocator: Option<crate::fitting::ModuleId>,
+    ) -> (ModuleCatalog, Hull, Fit, FitLayout) {
+        use crate::fitting::content::{HULL_FIGHTER, MODULE_THRUSTER_BASIC};
+        use crate::fitting::{HardpointType, Slot, SlotId, SlotSize};
+        let (modules, hulls) = seed_catalogs();
+        let mut hull = hulls.get(HULL_FIGHTER).unwrap().clone();
+        if let Some(sl) = hull.slots.iter_mut().find(|s| s.id == SlotId(1)) {
+            sl.facing = std::f32::consts::FRAC_PI_4;
+        }
+        let mut fit = Fit::new(hull.id);
+        fit.install_raw(SlotId(1), MODULE_THRUSTER_BASIC);
+        if let Some(alloc) = allocator {
+            let taken: Vec<(u16, u16)> = hull.slots.iter().map(|s| s.coord).collect();
+            let c = hull
+                .cells
+                .iter()
+                .map(|c| c.coord)
+                .find(|c| !taken.contains(c))
+                .expect("a free structural cell");
+            for cell in hull.cells.iter_mut() {
+                if cell.coord == c {
+                    cell.structural = false;
+                }
+            }
+            hull.slots.push(Slot {
+                id: SlotId(98),
+                slot_type: HardpointType::Utility,
+                size: SlotSize::Small,
+                coord: c,
+                facing: 0.0,
+                is_weapon_mount: false,
+            });
+            fit.install_raw(SlotId(98), alloc);
+        }
+        let layout = build_layout(&hull, &fit, &modules);
+        (modules, hull, fit, layout)
+    }
+
+    /// R94 — the per-thruster mask routes channels on a RELAY ship (manual), but a Flight Computer
+    /// OVERRIDES it (auto = full projection).
+    #[test]
+    fn relay_mask_routes_thruster_channels_but_an_fc_overrides() {
+        use crate::fitting::{ModuleId, SlotId};
+        let sim = SimTuning::default();
+        let mut tc = ThrusterControls::default();
+        tc.mask.insert(SlotId(1), CTRL_FORWARD); // the off-axis jet allowed for FORWARD only
+
+        // No allocator, no mask → full projection: the off-axis jet feeds strafe-port.
+        let (m0, h0, f0, l0) = fighter_thruster_and_allocator(None);
+        let base =
+            derive_ship_stats_with(&h0, &f0, &m0, &l0, &sim, &CellMaterials::default(), None);
+        assert!(
+            base.strafe_port > sim.baseline_strafe_force + 1e-3,
+            "with no mask the jet feeds strafe"
+        );
+
+        // Relay + forward-only mask → the jet is removed from strafe (mask bites), forward kept.
+        let (m1, h1, f1, l1) = fighter_thruster_and_allocator(Some(ModuleId(31))); // Control Relay
+        let relay = derive_ship_stats_with(
+            &h1,
+            &f1,
+            &m1,
+            &l1,
+            &sim,
+            &CellMaterials::default(),
+            Some(&tc),
+        );
+        assert!(
+            (relay.strafe_port - sim.baseline_strafe_force).abs() < 1e-3,
+            "the relay mask removes the jet from the strafe channel"
+        );
+        assert!(
+            relay.thrust_force > THRUST_FLOOR + 1e-3,
+            "the forward channel is still fed"
+        );
+
+        // Flight Computer + the SAME mask → auto overrides → the jet feeds strafe again.
+        let (m2, h2, f2, l2) = fighter_thruster_and_allocator(Some(ModuleId(28))); // FC I
+        let fc = derive_ship_stats_with(
+            &h2,
+            &f2,
+            &m2,
+            &l2,
+            &sim,
+            &CellMaterials::default(),
+            Some(&tc),
+        );
+        assert!(
+            fc.strafe_port > sim.baseline_strafe_force + 1e-3,
+            "an FC overrides the mask → full projection (auto)"
+        );
+    }
+
+    /// R94 — an all-ON mask (or `None`) derives byte-identical to today's full projection.
+    #[test]
+    fn all_on_mask_is_identical_to_no_thruster_controls() {
+        use crate::fitting::ModuleId;
+        let sim = SimTuning::default();
+        let (m, h, f, l) = fighter_thruster_and_allocator(Some(ModuleId(31))); // relay fitted
+        let none = derive_ship_stats_with(&h, &f, &m, &l, &sim, &CellMaterials::default(), None);
+        let allon = derive_ship_stats_with(
+            &h,
+            &f,
+            &m,
+            &l,
+            &sim,
+            &CellMaterials::default(),
+            Some(&ThrusterControls::default()),
+        );
+        assert_eq!(none.strafe_port, allon.strafe_port);
+        assert_eq!(none.turn_ccw, allon.turn_ccw);
+        assert_eq!(none.thrust_force, allon.thrust_force);
     }
 }

@@ -190,6 +190,30 @@ pub fn ship_motion_system(
 
     // Fitted: each ship uses its own fit-derived stats.
     for (intent, mut pos, mut vel, mut heading, mut omega, mut assist, stats, ab) in &mut fitted {
+        // R93 — DERELICT: a ship that FITTED a cockpit/FC but has no LIVE one left (canopy shot off,
+        // no drone brain) ignores pilot input and coasts frictionlessly — no thrust, no dampers
+        // (same Newtonian coast as a wreck). Opt-in: `control_fitted` is false for every ship that
+        // fits no control module, so legacy/golden ships are byte-identical.
+        if stats.control_fitted && !stats.has_control {
+            let stepped = integrate(BodyState::new(pos.0, vel.0), Vec2::ZERO, dt);
+            pos.0 = stepped.pos;
+            heading.0 = (heading.0 + omega.0 * dt).rem_euclid(std::f32::consts::TAU);
+            continue;
+        }
+        // R93 — STRAFE GATE: a control-fitted ship with no live Flight Computer (cockpit-only) has no
+        // strafe authority → zero the lateral input (a basic mover: forward + turn). Non-control-fitted
+        // ships keep full strafe (today's behaviour).
+        let gated;
+        let intent: &ShipIntent =
+            if stats.control_fitted && !stats.can_strafe && intent.strafe != 0.0 {
+                gated = ShipIntent {
+                    strafe: 0.0,
+                    ..*intent
+                };
+                &gated
+            } else {
+                intent
+            };
         let params = FlightParams::from_ship_stats(stats);
         // Phase F: boost translational thrust while the afterburner is held AND has charge.
         let boosting = intent.afterburner && ab.is_some_and(|a| a.current > 0.0);

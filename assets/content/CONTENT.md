@@ -59,6 +59,20 @@ Per-kind `specifics`:
   scaled. With a dead reactor the stored charge persists (regen 0) and drains as used.
 - **`CargoBay( volume )`** — R92: cargo hold volume → the ship's `cargo_capacity` stat (display
   now; pickup gameplay later), health-scaled.
+- **`Cockpit`** — R93: a crewed pilot station = basic controls (forward + turn). A ship that fits
+  any cockpit/FC opts into the control-source model: with no LIVE cockpit/FC left it goes **derelict**
+  (input ignored, free drift). Place it anywhere (not the nose). Backups allowed.
+- **`FlightComputer( tier )`** — R93: an automated control brain (flies a cockpit-less / canopy-shot
+  ship — a drone) + capability tiers. `tier 1` = strafe authority; `tier 2` = + diagonal-direction
+  keys. Higher tiers / add-on upgrades host the assist features (later round).
+- **`ReactionWheel( torque )`** — R93: placement-FREE flat torque to BOTH turn channels (internal
+  momentum exchange — works anywhere), health-scaled. No thrust/strafe. Turn authority for hulls
+  with no good RCS placement.
+- **`ControlRelay`** — R94: the MANUAL control allocator (the cheap sibling of the Flight Computer).
+  A control source that unlocks strafe; when it's the live allocator (and no FC is present, which
+  overrides to full-auto) the derive respects the player's per-thruster `ThrusterControls` channel
+  masks (which of the six commands — fwd/rev/strafe-L/strafe-R/turn-L/turn-R — each thruster feeds),
+  set in the fitting screen. No relay → masks default to all-on = full geometric projection.
 - **`Utility`** — generic seam; no flight/weapon contribution yet.
 - **`Weapon( … )`** — see the weapon model below.
 
@@ -71,7 +85,10 @@ Per-kind `specifics`:
 **Weapons** `16` Vulcan · `17` Cannon · `18` Missile Launcher · `19` Plasma Cannon ·
 `20` Ion Cannon · `21` Machine Gun · `22` Heavy Machine Gun · `23` Gatling Gun ·
 **R92 utilities** `24` Capacitor (store 25, light) · `25` Battery Bank (store 80, heavy) ·
-`26` Cargo Bay (volume 50).
+`26` Cargo Bay (volume 50) ·
+**R93 control** `27` Cockpit · `28` Flight Computer I (strafe) · `29` Flight Computer II
+(+ diagonal) · `30` Reaction Wheel (torque 8) ·
+**R94 control** `31` Control Relay (manual allocator — per-thruster channel masks).
 
 ---
 

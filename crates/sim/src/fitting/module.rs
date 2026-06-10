@@ -276,6 +276,28 @@ pub enum ModuleSpecifics {
         /// Cargo volume contribution (`>= 0`), health-scaled at derive time.
         volume: f32,
     },
+    /// R93 — a crewed COCKPIT: a live pilot + basic controls (forward + turn). A ship that FITS a
+    /// cockpit/FC becomes derelict if no control source survives (the canopy-shot consequence);
+    /// strafe still needs a Flight Computer. Placeable anywhere (not forced to the nose).
+    Cockpit,
+    /// R93 — a FLIGHT COMPUTER: an automated control brain (a cockpit-less / canopy-shot ship can
+    /// still fly with one — a drone) plus capability tiers. `tier >= 1` → strafe authority; `tier >= 2`
+    /// → diagonal-direction keys. Higher tiers / add-on upgrades host the assist features (later round).
+    FlightComputer {
+        /// Capability tier (`1` = strafe, `2` = + diagonal). Clamped sane at use.
+        tier: u8,
+    },
+    /// R93 — a REACTION WHEEL / control-moment gyro: placement-FREE flat torque to BOTH turn channels
+    /// (internal momentum exchange — works anywhere on the hull), health-scaled. No thrust/strafe.
+    ReactionWheel {
+        /// Torque added to each turn channel (`>= 0`), health-scaled at derive time.
+        torque: f32,
+    },
+    /// R94 — a CONTROL RELAY: the MANUAL control allocator (the cheap-but-yours sibling of the Flight
+    /// Computer). A control source that unlocks strafe; when it's the live allocator (and no FC is
+    /// present to override to full-auto) the derive respects the player's per-thruster
+    /// [`ThrusterControls`](crate::components::ThrusterControls) channel masks.
+    ControlRelay,
     /// Utility: generic seam; no flight/weapon contribution this epic.
     Utility,
 }

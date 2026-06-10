@@ -15,10 +15,14 @@
 
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
-use sim::components::{FireMapping, Trigger, WeaponGroups};
+use sim::components::{
+    FireMapping, ThrusterControls, Trigger, WeaponGroups, CTRL_FORWARD, CTRL_REVERSE,
+    CTRL_STRAFE_PORT, CTRL_STRAFE_STARBOARD, CTRL_TURN_CCW, CTRL_TURN_CW,
+};
 use sim::fitting::{
     check_slot_fit, derive_weapon, preview_stats, seed_catalogs, validate_fit, Fit, FitRejection,
-    HardpointType, Hull, HullCatalog, Module, ModuleCatalog, ModuleId, SlotId, HULL_FIGHTER,
+    HardpointType, Hull, HullCatalog, Module, ModuleCatalog, ModuleId, ModuleSpecifics, SlotId,
+    HULL_FIGHTER,
 };
 
 use crate::net::{LoopbackHost, NetClientState};
@@ -82,6 +86,11 @@ pub struct FittingSession {
     /// R46 — the committed fire-group baseline (rebased on Apply, like [`applied_fit`](Self::applied_fit)).
     /// Drives the "unsaved changes" indicator alongside `applied_fit`.
     pub applied_groups: WeaponGroups,
+    /// R94 — the working per-thruster control masks (manual allocation). Editable only when a Control
+    /// Relay is fitted; committed alongside the `Fit` on Apply. Slots absent default to all channels.
+    pub thruster_controls: ThrusterControls,
+    /// R94 — the committed control-mask baseline (rebased on Apply; drives "unsaved changes").
+    pub applied_controls: ThrusterControls,
     /// Human-readable outcome of the last action (install/remove/apply rejection or success).
     pub status: String,
 }
@@ -99,6 +108,8 @@ impl Default for FittingSession {
             selected_slot: None,
             weapon_groups: WeaponGroups::default(),
             applied_groups: WeaponGroups::default(),
+            thruster_controls: ThrusterControls::default(),
+            applied_controls: ThrusterControls::default(),
             status: String::new(),
         }
     }
@@ -141,6 +152,10 @@ fn load_fitting_session(
             session.weapon_groups = w.get::<WeaponGroups>(ship).cloned().unwrap_or_default();
             // R46 — rebase the "unsaved changes" baseline to the just-loaded groups.
             session.applied_groups = session.weapon_groups.clone();
+            // R94 — load the ship's live per-thruster control masks (absent → all channels on).
+            session.thruster_controls =
+                w.get::<ThrusterControls>(ship).cloned().unwrap_or_default();
+            session.applied_controls = session.thruster_controls.clone();
         }
     }
     inventory.available = session.modules.modules.keys().copied().collect();
@@ -171,9 +186,22 @@ fn fitting_screen_ui(
     let modules = session.modules.clone();
     let selected = session.selected_slot;
     let groups = session.weapon_groups.clone();
-    // R46 — are there edits not yet committed to the ship? (drives the "unsaved changes" label)
+    let controls = session.thruster_controls.clone();
+    // R94 — which control allocator does the WORKING fit carry? A Control Relay enables the manual
+    // per-thruster channel masks; a Flight Computer overrides them to full auto.
+    let has_kind = |pred: fn(&ModuleSpecifics) -> bool| {
+        working
+            .assignments
+            .values()
+            .filter_map(|m| modules.get(*m))
+            .any(|m| pred(&m.specifics))
+    };
+    let relay_fitted = has_kind(|s| matches!(s, ModuleSpecifics::ControlRelay));
+    let fc_fitted = has_kind(|s| matches!(s, ModuleSpecifics::FlightComputer { .. }));
+    // R46/R94 — are there edits not yet committed to the ship? (drives the "unsaved changes" label)
     let dirty = session.working_fit != session.applied_fit
-        || session.weapon_groups != session.applied_groups;
+        || session.weapon_groups != session.applied_groups
+        || session.thruster_controls != session.applied_controls;
     let (budget, stats) = preview_stats(&hull, &working, &modules);
     let baseline = preview_stats(&hull, &session.applied_fit, &modules).1;
 
@@ -183,6 +211,8 @@ fn fitting_screen_ui(
     let mut to_remove: Option<SlotId> = None;
     // R45 — a fire-group edit (slot → new group/trigger), applied to `session.weapon_groups` after.
     let mut to_assign: Option<(SlotId, FireMapping)> = None;
+    // R94 — a thruster control-mask edit (slot → new 6-bit mask), applied to `thruster_controls` after.
+    let mut to_mask: Option<(SlotId, u8)> = None;
     let mut do_apply = false;
     let mut do_close = false;
 
@@ -224,6 +254,7 @@ fn fitting_screen_ui(
                     &working,
                     &modules,
                     &groups,
+                    &controls,
                     selected,
                     &mut select,
                 );
@@ -234,10 +265,14 @@ fn fitting_screen_ui(
                     &modules,
                     &inventory,
                     &groups,
+                    &controls,
+                    relay_fitted,
+                    fc_fitted,
                     selected,
                     &mut to_install,
                     &mut to_remove,
                     &mut to_assign,
+                    &mut to_mask,
                 );
             });
             ui.separator();
@@ -301,17 +336,32 @@ fn fitting_screen_ui(
             mapping.trigger
         );
     }
+    if let Some((slot, mask)) = to_mask {
+        // R94 — all-channels-on is the implicit default → drop it to keep the committed map minimal.
+        if mask == sim::components::CTRL_ALL {
+            session.thruster_controls.mask.remove(&slot);
+        } else {
+            session.thruster_controls.mask.insert(slot, mask);
+        }
+        session.status = format!("Slot {} channels {mask:06b}", slot.0);
+    }
     if do_apply {
         // R45 (Bug #1): validate BEFORE committing — refuse an over-budget / invalid fit (you can
         // over-REMOVE, e.g. drop a reactor → power.over, which install never lets you do) instead of
         // a false "Applied ✓".
         let v = validate_fit(&hull, &session.working_fit, &session.modules);
         if v.valid {
-            session.status =
-                apply_to_ship(host, state, &session.working_fit, &session.weapon_groups);
+            session.status = apply_to_ship(
+                host,
+                state,
+                &session.working_fit,
+                &session.weapon_groups,
+                &session.thruster_controls,
+            );
             session.applied_fit = session.working_fit.clone();
-            // R46 — rebase the fire-group baseline too, so the "unsaved changes" label clears.
+            // R46/R94 — rebase the fire-group + control-mask baselines too, so "unsaved" clears.
             session.applied_groups = session.weapon_groups.clone();
+            session.applied_controls = session.thruster_controls.clone();
         } else {
             let over = if v.usage.power.over {
                 "power"
@@ -342,6 +392,7 @@ fn apply_to_ship(
     state: Option<NonSend<NetClientState>>,
     fit: &Fit,
     groups: &WeaponGroups,
+    controls: &ThrusterControls,
 ) -> String {
     let (Some(mut host), Some(state)) = (host, state) else {
         return "No embedded server to apply to".to_string();
@@ -350,19 +401,24 @@ fn apply_to_ship(
         return "No player ship to apply to".to_string();
     };
     let world = host.server.world_mut();
-    // R46 — diff against what's ALREADY on the ship so we only claim "Applied ✓" on a real change.
+    // R46/R94 — diff against what's ALREADY on the ship so we only claim "Applied ✓" on a real change.
     // (A swap silently rejected at install leaves working_fit == the live fit, so this catches the
     // "Applied ✓ but nothing changed" lie.) `.cloned()` ends the immutable borrows before the mut one.
     let cur_fit = world.get::<Fit>(ship).cloned();
     let cur_groups = world.get::<WeaponGroups>(ship).cloned().unwrap_or_default();
-    if cur_fit.as_ref() == Some(fit) && &cur_groups == groups {
+    let cur_controls = world
+        .get::<ThrusterControls>(ship)
+        .cloned()
+        .unwrap_or_default();
+    if cur_fit.as_ref() == Some(fit) && &cur_groups == groups && &cur_controls == controls {
         return "No changes to apply".to_string();
     }
     let fit = fit.clone();
     let groups = groups.clone();
+    let controls = controls.clone();
     match world.get_entity_mut(ship) {
         Ok(mut e) => {
-            e.insert((fit, groups));
+            e.insert((fit, groups, controls));
             "Applied to ship ✓".to_string()
         }
         Err(_) => "Player ship entity missing".to_string(),
@@ -375,12 +431,14 @@ const CELL: f32 = 16.0;
 /// Draw the ship as an egui grid: each hull cell is a dim filler, each SLOT is a clickable coloured
 /// button at its hull position (label = installed module's short name, or the slot-type initial). The
 /// selected slot is highlighted. Rows are drawn top-down so the nose (high row) points up.
+#[allow(clippy::too_many_arguments)]
 fn draw_ship(
     ui: &mut egui::Ui,
     hull: &Hull,
     fit: &Fit,
     modules: &ModuleCatalog,
     groups: &WeaponGroups,
+    controls: &ThrusterControls,
     selected: Option<SlotId>,
     select: &mut Option<SlotId>,
 ) {
@@ -403,6 +461,11 @@ fn draw_ship(
                         let map = groups.for_slot(slot.id);
                         let is_weapon =
                             slot.slot_type == HardpointType::Weapon && installed.is_some();
+                        // R94 — a thruster with a non-default (custom) control mask is tinted to flag
+                        // its manual routing at a glance.
+                        let is_masked_thruster = slot.slot_type == HardpointType::Thruster
+                            && installed.is_some()
+                            && controls.for_slot(slot.id) != sim::components::CTRL_ALL;
                         let label = if is_weapon {
                             (map.group + 1).to_string()
                         } else {
@@ -418,6 +481,8 @@ fn draw_ship(
                                 Trigger::Secondary => egui::Color32::from_rgb(80, 140, 210),
                                 Trigger::Off => egui::Color32::from_rgb(90, 90, 95),
                             }
+                        } else if is_masked_thruster {
+                            egui::Color32::from_rgb(170, 110, 200) // custom-routed thruster
                         } else {
                             slot_color(slot.slot_type)
                         };
@@ -471,10 +536,14 @@ fn slot_panel(
     modules: &ModuleCatalog,
     inventory: &Inventory,
     groups: &WeaponGroups,
+    controls: &ThrusterControls,
+    relay_fitted: bool,
+    fc_fitted: bool,
     selected: Option<SlotId>,
     to_install: &mut Option<(SlotId, ModuleId)>,
     to_remove: &mut Option<SlotId>,
     to_assign: &mut Option<(SlotId, FireMapping)>,
+    to_mask: &mut Option<(SlotId, u8)>,
 ) {
     let Some(slot_id) = selected else {
         ui.label("Click a slot on the ship to fit a module.");
@@ -538,6 +607,47 @@ fn slot_panel(
                 }
             }
         });
+    }
+    // R94 — a thruster with a module installed gets a CONTROL-CHANNEL editor when a Control Relay is
+    // fitted (manual allocation): toggle which of the six commands this jet may feed. A Flight Computer
+    // overrides to full auto (mask ignored); with neither, fit a relay to wire it.
+    if slot.slot_type == HardpointType::Thruster && installed.is_some() {
+        ui.separator();
+        ui.label("Control channels");
+        if fc_fitted {
+            ui.colored_label(
+                egui::Color32::from_rgb(120, 180, 120),
+                "Auto — Flight Computer routes all jets (mask ignored)",
+            );
+        } else if relay_fitted {
+            let mask = controls.for_slot(slot_id);
+            ui.horizontal(|ui| {
+                for (label, bit) in [
+                    ("Fwd", CTRL_FORWARD),
+                    ("Rev", CTRL_REVERSE),
+                    ("S-L", CTRL_STRAFE_PORT),
+                    ("S-R", CTRL_STRAFE_STARBOARD),
+                    ("T-L", CTRL_TURN_CCW),
+                    ("T-R", CTRL_TURN_CW),
+                ] {
+                    if ui.selectable_label(mask & bit != 0, label).clicked() {
+                        *to_mask = Some((slot_id, mask ^ bit)); // toggle this channel
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "which commands fire this jet (its real thrust direction still applies)",
+                )
+                .small()
+                .weak(),
+            );
+        } else {
+            ui.colored_label(
+                egui::Color32::from_rgb(150, 150, 90),
+                "Fit a Control Relay to wire this thruster manually",
+            );
+        }
     }
     ui.separator();
     ui.label("Compatible modules (inventory):");

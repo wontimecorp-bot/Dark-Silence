@@ -843,7 +843,11 @@ fn build_equipment(fit: &Fit, catalog: Option<&ModuleCatalog>) -> (Vec<Equipment
             | ModuleSpecifics::Utility
             | ModuleSpecifics::Sensor { .. }
             | ModuleSpecifics::EnergyStore { .. }
-            | ModuleSpecifics::CargoBay { .. } => {}
+            | ModuleSpecifics::CargoBay { .. }
+            | ModuleSpecifics::Cockpit
+            | ModuleSpecifics::FlightComputer { .. }
+            | ModuleSpecifics::ReactionWheel { .. }
+            | ModuleSpecifics::ControlRelay => {}
         }
         rows.push(EquipmentRow {
             slot: slot.0,
@@ -2020,9 +2024,22 @@ fn dev_panel_ui(
                                                         slider(ui, "cargo volume", volume, 0.0..=500.0)
                                                             .on_hover_text("R92 — cargo hold volume this bay adds (health-scaled live).");
                                                     }
+                                                    // R93 — control modules.
+                                                    ModuleSpecifics::ReactionWheel { torque } => {
+                                                        slider(ui, "wheel torque", torque, 0.0..=40.0)
+                                                            .on_hover_text("R93 — placement-free torque this CMG/reaction wheel adds to BOTH turn channels (health-scaled).");
+                                                    }
+                                                    ModuleSpecifics::FlightComputer { tier } => {
+                                                        let mut t = *tier as f32;
+                                                        slider(ui, "FC tier", &mut t, 1.0..=2.0)
+                                                            .on_hover_text("R93 — Flight Computer tier: 1 = strafe authority, 2 = + diagonal keys.");
+                                                        *tier = t.round() as u8;
+                                                    }
                                                     ModuleSpecifics::Thruster { .. }
                                                     | ModuleSpecifics::Reactor
                                                     | ModuleSpecifics::Utility
+                                                    | ModuleSpecifics::Cockpit
+                                                    | ModuleSpecifics::ControlRelay
                                                     | ModuleSpecifics::Sensor { .. } => {}
                                                 }
                                                 // R42: read-only DERIVED game stats (the real specs

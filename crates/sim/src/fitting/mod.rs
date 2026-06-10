@@ -76,7 +76,7 @@ pub use validate::{
 
 use bevy_ecs::prelude::*;
 
-use crate::components::{ArmorHp, WeaponBank};
+use crate::components::{ArmorHp, ThrusterControls, WeaponBank};
 use crate::damage::Shields;
 
 /// Re-derive a ship's [`ShipStats`] whenever its [`Fit`] **or** its [`FitLayout`]
@@ -132,13 +132,18 @@ pub fn recompute_ship_stats_system(
             Option<&mut ArmorHp>,
             // R45 — the per-weapon firing state, read to PRESERVE cooldown/spool across a re-derive.
             Option<&WeaponBank>,
+            // R94 — the per-thruster control masks (manual allocation via a Control Relay); `None`
+            // (every legacy/golden ship) → full projection.
+            Option<&ThrusterControls>,
         ),
-        Or<(Changed<Fit>, Changed<FitLayout>)>,
+        Or<(Changed<Fit>, Changed<FitLayout>, Changed<ThrusterControls>)>,
     >,
 ) {
     let sim = sim.map(|s| *s).unwrap_or_default();
     let materials = materials.map(|m| m.clone()).unwrap_or_default();
-    for (entity, fit, mut stats, mut layout, shields, armor, weapon_bank) in &mut q {
+    for (entity, fit, mut stats, mut layout, shields, armor, weapon_bank, thruster_controls) in
+        &mut q
+    {
         let Some(hull) = hulls.get(fit.hull) else {
             // Unknown hull: cannot derive; leave the prior stats/layout untouched.
             continue;
@@ -148,7 +153,15 @@ pub fn recompute_ship_stats_system(
         if fit.is_changed() {
             *layout = build_layout_with(hull, &fit, &modules, sim.struct_cell_hp, &materials);
         }
-        *stats = derive_ship_stats_with(hull, &fit, &modules, &layout, &sim, &materials);
+        *stats = derive_ship_stats_with(
+            hull,
+            &fit,
+            &modules,
+            &layout,
+            &sim,
+            &materials,
+            thruster_controls,
+        );
 
         // R45 — derive the FULL alive-weapon list + maintain the per-weapon firing-state bank: each
         // surviving weapon slot keeps its cooldown/spool, a new weapon starts fresh, a removed one is

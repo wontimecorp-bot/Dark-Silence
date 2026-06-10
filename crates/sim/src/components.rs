@@ -580,6 +580,43 @@ impl WeaponGroups {
     }
 }
 
+/// R94 — the six FLIGHT control channels a thruster can be routed onto by a **Control Relay** (the
+/// manual control allocator). A thruster's mask is a bitwise-OR of these.
+pub const CTRL_FORWARD: u8 = 1 << 0;
+/// Reverse (retro) thrust channel.
+pub const CTRL_REVERSE: u8 = 1 << 1;
+/// Strafe LEFT / port (`+y`).
+pub const CTRL_STRAFE_PORT: u8 = 1 << 2;
+/// Strafe RIGHT / starboard (`-y`).
+pub const CTRL_STRAFE_STARBOARD: u8 = 1 << 3;
+/// Turn left / counter-clockwise.
+pub const CTRL_TURN_CCW: u8 = 1 << 4;
+/// Turn right / clockwise.
+pub const CTRL_TURN_CW: u8 = 1 << 5;
+/// All six channels enabled — the DEFAULT (full geometric projection = today's behaviour).
+pub const CTRL_ALL: u8 = 0b0011_1111;
+
+/// R94 — the ship's per-thruster **control MASK** (manual allocation), keyed by thruster `SlotId`.
+/// Each mask is a 6-bit set (the `CTRL_*` flags) of which control channels that thruster may feed.
+/// A missing slot (or no component) defaults to [`CTRL_ALL`] = today's full geometric projection.
+///
+/// The mask bites ONLY on a ship whose live control allocator is a **Control Relay** (the manual
+/// path) and NOT a Flight Computer (which overrides to full auto). Set in the fitting screen,
+/// committed alongside the [`Fit`](crate::fitting::Fit) — every legacy/golden ship carries no
+/// component → `CTRL_ALL` everywhere → byte-identical derivation.
+#[derive(Component, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ThrusterControls {
+    /// `SlotId` → its 6-bit channel mask. Missing entries default to [`CTRL_ALL`].
+    pub mask: BTreeMap<SlotId, u8>,
+}
+
+impl ThrusterControls {
+    /// The channel mask for a thruster slot — [`CTRL_ALL`] when unassigned.
+    pub fn for_slot(&self, slot: SlotId) -> u8 {
+        self.mask.get(&slot).copied().unwrap_or(CTRL_ALL)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
