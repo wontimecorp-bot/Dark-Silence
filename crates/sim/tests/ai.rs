@@ -5663,3 +5663,462 @@ fn player_order_ship_is_squad_exempt() {
     assert_eq!((b.leader, b.formation_slot), (None, None), "squad-exempt");
     let _ = OrderKind::MoveTo(player_goal); // OrderKind import is load-bearing.
 }
+
+// ---------------------------------------------------------------------------
+// R100 — commanded MOVE arrives-and-PARKS (L1: Rush default), and the braking
+// ORIENTATION is situational (L2: goal-facing reverse-brake / flip-and-burn
+// retrograde / threat-facing) as an emergent AIM-channel decision. These run
+// the FULL fixed schedule (think + execute + flight) so the precedence + the
+// arrive_braked seam are exercised live.
+// ---------------------------------------------------------------------------
+
+/// A commanded-move world: `obj2_world` with the AOI radii opened so the ship
+/// stays Active over a long transit, and the given `AiTuning` installed (the
+/// toggle-off / control variants pass a non-default tuning here).
+fn commanded_world(tuning: AiTuning) -> (World, Schedule) {
+    let (mut w, s) = obj2_world();
+    w.insert_resource(AiTuning {
+        aoi_radius_active: 10_000.0,
+        aoi_radius_mid: 20_000.0,
+        ..tuning
+    });
+    w.spawn((PlayerShip, Position(Vec2::ZERO))); // keep the ship Active-tier
+    (w, s)
+}
+
+/// A FITTED AI fighter under a `PlayerOrder::move_to(goal)` — a DEFAULT brain
+/// (Generic archetype → the Cruise/coast default the L1 Rush override replaces),
+/// the given `ShipStats`, spawned at `start` heading toward the goal. Returns the
+/// ship entity. No role/squad: the only nav driver is the player order.
+fn spawn_commanded_mover(
+    w: &mut World,
+    id: u64,
+    start: Vec2,
+    goal: Vec2,
+    stats: sim::fitting::ShipStats,
+) -> Entity {
+    let buckets = w.resource::<AiTuning>().fallback_bucket_count;
+    let heading = (goal - start).to_angle();
+    let ship = w
+        .spawn((
+            Ship,
+            ShipIntent::default(),
+            Position(start),
+            Velocity(Vec2::ZERO),
+            Heading(heading),
+            AngularVelocity(0.0),
+            FlightAssist::On,
+            stats,
+            AiStableId(id),
+            AiBrain {
+                think_tier: Tier::Active,
+                ..AiBrain::new(AiStableId(id), buckets)
+            },
+            AoiTier {
+                tier: Tier::Active,
+                since_tick: 0,
+            },
+        ))
+        .id();
+    w.entity_mut(ship).insert(PlayerOrder::move_to(goal));
+    ship
+}
+
+/// R100 L1 — THE REGRESSION PROOF: a default Generic fighter under a bare
+/// `PlayerOrder::move_to(P)` resolves to `Rush` (NOT the archetype Cruise coast),
+/// flies to P, and PARKS — no overshoot blow-through, no under-damped limit-cycle
+/// (the "strafing loop" the old drag-braked coast produced).
+#[test]
+fn commanded_move_parks_without_orbit() {
+    const TICKS: u64 = 2400;
+    let start = Vec2::new(0.0, 0.0);
+    let goal = Vec2::new(220.0, 0.0);
+    // Strong retros (reverse 60) so the goal-facing reverse-brake is decisive and
+    // the ratio (80/60 ≈ 1.33 < 1.5) keeps it from flipping — a pure L1 park test.
+    let stats = stats_with_brake(80.0, 60.0);
+
+    let (mut w, mut s) = commanded_world(AiTuning::default());
+    let ship = spawn_commanded_mover(&mut w, 0, start, goal, stats);
+
+    // First think resolves the profile to Rush (the park default).
+    mirror_tick_and_run(&mut w, &mut s, 0);
+    assert_eq!(
+        brain_of(&w, ship).movement_profile,
+        MovementProfile::Rush,
+        "a bare commanded MoveTo resolves to Rush (parks), not the Cruise coast"
+    );
+
+    let mut max_overshoot: f32 = 0.0;
+    // Tail-window samples (last ~60 ticks) for the settle + limit-cycle probes.
+    let mut tail_along: Vec<f32> = Vec::new();
+    let mut tail_speed: f32 = 0.0;
+    let mut tail_vx_signs: Vec<i32> = Vec::new();
+    for tick in 1..TICKS {
+        mirror_tick_and_run(&mut w, &mut s, tick);
+        let (p, v, _) = kinematics(&w, ship);
+        max_overshoot = max_overshoot.max(p.x - goal.x); // how far PAST the goal (+X)
+        if tick >= TICKS - 60 {
+            tail_along.push(p.x - goal.x);
+            tail_speed = tail_speed.max(v.length());
+            tail_vx_signs.push(if v.x > 0.05 {
+                1
+            } else if v.x < -0.05 {
+                -1
+            } else {
+                0
+            });
+        }
+    }
+
+    let (fp, _, _) = kinematics(&w, ship);
+    let final_dist = (goal - fp).length();
+    assert!(
+        final_dist < 1.5 * R96_ARRIVE_RADIUS,
+        "parks within 1.5×ARRIVE_RADIUS of the goal (final dist {final_dist})"
+    );
+    assert!(
+        max_overshoot < 40.0,
+        "no blow-through past the goal (max overshoot {max_overshoot})"
+    );
+    assert!(
+        tail_speed < 2.5,
+        "the tail is genuinely settled — no residual oscillation (tail speed {tail_speed})"
+    );
+    // NO limit-cycle: the along-goal-axis position does not swing (tight band) and
+    // the along-axis velocity does not repeatedly flip sign (the loop signature).
+    let along_min = tail_along.iter().copied().fold(f32::INFINITY, f32::min);
+    let along_max = tail_along.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    assert!(
+        along_max - along_min < 5.0,
+        "no along-axis oscillation in the tail (swing {})",
+        along_max - along_min
+    );
+    let sign_flips = tail_vx_signs
+        .windows(2)
+        .filter(|w| w[0] != 0 && w[1] != 0 && w[0] != w[1])
+        .count();
+    assert!(
+        sign_flips <= 1,
+        "no repeated along-axis velocity sign flips (limit-cycle), got {sign_flips}"
+    );
+}
+
+/// R100 L2 — a WEAK-RETRO ship on a long, fast transit FLIPS to a retrograde
+/// (flip-and-burn) brake: the heading passes within ~25° of (−vel) at some
+/// braking tick, and it parks in LESS distance than a control run with the
+/// orientation toggle OFF (which reverse-brakes nose-on against the weak retros).
+#[test]
+fn long_fast_transit_flips_to_retrograde_brake() {
+    const TICKS: u64 = 2400;
+    let start = Vec2::new(0.0, 0.0);
+    let goal = Vec2::new(600.0, 0.0);
+    // thrust:reverse ≈ 6:1 — a weak retro the flip clearly pays to escape.
+    let stats = stats_with_brake(120.0, 20.0);
+
+    // The run captures: did the nose ever align with retrograde during braking,
+    // and the rest distance at the end.
+    let run = |enabled: bool| -> (bool, f32) {
+        let (mut w, mut s) = commanded_world(AiTuning {
+            brake_orient_enabled: enabled,
+            ..AiTuning::default()
+        });
+        let ship = spawn_commanded_mover(&mut w, 0, start, goal, stats);
+        let goal_dir = (goal - start).normalize_or_zero();
+        let mut saw_retrograde = false;
+        for tick in 0..TICKS {
+            mirror_tick_and_run(&mut w, &mut s, tick);
+            let (p, v, h) = kinematics(&w, ship);
+            // A genuine flip-and-burn tick: still CLOSING on the goal and not yet
+            // past it (p.x < goal.x), moving fast — yet the nose already points
+            // retrograde. (Restricting to the closing phase rejects the post-
+            // overshoot "nose turns back toward the goal" case, where a goal-facing
+            // nose happens to align with −vel while the ship recedes past the goal.)
+            let v_close = v.dot(goal_dir);
+            if v_close > 20.0 && p.x < goal.x {
+                let retro = (-v).normalize_or_zero();
+                let nose = Vec2::from_angle(h);
+                if retro != Vec2::ZERO && nose.dot(retro) > 0.906 {
+                    // cos(25°) ≈ 0.906
+                    saw_retrograde = true;
+                }
+            }
+        }
+        let (fp, _, _) = kinematics(&w, ship);
+        (saw_retrograde, (goal - fp).length())
+    };
+
+    let (flipped, on_rest) = run(true);
+    let (toggle_off_flipped, off_rest) = run(false);
+
+    assert!(
+        flipped,
+        "the weak-retro ship turns its nose retrograde (flip-and-burn) while braking"
+    );
+    assert!(
+        !toggle_off_flipped,
+        "the toggle-off control reverse-brakes nose-on (never flips)"
+    );
+    assert!(
+        on_rest < off_rest,
+        "flip-and-burn parks tighter than the nose-on weak-retro brake \
+         (flip {on_rest} < nose-on {off_rest})"
+    );
+}
+
+/// R100 L2 — a short hop (closing speed never reaches `flip_min_speed`) and a
+/// strong-retro (ratio 1.0) ship on a long move BOTH keep the nose on the goal
+/// (no 180° flip) throughout braking.
+#[test]
+fn short_hop_or_strong_reverse_does_not_flip() {
+    // The maximum nose-off-goal angle (deg) seen while braking-and-CLOSING on a
+    // given move. The window is restricted to the closing approach (still short of
+    // the goal along the axis) so a post-overshoot "nose turns back toward the now-
+    // behind goal" swing — a legitimate goal-facing re-approach, not a flip — is
+    // never miscounted as a 180° flip.
+    let max_brake_nose_offset = |goal: Vec2, stats: sim::fitting::ShipStats| -> f32 {
+        const TICKS: u64 = 1200;
+        let (mut w, mut s) = commanded_world(AiTuning::default());
+        let ship = spawn_commanded_mover(&mut w, 0, Vec2::ZERO, goal, stats);
+        let goal_dir = goal.normalize_or_zero();
+        let mut max_off: f32 = 0.0;
+        for tick in 0..TICKS {
+            mirror_tick_and_run(&mut w, &mut s, tick);
+            let (p, v, h) = kinematics(&w, ship);
+            // A braking-and-closing tick: inside the stop region, still moving
+            // toward the goal and not yet past it along the approach axis.
+            let v_close = v.dot(goal_dir);
+            let along = p.dot(goal_dir);
+            let goal_along = goal.dot(goal_dir);
+            if (goal - p).length() < 60.0 && v_close > 1.0 && along < goal_along {
+                let nose = Vec2::from_angle(h);
+                let cos = nose.dot(goal_dir).clamp(-1.0, 1.0);
+                max_off = max_off.max(cos.acos().to_degrees());
+            }
+        }
+        max_off
+    };
+
+    // (a) A short hop: v_close never reaches flip_min_speed (15) on a 30-u move.
+    let short = max_brake_nose_offset(Vec2::new(30.0, 0.0), stats_with_brake(80.0, 12.0));
+    assert!(
+        short < 30.0,
+        "short hop never flips — nose stays on goal (max offset {short}°)"
+    );
+
+    // (b) A ratio-1.0 ship (thrust == reverse) on a long move: retros strong
+    // enough → never flips even at speed.
+    let mut equal = stats_with_brake(80.0, 80.0); // reverse == thrust → ratio 1.0
+    equal.reverse_force = equal.thrust_force; // pin exactly equal
+    let strong = max_brake_nose_offset(Vec2::new(300.0, 0.0), equal);
+    assert!(
+        strong < 30.0,
+        "ratio-1.0 ship never flips — nose stays on goal (max offset {strong}°)"
+    );
+}
+
+/// R100 L2 — an armed ally commanded to a point near a parked hostile keeps its
+/// nose ON the threat while braking (threat-facing wins the AIM channel over both
+/// goal-facing and flip), and still parks near the goal.
+#[test]
+fn move_toward_point_near_hostile_keeps_nose_on_threat() {
+    let (mut w, mut s) = roles_world();
+    let goal = Vec2::new(300.0, 0.0);
+    // A hostile parked just past the goal, well within brake_threat_range (250).
+    let hostile_pos = Vec2::new(340.0, 0.0);
+
+    // An armed Red fighter, commanded to the goal; a Blue hostile by the goal.
+    let ship = spawn_roled_ship(
+        &mut w,
+        0,
+        Faction::Red,
+        Vec2::ZERO,
+        ScenarioRole::new(
+            RoleGoal::PatrolRoute(vec![Vec2::new(-200.0, 0.0)]),
+            Posture::FreeEngage,
+        ),
+        true,
+    );
+    w.entity_mut(ship).insert(PlayerOrder::move_to(goal));
+    let hostile = spawn_hostile_body(&mut w, Faction::Blue, hostile_pos, 5.0);
+
+    let mut nose_on_threat = false;
+    let mut parked = false;
+    for tick in 0..2400 {
+        mirror_tick_and_run(&mut w, &mut s, tick);
+        let (p, _v, h) = kinematics(&w, ship);
+        let to_threat = (hostile_pos - p).normalize_or_zero();
+        let nose = Vec2::from_angle(h);
+        // While braking (near the goal), the nose should track the threat.
+        if (goal - p).length() < 50.0 && to_threat != Vec2::ZERO && nose.dot(to_threat) > 0.85 {
+            nose_on_threat = true;
+        }
+        if (goal - p).length() <= 1.5 * R96_ARRIVE_RADIUS {
+            parked = true;
+        }
+    }
+    assert!(
+        nose_on_threat,
+        "the braking ship keeps its nose on the nearby hostile (threat-facing)"
+    );
+    assert!(parked, "it still parks near the commanded goal");
+    let _ = hostile; // entity handle kept for clarity
+}
+
+/// R100 L2 — a `can_strafe` ship braking toward a point with a hostile off to the
+/// SIDE: the nose tracks the threat (decoupled from the goal), the brake (away
+/// from the goal) projects laterally onto the threat-facing nose → the STRAFE
+/// channel carries part of the deceleration. No 180° flip (the threat is to the
+/// side, not retrograde) and it parks. This exercises the decoupled aimed-compose
+/// path of the braking seam for a strafe hull.
+#[test]
+fn strafe_ship_brakes_without_flipping() {
+    let (mut w, mut s) = roles_world();
+    let goal = Vec2::new(300.0, 0.0);
+    // A hostile off to the SIDE of the goal (≈90° off the approach axis), within
+    // brake_threat_range (250) of the goal → captures the AIM channel while
+    // braking. The threat-facing nose + the away-from-goal brake are not collinear
+    // → the brake projects onto the strafe channel.
+    let hostile_pos = Vec2::new(300.0, 120.0);
+
+    let ship = spawn_roled_ship(
+        &mut w,
+        0,
+        Faction::Red,
+        Vec2::ZERO,
+        ScenarioRole::new(
+            RoleGoal::PatrolRoute(vec![Vec2::new(-200.0, 0.0)]),
+            Posture::FreeEngage,
+        ),
+        true,
+    );
+    // Grant strafe authority to the armed fighter's derived stats.
+    w.get_mut::<sim::fitting::ShipStats>(ship)
+        .expect("armed ship has ShipStats")
+        .can_strafe = true;
+    w.entity_mut(ship).insert(PlayerOrder::move_to(goal));
+    let _hostile = spawn_hostile_body(&mut w, Faction::Blue, hostile_pos, 5.0);
+
+    let goal_dir = goal.normalize_or_zero();
+    let mut max_nose_off_goal: f32 = 0.0;
+    let mut saw_strafe = false;
+    let mut parked = false;
+    for tick in 0..2400 {
+        mirror_tick_and_run(&mut w, &mut s, tick);
+        let (p, v, h) = kinematics(&w, ship);
+        let intent = *w.get::<ShipIntent>(ship).expect("ship has ShipIntent");
+        let v_close = v.dot(goal_dir);
+        let along = p.dot(goal_dir);
+        let goal_along = goal.dot(goal_dir);
+        if (goal - p).length() < 60.0 && v_close > 1.0 && along < goal_along {
+            let nose = Vec2::from_angle(h);
+            let cos = nose.dot(goal_dir).clamp(-1.0, 1.0);
+            max_nose_off_goal = max_nose_off_goal.max(cos.acos().to_degrees());
+            if intent.strafe.abs() > 1e-3 {
+                saw_strafe = true;
+            }
+        }
+        if (goal - p).length() <= 1.5 * R96_ARRIVE_RADIUS {
+            parked = true;
+        }
+    }
+    assert!(
+        max_nose_off_goal < 135.0,
+        "the strafe ship never swings a full 180° while closing (max nose off goal \
+         {max_nose_off_goal}°)"
+    );
+    assert!(
+        saw_strafe,
+        "the strafe channel is non-zero while braking (lateral brake via the \
+         decoupled aimed-compose)"
+    );
+    assert!(parked, "the strafe ship parks near the goal");
+}
+
+/// R100 L1 — a USER-pinned profile beats the park default: `move_to(p)` with
+/// `.with_profile(Leisurely)` resolves to Leisurely every think (the Rush default
+/// only applies when the user pinned nothing).
+#[test]
+fn user_profile_override_beats_park_default() {
+    let (mut w, mut s) = commanded_world(AiTuning::default());
+    let goal = Vec2::new(220.0, 0.0);
+    let stats = stats_with_brake(80.0, 60.0);
+    let ship = spawn_commanded_mover(&mut w, 0, Vec2::ZERO, goal, stats);
+    // Replace the bare order with a profile-pinned one.
+    w.entity_mut(ship)
+        .insert(PlayerOrder::move_to(goal).with_profile(MovementProfile::Leisurely));
+    for tick in 0..30 {
+        mirror_tick_and_run(&mut w, &mut s, tick);
+        assert_eq!(
+            brain_of(&w, ship).movement_profile,
+            MovementProfile::Leisurely,
+            "the user-pinned Leisurely wins the Rush park default (tick {tick})"
+        );
+    }
+}
+
+/// R100 PARITY (CRITICAL) — the toggle-OFF braking path is byte-for-byte the
+/// pre-R100 R98 reverse-brake primitive: a commanded Rush move with
+/// `brake_orient_enabled=false` produces a trajectory BIT-identical to a run that
+/// forces goal-facing (the literal `compose_intent` primitive). Both runs are the
+/// disabled path here, so this also proves the disabled path is deterministic and
+/// equals the goal-facing primitive.
+#[test]
+fn brake_orient_disabled_matches_r98() {
+    const TICKS: u64 = 1200;
+    let goal = Vec2::new(220.0, 0.0);
+    let stats = stats_with_brake(80.0, 60.0);
+
+    let disabled_run = || {
+        let (mut w, mut s) = commanded_world(AiTuning {
+            brake_orient_enabled: false,
+            ..AiTuning::default()
+        });
+        let ship = spawn_commanded_mover(&mut w, 0, Vec2::ZERO, goal, stats);
+        let mut trace = Vec::with_capacity(TICKS as usize);
+        for tick in 0..TICKS {
+            mirror_tick_and_run(&mut w, &mut s, tick);
+            trace.push(state_bits(&w, ship));
+        }
+        trace
+    };
+
+    assert_eq!(
+        disabled_run(),
+        disabled_run(),
+        "the toggle-off braking path is deterministic AND the literal R98 \
+         goal-facing reverse-brake primitive (bit-identical)"
+    );
+}
+
+/// R100 PARITY (CRITICAL) — with the toggle ON, a STRONG-retro (ratio < 1.5) ship
+/// with no threat NEVER flips, so the goal-facing branch reuses the LITERAL R98
+/// `compose_intent` primitive → its trajectory is byte-identical to the toggle-OFF
+/// run. Proves the default braking case stays bit-identical post-R100.
+#[test]
+fn goal_facing_brake_matches_r98_when_no_threat_and_aligned() {
+    const TICKS: u64 = 1200;
+    let goal = Vec2::new(220.0, 0.0);
+    // ratio 80/60 ≈ 1.33 < 1.5 → brake_orientation early-outs to goal-facing.
+    let stats = stats_with_brake(80.0, 60.0);
+
+    let run = |enabled: bool| {
+        let (mut w, mut s) = commanded_world(AiTuning {
+            brake_orient_enabled: enabled,
+            ..AiTuning::default()
+        });
+        let ship = spawn_commanded_mover(&mut w, 0, Vec2::ZERO, goal, stats);
+        let mut trace = Vec::with_capacity(TICKS as usize);
+        for tick in 0..TICKS {
+            mirror_tick_and_run(&mut w, &mut s, tick);
+            trace.push(state_bits(&w, ship));
+        }
+        trace
+    };
+
+    assert_eq!(
+        run(true),
+        run(false),
+        "toggle ON with a strong-retro ship + no threat is byte-identical to \
+         toggle OFF (the goal-facing branch reuses the literal R98 primitive)"
+    );
+}

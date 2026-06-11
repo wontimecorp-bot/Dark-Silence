@@ -149,6 +149,28 @@ impl PlayerOrder {
         self
     }
 
+    /// R100 — the movement profile a commanded MOVE uses when the user hasn't
+    /// pinned one: POSITIONAL kinds (`MoveTo`/`HoldAt`/`Patrol`) default to
+    /// [`MovementProfile::Rush`] so they ACTIVELY BRAKE and PARK (`arrive_braked`)
+    /// instead of inheriting the archetype default (which is `Cruise` — a
+    /// drag-braked COAST that overshoots and limit-cycles). A user-pinned
+    /// `profile` always wins (`self.profile.or(..)`). `Attack` and settings-only
+    /// orders DEFER to `self.profile` (their pace is the role/squad/archetype
+    /// chain — `engage_motion` drives the approach, not a parking waypoint).
+    ///
+    /// This is the L1 seam consumed by `ai_think_system`'s style resolution:
+    /// `player_profile = order.resolved_move_profile()` (instead of the bare
+    /// `order.profile`), so a bare `move_to(p)` parks without the user having to
+    /// `.with_profile(Rush)`.
+    pub fn resolved_move_profile(&self) -> Option<MovementProfile> {
+        match self.kind {
+            Some(OrderKind::MoveTo(_))
+            | Some(OrderKind::HoldAt { .. })
+            | Some(OrderKind::Patrol { .. }) => self.profile.or(Some(MovementProfile::Rush)),
+            Some(OrderKind::Attack(_)) | None => self.profile,
+        }
+    }
+
     /// Builder: pin the [`CombatStance`] override (the top precedence link).
     pub fn with_stance(mut self, stance: CombatStance) -> Self {
         self.stance = Some(stance);
@@ -297,6 +319,50 @@ mod tests {
         assert_eq!(brain.waypoint, Some(p1));
         order.apply(&mut brain, p1, 2);
         assert_eq!(brain.waypoint, Some(p0), "cursor wraps");
+    }
+
+    /// R100 — `resolved_move_profile`: bare POSITIONAL kinds park (default
+    /// `Rush`); a user-pinned `profile` wins over the default; `Attack` and
+    /// settings-only defer to `self.profile` (no park default).
+    #[test]
+    fn resolved_move_profile() {
+        let foe = bevy_ecs::world::World::new().spawn_empty().id();
+        // Bare positional kinds default to Rush (park onto the goal).
+        assert_eq!(
+            PlayerOrder::move_to(Vec2::new(50.0, 0.0)).resolved_move_profile(),
+            Some(MovementProfile::Rush)
+        );
+        assert_eq!(
+            PlayerOrder::hold_at(Vec2::ZERO, 100.0).resolved_move_profile(),
+            Some(MovementProfile::Rush)
+        );
+        assert_eq!(
+            PlayerOrder::patrol(vec![Vec2::ZERO, Vec2::new(10.0, 0.0)]).resolved_move_profile(),
+            Some(MovementProfile::Rush)
+        );
+        // A user-pinned profile WINS the default.
+        assert_eq!(
+            PlayerOrder::move_to(Vec2::new(50.0, 0.0))
+                .with_profile(MovementProfile::Leisurely)
+                .resolved_move_profile(),
+            Some(MovementProfile::Leisurely)
+        );
+        // Attack defers to self.profile (no park default — `engage_motion` paces).
+        assert_eq!(PlayerOrder::attack(foe).resolved_move_profile(), None);
+        assert_eq!(
+            PlayerOrder::attack(foe)
+                .with_profile(MovementProfile::Rush)
+                .resolved_move_profile(),
+            Some(MovementProfile::Rush)
+        );
+        // Settings-only defers to self.profile.
+        assert_eq!(PlayerOrder::settings_only().resolved_move_profile(), None);
+        assert_eq!(
+            PlayerOrder::settings_only()
+                .with_profile(MovementProfile::Cruise)
+                .resolved_move_profile(),
+            Some(MovementProfile::Cruise)
+        );
     }
 
     /// A settings-only order (`kind == None`) writes no nav field; the style

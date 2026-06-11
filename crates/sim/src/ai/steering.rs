@@ -198,6 +198,78 @@ pub fn arrive_braked(
     }
 }
 
+/// R100 — desired NOSE direction while braking onto a goal: an EMERGENT AIM
+/// decision between **goal-facing** (a nose-on reverse-brake, the default and the
+/// EXACT R98 primitive) and **retrograde** (flip-and-burn — turn 180° to brake on
+/// the stronger FORWARD thrust). Threat-facing is decided by the CALLER, not here.
+///
+/// **The flip pays off only when the physics earns it.** The forward drive is
+/// stronger than the retros (`reverse_force ≈ ½·thrust_force` by default, R92), so
+/// flipping to brake forward decelerates harder — but the 180° turn COSTS time the
+/// ship is not braking. The decision compares the braking time SAVED against the
+/// turn time SPENT:
+/// - `dt = v_close · (1/a_rev − 1/a_fwd)` — the seconds of braking saved by
+///   decelerating on `a_fwd` instead of `a_rev` (positive iff `a_fwd > a_rev`).
+/// - `t_turn = misalign · π / turn_rate` — a π-BOUNDED, monotone turn-cost
+///   estimate (no `acos`): `misalign = (1 − nose·retro)/2 ∈ [0,1]` is `0` when the
+///   nose already points retrograde, `1` at a full 180°. Flip iff
+///   `dt > flip_turn_margin · t_turn`.
+///
+/// **Early outs (cheap, monotone gates)**: a short/slow approach
+/// (`v_close < flip_min_speed`) never flips (no speed worth the turn); a ship whose
+/// retros are already strong enough (`a_fwd / a_rev <= flip_thrust_ratio`) never
+/// flips (reverse-brake nose-on is fine); a zero goal or zero velocity falls back
+/// to goal-facing.
+///
+/// Pure + deterministic, no `acos`/RNG/NaN: every denominator is floored
+/// (`a_rev`/`a_fwd`/`turn_rate` via `f32::MIN_POSITIVE`), `normalize_or_zero`
+/// handles degenerate vectors, and `v_close = max(0, vel·goal)` is non-negative.
+/// The returned vector is the desired NOSE (unit `goal` or unit `retro`); the
+/// caller composes the actual brake intent around it.
+#[allow(clippy::too_many_arguments)] // One scalar per physical knob (pure function).
+pub fn brake_orientation(
+    vel: Vec2,
+    goal_dir: Vec2,
+    heading: f32,
+    a_fwd: f32,
+    a_rev: f32,
+    turn_rate: f32,
+    flip_thrust_ratio: f32,
+    flip_min_speed: f32,
+    flip_turn_margin: f32,
+) -> Vec2 {
+    let goal = goal_dir.normalize_or_zero();
+    if goal == Vec2::ZERO {
+        return goal_dir;
+    }
+    // Only the speed CLOSING on the goal is worth braking (receding/lateral does
+    // not motivate a flip).
+    let v_close = vel.dot(goal).max(0.0);
+    if v_close < flip_min_speed {
+        return goal; // short/slow → don't pay for a 180° turn.
+    }
+    let a_rev = a_rev.max(f32::MIN_POSITIVE);
+    let a_fwd = a_fwd.max(f32::MIN_POSITIVE);
+    if a_fwd / a_rev <= flip_thrust_ratio {
+        return goal; // retros strong enough → reverse-brake nose-on is fine.
+    }
+    let retro = (-vel).normalize_or_zero();
+    if retro == Vec2::ZERO {
+        return goal;
+    }
+    // Braking time SAVED by decelerating on the stronger forward drive.
+    let dt = v_close * (1.0 / a_rev - 1.0 / a_fwd);
+    // Turn time SPENT to swing the nose retrograde — π-bounded, monotone, no acos.
+    let nose = Vec2::from_angle(heading);
+    let misalign = ((1.0 - nose.dot(retro)) * 0.5).clamp(0.0, 1.0);
+    let t_turn = misalign * std::f32::consts::PI / turn_rate.max(f32::MIN_POSITIVE);
+    if dt > flip_turn_margin * t_turn {
+        retro
+    } else {
+        goal
+    }
+}
+
 /// First-order intercept point for a chaser/projectile closing at `speed` on a
 /// target at `target_pos` moving at `target_vel`, or `None` when no positive
 /// intercept time exists (the target outruns the chaser).
@@ -1287,5 +1359,99 @@ mod tests {
                 && aim_only.strafe.is_finite()
                 && aim_only.turn.is_finite()
         );
+    }
+
+    // R100 — `brake_orientation`: the emergent goal-vs-flip nose decision.
+    // Default knobs: ratio 1.5, min_speed 15, margin 1.0.
+    const FLIP_RATIO: f32 = 1.5;
+    const FLIP_MIN_SPEED: f32 = 15.0;
+    const FLIP_MARGIN: f32 = 1.0;
+
+    #[test]
+    fn brake_orientation_flips_to_retrograde_on_a_long_fast_weak_retro_brake() {
+        // Heading +X, flying +X fast, goal ahead at +X. Weak retros (a_fwd 10,
+        // a_rev 1 → ratio 10 > 1.5) and a slow turn → the saved braking time far
+        // exceeds the turn cost → flip to retrograde (face −X).
+        let nose = brake_orientation(
+            Vec2::new(60.0, 0.0), // fast, closing on the +X goal
+            Vec2::X,
+            0.0,  // heading +X
+            10.0, // a_fwd
+            1.0,  // a_rev (weak)
+            2.0,  // turn_rate (rad/s)
+            FLIP_RATIO,
+            FLIP_MIN_SPEED,
+            FLIP_MARGIN,
+        );
+        assert!(
+            nose.dot(Vec2::new(-1.0, 0.0)) > 0.9,
+            "weak-retro long-fast brake flips to retrograde (nose≈−X), got {nose:?}"
+        );
+    }
+
+    #[test]
+    fn brake_orientation_stays_goal_facing_when_slow_or_strong_retro() {
+        // (a) Below flip_min_speed → never flips even with weak retros.
+        let slow = brake_orientation(
+            Vec2::new(10.0, 0.0), // v_close 10 < 15
+            Vec2::X,
+            0.0,
+            10.0,
+            1.0,
+            2.0,
+            FLIP_RATIO,
+            FLIP_MIN_SPEED,
+            FLIP_MARGIN,
+        );
+        assert!(
+            slow.dot(Vec2::X) > 0.9,
+            "sub-min-speed brake never flips (nose stays on goal +X), got {slow:?}"
+        );
+        // (b) Ratio 1.0 (forward == reverse) → retros strong enough → never flips.
+        let strong = brake_orientation(
+            Vec2::new(60.0, 0.0),
+            Vec2::X,
+            0.0,
+            10.0,
+            10.0, // a_fwd == a_rev → ratio 1.0 <= 1.5
+            2.0,
+            FLIP_RATIO,
+            FLIP_MIN_SPEED,
+            FLIP_MARGIN,
+        );
+        assert!(
+            strong.dot(Vec2::X) > 0.9,
+            "ratio-1.0 brake never flips (nose stays on goal), got {strong:?}"
+        );
+    }
+
+    #[test]
+    fn brake_orientation_is_goal_facing_for_degenerate_inputs_no_nan() {
+        // Zero goal → returns the (zero) goal_dir, finite.
+        let z = brake_orientation(
+            Vec2::new(50.0, 0.0),
+            Vec2::ZERO,
+            0.0,
+            10.0,
+            1.0,
+            2.0,
+            FLIP_RATIO,
+            FLIP_MIN_SPEED,
+            FLIP_MARGIN,
+        );
+        assert!(z.x.is_finite() && z.y.is_finite());
+        // Zero velocity → v_close 0 < min_speed → goal-facing, finite.
+        let still = brake_orientation(
+            Vec2::ZERO,
+            Vec2::X,
+            0.0,
+            10.0,
+            1.0,
+            2.0,
+            FLIP_RATIO,
+            FLIP_MIN_SPEED,
+            FLIP_MARGIN,
+        );
+        assert!((still - Vec2::X).length() < 1e-6, "zero vel → goal-facing");
     }
 }

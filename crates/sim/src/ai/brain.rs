@@ -44,8 +44,8 @@ use crate::ai::lod::{AoiTier, Tier};
 use crate::ai::perception::{nearest_contact, ContactList};
 use crate::ai::role::{role_apply, Posture, RoleGoal, ScenarioRole};
 use crate::ai::steering::{
-    arrive, arrive_braked, compose_intent, compose_intent_aimed, formation_keep, pursue_intercept,
-    range_band_radial, steer_to_intent, waypoint_follow, ContextMap,
+    arrive, arrive_braked, brake_orientation, compose_intent, compose_intent_aimed, formation_keep,
+    pursue_intercept, range_band_radial, steer_to_intent, waypoint_follow, ContextMap,
 };
 use crate::ai::tuning::AiTuning;
 use crate::broadphase::ObstacleField;
@@ -1883,7 +1883,12 @@ pub fn ai_think_system(
         let mut player_stance: Option<CombatStance> = None;
         if let Some(order) = player_order.as_mut() {
             order.apply(&mut brain, pos.map_or(Vec2::ZERO, |p| p.0), now);
-            player_profile = order.profile;
+            // R100 — a commanded POSITIONAL move (MoveTo/HoldAt/Patrol) PARKS:
+            // it defaults to `Rush` (active-braking `arrive_braked`) when the
+            // user pinned no profile, instead of inheriting the archetype
+            // default (`Cruise` — a drag-braked coast that overshoots). A pinned
+            // profile, an `Attack`, and a settings-only order are unchanged.
+            player_profile = order.resolved_move_profile();
             player_stance = order.stance;
             // The player posture (if set) wins over the role posture; the engage
             // gate is re-derived from the resolved posture.
@@ -2306,6 +2311,12 @@ pub fn ai_execute_system(
                     .map(|x| (x.last_pos, Vec2::ZERO))
             });
         let threat_aim = threat.map(|(tpos, _)| (tpos - pos.0).normalize_or_zero());
+        // R100 — the BRAKING-ORIENTATION threat picture: a plain `Copy` of the
+        // already-computed execute-scope `threat` (pos, vel) so the `fly_to`
+        // closure (which the Patrol arm mutates `brain` through) never borrows
+        // `brain`. NO new query/perception — the same hostile the survival arms
+        // watch decides whether a braking ship keeps its nose on a threat.
+        let brake_threat = threat;
         // R96 — the movement-profile triple for this ship's pace. Cruise is the
         // pinned parity triple (1.0, 1.0, 4.0); only Rush/Leisurely diverge.
         // Copied out so the `fly_to` closure never borrows `brain` (the Patrol
@@ -2380,17 +2391,63 @@ pub fn ai_execute_system(
                         ai.arrive_eps_speed,
                     );
                     if throttle < 0.0 {
-                        // Reverse-brake: keep the nose on the goal (turn channel
-                        // via compose_intent with 0 forward), then drive forward
-                        // NEGATIVE so the retro thrusters brake nose-on. R98
-                        // HOTFIX C: the burn is the PROPORTIONAL value
-                        // arrive_braked returned (scaled by the profile cap),
-                        // not a flat full reverse — the brake decays smoothly
-                        // into the arrive deadband instead of bang-banging.
-                        let mut brake = compose_intent(dir, 0.0, heading.0);
-                        brake.forward = (throttle * profile_cap).clamp(-1.0, 0.0);
-                        // Best-effort: a braking ship skips avoidance (it is near
-                        // its goal, not transiting past an obstacle).
+                        // R100 — SITUATIONAL braking ORIENTATION (an emergent AIM
+                        // decision). The default is goal-facing (the EXACT R98
+                        // reverse-brake primitive, kept byte-identical for parity);
+                        // only a threat override or a paid-for flip decouples the
+                        // nose from the goal.
+                        let goal_dir = dir; // arrive_braked's `dir` == (goal − pos) normalized.
+                        let aim = if ai.brake_orient_enabled {
+                            // Threat override: a hostile near the SHIP or near the
+                            // GOAL wins the AIM channel (face it while braking → a
+                            // braking ship still bears its fixed-forward gun).
+                            let threat_aim = brake_threat.and_then(|(tp, _tv)| {
+                                let near = (tp - pos.0).length() <= ai.brake_threat_range
+                                    || (tp - goal).length() <= ai.brake_threat_range;
+                                let d = (tp - pos.0).normalize_or_zero();
+                                (near && d != Vec2::ZERO).then_some(d)
+                            });
+                            threat_aim.unwrap_or_else(|| {
+                                brake_orientation(
+                                    vel.0,
+                                    goal_dir,
+                                    heading.0,
+                                    s.thrust_force / s.total_mass,
+                                    s.reverse_force / s.total_mass,
+                                    s.max_turn_rate(),
+                                    ai.brake_flip_thrust_ratio,
+                                    ai.brake_flip_min_speed,
+                                    ai.brake_flip_turn_margin,
+                                )
+                            })
+                        } else {
+                            goal_dir
+                        };
+                        // Goal-facing (no threat, no flip): the LITERAL R98
+                        // primitive — keep the nose on the goal (turn channel via
+                        // compose_intent with 0 forward), drive forward NEGATIVE so
+                        // the retros brake nose-on at the PROPORTIONAL value
+                        // arrive_braked returned (scaled by the profile cap). This
+                        // branch is byte-for-byte identical to pre-R100, so the
+                        // default braking case stays bit-identical (and the
+                        // toggle-off path is exactly this primitive).
+                        if aim == goal_dir {
+                            let mut brake = compose_intent(goal_dir, 0.0, heading.0);
+                            brake.forward = (throttle * profile_cap).clamp(-1.0, 0.0);
+                            // Best-effort: a braking ship skips avoidance (it is
+                            // near its goal, not transiting past an obstacle).
+                            return brake;
+                        }
+                        // Threat-facing or flip: aim/move decoupled. The MOVE is the
+                        // deceleration PUSH (away from the goal) so the aimed compose
+                        // emits the correct (reverse-relative-to-aim) sign; the nose
+                        // tracks `aim`. The strafe channel carries any lateral brake
+                        // for a `can_strafe` hull.
+                        let decel_move = (-goal_dir).normalize_or_zero();
+                        let brake_mag = (-throttle * profile_cap).clamp(0.0, 1.0);
+                        let mut brake =
+                            compose_intent_aimed(decel_move, brake_mag, aim, heading.0, can_strafe);
+                        brake.forward = brake.forward.clamp(-profile_cap, profile_cap);
                         return brake;
                     }
                     // Normal approach: compose, then clamp forward to the cap.

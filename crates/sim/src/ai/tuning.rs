@@ -133,6 +133,35 @@ pub struct AiTuning {
     /// never build backward speed at the goal (the anti-oscillation floor).
     pub arrive_eps_speed: f32,
 
+    // --- R100 situational braking orientation ---
+    // The knobs `steering::brake_orientation` + the `fly_to` braking seam read to
+    // pick a braking ship's NOSE (goal-facing reverse-brake vs flip-and-burn
+    // retrograde vs threat-facing). With `brake_orient_enabled = false` the seam
+    // is the LITERAL R98 goal-facing primitive (the disabled-path parity guard).
+    /// R100 — master toggle for the situational braking-orientation decision.
+    /// `true` = pick the brake nose situationally (threat / flip / goal); `false`
+    /// = the pre-R100 goal-facing reverse-brake primitive, byte-for-byte.
+    pub brake_orient_enabled: bool,
+    /// R100 — flip-and-burn FORWARD/REVERSE acceleration RATIO gate: a braking
+    /// ship considers turning 180° to brake on its forward drive only when
+    /// `a_fwd / a_rev > this`. At/below it the retros are strong enough to
+    /// reverse-brake nose-on (no flip). `>= 1` (a flip never helps when forward is
+    /// weaker than reverse).
+    pub brake_flip_thrust_ratio: f32,
+    /// R100 — minimum CLOSING speed (world units/s) at which a flip-and-burn is
+    /// even considered: below it a short/slow approach never pays for the 180°
+    /// turn. Must exceed `arrive_eps_speed` (a sub-deadband approach already
+    /// coasts — there is nothing to brake).
+    pub brake_flip_min_speed: f32,
+    /// R100 — flip-decision MARGIN: flip iff the braking time SAVED by forward
+    /// braking exceeds `this ×` the turn time SPENT (`dt > margin · t_turn`). `> 1`
+    /// is conservative (demands a clear win before flipping); `< 1` flips eagerly.
+    pub brake_flip_turn_margin: f32,
+    /// R100 — threat-facing range (world units): while braking, a hostile within
+    /// this distance of the SHIP or the GOAL captures the AIM channel (nose on the
+    /// threat) so a braking ship still bears its fixed-forward gun. `> 0`.
+    pub brake_threat_range: f32,
+
     // --- Combat stances (R96 Part C) ---
     // The per-stance combat-steering knobs read by `engage_motion`. None of
     // these touch the `CombatStance::Charge` path (the PARITY default reuses the
@@ -305,6 +334,16 @@ impl Default for AiTuning {
             // 40 u/s closing speed, coast-settle below 2 u/s (the deadband).
             brake_ref_speed: 40.0,
             arrive_eps_speed: 2.0,
+            // R100 situational braking orientation: ON by default; flip-and-burn
+            // only when forward thrust is > 1.5× the retros AND the closing speed
+            // is worth the turn (>= 15 u/s) AND the saved braking time beats the
+            // turn time (margin 1.0 — break even). A hostile within 250 u of the
+            // ship or the goal captures the brake nose (threat-facing).
+            brake_orient_enabled: true,
+            brake_flip_thrust_ratio: 1.5,
+            brake_flip_min_speed: 15.0,
+            brake_flip_turn_margin: 1.0,
+            brake_threat_range: 250.0,
             // Combat stances (R96 Part C): orbit at the standoff ring with a
             // moderate tangential bank, kite just past the envelope edge, full
             // lateral strafe for hulls that can. None affect the Charge parity path.
@@ -422,6 +461,13 @@ mod tests {
         // deadband strictly below it (otherwise the brake could never engage).
         assert!(t.brake_ref_speed > 0.0 && t.arrive_eps_speed > 0.0);
         assert!(t.arrive_eps_speed < t.brake_ref_speed);
+        // R100 situational braking orientation: a flip-thrust ratio >= 1 (a flip
+        // never helps when forward is weaker than reverse), a flip-min speed above
+        // the arrive deadband (a sub-deadband approach already coasts), and
+        // positive ranges/margin.
+        assert!(t.brake_flip_thrust_ratio >= 1.0);
+        assert!(t.brake_flip_min_speed > t.arrive_eps_speed);
+        assert!(t.brake_flip_turn_margin > 0.0 && t.brake_threat_range > 0.0);
         // R96 Part C combat stances: positive ring/range fracs, a strafe magnitude in [0,1].
         assert!(t.orbit_radius_frac > 0.0 && t.orbit_tangential_weight > 0.0);
         assert!(t.kite_range_frac > 0.0 && (0.0..=1.0).contains(&t.strafe_stance_lateral));
@@ -514,5 +560,12 @@ mod tests {
         assert_eq!(t.arrive_eps_speed, d.arrive_eps_speed);
         assert_eq!(t.defend_release_factor, d.defend_release_factor);
         assert_eq!(t.damage_rethink_interval, d.damage_rethink_interval);
+        // R100 situational braking-orientation fields are also `#[serde(default)]`:
+        // absent from this older/partial RON, they fall back to the pinned defaults.
+        assert_eq!(t.brake_orient_enabled, d.brake_orient_enabled);
+        assert_eq!(t.brake_flip_thrust_ratio, d.brake_flip_thrust_ratio);
+        assert_eq!(t.brake_flip_min_speed, d.brake_flip_min_speed);
+        assert_eq!(t.brake_flip_turn_margin, d.brake_flip_turn_margin);
+        assert_eq!(t.brake_threat_range, d.brake_threat_range);
     }
 }
