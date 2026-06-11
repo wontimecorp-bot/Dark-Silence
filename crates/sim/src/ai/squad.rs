@@ -58,6 +58,7 @@ use glam::Vec2;
 use crate::ai::brain::{
     cadence_for_tier, AiBrain, AiEvent, Behavior, CombatStance, MovementProfile, RethinkQueue,
 };
+use crate::ai::command::PlayerOrder;
 use crate::ai::ident::{phase_bucket, AiIdAllocator, AiStableId};
 use crate::ai::lod::{AoiTier, GlideState, Tier};
 use crate::ai::role::ScenarioRole;
@@ -442,6 +443,11 @@ pub fn squad_think_system(
             // think time, so writing the squad goal here would only thrash).
             // Centroid + pace-anchor derivation still count roled members.
             Option<&ScenarioRole>,
+            // R99 Phase A: a member under a USER command (`PlayerOrder`) is
+            // ALSO squad-exempt — the player's order outranks the squad order
+            // exactly as a role does, so the squad must not write its goal over
+            // a commanded ship. Centroid/pace derivation still counts it.
+            Has<PlayerOrder>,
         ),
         Without<Squad>,
     >,
@@ -475,7 +481,7 @@ pub fn squad_think_system(
             let mut sum = Vec2::ZERO;
             let mut counted = 0u32;
             for &m in &squad.members {
-                if let Ok((pos, _, _, _)) = members.get(m) {
+                if let Ok((pos, _, _, _, _)) = members.get(m) {
                     sum += pos.0;
                     counted += 1;
                 }
@@ -512,7 +518,7 @@ pub fn squad_think_system(
         // ties keep the first member in stable order.
         let mut anchor: Option<(Entity, f32)> = None;
         for &m in &squad.members {
-            let Ok((_, stats, _, _)) = members.get(m) else {
+            let Ok((_, stats, _, _, _)) = members.get(m) else {
                 continue;
             };
             let speed = stats.map_or(base.top_speed(), ShipStats::top_speed);
@@ -542,8 +548,10 @@ pub fn squad_think_system(
         // (T032: a scenario-roled member keeps its script instead.)
         if squad.members.len() == 1 {
             let m = squad.members[0];
-            if let Ok((_, _, mut brain, role)) = members.get_mut(m) {
-                if role.is_none() {
+            if let Ok((_, _, mut brain, role, commanded)) = members.get_mut(m) {
+                // R99 Phase A: a roled OR player-commanded member is exempt
+                // (script/player > squad) — leave its goal to the role/player.
+                if role.is_none() && !commanded {
                     apply_assignment(
                         m,
                         &mut brain,
@@ -559,7 +567,7 @@ pub fn squad_think_system(
         let leader = squad.members[0];
         let leader_top = members
             .get(leader)
-            .map_or(base.top_speed(), |(_, stats, _, _)| {
+            .map_or(base.top_speed(), |(_, stats, _, _, _)| {
                 stats.map_or(base.top_speed(), ShipStats::top_speed)
             });
         let leader_cap = if leader_top > 0.0 {
@@ -571,9 +579,10 @@ pub fn squad_think_system(
             let m = squad.members[index];
             let slot = slot_offset(&squad.formation, index);
             let desired = member_assignment(squad.order, index, leader, slot, leader_cap, style);
-            if let Ok((_, _, mut brain, role)) = members.get_mut(m) {
-                // T032: scenario-roled members are exempt (script > squad).
-                if role.is_none() {
+            if let Ok((_, _, mut brain, role, commanded)) = members.get_mut(m) {
+                // T032/R99: scenario-roled OR player-commanded members are exempt
+                // (script/player > squad).
+                if role.is_none() && !commanded {
                     apply_assignment(m, &mut brain, &desired, &mut queue);
                 }
             }

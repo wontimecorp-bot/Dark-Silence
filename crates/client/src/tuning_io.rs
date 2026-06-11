@@ -134,6 +134,13 @@ pub struct DevSettings {
     /// runs keep the pinned `AiTuning::default()` (a saved edit invalidates comparability, TR-020).
     #[serde(default)]
     pub ai: sim::ai::AiTuning,
+    /// R99 Phase B/C — the player's PREFERRED faction, stored by the `tint_tag` convention
+    /// (`1` = Red, `2` = Blue; `None` = no preference) so we don't depend on a serde derive for
+    /// the sim `Faction` type. Set by the dev panel's Team buttons; HONOURED at join in
+    /// `net.rs` (a saved preference picks that side; absent → the human-counting balancer). Present
+    /// in BOTH feature configs (only the buttons are dev-gated) so `net.rs` compiles without `dev_panel`.
+    #[serde(default)]
+    pub preferred_faction: Option<u8>,
 }
 
 impl Default for DevSettings {
@@ -151,6 +158,7 @@ impl Default for DevSettings {
             ship_visual: crate::ship_visuals::ShipVisualTuning::default(),
             cell_materials: CellMaterials::default(),
             ai: sim::ai::AiTuning::default(),
+            preferred_faction: None,
         }
     }
 }

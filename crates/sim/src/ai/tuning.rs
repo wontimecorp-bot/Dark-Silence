@@ -37,6 +37,8 @@ pub struct AiTuning {
     /// Player-proximity radius of the Active tier (full per-ship AI), world units.
     pub aoi_radius_active: f32,
     /// Player-proximity radius of the Mid tier (squad-driven AI), world units.
+    /// R98 HOTFIX B3: must comfortably exceed the max-zoom view corner (~202 u)
+    /// so dormant cheap-glide kinematics are NEVER visible near the player.
     pub aoi_radius_mid: f32,
     /// Minimum ticks between tier changes per entity — boundary hysteresis (no thrash).
     pub tier_hysteresis_ticks: u32,
@@ -117,6 +119,19 @@ pub struct AiTuning {
     pub arrive_slow_factor_cruise: f32,
     /// Arrive slow-radius factor for `Leisurely` (wide ramp — eases in early).
     pub arrive_slow_factor_leisurely: f32,
+    /// R98 HOTFIX C — proportional-brake reference speed (world units/s) for
+    /// [`arrive_braked`]: inside the stopping distance the reverse throttle is
+    /// `-(v_close / this).clamp(0, 1)`, so the brake force scales with the
+    /// closing speed and decays smoothly into the arrive deadband instead of
+    /// bang-banging full reverse at the goal.
+    ///
+    /// [`arrive_braked`]: crate::ai::steering::arrive_braked
+    pub brake_ref_speed: f32,
+    /// R98 HOTFIX C — arrive deadband speed (world units/s): inside the
+    /// stopping distance, a closing speed below this coasts (`throttle 0` —
+    /// drag finishes the settle) instead of braking, so reverse thrust can
+    /// never build backward speed at the goal (the anti-oscillation floor).
+    pub arrive_eps_speed: f32,
 
     // --- Combat stances (R96 Part C) ---
     // The per-stance combat-steering knobs read by `engage_motion`. None of
@@ -163,6 +178,67 @@ pub struct AiTuning {
     /// debris/ships are not.
     pub obstacle_min_radius: f32,
 
+    // --- R97 Phase 1 Stage A — drive/threat/collision primitives ---
+    // Pinned placeholders the later R97 stages (B/C/D) consume; NOTHING reads
+    // them yet on the execute path, so they are inert in every existing world
+    // (golden trio unaffected). Pinned defaults keep golden/bench comparability.
+    /// Recency window (ticks) over which a `last_damaged_tick` stamp counts as
+    /// "recently fired upon" — the survival-pressure horizon Stage B/C read
+    /// (`now − last_damaged_tick < this`). 90 ticks ≈ 3 s at 30 Hz.
+    pub threat_recency_window_ticks: u64,
+    /// Proximity range (world units) inside which a hostile contributes to the
+    /// incoming-threat consideration — the spatial half of the threat scalar.
+    pub threat_proximity_range: f32,
+    /// Gain applied to the collision-imminence consideration when sizing its
+    /// preemptive avoidance response (Stage D) — higher brakes/turns earlier.
+    pub collision_preempt_gain: f32,
+    /// Collision look-ahead horizon (s): the time window over which the
+    /// time-to-collision is normalized for `con_collision_imminence`
+    /// (`ttc / this`, clamped) — a collision beyond it scores ~0 imminence.
+    pub collision_horizon_s: f32,
+    /// Per-channel BASE weight (R97) for the MOVE-drive utility channel — a
+    /// placeholder Stage B scales its move-intent considerations by. `1.0` = the
+    /// neutral pass-through default.
+    pub move_drive_weight: f32,
+    /// Per-channel BASE weight (R97) for the AIM-drive utility channel — the
+    /// twin of [`Self::move_drive_weight`] for the aim/fire considerations
+    /// (Stage C). `1.0` = neutral.
+    pub aim_drive_weight: f32,
+    /// Floor applied to the flee/evade desire while weapons-free (R97): a
+    /// non-zero floor keeps a minimum break-off willingness even mid-attack.
+    /// `0.0` = no floor (the inert default — flee is purely score-driven).
+    pub weapons_free_flee_floor: f32,
+
+    // --- R97 Phase 2 Stage E — strategic objective/planner tier (HTN) ---
+    // The SLOW squad-objective planner knobs (`strategic_plan_system`). Inert in
+    // every world without a `SquadObjective` (the planner's query is empty), so
+    // the golden trio is unaffected regardless of these values.
+    /// Strategic re-plan cadence, ticks (~3 s; the SLOW HTN decomposition runs
+    /// every `strategic_plan_ticks`, offset by the squad's phase bucket).
+    pub strategic_plan_ticks: u32,
+    /// Outnumbered threshold: a `DestroyTarget` squad WITHDRAWS when the
+    /// perceived enemy strength is `>= outnumbered_ratio ×` its own strength.
+    pub outnumbered_ratio: f32,
+    /// Regroup cohesion radius (world units): a squad is "cohered" when every
+    /// member is within this distance of the centroid — the Regroup-complete test.
+    pub regroup_cohesion_radius: f32,
+    /// Arrive radius (world units) for the strategic planner's arrival tests:
+    /// DefendZone hold, Withdraw-complete, PatrolRoute waypoint advance, and the
+    /// escort-screening ring around a DestroyTarget.
+    pub defend_arrive_radius: f32,
+    /// R98 HOTFIX D — DefendZone engage-release HYSTERESIS: a squad already
+    /// engaging an intruder keeps engaging while the intruder's last-seen
+    /// position stays within `radius × this` of the anchor; it releases (falls
+    /// back to acquisition / MoveTo) only when the intruder despawns, leaves
+    /// the fused picture, or exits that wider release ring. `> 1` kills the
+    /// Engage↔MoveTo flap for an intruder hovering on the acquisition edge.
+    pub defend_release_factor: f32,
+    /// R98 HOTFIX E — minimum ticks between `DamageTaken` re-think events per
+    /// brain: sustained fire pushes at most one survival re-think per interval
+    /// (the first-ever hit always pushes), while `last_damaged_tick` itself
+    /// stays per-hit accurate for the threat-recency consideration.
+    pub damage_rethink_interval: u64,
+
     // --- Debug (TR-020a) ---
     /// Per-brain transition-history ring length (capture feature-gated off in
     /// headless/bench builds).
@@ -177,10 +253,13 @@ impl Default for AiTuning {
             think_ticks_mid: 15,
             think_ticks_dormant: 90,
             fallback_bucket_count: 16,
-            // AOI: Active within ~60 u of a player, Mid to 240 u, beyond = Dormant;
-            // 30-tick (1 s) hysteresis; nudge bounded to one fine cell (TR-008).
-            aoi_radius_active: 60.0,
-            aoi_radius_mid: 240.0,
+            // AOI (R98 HOTFIX B3): Active within ~120 u of a player, Mid to
+            // 520 u, beyond = Dormant. The Mid radius must clear the max-zoom
+            // view corner (~202 u) with margin for the collapse/expand dance so
+            // dormant cheap-glide kinematics never happen on screen; 30-tick
+            // (1 s) hysteresis; nudge bounded to one fine cell (TR-008).
+            aoi_radius_active: 120.0,
+            aoi_radius_mid: 520.0,
             tier_hysteresis_ticks: 30,
             promote_nudge_max: CELL_WORLD_SIZE,
             // Squads.
@@ -222,6 +301,10 @@ impl Default for AiTuning {
             arrive_slow_factor_rush: 1.5,
             arrive_slow_factor_cruise: 4.0,
             arrive_slow_factor_leisurely: 8.0,
+            // R98 HOTFIX C — proportional brake: full reverse only at/above
+            // 40 u/s closing speed, coast-settle below 2 u/s (the deadband).
+            brake_ref_speed: 40.0,
+            arrive_eps_speed: 2.0,
             // Combat stances (R96 Part C): orbit at the standoff ring with a
             // moderate tangential bank, kite just past the envelope edge, full
             // lateral strafe for hulls that can. None affect the Charge parity path.
@@ -245,6 +328,31 @@ impl Default for AiTuning {
             obstacle_clearance_pad: 15.0,
             obstacle_query_radius: 200.0,
             obstacle_min_radius: 20.0,
+            // R97 Phase 1 Stage A — drive/threat/collision primitives (pinned
+            // placeholders for Stage B/C/D). Inert on the execute path today, so
+            // the golden trio is unaffected regardless of these values.
+            threat_recency_window_ticks: 90,
+            threat_proximity_range: 250.0,
+            collision_preempt_gain: 4.0,
+            collision_horizon_s: 1.5,
+            move_drive_weight: 1.0,
+            aim_drive_weight: 1.0,
+            weapons_free_flee_floor: 0.0,
+            // R97 Phase 2 Stage E — strategic objective/planner tier (HTN).
+            // SLOW 90-tick (3 s) re-plan cadence; withdraw when outnumbered
+            // 1.5×; 40 u cohesion ring for Regroup; 50 u arrive radius for the
+            // DefendZone/Withdraw/Patrol arrival + escort-screening tests. Inert
+            // without a `SquadObjective`, so the golden trio is unaffected.
+            strategic_plan_ticks: 90,
+            outnumbered_ratio: 1.5,
+            regroup_cohesion_radius: 40.0,
+            defend_arrive_radius: 50.0,
+            // R98 HOTFIX D — keep engaging an already-engaged DefendZone
+            // intruder out to 1.25× the acquisition ring (release hysteresis).
+            defend_release_factor: 1.25,
+            // R98 HOTFIX E — at most one DamageTaken re-think per 15 ticks
+            // (0.5 s at 30 Hz) of sustained fire.
+            damage_rethink_interval: 15,
             // Debug history ring (TR-020a).
             debug_history_len: 16,
         }
@@ -310,6 +418,10 @@ mod tests {
         assert!((0.0..=1.0).contains(&t.profile_leisurely_cap));
         assert!(t.brake_aggression_rush > 0.0 && t.brake_aggression_leisurely > 0.0);
         assert!(t.arrive_slow_factor_rush > 0.0 && t.arrive_slow_factor_leisurely > 0.0);
+        // R98 HOTFIX C — proportional brake: a positive reference speed and a
+        // deadband strictly below it (otherwise the brake could never engage).
+        assert!(t.brake_ref_speed > 0.0 && t.arrive_eps_speed > 0.0);
+        assert!(t.arrive_eps_speed < t.brake_ref_speed);
         // R96 Part C combat stances: positive ring/range fracs, a strafe magnitude in [0,1].
         assert!(t.orbit_radius_frac > 0.0 && t.orbit_tangential_weight > 0.0);
         assert!(t.kite_range_frac > 0.0 && (0.0..=1.0).contains(&t.strafe_stance_lateral));
@@ -317,6 +429,24 @@ mod tests {
         assert!(t.obstacle_danger_weight > 0.0 && t.obstacle_lookahead_s > 0.0);
         assert!(t.obstacle_clearance_pad >= 0.0 && t.obstacle_query_radius > 0.0);
         assert!(t.obstacle_min_radius > 0.0);
+        // R97 Stage A drive/threat/collision primitives: positive windows/ranges,
+        // neutral (positive) channel weights, a non-negative flee floor.
+        assert!(t.threat_recency_window_ticks > 0 && t.threat_proximity_range > 0.0);
+        assert!(t.collision_preempt_gain > 0.0 && t.collision_horizon_s > 0.0);
+        assert!(t.move_drive_weight > 0.0 && t.aim_drive_weight > 0.0);
+        assert!(t.weapons_free_flee_floor >= 0.0);
+        // R97 Stage E strategic planner: positive slow cadence, an outnumbered
+        // ratio >= 1, and positive cohesion/arrive radii.
+        assert!(t.strategic_plan_ticks > 0 && t.outnumbered_ratio >= 1.0);
+        assert!(t.regroup_cohesion_radius > 0.0 && t.defend_arrive_radius > 0.0);
+        // R98 HOTFIX B3 — the Mid radius must clear the max-zoom view corner
+        // (~202 u) so dormant kinematics never occur on screen.
+        assert!(t.aoi_radius_mid > 202.0);
+        // R98 HOTFIX D — the release ring must be at least the acquisition ring
+        // (>= 1 keeps the hysteresis a pure widening, never a shrink).
+        assert!(t.defend_release_factor >= 1.0);
+        // R98 HOTFIX E — a positive damage re-think interval.
+        assert!(t.damage_rethink_interval > 0);
     }
 
     /// R96 Part A — Cruise's triple is PINNED to the pre-R96 constants (cap 1.0,
@@ -367,5 +497,22 @@ mod tests {
         let d = AiTuning::default();
         assert_eq!(t.aoi_radius_mid, d.aoi_radius_mid);
         assert_eq!(t.think_ticks_dormant, d.think_ticks_dormant);
+        // R97 Stage A fields are also `#[serde(default)]`: absent from this
+        // older/partial RON, they fall back to the pinned defaults.
+        assert_eq!(t.threat_recency_window_ticks, d.threat_recency_window_ticks);
+        assert_eq!(t.move_drive_weight, d.move_drive_weight);
+        assert_eq!(t.weapons_free_flee_floor, d.weapons_free_flee_floor);
+        // R97 Stage E strategic planner fields are also `#[serde(default)]`:
+        // absent from this partial RON, they fall back to the pinned defaults.
+        assert_eq!(t.strategic_plan_ticks, d.strategic_plan_ticks);
+        assert_eq!(t.outnumbered_ratio, d.outnumbered_ratio);
+        assert_eq!(t.regroup_cohesion_radius, d.regroup_cohesion_radius);
+        assert_eq!(t.defend_arrive_radius, d.defend_arrive_radius);
+        // R98 HOTFIX fields are also `#[serde(default)]`: absent from an
+        // older/partial RON, they fall back to the pinned defaults.
+        assert_eq!(t.brake_ref_speed, d.brake_ref_speed);
+        assert_eq!(t.arrive_eps_speed, d.arrive_eps_speed);
+        assert_eq!(t.defend_release_factor, d.defend_release_factor);
+        assert_eq!(t.damage_rethink_interval, d.damage_rethink_interval);
     }
 }

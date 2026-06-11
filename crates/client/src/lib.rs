@@ -26,6 +26,10 @@
 #![allow(clippy::type_complexity)]
 
 pub mod camera;
+// R99 Phase B — dev-panel "Command Mode": in-world RTS clicking to command allied AI ships
+// (picking + commands in the SERVER world) + a selection ring. Dev-gated, client-only.
+#[cfg(feature = "dev_panel")]
+pub mod command_mode;
 #[cfg(feature = "dev_panel")]
 pub mod dev_panel;
 pub mod fitting_ui;
@@ -222,6 +226,16 @@ pub fn run() -> AppExit {
         // R60 — the dev hull design editor (F8 toggles it).
         app.add_plugins(hull_editor::HullEditorPlugin);
         app.add_systems(Update, toggle_hull_editor);
+        // R99 Phase B — in-world Command Mode: the picker (left/right-click) + the lazily-built
+        // selection ring. Both early-return unless command mode is toggled on in the dev panel.
+        app.init_resource::<command_mode::SelectionRing>()
+            .add_systems(
+                Update,
+                (
+                    command_mode::command_mode_system,
+                    command_mode::update_selection_ring,
+                ),
+            );
     }
 
     app.run()

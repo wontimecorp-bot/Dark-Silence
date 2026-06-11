@@ -219,6 +219,40 @@ pub fn add_fixed_step_systems(schedule: &mut Schedule) {
                     .run_if(resource_exists::<ai::AiTuning>)
                     .run_if(resource_exists::<clock::CurrentTick>)
                     .run_if(resource_exists::<ai::SensorNetworks>),
+                // R97 Phase 2 Stage F {TR-009}: the THIN WING planner — the
+                // tier ABOVE the strategic squad planner. Per WING entity
+                // carrying a `WingObjective`, at the slow `strategic_plan_ticks`
+                // cadence, it decomposes the wing `Objective` into each member
+                // squad's `SquadObjective` (members are squads with
+                // `wing == Some(this_wing)`, lowest stable id = lead). BEFORE
+                // `strategic_plan_system` (the wing sets member-squad objectives
+                // → strategic_plan decomposes them into squad orders →
+                // squad_think translates to members, all the same tick).
+                // Triple-gated (graceful degradation); a wing WITHOUT a
+                // `WingObjective` is skipped, a squad with `wing == None` is
+                // never matched, and no golden world spawns a `WingObjective`,
+                // so the scenario goldens stay bit-identical.
+                ai::wing_plan_system
+                    .run_if(resource_exists::<scenario::ScenarioActive>)
+                    .run_if(resource_exists::<ai::AiTuning>)
+                    .run_if(resource_exists::<clock::CurrentTick>),
+                // R97 Phase 2 Stage E {TR-009}: the STRATEGIC objective/planner
+                // tier — the SLOW, additive HTN layer ABOVE the squad system.
+                // Per squad carrying a `SquadObjective`, at the slow
+                // `strategic_plan_ticks` cadence, it decomposes the `Objective`
+                // into the next `SquadOrder` from the squad faction's fused
+                // contact picture + its own strength/cohesion, and writes ONLY
+                // `squad.order` (compare-before-write). BEFORE `squad_think`
+                // (the objective sets the order → squad_think translates it to
+                // members → channel-fusion executes, all the same tick) and
+                // AFTER perception/fusion (it reads this tick's fused picture).
+                // Triple-gated (graceful degradation); a squad WITHOUT a
+                // `SquadObjective` is skipped, and no golden world spawns an
+                // `Objective`, so the scenario goldens stay bit-identical.
+                ai::strategic_plan_system
+                    .run_if(resource_exists::<scenario::ScenarioActive>)
+                    .run_if(resource_exists::<ai::AiTuning>)
+                    .run_if(resource_exists::<clock::CurrentTick>),
                 // T017 {TR-009, TR-010}: the squad brain — centroid Position
                 // upkeep every tick, plus (at the squad's tier cadence, or
                 // same-tick on a membership change) the assignment pass that

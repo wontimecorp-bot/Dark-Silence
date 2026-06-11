@@ -345,7 +345,15 @@ fn setup_loopback_host(world: &mut World) {
     // not) and they start near their refinery. Sandbox has no `FactionSpawns` → the player stays
     // unfactioned at the origin (the original free-for-all behaviour).
     if let Some(spawns) = server.world().get_resource::<FactionSpawns>().copied() {
-        let faction = server.assign_faction();
+        // R99 Phase B/C — honour a saved faction PREFERENCE (the dev panel's Team buttons persist
+        // `preferred_faction` by `tint_tag`: 1=Red, 2=Blue). If set, join THAT side (sticky across
+        // loads); else fall back to the human-counting balancer (`assign_faction` → Red when solo,
+        // Phase C). This read compiles in both feature configs (the field always exists).
+        let faction = match dev.preferred_faction {
+            Some(1) => sim::components::Faction::Red,
+            Some(2) => sim::components::Faction::Blue,
+            _ => server.assign_faction(),
+        };
         if let Some(ship) = server.ship_entity_for(local_id) {
             let mut entity = server.world_mut().entity_mut(ship);
             entity.insert(faction);

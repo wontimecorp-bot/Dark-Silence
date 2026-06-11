@@ -25,10 +25,13 @@ use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 #[cfg(feature = "ai_debug")]
 use sim::ai::AiDebugCapture;
 use sim::ai::{
-    cadence_for_tier, AiBrain, AiStableId, AiTuning, AoiTier, ContactList, GlideState, LinkState,
-    SensorNetworks, Squad, Tier,
+    cadence_for_tier, AiBrain, AiStableId, AiTuning, AoiTier, CombatStance, ContactList,
+    GlideState, LinkState, MovementProfile, Objective, OrderKind, PlayerOrder, Posture,
+    SensorNetworks, Squad, SquadObjective, Tier, WingObjective,
 };
-use sim::components::{Afterburner, ArmorHp, Energy, Heading, Health, Heat, Position, Velocity};
+use sim::components::{
+    Afterburner, ArmorHp, Energy, Faction, Heading, Health, Heat, Position, Velocity,
+};
 use sim::damage::{
     default_resistance_matrix, HullStructure, PenetrationConfig, ResistanceMatrix, SalvageConfig,
     ShieldConfig, Shields, StatScalingConfig,
@@ -37,7 +40,7 @@ use sim::fitting::{
     derive_weapon, force_rederive_all, force_rederive_keep_health, seed_catalogs, Fit, FitLayout,
     HullCatalog, ModuleCatalog, ModuleId, ModuleKind, ModuleSpecifics, ShipStats, SlotId,
 };
-use sim::{CurrentTick, FixedDt, MiningTuning, SimTuning, Tuning};
+use sim::{CurrentTick, FactionSpawns, FixedDt, MiningTuning, SimTuning, Tuning};
 
 use crate::hud_bars::HudLayout;
 use crate::net::{LoopbackHost, NetClientState};
@@ -903,6 +906,13 @@ struct AiSquadInfo {
     wing: Option<String>,
     gliding: bool,
     last_think_tick: u64,
+    /// R97 Phase 2 — the squad's STRATEGIC objective, if it carries a
+    /// [`SquadObjective`]: `"{goal:?} (plan_idx {i}, planned @{tick})"`. `None`
+    /// when the squad has no strategic tier (the planner skips it).
+    objective: Option<String>,
+    /// R97 Phase 2 — the parent wing's STRATEGIC objective, if the squad has a
+    /// `wing` AND that wing entity carries a [`WingObjective`]: `"{goal:?}"`.
+    wing_objective: Option<String>,
 }
 
 /// The last-think score breakdown (T038, TR-020a) — a render copy of [`AiDebugCapture`], captured
@@ -915,6 +925,10 @@ struct AiCaptureView {
     momentum_applied: f32,
     /// Bounded transition ring, newest first: `(tick, from, to)`.
     transitions: Vec<(u64, String, String)>,
+    /// R97 Stage D — the per-channel decision of the LAST executed tick (written
+    /// every tick, not on the think cadence), pre-formatted into one line: which
+    /// way each channel drove + WHY fire did/didn't happen.
+    channels: String,
 }
 
 /// Full detail of the selected AI ship (T038). All strings pre-formatted in the read phase.
@@ -932,8 +946,20 @@ struct AiShipDetail {
     throttle_cap: f32,
     last_think_tick: u64,
     commit_until_tick: u64,
+    /// R97 — the tick this brain was last fired upon (the threat-recency stamp
+    /// Stage B/C reads against `AiTuning::threat_recency_window_ticks`).
+    last_damaged_tick: u64,
     thinks_total: u64,
     target: Option<String>,
+    /// R99 Phase B — the selected ship's live [`PlayerOrder`], pre-formatted (kind +
+    /// the 3 style fields), or `"none"` when the component is absent. Surfaced as a
+    /// read-only inspection line + read back into the command controls.
+    player_order: String,
+    /// R99 Phase B — the raw style overrides from the ship's `PlayerOrder` (all `None`
+    /// when the component is absent), so the B4 dropdowns can show the live selection.
+    order_profile: Option<MovementProfile>,
+    order_stance: Option<CombatStance>,
+    order_posture: Option<Posture>,
     contacts_total: usize,
     last_scan_tick: u64,
     /// Nearest few contacts (by distance to the ship).
@@ -972,6 +998,16 @@ struct AiMetrics {
     squads: usize,
     /// Squads currently collapsed to a cheap-glide aggregate (`GlideState` present).
     gliding_aggregates: usize,
+    /// R97 Phase 2 — squads carrying a `SquadObjective` (the strategic tier).
+    squad_objectives: usize,
+    /// Breakdown of those by objective kind: Hold / DefendZone / DestroyTarget /
+    /// PatrolRoute / Withdraw / Regroup. Withdraw+Regroup are reported together as
+    /// "withdrawing/regrouping" (the disengage states).
+    obj_holding: usize,
+    obj_defending: usize,
+    obj_destroying: usize,
+    obj_patrolling: usize,
+    obj_withdrawing: usize,
     /// STF-001 live signal: EXPANDED squads (no `GlideState`) farther from the player than
     /// `AiTuning::aoi_radius_mid` — off-screen promoted battles.
     offscreen_battles: usize,
@@ -993,6 +1029,110 @@ struct AiPanelData {
     rows: Vec<AiShipRow>,
     detail: Option<AiShipDetail>,
     metrics: AiMetrics,
+}
+
+/// R99 Phase B — pre-format a ship's [`PlayerOrder`] (kind + the 3 style overrides)
+/// into one inspection line, or `"none"` when the component is absent (= no order).
+/// `Vec2` has no `Display`, so the nav points are formatted component-wise.
+fn format_player_order(order: Option<&PlayerOrder>) -> String {
+    let Some(o) = order else {
+        return "none".to_string();
+    };
+    let kind = match &o.kind {
+        None => "settings-only".to_string(),
+        Some(OrderKind::MoveTo(p)) => format!("MoveTo({:.0}, {:.0})", p.x, p.y),
+        Some(OrderKind::HoldAt { anchor, radius }) => {
+            format!("HoldAt(({:.0}, {:.0}) r{:.0})", anchor.x, anchor.y, radius)
+        }
+        Some(OrderKind::Attack(t)) => format!("Attack({t:?})"),
+        Some(OrderKind::Patrol { points, index }) => {
+            format!("Patrol({} pts @{index})", points.len())
+        }
+    };
+    let style = |label: &str, s: Option<String>| match s {
+        Some(v) => format!(" | {label}: {v}"),
+        None => format!(" | {label}: (inherit)"),
+    };
+    format!(
+        "{kind}{}{}{}",
+        style("profile", o.profile.map(|p| format!("{p:?}"))),
+        style("stance", o.stance.map(|s| format!("{s:?}"))),
+        style("posture", o.posture.map(|p| format!("{p:?}"))),
+    )
+}
+
+/// R99 Phase B — a command captured in the UI (read/draw) phase and applied in the
+/// write-back phase (where `host.server.world_mut()` is mutable), mirroring the R43
+/// `equip_weapon` deferral. Each variant carries the SERVER ship entity it targets.
+enum CommandRequest {
+    /// "Hold here" — `PlayerOrder::hold_at(ship_pos, radius)` (read the ship's pos at apply).
+    HoldHere(Entity),
+    /// "Clear command" — REMOVE the `PlayerOrder` so the ship reverts to scenario behaviour.
+    Clear(Entity),
+    /// Merge a movement-profile override (`None` = `(inherit)`).
+    SetProfile(Entity, Option<MovementProfile>),
+    /// Merge a combat-stance override (`None` = `(inherit)`).
+    SetStance(Entity, Option<CombatStance>),
+    /// Merge a posture override (`None` = `(inherit)`).
+    SetPosture(Entity, Option<Posture>),
+}
+
+/// R99 Phase B (B5) — a live Team-join request captured in the UI phase: re-faction
+/// + reposition the player ship to `faction`'s base, mirroring `net.rs` auto-join.
+struct TeamJoinRequest {
+    faction: Faction,
+}
+
+/// The hold radius (world units) a "Hold here" command guards around the ship's
+/// current position — a small default, tunable for feel.
+const HOLD_RADIUS: f32 = 30.0;
+
+/// R99 Phase B — the combat-stance dropdown choices. `Orbit` carries a `ccw: bool`,
+/// so it is split into two concrete picks; the rest are field-less. `None` =
+/// `(inherit)`. The fixed list drives both the label and the merged override.
+fn stance_choices() -> [(&'static str, Option<CombatStance>); 6] {
+    [
+        ("(inherit)", None),
+        ("Charge", Some(CombatStance::Charge)),
+        ("Orbit CCW", Some(CombatStance::Orbit { ccw: true })),
+        ("Orbit CW", Some(CombatStance::Orbit { ccw: false })),
+        ("Standoff", Some(CombatStance::Standoff)),
+        ("Kite", Some(CombatStance::Kite)),
+    ]
+}
+
+/// R99 Phase B — the movement-profile dropdown choices (`None` = `(inherit)`).
+fn profile_choices() -> [(&'static str, Option<MovementProfile>); 4] {
+    [
+        ("(inherit)", None),
+        ("Rush", Some(MovementProfile::Rush)),
+        ("Cruise", Some(MovementProfile::Cruise)),
+        ("Leisurely", Some(MovementProfile::Leisurely)),
+    ]
+}
+
+/// R99 Phase B — the posture dropdown choices (`None` = `(inherit)`).
+fn posture_choices() -> [(&'static str, Option<Posture>); 4] {
+    [
+        ("(inherit)", None),
+        ("FreeEngage", Some(Posture::FreeEngage)),
+        ("DefensiveOnly", Some(Posture::DefensiveOnly)),
+        ("HoldFire", Some(Posture::HoldFire)),
+    ]
+}
+
+/// The label for a currently-selected dropdown value, found by matching against the
+/// choice list (so the closed combo shows the live override). Falls back to the
+/// `(inherit)` head when nothing matches.
+fn choice_label<T: PartialEq + Copy>(
+    choices: &[(&'static str, Option<T>)],
+    cur: Option<T>,
+) -> &'static str {
+    choices
+        .iter()
+        .find(|(_, v)| *v == cur)
+        .map(|(l, _)| *l)
+        .unwrap_or(choices[0].0)
 }
 
 /// Gather the T038 inspection snapshot + T039 metrics from the embedded server world.
@@ -1088,10 +1228,20 @@ fn gather_ai(
         .filter(|a| now > 0 && a.since_tick == now)
         .count();
 
-    // Pass 3 — squads: counts, glide aggregates, off-screen battles + the selected ship's squad.
+    // Pass 3 — squads: counts, glide aggregates, off-screen battles, the R97 strategic-objective
+    // tally + the selected ship's squad. `SquadObjective` is the strategic tier over `Squad`.
     let mut squad_info: Option<AiSquadInfo> = None;
-    let mut squads = world.query::<(Entity, &Squad, Option<&GlideState>, Option<&Position>)>();
-    for (se, squad, glide, spos) in squads.iter(world) {
+    // The chosen squad's parent wing, if any — read its `WingObjective` AFTER the squad query
+    // releases its `world` borrow (the loop can't `world.get` while iterating).
+    let mut chosen_wing: Option<Entity> = None;
+    let mut squads = world.query::<(
+        Entity,
+        &Squad,
+        Option<&GlideState>,
+        Option<&Position>,
+        Option<&SquadObjective>,
+    )>();
+    for (se, squad, glide, spos, objective) in squads.iter(world) {
         metrics.squads += 1;
         if glide.is_some() {
             metrics.gliding_aggregates += 1;
@@ -1102,7 +1252,20 @@ fn gather_ai(
                 metrics.offscreen_battles += 1;
             }
         }
+        // R97 Phase 2 — cheap strategic tally: one match on the objective kind per squad.
+        if let Some(o) = objective {
+            metrics.squad_objectives += 1;
+            match o.goal {
+                Objective::Hold => metrics.obj_holding += 1,
+                Objective::DefendZone { .. } => metrics.obj_defending += 1,
+                Objective::DestroyTarget(_) => metrics.obj_destroying += 1,
+                Objective::PatrolRoute(_) => metrics.obj_patrolling += 1,
+                // Withdraw + Regroup are the disengage states — reported together.
+                Objective::Withdraw(_) | Objective::Regroup { .. } => metrics.obj_withdrawing += 1,
+            }
+        }
         if chosen.is_some_and(|c| squad.members.contains(&c)) {
+            chosen_wing = squad.wing;
             squad_info = Some(AiSquadInfo {
                 squad: format!("{se:?}"),
                 order: format!("{:?}", squad.order),
@@ -1112,8 +1275,25 @@ fn gather_ai(
                 wing: squad.wing.map(|w| format!("{w:?}")),
                 gliding: glide.is_some(),
                 last_think_tick: squad.last_think_tick,
+                // R97 Phase 2 — the squad's strategic objective line (goal + plan cursor +
+                // last-plan tick); `None` when the squad has no strategic tier.
+                objective: objective.map(|o| {
+                    format!(
+                        "{:?} (plan_idx {}, planned @{})",
+                        o.goal, o.plan_index, o.last_plan_tick
+                    )
+                }),
+                // Filled in below from the parent wing's `WingObjective` (read after the query).
+                wing_objective: None,
             });
         }
+    }
+    // R97 Phase 2 — the parent wing's strategic objective (read after the squad query released
+    // its `world` borrow). Only shown when the squad has a wing AND that wing carries one.
+    if let (Some(info), Some(wing)) = (squad_info.as_mut(), chosen_wing) {
+        info.wing_objective = world
+            .get::<WingObjective>(wing)
+            .map(|w| format!("{:?} (planned @{})", w.goal, w.last_plan_tick));
     }
 
     // Pass 4 — perception: contact memory + own-scan counts.
@@ -1193,6 +1373,21 @@ fn gather_ai(
                 .rev()
                 .map(|(t, from, to)| (*t, format!("{from:?}"), format!("{to:?}")))
                 .collect(),
+            // R97 Stage D — the live per-channel readout: MOVE direction + throttle,
+            // the AIM drive + facing, the FIRE decision + WHY, and collision imminence.
+            // Vec2 has no Display, so format the components; the enums Debug-format.
+            channels: format!(
+                "MOVE ({:.2}, {:.2}) t{:.2} · AIM {:?} ({:.2}, {:.2}) · FIRE {} ({:?}) · collision {:.2}",
+                c.move_dir.x,
+                c.move_dir.y,
+                c.move_throttle,
+                c.aim_drive,
+                c.aim_dir.x,
+                c.aim_dir.y,
+                c.fire,
+                c.fire_reason,
+                c.collision_imminence,
+            ),
         });
         AiShipDetail {
             entity: e,
@@ -1208,8 +1403,13 @@ fn gather_ai(
             throttle_cap: brain.throttle_cap,
             last_think_tick: brain.last_think_tick,
             commit_until_tick: brain.commit_until_tick,
+            last_damaged_tick: brain.last_damaged_tick,
             thinks_total: brain.thinks_total,
             target: brain.target.map(|t| format!("{t:?}")),
+            player_order: format_player_order(world.get::<PlayerOrder>(e)),
+            order_profile: world.get::<PlayerOrder>(e).and_then(|o| o.profile),
+            order_stance: world.get::<PlayerOrder>(e).and_then(|o| o.stance),
+            order_posture: world.get::<PlayerOrder>(e).and_then(|o| o.posture),
             contacts_total,
             last_scan_tick,
             contacts,
@@ -1267,6 +1467,20 @@ fn render_ai_detail(ui: &mut egui::Ui, d: &AiShipDetail, now: u64) {
         ),
     )
     .on_hover_text("last_think_tick vs the current tick (how stale the shown decision is) + the commitment window end + lifetime completed thinks.");
+    stat(
+        ui,
+        "recency",
+        if d.last_damaged_tick == 0 {
+            "never fired upon".to_string()
+        } else {
+            format!(
+                "damaged @{} ({} ticks ago)",
+                d.last_damaged_tick,
+                now.saturating_sub(d.last_damaged_tick)
+            )
+        },
+    )
+    .on_hover_text("R97 — the tick this ship was last fired upon (last_damaged_tick) + how many ticks ago. The survival-pressure recency Stage B/C read against AiTuning::threat_recency_window_ticks.");
     stat(
         ui,
         "target",
@@ -1344,6 +1558,17 @@ fn render_ai_detail(ui: &mut egui::Ui, d: &AiShipDetail, now: u64) {
                 ),
             )
             .on_hover_text("Pace anchor (slowest essential member) + cached anchor speed, the parent wing (if any), and whether the squad is collapsed to a glide aggregate.");
+            // R97 Phase 2 — the STRATEGIC objective driving this squad's order (the planned
+            // strategy, not just the resulting order). Shown only when the squad carries a
+            // SquadObjective; the wing line only when the squad's wing carries a WingObjective.
+            if let Some(obj) = &s.objective {
+                stat(ui, "objective", obj)
+                    .on_hover_text("R97 Phase 2 — the squad's STRATEGIC objective (SquadObjective): the goal the HTN planner decomposes into the squad order above, its plan cursor (PatrolRoute waypoint index), and the tick it was last re-planned (the SLOW strategic cadence).");
+            }
+            if let Some(wobj) = &s.wing_objective {
+                stat(ui, "wing objective", wobj)
+                    .on_hover_text("R97 Phase 2 — the parent WING's strategic objective (WingObjective): the wing-level goal decomposed onto each member squad's objective (e.g. DefendZone → lead anchors, others patrol the perimeter).");
+            }
         }
     }
     // T038 score breakdown — the AiDebugCapture read, feature-gated exactly like the sim seam
@@ -1376,6 +1601,12 @@ fn render_ai_detail(ui: &mut egui::Ui, d: &AiShipDetail, now: u64) {
                     let marker = if *b == c.winner { "►" } else { " " };
                     ui.label(egui::RichText::new(format!("  {marker} {b:<14} {s:.3}")).monospace());
                 }
+                // R97 Stage D — the live per-channel readout (written EVERY tick, so it
+                // shows the action even between thinks): MOVE / AIM / FIRE (+ why) / collision.
+                ui.separator();
+                ui.label(egui::RichText::new("channels (live, this tick)").weak());
+                ui.label(egui::RichText::new(format!("  {}", c.channels)).monospace())
+                    .on_hover_text("R97 per-channel decision: MOVE translate dir + throttle, the AIM drive (None/Move/Target/Threat) + facing dir, the FIRE decision + WHY (NoTarget/PostureBlocked/Unarmed/OutOfRange/NotAligned/NoEnergy/Overheated/Fired), and the collision imminence [0,1].");
                 ui.label(
                     egui::RichText::new(format!(
                         "transitions (newest first, ring of {}):",
@@ -1427,6 +1658,14 @@ pub struct DevPanelState {
     ai_transitions_seen: u64,
     /// T039: tick of the first metrics sample — the rolling-rate window anchor.
     ai_metrics_since: Option<u64>,
+    /// R99 Phase B (command mode): when ON, in-world left-click selects the nearest
+    /// allied AI ship and right-click commands it (move / attack). The SELECTION is
+    /// the existing [`Self::ai_selected`] stable-id string — shared with the AI
+    /// inspection list, never a second selection. The picking/ring/commands all live
+    /// in [`crate::command_mode`] and read this flag.
+    pub command_mode: bool,
+    /// R99 Phase B (B5) — last status of a Team "Join Red/Blue" click (shown by the buttons).
+    pub team_status: String,
 }
 
 impl Default for DevPanelState {
@@ -1441,6 +1680,8 @@ impl Default for DevPanelState {
             ai_thinks_per_s: 0.0,
             ai_transitions_seen: 0,
             ai_metrics_since: None,
+            command_mode: false,
+            team_status: String::new(),
         }
     }
 }
@@ -1931,6 +2172,10 @@ fn dev_panel_ui(
     let equip_ship = net
         .as_ref()
         .and_then(|n| host.server.ship_entity_for(n.local_id));
+    // R99 Phase B — command/team requests captured in the UI phase, applied in the
+    // write-back phase below (where the server world is mutable). `None` = no request.
+    let mut command_request: Option<CommandRequest> = None;
+    let mut team_request: Option<TeamJoinRequest> = None;
 
     // T038/T039 (TR-020): snapshot the AI inspection + runtime metrics. `world_mut()` is needed
     // only to build the read-only QueryStates (see `gather_ai` docs) — nothing in the sim world is
@@ -2260,9 +2505,59 @@ fn dev_panel_ui(
                     slider(ui, "obstacle min radius", &mut ai_tun.obstacle_min_radius, 0.0..=100.0)
                         .on_hover_text("Minimum body radius (world units) to enter the ObstacleField — only LARGE neutral bodies (asteroids/outposts/transports) are avoided.");
                     ui.separator();
+                    ui.label(egui::RichText::new("Decision enrichment (R97)").strong());
+                    // threat_recency_window_ticks is a u64 (a tick stamp horizon), so it needs its
+                    // own slider — the shared `int` helper is u32-typed.
+                    ui.add(egui::Slider::new(&mut ai_tun.threat_recency_window_ticks, 0..=600).text("threat recency window ticks"))
+                        .on_hover_text("Recency window (ticks) over which a last_damaged_tick stamp counts as 'recently fired upon' — the survival-pressure horizon (now − last_damaged_tick < this). 90 ticks ≈ 3 s at 30 Hz.");
+                    slider(ui, "threat proximity range", &mut ai_tun.threat_proximity_range, 0.0..=600.0)
+                        .on_hover_text("Proximity range (world units) inside which a hostile contributes to the incoming-threat consideration — the spatial half of the threat scalar.");
+                    slider(ui, "collision preempt gain", &mut ai_tun.collision_preempt_gain, 0.0..=10.0)
+                        .on_hover_text("Gain applied to the collision-imminence consideration when sizing its preemptive avoidance response (Stage D) — higher brakes/turns earlier.");
+                    slider(ui, "collision horizon s", &mut ai_tun.collision_horizon_s, 0.0..=5.0)
+                        .on_hover_text("Collision look-ahead horizon (s): the window the time-to-collision is normalized over for con_collision_imminence (ttc / this, clamped) — a collision beyond it scores ~0 imminence.");
+                    slider(ui, "move drive weight", &mut ai_tun.move_drive_weight, 0.0..=3.0)
+                        .on_hover_text("Per-channel BASE weight for the MOVE-drive utility channel — Stage B scales its move-intent considerations by this. 1.0 = the neutral pass-through default.");
+                    slider(ui, "aim drive weight", &mut ai_tun.aim_drive_weight, 0.0..=3.0)
+                        .on_hover_text("Per-channel BASE weight for the AIM-drive utility channel — the twin of move drive weight for the aim/fire considerations (Stage C). 1.0 = neutral.");
+                    slider(ui, "weapons free flee floor", &mut ai_tun.weapons_free_flee_floor, 0.0..=1.0)
+                        .on_hover_text("Floor applied to the flee/evade desire while weapons-free: a non-zero floor keeps a minimum break-off willingness even mid-attack. 0.0 = no floor (flee is purely score-driven).");
+                    ui.separator();
                     ui.label(egui::RichText::new("Debug (TR-020a)").strong());
                     int(ui, "debug history len", &mut ai_tun.debug_history_len, 1..=128,
                         "Per-brain behavior-transition ring length (capture is feature-gated OFF in headless/bench builds).");
+                });
+
+                // R99 Phase B (B5) — Team join: live re-faction + reposition the player ship to
+                // a side's base (mirrors net.rs auto-join), and persist the preference so it is
+                // honoured at the next join. Captured here, applied in the write-back phase.
+                egui::CollapsingHeader::new("Team").show(ui, |ui| {
+                    let cur = net
+                        .as_ref()
+                        .and_then(|n| host.server.ship_entity_for(n.local_id))
+                        .and_then(|e| host.server.world().get::<Faction>(e).copied());
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "current: {}",
+                            match cur {
+                                Some(Faction::Red) => "Red",
+                                Some(Faction::Blue) => "Blue",
+                                None => "none (unfactioned)",
+                            }
+                        ))
+                        .monospace(),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Join Red").on_hover_text("Re-faction the player ship to Red and reposition at Red's base. Persists the preference (sticky across loads).").clicked() {
+                            team_request = Some(TeamJoinRequest { faction: Faction::Red });
+                        }
+                        if ui.button("Join Blue").on_hover_text("Re-faction the player ship to Blue and reposition at Blue's base. Persists the preference (sticky across loads).").clicked() {
+                            team_request = Some(TeamJoinRequest { faction: Faction::Blue });
+                        }
+                    });
+                    if !state.team_status.is_empty() {
+                        ui.label(egui::RichText::new(&state.team_status).weak());
+                    }
                 });
 
                 // T038 (TR-020a) — per-ship AI inspection: STRICTLY read-only (selection only
@@ -2273,6 +2568,12 @@ fn dev_panel_ui(
                         ui.label(egui::RichText::new("no AI ships in this world").weak());
                         return;
                     }
+                    // R99 Phase B (B1) — Command-Mode toggle. The in-world picker
+                    // (crate::command_mode) reads this flag; selection is the SAME
+                    // `ai_selected` the list below uses (one shared selection).
+                    ui.checkbox(&mut state.command_mode, "Command mode (in-world clicking)")
+                        .on_hover_text("LEFT-click an allied AI ship to select it; RIGHT-click an enemy to attack, or empty space to move there. The selected ship is highlighted by a cyan ground ring and shares this list's selection.");
+                    ui.separator();
                     ui.horizontal(|ui| {
                         ui.label("stable id");
                         ui.add(
@@ -2319,6 +2620,78 @@ fn dev_panel_ui(
                     if let Some(d) = &ai_data.detail {
                         render_ai_detail(ui, d, ai_data.metrics.now);
                     }
+                    // R99 Phase B (B4) — command + settings controls for the SELECTED ship,
+                    // shown only with command mode ON and a ship resolved. Each control captures
+                    // a request applied in the write-back phase (the world is read-only here).
+                    if state.command_mode {
+                        if let Some(d) = &ai_data.detail {
+                            let ship = d.entity;
+                            ui.separator();
+                            ui.label(egui::RichText::new("Command (selected ship)").strong());
+                            ui.label(
+                                egui::RichText::new(format!("order: {}", d.player_order)).monospace(),
+                            )
+                            .on_hover_text("The selected ship's live PlayerOrder (nav kind + the 3 style overrides). 'none' = no order; 'settings-only' = style overrides without a nav command.");
+                            ui.horizontal(|ui| {
+                                if ui.button("Hold here").on_hover_text("Command the ship to hold/defend at its current position.").clicked() {
+                                    command_request = Some(CommandRequest::HoldHere(ship));
+                                }
+                                if ui.button("Clear command").on_hover_text("Remove the PlayerOrder entirely — the ship reverts to its scenario behaviour.").clicked() {
+                                    command_request = Some(CommandRequest::Clear(ship));
+                                }
+                            });
+                            // Movement profile dropdown ((inherit) + every variant).
+                            let profiles = profile_choices();
+                            egui::ComboBox::from_label("profile")
+                                .selected_text(choice_label(&profiles, d.order_profile))
+                                .show_ui(ui, |ui| {
+                                    for (lbl, val) in profiles {
+                                        if ui
+                                            .selectable_label(d.order_profile == val, lbl)
+                                            .clicked()
+                                        {
+                                            command_request = Some(CommandRequest::SetProfile(ship, val));
+                                        }
+                                    }
+                                });
+                            // Combat stance dropdown (Orbit split CW/CCW).
+                            let stances = stance_choices();
+                            egui::ComboBox::from_label("stance")
+                                .selected_text(choice_label(&stances, d.order_stance))
+                                .show_ui(ui, |ui| {
+                                    for (lbl, val) in stances {
+                                        if ui
+                                            .selectable_label(d.order_stance == val, lbl)
+                                            .clicked()
+                                        {
+                                            command_request = Some(CommandRequest::SetStance(ship, val));
+                                        }
+                                    }
+                                });
+                            // Posture dropdown.
+                            let postures = posture_choices();
+                            egui::ComboBox::from_label("posture")
+                                .selected_text(choice_label(&postures, d.order_posture))
+                                .show_ui(ui, |ui| {
+                                    for (lbl, val) in postures {
+                                        if ui
+                                            .selectable_label(d.order_posture == val, lbl)
+                                            .clicked()
+                                        {
+                                            command_request = Some(CommandRequest::SetPosture(ship, val));
+                                        }
+                                    }
+                                });
+                        } else {
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(
+                                    "command mode on — left-click an allied AI ship to select one",
+                                )
+                                .weak(),
+                            );
+                        }
+                    }
                 });
 
                 // T039 (TR-020c) — runtime AI metrics: read-only whole-world counts, sampled at
@@ -2361,6 +2734,22 @@ fn dev_panel_ui(
                         format!("{} ({} gliding aggregates)", m.squads, m.gliding_aggregates),
                     )
                     .on_hover_text("Live squad entities; 'gliding' = collapsed to the cheap-glide aggregate (GlideState present).");
+                    // R97 Phase 2 — the strategic picture at a glance: how many squads carry a
+                    // SquadObjective, broken down by objective kind.
+                    stat(
+                        ui,
+                        "strategy",
+                        format!(
+                            "{} with objective ({} defending, {} destroying, {} patrolling, {} holding, {} withdrawing/regrouping)",
+                            m.squad_objectives,
+                            m.obj_defending,
+                            m.obj_destroying,
+                            m.obj_patrolling,
+                            m.obj_holding,
+                            m.obj_withdrawing,
+                        ),
+                    )
+                    .on_hover_text("R97 Phase 2 — squads carrying a SquadObjective (the strategic tier), broken down by objective kind. Withdraw + Regroup are reported together as the disengage states.");
                     stat(ui, "offscreen battles", m.offscreen_battles)
                         .on_hover_text("STF-001 live signal: EXPANDED (non-gliding) squads farther from the player than the Mid AOI radius — promoted off-screen engagements running full squad AI.");
                     let elapsed = m.now.saturating_sub(state.ai_metrics_since.unwrap_or(m.now));
@@ -3230,6 +3619,9 @@ fn dev_panel_ui(
                     ship_visual: *ship_visual,
                     cell_materials: cell_materials.clone(),
                     ai: ai_tun,
+                    // Preserve the persisted faction preference (not a server-world resource, so it
+                    // isn't rebuilt from `host` like the rest) — a full save must not reset it.
+                    preferred_faction: tuning_io::load_dev_settings().preferred_faction,
                 };
                 state.save_status = match tuning_io::save_dev_settings(&dev) {
                     Ok(m) => m,
@@ -3326,8 +3718,90 @@ fn dev_panel_ui(
     if let (Some(weapon_id), Some(ship)) = (equip_weapon, equip_ship) {
         state.equip_status = equip_module(world, ship, SlotId(3), weapon_id);
     }
+    // R99 Phase B (B4) — apply a captured command/settings request to the selected SERVER ship.
+    if let Some(req) = command_request {
+        apply_command_request(world, req);
+    }
+    // R99 Phase B (B5) — apply a captured Team-join request: re-faction + reposition the player
+    // ship live (mirrors net.rs auto-join), then persist the preference so it sticks at next join.
+    if let Some(req) = team_request {
+        let ship = net
+            .as_ref()
+            .and_then(|n| host.server.ship_entity_for(n.local_id));
+        let world = host.server.world_mut();
+        state.team_status = apply_team_join(world, ship, req.faction);
+    }
     state.tuning_open = tuning_open;
     state.stats_open = stats_open;
+}
+
+/// R99 Phase B (B4) — apply a [`CommandRequest`] to the selected SERVER ship,
+/// MERGING with any existing [`PlayerOrder`] so unrelated overrides survive
+/// (clone-or-`settings_only`, set the one field, re-insert). "Clear" removes the
+/// component entirely so the ship reverts to its scenario behaviour.
+fn apply_command_request(world: &mut World, req: CommandRequest) {
+    // Read-clone the current order (or a fresh settings-only) — the merge base.
+    let merge = |world: &mut World, ship: Entity, f: &dyn Fn(&mut PlayerOrder)| {
+        let mut order = world
+            .get::<PlayerOrder>(ship)
+            .cloned()
+            .unwrap_or_else(PlayerOrder::settings_only);
+        f(&mut order);
+        world.entity_mut(ship).insert(order);
+    };
+    match req {
+        CommandRequest::HoldHere(ship) => {
+            // Hold/defend at the ship's CURRENT position; merge so style overrides survive.
+            let pos = world.get::<Position>(ship).map(|p| p.0).unwrap_or_default();
+            merge(world, ship, &|o| {
+                o.kind = Some(OrderKind::HoldAt {
+                    anchor: pos,
+                    radius: HOLD_RADIUS,
+                });
+            });
+        }
+        CommandRequest::Clear(ship) => {
+            world.entity_mut(ship).remove::<PlayerOrder>();
+        }
+        CommandRequest::SetProfile(ship, profile) => {
+            merge(world, ship, &|o| o.profile = profile);
+        }
+        CommandRequest::SetStance(ship, stance) => {
+            merge(world, ship, &|o| o.stance = stance);
+        }
+        CommandRequest::SetPosture(ship, posture) => {
+            merge(world, ship, &|o| o.posture = posture);
+        }
+    }
+}
+
+/// R99 Phase B (B5) — live re-faction + reposition the player ship to `faction`'s
+/// base (mirrors the `net.rs` auto-join ops: insert `Faction` + `Position`), and
+/// persist `preferred_faction` (by `tint_tag`) so the choice is honoured at the next
+/// join. Returns a short status for the panel.
+fn apply_team_join(world: &mut World, ship: Option<Entity>, faction: Faction) -> String {
+    let Some(ship) = ship else {
+        return "no player ship to re-faction".to_string();
+    };
+    let Some(spawns) = world.get_resource::<FactionSpawns>().copied() else {
+        return "no FactionSpawns in this scenario".to_string();
+    };
+    let mut entity = world.entity_mut(ship);
+    entity.insert(faction);
+    entity.insert(Position(spawns.for_faction(faction)));
+
+    // Persist the preference: load the on-disk settings, set the tag, save back. Loading
+    // (vs. rebuilding from live world resources) preserves whatever else is on disk.
+    let mut dev = tuning_io::load_dev_settings();
+    dev.preferred_faction = Some(faction.tint_tag());
+    let side = match faction {
+        Faction::Red => "Red",
+        Faction::Blue => "Blue",
+    };
+    match tuning_io::save_dev_settings(&dev) {
+        Ok(_) => format!("joined {side} (preference saved)"),
+        Err(e) => format!("joined {side}, but save failed: {e}"),
+    }
 }
 
 /// Refinement 43 — install `module_id` into `slot` on the live `ship`'s [`Fit`] (validated against the

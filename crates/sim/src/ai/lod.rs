@@ -25,8 +25,9 @@ use bevy_ecs::entity::Entities;
 use bevy_ecs::prelude::*;
 use glam::Vec2;
 
-use crate::ai::brain::{AiEvent, RethinkQueue};
+use crate::ai::brain::{AiBrain, AiEvent, RethinkQueue};
 use crate::ai::ident::AiStableId;
+use crate::ai::role::ScenarioRole;
 use crate::ai::squad::{Squad, SquadOrder};
 use crate::ai::tuning::AiTuning;
 use crate::broadphase::{CoarseIndex, COARSE_CELL_SIZE};
@@ -203,11 +204,14 @@ pub struct GlideState {
     pub member_offsets: Vec<(Entity, Vec2)>,
     /// Tick the collapse happened (TR-020 lifecycle bookkeeping).
     pub collapsed_at: u64,
-    /// The order goal `vel` was last derived from (`MoveTo`/`Withdraw` target,
-    /// `None` for goal-less orders). Comparing this against the CURRENT order
-    /// each tick implements "recompute the aim only on order change" — the
-    /// per-tick glide math stays exactly `pos += vel · dt` (no per-tick
-    /// normalize), keeping the extrapolation cheap AND bit-stable.
+    /// The EFFECTIVE goal `vel` was last derived from (R98 HOTFIX B2): the
+    /// squad order's `MoveTo`/`Withdraw` target while ≥1 alive member is
+    /// non-roled, the LEAD member's `brain.waypoint` when every alive member
+    /// carries a `ScenarioRole`, `None` when goal-less. Comparing this against
+    /// the CURRENT effective goal each tick implements "recompute the aim only
+    /// on goal change" — the per-tick glide math stays exactly
+    /// `pos += vel · dt` (no per-tick normalize), keeping the extrapolation
+    /// cheap AND bit-stable.
     pub goal: Option<Vec2>,
 }
 
@@ -412,12 +416,23 @@ pub fn far_hostile_scan_system(
 /// one tick.
 ///
 /// **The glide step** (squad still `Dormant`):
-/// 1. *Re-aim on order change only*: if the order's goal (`MoveTo`/`Withdraw`
-///    target) differs from [`GlideState::goal`], point `vel` at it at the
-///    squad's ANCHOR speed (the pace the full-physics formation would fly);
-///    a change to a goal-less order stops the glide. Goal-less from collapse
-///    (e.g. `Hold`) keeps the collapse-time mean drift velocity (documented:
-///    a coasting hold drifts — cheap glide has no drag).
+/// 1. *Re-aim on effective-goal change only* (R98 HOTFIX B2 — the glide aims by
+///    WHO OWNS the members): when at least one alive member is NON-roled, the
+///    effective goal is the squad ORDER's target (`MoveTo`/`Withdraw` — today's
+///    behavior; the order layer commands those members). When EVERY alive
+///    member carries a [`ScenarioRole`] the squad order can't reach them
+///    (roled members are squad-order-exempt — steering the glide by the order
+///    would drag them against their roles, the playtest oscillation bug), so
+///    the effective goal is the LEAD (first alive) member's `brain.waypoint`
+///    (role_apply keeps it pointed along the scripted route at think cadence)
+///    — a dormant roled patrol glides its route; with no lead waypoint the
+///    glide HOLDS (zero velocity, members coast in place). A CHANGE of the
+///    effective goal is treated exactly like the pre-fix order-change re-aim:
+///    compare against [`GlideState::goal`], re-aim `vel` at the squad's ANCHOR
+///    speed ONCE on change (never per tick); a change to a goal-less state
+///    stops the glide. Goal-less from collapse on the ORDER path (e.g. `Hold`)
+///    keeps the collapse-time mean drift velocity (documented: a coasting hold
+///    drifts — cheap glide has no drag).
 /// 2. *Arrive*: within [`GLIDE_ARRIVE_RADIUS`] of the goal → `vel = ZERO`
 ///    (hold at goal, no overshoot).
 /// 3. *Integrate*: `squad_pos += vel · dt` (`dt` = the same [`FixedDt`] the
@@ -474,6 +489,10 @@ pub fn glide_motion_system(
         (With<Gliding>, Without<Squad>),
     >,
     colliders: Query<(&Position, &CollisionRadius), (Without<Gliding>, Without<Squad>)>,
+    // R98 HOTFIX B2 — read-only member OWNERSHIP view (brain waypoint + role
+    // presence) for the glide-aim rule. Access-disjoint from `members` (which
+    // mutates only Position/Velocity), so the queries coexist.
+    member_minds: Query<(Option<&AiBrain>, Option<&ScenarioRole>), Without<Squad>>,
 ) {
     let dt = dt.0;
     let nudge_max = tuning.promote_nudge_max;
@@ -554,10 +573,39 @@ pub fn glide_motion_system(
         // ------------------------------------------------------------------
         // GLIDE: one cheap extrapolation tick.
         // ------------------------------------------------------------------
-        // 1. Re-aim on order change ONLY (per-tick math stays pos += vel·dt).
-        let goal = match squad.order {
-            SquadOrder::MoveTo(g) | SquadOrder::Withdraw(g) => Some(g),
-            SquadOrder::Hold | SquadOrder::FormUp | SquadOrder::Engage(_) => None,
+        // 1. Re-aim on EFFECTIVE-GOAL change ONLY (per-tick math stays
+        //    pos += vel·dt). R98 HOTFIX B2 — the effective goal is owned by
+        //    whoever commands the members (see the system docs): ≥1 alive
+        //    NON-roled member → the squad ORDER's target (today's behavior);
+        //    ALL alive members roled → the LEAD (first alive) member's brain
+        //    waypoint (the scripted route), else HOLD (zero glide velocity).
+        let mut alive_seen = false;
+        let mut all_roled = true;
+        let mut lead_waypoint: Option<Vec2> = None;
+        for &m in &squad.members {
+            if !entities.contains(m) {
+                continue;
+            }
+            let Ok((brain, role)) = member_minds.get(m) else {
+                continue;
+            };
+            if !alive_seen {
+                alive_seen = true;
+                lead_waypoint = brain.and_then(|b| b.waypoint);
+            }
+            if role.is_none() {
+                all_roled = false;
+                break; // The order layer commands this member → order path.
+            }
+        }
+        let role_owned = alive_seen && all_roled;
+        let goal = if role_owned {
+            lead_waypoint
+        } else {
+            match squad.order {
+                SquadOrder::MoveTo(g) | SquadOrder::Withdraw(g) => Some(g),
+                SquadOrder::Hold | SquadOrder::FormUp | SquadOrder::Engage(_) => None,
+            }
         };
         if goal != gs.goal {
             gs.goal = goal;
@@ -571,8 +619,14 @@ pub fn glide_motion_system(
                         Vec2::ZERO
                     }
                 }
-                None => Vec2::ZERO, // Order dropped its goal mid-glide: stop.
+                None => Vec2::ZERO, // The effective goal vanished mid-glide: stop.
             };
+        } else if role_owned && goal.is_none() && gs.vel != Vec2::ZERO {
+            // R98 HOTFIX B2 — a role-owned squad with NO lead waypoint HOLDS:
+            // unlike the order path's documented coasting Hold (mean-drift),
+            // there is no order to drift on — zero the glide so the roled
+            // members coast in place (compare-before-write keeps this quiet).
+            gs.vel = Vec2::ZERO;
         }
         // 2. Arrive: hold at the goal instead of overshooting forever.
         if let Some(g) = gs.goal {
@@ -636,12 +690,13 @@ mod tests {
     fn near_player_promotes_immediately() {
         let mut world = lod_world();
         world.spawn((PlayerShip, Position(Vec2::ZERO)));
-        // Defaults: aoi_radius_active 60, aoi_radius_mid 240.
+        // Defaults (R98 HOTFIX B3): aoi_radius_active 120, aoi_radius_mid 520
+        // — same band geometry as before, positions re-pinned to the new radii.
         let near = world
             .spawn((Position(Vec2::new(10.0, 0.0)), AoiTier::default()))
             .id();
         let mid = world
-            .spawn((Position(Vec2::new(100.0, 0.0)), AoiTier::default()))
+            .spawn((Position(Vec2::new(300.0, 0.0)), AoiTier::default()))
             .id();
         let far = world
             .spawn((Position(Vec2::new(1000.0, 0.0)), AoiTier::default()))
@@ -1091,6 +1146,109 @@ mod tests {
                 "promoted squads stay expanded while hostiles remain (no dormant combat)"
             );
         }
+    }
+
+    /// (7) R98 HOTFIX B2 — the glide aims by member OWNERSHIP: a squad whose
+    /// alive members ALL carry a `ScenarioRole` glides toward the LEAD member's
+    /// `brain.waypoint` (the scripted route) — NOT the squad order's target —
+    /// and HOLDS (zero velocity) when the lead has no waypoint; a MIXED squad
+    /// (≥1 non-roled member) keeps aiming by the squad order (today's path).
+    #[test]
+    fn role_owned_glide_follows_lead_waypoint_not_order() {
+        use crate::ai::role::{Posture, RoleGoal, ScenarioRole};
+        let (mut world, mut schedule) = glide_world();
+        let order_goal = Vec2::new(400.0, 0.0); // The order pulls +X …
+        let route_goal = Vec2::new(0.0, 400.0); // … the role's route pulls +Y.
+
+        // (a) ALL-ROLED squad: glide follows the lead waypoint, not the order.
+        let roled = spawn_member(&mut world, Vec2::ZERO, Vec2::ZERO);
+        world.entity_mut(roled).insert(ScenarioRole::new(
+            RoleGoal::PatrolRoute(vec![route_goal]),
+            Posture::HoldFire,
+        ));
+        world.get_mut::<AiBrain>(roled).unwrap().waypoint = Some(route_goal);
+        let roled_sq = spawn_squad(
+            &mut world,
+            &[roled],
+            FormationDef::wedge(1, 10.0),
+            SquadOrder::MoveTo(order_goal),
+        );
+
+        // (b) ALL-ROLED squad with NO lead waypoint: the glide HOLDS (zero
+        // velocity) — seeded drift is zeroed, members coast in place.
+        let parked = spawn_member(&mut world, Vec2::new(2_000.0, 0.0), Vec2::new(3.0, 0.0));
+        world.entity_mut(parked).insert(ScenarioRole::new(
+            RoleGoal::PatrolRoute(vec![]),
+            Posture::HoldFire,
+        ));
+        let parked_sq = spawn_squad(
+            &mut world,
+            &[parked],
+            FormationDef::wedge(1, 10.0),
+            SquadOrder::MoveTo(order_goal),
+        );
+
+        // (c) MIXED squad (roled lead + plain wingman): the ORDER still owns
+        // the glide (≥1 commandable member — today's behavior, unchanged).
+        let mixed_roled = spawn_member(&mut world, Vec2::new(4_000.0, 0.0), Vec2::ZERO);
+        world.entity_mut(mixed_roled).insert(ScenarioRole::new(
+            RoleGoal::PatrolRoute(vec![route_goal]),
+            Posture::HoldFire,
+        ));
+        world.get_mut::<AiBrain>(mixed_roled).unwrap().waypoint = Some(route_goal);
+        let mixed_plain = spawn_member(&mut world, Vec2::new(4_010.0, 0.0), Vec2::ZERO);
+        let mixed_sq = spawn_squad(
+            &mut world,
+            &[mixed_roled, mixed_plain],
+            FormationDef::line_abreast(2, 10.0),
+            SquadOrder::MoveTo(Vec2::new(4_005.0, 800.0)),
+        );
+
+        // No players → everything settles Dormant; collapse lands at tick 30
+        // and the SAME tick's glide step performs the first re-aim.
+        for t in 0..=30 {
+            step(&mut world, &mut schedule, t);
+        }
+
+        let gs = world
+            .get::<GlideState>(roled_sq)
+            .expect("roled squad glides");
+        assert_eq!(
+            gs.goal,
+            Some(route_goal),
+            "all-roled squad: effective goal = the LEAD member's waypoint"
+        );
+        assert!(
+            gs.vel.y > 0.0 && gs.vel.x == 0.0,
+            "the glide aims along the scripted route (+Y), not the order (+X): {:?}",
+            gs.vel
+        );
+
+        let gs = world
+            .get::<GlideState>(parked_sq)
+            .expect("parked squad glides");
+        assert_eq!(gs.goal, None, "no lead waypoint → no effective goal");
+        assert_eq!(
+            gs.vel,
+            Vec2::ZERO,
+            "role-owned squad with no waypoint HOLDS (seeded drift zeroed)"
+        );
+        let parked_pos = pos_of(&world, parked);
+        step(&mut world, &mut schedule, 31);
+        assert_eq!(
+            pos_of(&world, parked),
+            parked_pos,
+            "held members coast in place (no kinematic drag toward the order)"
+        );
+
+        let gs = world
+            .get::<GlideState>(mixed_sq)
+            .expect("mixed squad glides");
+        assert_eq!(
+            gs.goal,
+            Some(Vec2::new(4_005.0, 800.0)),
+            "a mixed squad still glides by the squad ORDER target (unchanged)"
+        );
     }
 
     /// (6) No hostile → the squad keeps gliding: same-faction neighbors and a

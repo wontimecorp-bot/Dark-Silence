@@ -13,7 +13,8 @@ use glam::{Vec2, Vec3};
 use serde::Deserialize;
 use sim::ai::{
     spawn_squad, AiBrain, AiIdAllocator, AiTuning, AoiTier, CombatStance, ContactList,
-    FormationDef, MovementProfile, Posture, RoleGoal, ScenarioRole, SquadOrder,
+    FormationDef, MovementProfile, Objective, PlayerShip, Posture, RoleGoal, ScenarioRole, Squad,
+    SquadObjective, SquadOrder, WingObjective,
 };
 use sim::components::{
     AngularVelocity, BoxCollider, CollisionRadius, Faction, Heading, Health, Movable, Position,
@@ -95,6 +96,13 @@ struct VoxelStructureSpec {
 /// Default `RamMass` for a structure with no `mass` in RON — large enough that a ram barely moves it.
 fn default_ram_mass() -> f32 {
     5000.0
+}
+
+/// R97 Phase 2 Stage F authoring shorthand: a `DefendZone` objective centred on
+/// `anchor` (an outpost) with `radius`. Used for both the squad-level and
+/// wing-level DefendZone showcase objectives in `spawn_skirmish_ai`.
+fn defend_zone(anchor: Vec2, radius: f32) -> Objective {
+    Objective::DefendZone { anchor, radius }
 }
 
 /// A host's turret battery: the shared aim spec + (kinetic) weapon stats + per-turret mount offsets.
@@ -254,54 +262,79 @@ impl ServerApp {
         self.spawn_skirmish_ai(hw);
     }
 
-    /// T033 (TR-015) — author the mining skirmish's AI ships: per faction one
-    /// 3-fighter PATROL squad sweeping its own half (route north of the
-    /// mining lane, so the new fighters never collide with the transport
-    /// economy) and one 2-fighter AMBUSH pair lying dark beside the central
-    /// asteroid (trigger circle radius 120 around the rock — the contested
-    /// ground; an enemy transport docking at the mine, or an enemy patrol leg
-    /// crossing the middle, springs it: a living skirmish, by design).
+    /// T033 (TR-015) + R98 Fix A — author the mining skirmish's AI ships under
+    /// the **ONE-CONTROLLER rule**: every ship is driven EITHER by the
+    /// strategic tier (a squad `SquadObjective`/wing — members carry NO
+    /// `ScenarioRole`) OR by its own `ScenarioRole` (and then its squad, if it
+    /// has one, carries NO `SquadObjective`) — never both. The R98 playtest
+    /// glide tug-of-war came from violating this (roled, squad-exempt members
+    /// whose squads ALSO carried planner objectives: two masters per ship).
     ///
-    /// Posture examples (so postures are exercised in-game): the BLUE patrol
-    /// is `DefensiveOnly` (it returns fire only while fired-upon — see
-    /// `FIRED_UPON_WINDOW_TICKS`); everything else is `FreeEngage`.
+    /// The two showcase styles, one per faction:
     ///
-    /// R96 STYLE SHOWCASE (the precedence chain made visible): the patrols carry
-    /// a `MovementProfile` OVERRIDE on their `ScenarioRole` (patrols are roled, so
-    /// the role override is their live precedence link — the squad order is just
-    /// `Hold` and squad-exempt for roled members) — RED patrols
-    /// `Cruise` (purposeful, today's coast), BLUE patrols `Leisurely` (gentle,
-    /// energy-saving). The AMBUSH pairs carry a `CombatStance` override of
-    /// `Orbit{ccw:true}` (no movement override → archetype pace), so a sprung trap
-    /// banks AROUND its target near the asteroid instead of charging straight in.
-    /// The fighters' two-autocannon-plus-armor fit classifies as `Brawler`, whose
-    /// archetype default stance is `Charge`; the ambush role override flips that to
-    /// `Orbit`, showing the role-over-archetype contrast in-game.
+    /// - **RED = the STRATEGIC showcase** (objective/wing-driven): a WING
+    ///   (`WingObjective::DefendZone` around the Red outpost, radius
+    ///   `DEFEND_RADIUS`) over two role-less squads —
+    ///   - the 3-fighter **PATROL squad** (the wing LEAD — lowest stable id,
+    ///     spawned first): `SquadObjective::DefendZone` on the outpost. Its
+    ///     members carry NO role, so the squad order actually reaches them
+    ///     (leader `Waypoint`, wingmen `FormationKeep`); their pace comes from
+    ///     the squad's `Cruise` `movement_profile` override (the R96 squad
+    ///     style channel — the replacement for the deleted role override).
+    ///   - the 2-fighter **ESCORT squad** spawned just arena-side + south of
+    ///     the outpost: enrolled in the strategic tier with a placeholder
+    ///     `Objective::Hold` (`wing_plan_system` only re-targets squads that
+    ///     ALREADY carry a `SquadObjective`); the wing's first plan tick then
+    ///     assigns it — the rank-1 member — the perimeter `PatrolRoute` ring
+    ///     around the outpost (the Stage-F lead-anchors/others-screen split).
+    /// - **BLUE = the ROLE showcase** (role-driven): the 3-fighter patrol
+    ///   squad's members each carry `ScenarioRole::PatrolRoute` with the
+    ///   `DefensiveOnly` posture (returns fire only while fired-upon — see
+    ///   `FIRED_UPON_WINDOW_TICKS`) + the R96 `Leisurely` profile override.
+    ///   The squad entity exists for formation/pace bookkeeping only and
+    ///   carries NO `SquadObjective`: roled members are squad-order-exempt and
+    ///   the R98-B1 planner guard skips all-roled squads anyway — leaving the
+    ///   objective off makes the authoring honest. No wing.
+    /// - **AMBUSH pairs (both factions, identical shape)**: pure role-driven —
+    ///   2 UN-SQUADDED fighters each with `ScenarioRole::Ambush` (trigger
+    ///   circle radius 120 around the central rock — the contested ground; an
+    ///   enemy transport docking at the mine springs it) + an R96
+    ///   `CombatStance::Orbit{ccw:true}` override, so a sprung trap banks
+    ///   AROUND its target instead of the Brawler archetype's `Charge`. No
+    ///   squad, no objective, no wing.
     ///
-    /// 10 AI ships total — playtest content, not the bench. Additive only:
+    /// 12 AI ships total — playtest content, not the bench. Additive only:
     /// `Scenario::Sandbox` and every golden world are untouched, and the
     /// Phase-1 arena lock (`mining_skirmish_scenario_spawns_the_static_arena`)
     /// counts `Target` sub-kinds, which fitted `Ship`s never carry.
     fn spawn_skirmish_ai(&mut self, hw: f32) {
         use std::f32::consts::PI;
-        for (faction, sign, heading, patrol_posture, patrol_profile) in [
-            (
-                Faction::Red,
-                -1.0_f32,
-                0.0_f32,
-                Posture::FreeEngage,
-                MovementProfile::Cruise,
-            ),
-            (
-                Faction::Blue,
-                1.0,
-                PI,
-                Posture::DefensiveOnly,
-                MovementProfile::Leisurely,
-            ),
+        // The DefendZone ring the Red defense holds around its own outpost —
+        // wide enough to cover the outpost's approach lane (the player/enemy
+        // transport trips it well before reaching the structure).
+        const DEFEND_RADIUS: f32 = 400.0;
+        for (faction, sign, heading, strategic) in [
+            // Red fields the STRATEGIC showcase (wing + objectives, no roles).
+            (Faction::Red, -1.0_f32, 0.0_f32, true),
+            // Blue fields the ROLE showcase (roled members, no objectives).
+            (Faction::Blue, 1.0, PI, false),
         ] {
-            // PATROL: a 3-4 point loop over the faction's half, offset north
-            // (+Y) of the y = 0 transport lane. Mirrored per faction.
+            // The faction's own outpost — the anchor its defense is built on.
+            let outpost = Vec2::new(sign * hw, 0.0);
+            // The Stage-F wing brain (Red only): a bare entity carrying an
+            // `AiStableId` + a `WingObjective::DefendZone` around the outpost.
+            // `wing_plan_system` decomposes it onto the member squads below.
+            let wing_entity = strategic.then(|| {
+                let id = self.world.resource_mut::<AiIdAllocator>().allocate();
+                self.world
+                    .spawn((id, WingObjective::new(defend_zone(outpost, DEFEND_RADIUS))))
+                    .id()
+            });
+
+            // PATROL: a 3-point loop over the faction's half, offset north
+            // (+Y) of the y = 0 transport lane. Mirrored per faction. Blue's
+            // members fly it via their roles; for Red it only anchors the
+            // spawn cluster (the strategic tier owns Red's movement).
             let route = vec![
                 Vec2::new(sign * (hw - 200.0), 150.0),
                 Vec2::new(sign * hw * 0.5, 250.0),
@@ -315,23 +348,65 @@ impl ServerApp {
                     -sign * 15.0 * i as f32,
                     if i == 2 { -12.0 } else { 12.0 * i as f32 },
                 );
-                // R96: the patrol role carries the faction's MovementProfile
-                // override (Red Cruise / Blue Leisurely). No combat stance
-                // override → the archetype default (Brawler → Charge) stands.
-                let role = ScenarioRole::new(RoleGoal::PatrolRoute(route.clone()), patrol_posture)
-                    .with_style(Some(patrol_profile), None);
+                // ONE controller per ship: Blue patrol members are ROLE-driven
+                // (PatrolRoute + DefensiveOnly + Leisurely); Red patrol members
+                // carry NO role, so the squad order is their single master.
+                let role = (!strategic).then(|| {
+                    ScenarioRole::new(RoleGoal::PatrolRoute(route.clone()), Posture::DefensiveOnly)
+                        .with_style(Some(MovementProfile::Leisurely), None)
+                });
                 members.push(self.spawn_ai_fighter(route[0] + offset, heading, faction, role));
             }
-            spawn_squad(
+            let patrol_squad = spawn_squad(
                 &mut self.world,
                 &members,
                 FormationDef::wedge(members.len(), 12.0),
                 SquadOrder::Hold,
             );
+            if strategic {
+                // R96 squad style channel: Red's non-roled members pace at
+                // `Cruise` via the squad override (the deleted role override's
+                // replacement — the assignment pass writes it onto each
+                // member's `brain.squad_profile`).
+                if let Some(mut squad) = self.world.get_mut::<Squad>(patrol_squad) {
+                    squad.movement_profile = Some(MovementProfile::Cruise);
+                }
+                // Stage F: enroll the patrol as the wing LEAD squad (lowest
+                // stable id) — `DefendZone` on the outpost (the coordinated
+                // defense: hold station, engage ring intruders, withdraw +
+                // regroup when outnumbered).
+                self.attach_objective(
+                    patrol_squad,
+                    defend_zone(outpost, DEFEND_RADIUS),
+                    wing_entity,
+                );
 
-            // AMBUSH: a dark pair flanking the asteroid (south of the lane),
-            // sprung by any hostile contact inside the 120-radius circle
-            // around the rock.
+                // ESCORT (Red only): 2 role-less fighters just arena-side +
+                // south of the outpost — clear of the y = 0 transport lane and
+                // of the patrol cluster to the north. Enrolled under the wing
+                // with a placeholder `Hold` objective (the wing only re-targets
+                // squads that already carry a `SquadObjective`); the wing's
+                // decomposition then hands this rank-1 member the perimeter
+                // `PatrolRoute` ring around the outpost.
+                let mut escort_members = Vec::with_capacity(2);
+                for j in 0..2 {
+                    let pos = outpost
+                        + Vec2::new(-sign * (50.0 + 15.0 * j as f32), -60.0 - 10.0 * j as f32);
+                    escort_members.push(self.spawn_ai_fighter(pos, heading, faction, None));
+                }
+                let escort_squad = spawn_squad(
+                    &mut self.world,
+                    &escort_members,
+                    FormationDef::wedge(escort_members.len(), 12.0),
+                    SquadOrder::Hold,
+                );
+                self.attach_objective(escort_squad, Objective::Hold, wing_entity);
+            }
+
+            // AMBUSH (both factions): a dark, UN-SQUADDED pair flanking the
+            // asteroid (south of the lane), sprung by any hostile contact
+            // inside the 120-radius circle around the rock. Pure role-driven —
+            // no squad, no objective, no wing (the one-controller rule).
             let ambush = RoleGoal::Ambush {
                 trigger_center: Vec2::ZERO,
                 trigger_radius: 120.0,
@@ -344,7 +419,22 @@ impl ServerApp {
                 // movement-profile override → its archetype pace.
                 let role = ScenarioRole::new(ambush.clone(), Posture::FreeEngage)
                     .with_style(None, Some(CombatStance::Orbit { ccw: true }));
-                self.spawn_ai_fighter(pos, heading, faction, role);
+                self.spawn_ai_fighter(pos, heading, faction, Some(role));
+            }
+        }
+    }
+
+    /// Stage F authoring helper: enroll `squad` in the strategic tier with a
+    /// `SquadObjective` at `goal`, and (when `Some`) link it under `wing` so
+    /// `wing_plan_system` re-targets it. The wing link is written directly onto
+    /// the existing `Squad.wing` field (the hierarchy seam already present).
+    fn attach_objective(&mut self, squad: Entity, goal: Objective, wing: Option<Entity>) {
+        self.world
+            .entity_mut(squad)
+            .insert(SquadObjective::new(goal));
+        if let Some(w) = wing {
+            if let Some(mut s) = self.world.get_mut::<Squad>(squad) {
+                s.wing = Some(w);
             }
         }
     }
@@ -353,15 +443,16 @@ impl ServerApp {
     /// the R56 combatant fit) plus the full AI stack — `AiBrain` (phase bucket
     /// from a freshly allocated `AiStableId`, V-4), `AoiTier` (Dormant until
     /// the classifier promotes it near the player), `ContactList` (perception)
-    /// and its `ScenarioRole`. The helper's always-firing `ShipIntent` is
-    /// reset: an AI ship's trigger belongs to its brain's `fire_decision`
-    /// (TR-011), not a spawn-time pin.
+    /// and — for ROLE-driven ships only — its `ScenarioRole` (R98 Fix A: a
+    /// strategically commanded member passes `None`, the one-controller rule).
+    /// The helper's always-firing `ShipIntent` is reset: an AI ship's trigger
+    /// belongs to its brain's `fire_decision` (TR-011), not a spawn-time pin.
     fn spawn_ai_fighter(
         &mut self,
         pos: Vec2,
         heading: f32,
         faction: Faction,
-        role: ScenarioRole,
+        role: Option<ScenarioRole>,
     ) -> Entity {
         let entity = self.spawn_fitted_ship(pos, heading, faction);
         let bucket_count = self.world.get_resource::<AiTuning>().map_or_else(
@@ -374,8 +465,10 @@ impl ServerApp {
             id,
             AoiTier::default(),
             ContactList::default(),
-            role,
         ));
+        if let Some(role) = role {
+            self.world.entity_mut(entity).insert(role);
+        }
         if let Some(mut intent) = self.world.get_mut::<ShipIntent>(entity) {
             intent.fire_primary = false; // The brain owns the trigger (TR-011).
         }
@@ -416,11 +509,17 @@ impl ServerApp {
         }
     }
 
-    /// Auto-join (Phase 5): the side with FEWER human ships (Red on a tie). A method the future
-    /// multi-human path reuses per connection; for the solo windowed client it returns `Red`.
+    /// Auto-join (Phase 5): the side with FEWER **human** ships (Red on a tie). Balances only
+    /// [`PlayerShip`]-marked ships (the human AOI anchor inserted on every human-controlled craft
+    /// in `client/net.rs` auto-join) — AI fighters carry a [`Faction`] too but must NOT sway the
+    /// human's side, or the authored AI fleet composition decides where players go (R99-C). A
+    /// method the future multi-human path reuses per connection; for the solo windowed client it
+    /// returns `Red` (0 humans each side → tie), stable regardless of how many AI ships exist.
     pub fn assign_faction(&mut self) -> Faction {
         let (mut red, mut blue) = (0u32, 0u32);
-        let mut q = self.world.query_filtered::<&Faction, With<Ship>>();
+        let mut q = self
+            .world
+            .query_filtered::<&Faction, (With<Ship>, With<PlayerShip>)>();
         for f in q.iter(&self.world) {
             match f {
                 Faction::Red => red += 1,

@@ -114,8 +114,8 @@ pub fn arrive(pos: Vec2, _vel: Vec2, target: Vec2, slow_radius: f32) -> (Vec2, f
 /// it actively decelerates onto the goal instead of coasting through it.
 ///
 /// **Negative-throttle reverse-brake convention** (documented): the returned
-/// throttle is `-1.0` when the ship is inside its stopping distance — a NEGATIVE
-/// throttle is a request for REVERSE thrust. The caller maps it to a
+/// throttle is NEGATIVE when the ship is inside its stopping distance — a
+/// NEGATIVE throttle is a request for REVERSE thrust. The caller maps it to a
 /// [`ShipIntent`] with `forward < 0`, keeping the nose pointed at the goal (the
 /// turn channel) so the ship brakes NOSE-ON via the retro thrusters
 /// (`flight.rs` routes `intent.forward < 0` to `reverse_force`, which is not
@@ -124,18 +124,41 @@ pub fn arrive(pos: Vec2, _vel: Vec2, target: Vec2, slow_radius: f32) -> (Vec2, f
 /// linear ease-in across `slow_radius` so the ship doesn't slam from full-burn
 /// straight to the brake transition.
 ///
+/// **R98 HOTFIX C — proportional brake + arrive deadband (anti-bang-bang)**:
+/// the old inside-stop-dist response was a flat `-1.0` (full reverse). Once
+/// the velocity reversed, `v_close → 0` → `stop_dist → 0` → full FORWARD →
+/// a full-authority bang-bang oscillator parked on the goal. Now, inside the
+/// stopping distance:
+/// - `v_close < arrive_eps_speed` → `(dir, 0.0)` — the DEADBAND: coast and let
+///   linear drag finish the settle; reverse thrust can never build backward
+///   speed at the goal.
+/// - else → `(dir, -(v_close / brake_ref_speed).clamp(0, 1))` — a PROPORTIONAL
+///   reverse: the brake force scales with the closing speed and decays
+///   smoothly into the deadband instead of slamming full retro.
+///
 /// **Model**: `dir` points at the goal; `dist` is the range; `v_close =
 /// max(0, vel·dir)` is the speed component CLOSING on the goal (receding/lateral
-/// motion never triggers a brake). The kinematic stopping distance under a
-/// constant deceleration `decel` is `v_close² / (2·decel)`, scaled by
-/// `brake_aggression` (> 1 brakes EARLIER, more conservatively; < 1 later). If
-/// `dist <= stop_dist` the ship is inside the braking range → `(dir, -1.0)`.
-/// Otherwise `throttle = ((dist − stop_dist) / slow_radius).clamp(0, 1)`.
+/// motion never triggers a brake). The stopping distance is the kinematic
+/// `v_close² / (2·decel_eff)`, scaled by `brake_aggression` (> 1 brakes
+/// EARLIER, more conservatively; < 1 later), where `decel_eff` is the
+/// deceleration the PROPORTIONAL controller will actually command —
+/// `decel · (v_close / brake_ref_speed).clamp(0, 1)` — i.e.
+/// `stop_dist = aggression · v_close · max(v_close, brake_ref_speed) /
+/// (2·decel)`. (The CONSISTENCY condition of the R98 proportional brake:
+/// computing the stop distance against FULL reverse authority while only
+/// commanding the `v/ref` fraction of it would start every sub-reference-speed
+/// brake too late — a guaranteed overshoot that re-thrusts, flips around, and
+/// limit-cycles through the goal. At/above the reference speed the brake
+/// saturates at full reverse and the formula reduces to the classic
+/// `v²/(2·decel)`, so far approaches are unchanged.) Outside the stopping
+/// distance, `throttle = ((dist − stop_dist) / slow_radius).clamp(0, 1)`.
 ///
 /// **Determinism / no-NaN**: every denominator is floored
-/// (`decel.max(EPS)`, `slow_radius.max(EPS)`), `normalize_or_zero` handles a
-/// coincident goal, and `v_close` is non-negative — so degenerate inputs
-/// (`dist = 0`, `decel = 0`, zero velocity) yield finite results, never NaN.
+/// (`decel.max(EPS)`, `slow_radius.max(EPS)`, `brake_ref_speed.max(EPS)`),
+/// `normalize_or_zero` handles a coincident goal, and `v_close` is
+/// non-negative — so degenerate inputs (`dist = 0`, `decel = 0`, zero
+/// velocity) yield finite results, never NaN.
+#[allow(clippy::too_many_arguments)] // One scalar per physical knob (pure function).
 pub fn arrive_braked(
     pos: Vec2,
     vel: Vec2,
@@ -143,6 +166,8 @@ pub fn arrive_braked(
     slow_radius: f32,
     decel: f32,
     brake_aggression: f32,
+    brake_ref_speed: f32,
+    arrive_eps_speed: f32,
 ) -> (Vec2, f32) {
     let to = target - pos;
     let dist = to.length();
@@ -150,10 +175,21 @@ pub fn arrive_braked(
     // Closing-speed component only — receding or purely lateral motion (or a
     // coincident goal where `dir == ZERO`) contributes no brake demand.
     let v_close = vel.dot(dir).max(0.0);
-    let stop_dist = brake_aggression * v_close * v_close / (2.0 * decel.max(f32::MIN_POSITIVE));
+    // R98 HOTFIX C — the stop distance assumes the deceleration the
+    // PROPORTIONAL brake will actually command (`v/ref` of full reverse below
+    // the reference speed): `v · max(v, ref) / (2·decel)`. See the model docs.
+    let stop_dist = brake_aggression * v_close * v_close.max(brake_ref_speed)
+        / (2.0 * decel.max(f32::MIN_POSITIVE));
     if dist <= stop_dist {
-        // Inside the braking range → request REVERSE thrust (negative throttle).
-        (dir, -1.0)
+        if v_close < arrive_eps_speed {
+            // Deadband: settled enough — coast, drag finishes (never reverse).
+            (dir, 0.0)
+        } else {
+            // Proportional reverse: brake scales with closing speed, decaying
+            // smoothly toward the deadband (no full-reverse bang-bang).
+            let brake = (v_close / brake_ref_speed.max(f32::MIN_POSITIVE)).clamp(0.0, 1.0);
+            (dir, -brake)
+        }
     } else {
         // Full burn to the brake point, then a short linear ease across the
         // slow radius (so the approach isn't a hard full-burn → brake snap).
@@ -332,6 +368,99 @@ pub fn compose_intent(desired_dir: Vec2, throttle: f32, heading: f32) -> ShipInt
     let align = Vec2::from_angle(heading).dot(dir).max(0.0);
     ShipIntent {
         forward: throttle.clamp(0.0, 1.0) * align,
+        turn,
+        ..Default::default()
+    }
+}
+
+/// R97 Phase 1 Stage A — **aim-decoupled** intent composition: the strict
+/// generalization of [`compose_intent`] that DECOUPLES where the ship points
+/// (the `turn` channel, driven by `aim_dir`) from where it wants to MOVE (the
+/// `forward`/`strafe` channels, driven by `move_dir`). This is the primitive
+/// Stage B/C consume so a ship can keep its guns on a target (`aim_dir` = the
+/// gunnery lead) while translating anywhere — toward, away, or laterally.
+///
+/// **Aim → turn**: identical proportional control to [`compose_intent`]
+/// ([`TURN_GAIN`] on the wrapped heading error, clamped ±1), but on `aim_dir`
+/// instead of `move_dir`. A zero `aim_dir` falls back to `move_dir` (so an
+/// aimless mover still faces where it's going).
+///
+/// **Move → forward/strafe** (decomposed in the ship's HEADING frame):
+/// `nose = from_angle(heading)`, `fwd_comp = nose·m̂`, `lateral = perp(nose)·m̂`
+/// where `m̂` is the normalized move direction (`perp(v) = (-v.y, v.x)`, the
+/// +90°/CCW rotation matching the rest of the AI substrate).
+/// `forward`'s SIGN follows whether the move agrees with the AIM (`aim·m̂`) —
+/// the aim is where the nose is converging, so it decides forward vs retro.
+/// When the move is toward the aim (`aim·m̂ ≥ 0`) it is FORWARD thrust,
+/// alignment-gated on the CURRENT nose exactly like [`compose_intent`]
+/// (`throttle · max(0, fwd_comp)` — turn first, then burn). When the move is
+/// away from the aim (`aim·m̂ < 0`) the ship wants to hold its guns on the aim
+/// while translating opposite it → REVERSE thrust `throttle · fwd_comp`
+/// (negative; `flight.rs` routes `forward < 0` to `reverse_force`, un-gated, so
+/// it brakes/retros NOSE-ON). The result is clamped to `[-1, 1]`. Gating the
+/// reverse on `aim·m̂` (not raw `fwd_comp`) is what preserves parity: when
+/// `aim == move`, `aim·m̂ = 1 ≥ 0` always, so the forward branch is taken and the
+/// `max(0, fwd_comp)` gate reproduces `compose_intent` exactly.
+///
+/// `strafe = if can_strafe { (throttle · lateral).clamp(-1, 1) } else { 0 }` —
+/// the lateral component, gated on strafe authority (R93) — a forward-only hull
+/// keeps `strafe = 0` and translates by turning, just like today.
+///
+/// **Parity guarantee (the keystone Stage B relies on)**: when
+/// `aim_dir == move_dir` AND `!can_strafe` AND `throttle >= 0`, this returns
+/// BIT-IDENTICAL output to `compose_intent(move_dir, throttle, heading)` — the
+/// turn comes from the same vector, `aim·m̂ = 1 ≥ 0` selects the forward branch
+/// whose `throttle · max(0, fwd_comp)` IS `compose_intent`'s align-gated
+/// throttle, and strafe is forced to 0. (Proven over several geometries —
+/// forward, off-angle, BEHIND — in
+/// `compose_intent_aimed_matches_compose_intent_at_parity`.)
+///
+/// Pure + deterministic, no-NaN: `normalize_or_zero` handles degenerate inputs
+/// and a zero aim/move yields the default coasting intent.
+pub fn compose_intent_aimed(
+    move_dir: Vec2,
+    throttle: f32,
+    aim_dir: Vec2,
+    heading: f32,
+    can_strafe: bool,
+) -> ShipIntent {
+    let m = move_dir.normalize_or_zero();
+    // Aim drives the turn channel; fall back to the move direction when aimless.
+    let aim = if aim_dir == Vec2::ZERO {
+        m
+    } else {
+        aim_dir.normalize_or_zero()
+    };
+    if aim == Vec2::ZERO {
+        return ShipIntent::default();
+    }
+    let err = wrap_angle(aim.to_angle() - heading);
+    let turn = (err * TURN_GAIN).clamp(-1.0, 1.0);
+
+    // Decompose the desired MOVE in the ship's heading frame (nose = +X-local).
+    let nose = Vec2::from_angle(heading);
+    let left = Vec2::new(-nose.y, nose.x); // perp(nose), +90°/CCW
+    let fwd_comp = nose.dot(m); // > 0 ahead of the nose, < 0 behind it
+    let lateral = left.dot(m); // > 0 to port/left, < 0 to starboard/right
+    let throttle = throttle.clamp(-1.0, 1.0);
+    // The forward SIGN follows whether the move agrees with the AIM (where the
+    // nose converges). Move toward the aim → forward, align-gated on the current
+    // nose like `compose_intent` (`max(0, fwd_comp)`, turn-first — the parity
+    // branch). Move away from the aim → reverse `fwd_comp` (retro nose-on).
+    let forward = if aim.dot(m) >= 0.0 {
+        throttle * fwd_comp.max(0.0)
+    } else {
+        throttle * fwd_comp
+    }
+    .clamp(-1.0, 1.0);
+    let strafe = if can_strafe {
+        (throttle * lateral).clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    ShipIntent {
+        forward,
+        strafe,
         turn,
         ..Default::default()
     }
@@ -558,11 +687,23 @@ mod tests {
     fn arrive_braked_cuts_to_reverse_inside_stopping_distance() {
         let target = Vec2::new(100.0, 0.0);
         let decel = 10.0;
+        // R98 HOTFIX C — the pinned proportional-brake knobs (the AiTuning
+        // defaults): full reverse at/above 40 u/s closing, deadband below 2.
+        let (brake_ref, eps) = (40.0, 2.0);
         // Fast-closing ship just OUTSIDE its stopping distance → positive ramp,
-        // not a brake. stop_dist = 1·40²/(2·10) = 80, so at dist 100 (pos x=20)
-        // the ship is 20 u outside → ramp over a 50 u slow radius = 0.4.
+        // not a brake. stop_dist = 1·40·max(40, 40)/(2·10) = 80, so at dist 100
+        // (pos x=0) the ship is 20 u outside → ramp over a 50 u slow radius = 0.4.
         let fast = Vec2::new(40.0, 0.0);
-        let (dir_out, t_out) = arrive_braked(Vec2::new(0.0, 0.0), fast, target, 50.0, decel, 1.0);
+        let (dir_out, t_out) = arrive_braked(
+            Vec2::new(0.0, 0.0),
+            fast,
+            target,
+            50.0,
+            decel,
+            1.0,
+            brake_ref,
+            eps,
+        );
         assert!((dir_out - Vec2::X).length() < 1e-6, "steers at the goal");
         assert!(
             t_out > 0.0,
@@ -574,18 +715,79 @@ mod tests {
         );
 
         // SAME fast ship moved INSIDE the stopping distance (dist 70 < 80) →
-        // request reverse thrust (negative throttle).
-        let (dir_in, t_in) = arrive_braked(Vec2::new(30.0, 0.0), fast, target, 50.0, decel, 1.0);
+        // request reverse thrust: PROPORTIONAL — at the reference closing speed
+        // (40 = brake_ref) the brake saturates at the full -1.0.
+        let (dir_in, t_in) = arrive_braked(
+            Vec2::new(30.0, 0.0),
+            fast,
+            target,
+            50.0,
+            decel,
+            1.0,
+            brake_ref,
+            eps,
+        );
         assert!(
             (dir_in - Vec2::X).length() < 1e-6,
             "still steers at the goal"
         );
-        assert_eq!(t_in, -1.0, "inside the brake point → reverse-brake request");
+        assert_eq!(
+            t_in, -1.0,
+            "closing at brake_ref inside the brake point → saturated reverse"
+        );
+
+        // PROPORTIONAL: a slower close brakes proportionally LESS. v_close 20 →
+        // stop_dist = 20·max(20, 40)/(2·10) = 40 (the authority-consistent
+        // model); at dist 15 (inside) → -(20/40) = -0.5.
+        let slow = Vec2::new(20.0, 0.0);
+        let (_, t_prop) = arrive_braked(
+            Vec2::new(85.0, 0.0),
+            slow,
+            target,
+            50.0,
+            decel,
+            1.0,
+            brake_ref,
+            eps,
+        );
+        assert!(
+            (t_prop + 0.5).abs() < 1e-5,
+            "half the reference closing speed → half the reverse (got {t_prop})"
+        );
+
+        // DEADBAND: closing below arrive_eps_speed inside the stopping distance
+        // coasts (throttle 0) — drag settles it; reverse NEVER builds backward
+        // speed at the goal (the anti-bang-bang guarantee).
+        let crawl = Vec2::new(1.0, 0.0); // stop_dist = 1/20 = 0.05
+        let (_, t_dead) = arrive_braked(
+            Vec2::new(99.96, 0.0),
+            crawl,
+            target,
+            50.0,
+            decel,
+            1.0,
+            brake_ref,
+            eps,
+        );
+        assert_eq!(
+            t_dead, 0.0,
+            "sub-deadband closing speed inside the brake point → coast-settle"
+        );
 
         // Higher brake_aggression brakes EARLIER: at the same far position the
         // stopping distance grows, so an aggression that pushes stop_dist past
-        // the range flips the ramp into a brake.
-        let (_, t_aggr) = arrive_braked(Vec2::new(0.0, 0.0), fast, target, 50.0, decel, 2.0);
+        // the range flips the ramp into a brake (still proportional: v_close 40
+        // = brake_ref → the saturated -1.0).
+        let (_, t_aggr) = arrive_braked(
+            Vec2::new(0.0, 0.0),
+            fast,
+            target,
+            50.0,
+            decel,
+            2.0,
+            brake_ref,
+            eps,
+        );
         assert_eq!(
             t_aggr, -1.0,
             "aggression 2 → stop_dist 160 > range 100 → brakes earlier"
@@ -599,19 +801,31 @@ mod tests {
             50.0,
             decel,
             1.0,
+            brake_ref,
+            eps,
         );
         assert!(t_recede > 0.0, "receding → no brake demand, full ramp");
 
-        // Degenerate inputs never NaN: coincident goal, zero decel, zero vel.
-        let (d0, t0) = arrive_braked(target, fast, target, 50.0, decel, 1.0);
+        // Degenerate inputs never NaN: coincident goal (v_close 0 → deadband
+        // coast), zero decel, zero vel.
+        let (d0, t0) = arrive_braked(target, fast, target, 50.0, decel, 1.0, brake_ref, eps);
         assert!(d0.is_finite() && t0.is_finite() && d0 == Vec2::ZERO);
-        let (_, t_z) = arrive_braked(Vec2::ZERO, fast, target, 50.0, 0.0, 1.0);
+        assert_eq!(t0, 0.0, "coincident goal → deadband coast (no reverse)");
+        let (_, t_z) = arrive_braked(Vec2::ZERO, fast, target, 50.0, 0.0, 1.0, brake_ref, eps);
         assert!(
             t_z.is_finite(),
             "zero decel floors the denominator (got {t_z})"
         );
-        let (_, t_still) =
-            arrive_braked(Vec2::new(99.0, 0.0), Vec2::ZERO, target, 50.0, decel, 1.0);
+        let (_, t_still) = arrive_braked(
+            Vec2::new(99.0, 0.0),
+            Vec2::ZERO,
+            target,
+            50.0,
+            decel,
+            1.0,
+            brake_ref,
+            eps,
+        );
         assert!(
             t_still.is_finite() && t_still >= 0.0,
             "stationary → finite ramp"
@@ -956,5 +1170,122 @@ mod tests {
         );
         // PI sanity for the wrap helper used throughout.
         assert!((wrap_angle(PI + 0.1) + PI - 0.1).abs() < 1e-5);
+    }
+
+    // --- R97 Stage A: compose_intent_aimed (aim/move decoupling) ---
+
+    #[test]
+    fn compose_intent_aimed_matches_compose_intent_at_parity() {
+        // THE PARITY PROOF (the strict-generalization guarantee Stage B relies on):
+        // aim == move AND !can_strafe AND throttle >= 0 → BIT-IDENTICAL to
+        // compose_intent(move, throttle, heading) across several geometries.
+        let cases = [
+            // (move_dir, throttle, heading)
+            (Vec2::X, 1.0, 0.0),                // forward, aligned
+            (Vec2::Y, 1.0, 0.0),                // 90° off (target to the left)
+            (Vec2::new(-1.0, 0.0), 1.0, 0.0),   // directly behind the nose
+            (Vec2::from_angle(0.7), 0.5, 0.0),  // off-angle, half throttle
+            (Vec2::from_angle(-3.0), 1.0, 3.0), // wrapped across the ±π seam
+            (Vec2::from_angle(2.1), 0.3, -1.2), // arbitrary heading + dir
+            (Vec2::ZERO, 1.0, 0.4),             // degenerate move → default
+        ];
+        for (dir, throttle, heading) in cases {
+            let baseline = compose_intent(dir, throttle, heading);
+            let aimed = compose_intent_aimed(dir, throttle, dir, heading, false);
+            assert_eq!(
+                aimed, baseline,
+                "parity (aim==move, !can_strafe, throttle>=0) must be bit-identical: \
+                 dir={dir:?} throttle={throttle} heading={heading}"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_intent_aimed_decouples_aim_from_move() {
+        // Heading +X. AIM at a target to +X (dead ahead) while WANTING to move -X
+        // (away). Expect: turn toward +X ≈ 0 (already facing it), and forward < 0
+        // (a REVERSE-thrust request — retro away while the gun bears on +X).
+        let intent = compose_intent_aimed(Vec2::new(-1.0, 0.0), 1.0, Vec2::X, 0.0, false);
+        assert!(intent.turn.abs() < 1e-6, "already aimed at +X → ~zero turn");
+        assert!(
+            intent.forward < 0.0,
+            "move is BEHIND the nose → reverse thrust (got {})",
+            intent.forward
+        );
+        assert!(
+            (intent.forward + 1.0).abs() < 1e-6,
+            "full retro at throttle 1"
+        );
+        assert_eq!(intent.strafe, 0.0, "no strafe authority → strafe 0");
+
+        // Heading +X, AIM at +X target, MOVE +Y (lateral): a can_strafe hull
+        // strafes port (+) and barely thrusts forward; turn stays ~0 (facing +X).
+        let strafer = compose_intent_aimed(Vec2::Y, 1.0, Vec2::X, 0.0, true);
+        assert!(
+            strafer.turn.abs() < 1e-6,
+            "aim +X from heading +X → ~zero turn"
+        );
+        assert!(
+            (strafer.strafe - 1.0).abs() < 1e-6,
+            "full port strafe for +Y move"
+        );
+        assert!(
+            strafer.forward.abs() < 1e-6,
+            "pure lateral move → ~zero forward"
+        );
+    }
+
+    #[test]
+    fn compose_intent_aimed_turn_follows_aim_not_move() {
+        // Heading +X, MOVE +X (dead ahead) but AIM at +Y (target to the left):
+        // the turn must follow the AIM (positive/CCW), not the move (which is
+        // aligned and would give zero turn).
+        let intent = compose_intent_aimed(Vec2::X, 1.0, Vec2::Y, 0.0, false);
+        assert!(
+            intent.turn > 0.0,
+            "turn follows the aim (+Y is to the left → CCW) not the move (got {})",
+            intent.turn
+        );
+        // Forward still tracks the MOVE (aligned with the nose → full forward).
+        assert!(
+            (intent.forward - 1.0).abs() < 1e-6,
+            "forward tracks the move"
+        );
+    }
+
+    #[test]
+    fn compose_intent_aimed_strafe_only_when_can_strafe() {
+        // Same lateral move; only the can_strafe hull writes a strafe channel.
+        let no_strafe = compose_intent_aimed(Vec2::Y, 1.0, Vec2::X, 0.0, false);
+        assert_eq!(no_strafe.strafe, 0.0, "no strafe authority → 0");
+        let strafer = compose_intent_aimed(Vec2::Y, 1.0, Vec2::X, 0.0, true);
+        assert!(
+            strafer.strafe.abs() > 0.5,
+            "strafe authority → real lateral"
+        );
+    }
+
+    #[test]
+    fn compose_intent_aimed_is_never_nan_on_degenerate_inputs() {
+        // Zero move + zero aim → the default coasting intent (no NaN).
+        assert_eq!(
+            compose_intent_aimed(Vec2::ZERO, 1.0, Vec2::ZERO, 0.5, true),
+            ShipIntent::default()
+        );
+        // Zero aim but a real move → aim falls back to the move (faces where it goes).
+        let fallback = compose_intent_aimed(Vec2::Y, 1.0, Vec2::ZERO, 0.0, false);
+        assert!(fallback.turn > 0.0 && fallback.forward.is_finite());
+        // Zero move but a real aim → faces the aim, no translation, all finite.
+        let aim_only = compose_intent_aimed(Vec2::ZERO, 1.0, Vec2::Y, 0.0, true);
+        assert!(aim_only.turn > 0.0, "turns toward the aim");
+        assert!(
+            aim_only.forward.abs() < 1e-6 && aim_only.strafe.abs() < 1e-6,
+            "no move → no thrust"
+        );
+        assert!(
+            aim_only.forward.is_finite()
+                && aim_only.strafe.is_finite()
+                && aim_only.turn.is_finite()
+        );
     }
 }

@@ -925,7 +925,12 @@ fn rush_settles_on_goal_vs_leisurely_coasts_past() {
     // top_speed 80, a strong retro (reverse_force 60) so braking is decisive.
     let stats = stats_with_brake(80.0, 60.0);
 
-    let rest_distance = |profile: MovementProfile| -> (f32, f32) {
+    // R98 HOTFIX C — the run is EXTENDED past the original 400-tick window so
+    // the heavy test fighter (mass ~20, retro 60 → ≤ ~4 u/s² of brake) genuinely
+    // ARRIVES and parks; the original rest/overshoot comparisons keep their
+    // exact pre-R98 semantics by sampling at the original 400-tick mark.
+    const SETTLE_TICKS: u64 = 2400;
+    let rest_distance = |profile: MovementProfile| -> (f32, f32, f32) {
         let (mut w, mut s) = obj2_world();
         w.spawn((PlayerShip, Position(start))); // keep the ship Active-tier
         let buckets = w.resource::<AiTuning>().fallback_bucket_count;
@@ -958,18 +963,30 @@ fn rush_settles_on_goal_vs_leisurely_coasts_past() {
             ))
             .id();
         let mut max_overshoot: f32 = 0.0;
-        for tick in 0..TICKS {
+        let mut rest_at_400 = f32::INFINITY;
+        // R98 HOTFIX C — the anti-bang-bang probe: the peak SPEED over the
+        // final ~60 ticks of the extended run. The old full-reverse brake
+        // parked the ship on a full-authority forward/reverse oscillator at
+        // the goal; the proportional brake + deadband must leave it genuinely
+        // settled.
+        let mut tail_max_speed: f32 = 0.0;
+        for tick in 0..SETTLE_TICKS {
             mirror_tick_and_run(&mut w, &mut s, tick);
-            let (p, ..) = kinematics(&w, ship);
+            let (p, v, _) = kinematics(&w, ship);
             // Overshoot = how far PAST the goal along the approach axis (+X).
             max_overshoot = max_overshoot.max(p.x - goal.x);
+            if tick + 1 == TICKS {
+                rest_at_400 = (goal - p).length();
+            }
+            if tick >= SETTLE_TICKS - 60 {
+                tail_max_speed = tail_max_speed.max(v.length());
+            }
         }
-        let (p, ..) = kinematics(&w, ship);
-        ((goal - p).length(), max_overshoot)
+        (rest_at_400, max_overshoot, tail_max_speed)
     };
 
-    let (rush_rest, rush_overshoot) = rest_distance(MovementProfile::Rush);
-    let (leisurely_rest, _) = rest_distance(MovementProfile::Leisurely);
+    let (rush_rest, rush_overshoot, rush_tail_speed) = rest_distance(MovementProfile::Rush);
+    let (leisurely_rest, _, leisurely_tail_speed) = rest_distance(MovementProfile::Leisurely);
 
     assert!(
         rush_rest < leisurely_rest,
@@ -981,6 +998,19 @@ fn rush_settles_on_goal_vs_leisurely_coasts_past() {
     assert!(
         rush_overshoot < 40.0,
         "Rush does not blow past the goal (max overshoot {rush_overshoot})"
+    );
+    // R98 HOTFIX C — the anti-bang-bang guarantee: over the final ~60 ticks the
+    // ship is genuinely AT REST (speed under a small bound — the proportional
+    // brake decays into the arrive deadband and drag finishes), with NO residual
+    // full-reverse/full-forward oscillation parked on the goal.
+    assert!(
+        rush_tail_speed < 2.5,
+        "Rush rests settled at the goal — no residual oscillation \
+         (tail max speed {rush_tail_speed})"
+    );
+    assert!(
+        leisurely_tail_speed < 2.5,
+        "Leisurely rests settled too (tail max speed {leisurely_tail_speed})"
     );
 }
 
@@ -1357,7 +1387,7 @@ fn set_squad_order(w: &mut World, se: Entity, order: SquadOrder) {
 #[test]
 fn aggregate_round_trip_has_no_positional_pop() {
     let (mut w, mut s) = obj2_world();
-    // A player EXISTS but far beyond aoi_radius_mid (240): the squad settles
+    // A player EXISTS but far beyond aoi_radius_mid (520): the squad settles
     // Dormant exactly as an off-screen formation would.
     let player = w
         .spawn((PlayerShip, Position(Vec2::new(50_000.0, 0.0))))
@@ -1426,8 +1456,10 @@ fn aggregate_round_trip_has_no_positional_pop() {
     // classifier promotes the squad THIS tick (promotion is immediate) and
     // `glide_motion_system` expands the same tick. No penetration → zero
     // nudge → promote-tick positions equal the last glide-written positions
-    // bit-for-bit (TR-008 no-pop).
-    w.get_mut::<Position>(player).unwrap().0 = pos_of(&w, se) + Vec2::new(100.0, 0.0);
+    // bit-for-bit (TR-008 no-pop). R98 HOTFIX B3 re-pin: 300 u sits inside the
+    // Mid band of the new default radii (Active 120 < 300 ≤ Mid 520) — the
+    // same band geometry the old 100 u had against the 60/240 defaults.
+    w.get_mut::<Position>(player).unwrap().0 = pos_of(&w, se) + Vec2::new(300.0, 0.0);
     mirror_tick_and_run(&mut w, &mut s, 64);
     assert!(
         w.get::<GlideState>(se).is_none(),
@@ -1839,8 +1871,8 @@ const SHOOTER_RANGE: f32 = 120.0;
 /// E007 fitted-damage resource (the `damage.rs` `insert_full_combat_resources`
 /// set), at the live 30 Hz step. The `AiTuning` AOI radii are widened so the
 /// whole engagement bubble stays Active-tier around the player marker (the
-/// default 60/240 radii are smaller than a weapon envelope — pure scenario
-/// tuning, no logic change).
+/// default 120/520 radii can be smaller than an engagement bubble — pure
+/// scenario tuning, no logic change).
 fn combat_world() -> (World, Schedule) {
     let mut w = World::new();
     let (modules, hulls) = seed_catalogs();
@@ -2694,6 +2726,476 @@ fn kite_stance_opens_range_when_closed_and_faces_target() {
     );
 }
 
+/// R97 Phase 1 Stage C — THE EMERGENCE: a FIGHTING RETREAT (open range while
+/// facing + firing on the pursuer) emerges from the independent MOVE/AIM/FIRE
+/// channels alone — NO dedicated `FightingRetreat` behavior exists. An armed ship
+/// pinned to `Retreat` against an in-range armed pursuer must, over a window:
+/// (a) OPEN the range (distance to the pursuer grows), (b) FIRE on the aligned
+/// ticks (the weapons-free rule: AIM on the hostile + aligned + gates pass),
+/// (c) keep its NOSE on the pursuer (the AIM channel), and (d) stay `Retreat`
+/// THROUGHOUT (proving emergence, not a new behavior). Run for BOTH a
+/// forward-only hull (reverse-thrust retrograde) and a `can_strafe` hull (lateral
+/// strafe).
+#[test]
+fn fighting_retreat_emerges_without_a_dedicated_behavior() {
+    // (strafe, home) — forward-only flees directly away (reverse-drift); the
+    // can_strafe hull flees PERPENDICULAR to the threat (toward `home`) so the
+    // lateral channel — strafe, not reverse — does the opening while the gun bears.
+    for (label, can_strafe, home) in [
+        ("forward-only", false, None),
+        ("can_strafe", true, Some(Vec2::new(0.0, 600.0))),
+    ] {
+        const TICKS: u64 = 240;
+        let (mut w, mut s) = combat_world();
+        w.spawn((PlayerShip, Position(Vec2::ZERO)));
+        // An indestructible, NON-shooting pursuer in weapon range (range 1000):
+        // it never damages the retreater, so no `DamageTaken` ever breaks the
+        // pinned commit — the behavior stays `Retreat` for the whole window.
+        let pursuer_pos = Vec2::new(100.0, 0.0);
+        let pursuer = w
+            .spawn((
+                Target,
+                TargetKind::Dummy,
+                Position(pursuer_pos),
+                Velocity(Vec2::ZERO),
+                Heading(0.0),
+                AngularVelocity(0.0),
+                CollisionRadius(1.2),
+                Health(1.0e9),
+                Faction::Blue,
+            ))
+            .id();
+        let mut stats = combat_stats(80.0, 30.0, 0.0);
+        stats.can_strafe = can_strafe;
+        let retreater = spawn_armed_ai_fighter(&mut w, 0, Vec2::ZERO, pursuer, stats);
+        {
+            // PIN Retreat (commit never expires; nothing damages it to re-think).
+            let mut b = w.get_mut::<AiBrain>(retreater).unwrap();
+            b.behavior = Behavior::Retreat;
+            b.commit_until_tick = u64::MAX;
+            b.home = home;
+        }
+
+        let start_range = (pos_of(&w, retreater) - pursuer_pos).length();
+        let mut fired_ticks = 0usize;
+        let mut aligned_ticks = 0usize;
+        for tick in 0..TICKS {
+            mirror_tick_and_run(&mut w, &mut s, tick);
+            // (d) Retreat THROUGHOUT — the emergence is channels, not a new behavior.
+            assert_eq!(
+                brain_of(&w, retreater).behavior,
+                Behavior::Retreat,
+                "[{label}] stays Retreat (no FightingRetreat variant) (tick {tick})"
+            );
+            // (c) the nose tracks the pursuer (the AIM channel).
+            let p = pos_of(&w, retreater);
+            let to_threat = (pursuer_pos - p).normalize_or_zero();
+            let nose = Vec2::from_angle(w.get::<Heading>(retreater).unwrap().0);
+            if nose.dot(to_threat) > 0.9 {
+                aligned_ticks += 1;
+                // (b) FIRE on the aligned ticks (weapons-free + gates pass).
+                if fires(&w, retreater) {
+                    fired_ticks += 1;
+                }
+            }
+        }
+        let end_range = (pos_of(&w, retreater) - pursuer_pos).length();
+
+        // (a) the range OPENED.
+        assert!(
+            end_range > start_range + 15.0,
+            "[{label}] fighting retreat OPENS the range ({start_range:.1} → {end_range:.1})"
+        );
+        // (c) the nose stayed on the pursuer for the bulk of the window.
+        assert!(
+            aligned_ticks as f32 / TICKS as f32 > 0.8,
+            "[{label}] the nose tracks the threat ({aligned_ticks}/{TICKS} aligned)"
+        );
+        // (b) it FIRED while opening range (the fighting retreat, not a pure run).
+        assert!(
+            fired_ticks > 0,
+            "[{label}] fires on the pursuer while withdrawing ({fired_ticks} fire-ticks)"
+        );
+        eprintln!(
+            "[r97c] fighting-retreat ({label}): range {start_range:.1} → {end_range:.1}, \
+             aligned {aligned_ticks}/{TICKS}, fired {fired_ticks}"
+        );
+    }
+}
+
+/// R98 HOTFIX F — Retreat reverse-thrust obstacle masking: a retreating ship
+/// with a LARGE body squarely on its flee line (directly BEHIND it — it backs
+/// toward the obstacle nose-on the pursuer) resolves its flee direction
+/// through the danger-masked ContextMap and so STOPS SHORT / deviates instead
+/// of reversing straight through the body. Pre-fix, the survival arms composed
+/// via `compose_intent_aimed` with NO obstacle field — the ship plunged
+/// blindly through the obstacle (no ship↔dummy collision response exists, so
+/// penetration is the discriminating observable). The behavior must stay
+/// `Retreat` throughout (the fix is a move-channel mask, not a re-selection).
+#[test]
+fn retreat_masks_reverse_thrust_around_obstacle_behind_it() {
+    const TICKS: u64 = 400;
+    let (mut w, mut s) = combat_world();
+    w.insert_resource(ObstacleField::default()); // enable the Part-D build system.
+                                                 // The move-arm detour knobs (the `ship_steers_around_obstacle…` pattern):
+                                                 // wide clearance + long predictive lookahead so the reversing ship reacts
+                                                 // well before its tail reaches the body.
+    w.insert_resource(AiTuning {
+        aoi_radius_active: 10_000.0,
+        aoi_radius_mid: 20_000.0,
+        obstacle_clearance_pad: 40.0,
+        obstacle_query_radius: 320.0,
+        obstacle_lookahead_s: 6.0,
+        ..AiTuning::default()
+    });
+    w.spawn((PlayerShip, Position(Vec2::ZERO)));
+
+    // An indestructible, NON-shooting pursuer ahead (+X): the flee line is -X.
+    let pursuer_pos = Vec2::new(100.0, 0.0);
+    let pursuer = w
+        .spawn((
+            Target,
+            TargetKind::Dummy,
+            Position(pursuer_pos),
+            Velocity(Vec2::ZERO),
+            Heading(0.0),
+            AngularVelocity(0.0),
+            CollisionRadius(1.2),
+            Health(1.0e9),
+            Faction::Blue,
+        ))
+        .id();
+    // A LARGE body squarely on the flee line, BEHIND the retreater (surface at
+    // x = -100): pre-fix the reverse-drifting ship backed straight through it.
+    let obstacle_pos = Vec2::new(-150.0, 0.0);
+    let obstacle_radius = 50.0;
+    spawn_obstacle(&mut w, obstacle_pos, obstacle_radius);
+
+    let stats = combat_stats(80.0, 30.0, 0.0);
+    let retreater = spawn_armed_ai_fighter(&mut w, 0, Vec2::ZERO, pursuer, stats);
+    w.entity_mut(retreater).insert(CollisionRadius(4.0));
+    {
+        // PIN Retreat (commit never expires; nothing damages it to re-think);
+        // no home → the flee vector is directly away from the pursuer (-X).
+        let mut b = w.get_mut::<AiBrain>(retreater).unwrap();
+        b.behavior = Behavior::Retreat;
+        b.commit_until_tick = u64::MAX;
+        b.home = None;
+    }
+
+    let mut min_x: f32 = 0.0;
+    let mut min_surface_gap = f32::INFINITY;
+    for tick in 0..TICKS {
+        mirror_tick_and_run(&mut w, &mut s, tick);
+        assert_eq!(
+            brain_of(&w, retreater).behavior,
+            Behavior::Retreat,
+            "the mask is a move-channel deflection — the behavior stays Retreat (tick {tick})"
+        );
+        let p = pos_of(&w, retreater);
+        min_x = min_x.min(p.x);
+        min_surface_gap = min_surface_gap.min((p - obstacle_pos).length() - obstacle_radius - 4.0);
+    }
+
+    // It REALLY retreated toward the body (the scenario is exercised, not a
+    // vacuous stand-still) …
+    assert!(
+        min_x < -20.0,
+        "the ship genuinely withdrew along the flee line (min x {min_x:.1})"
+    );
+    // … but NEVER reversed into/through it: the danger-masked flee keeps real
+    // surface clearance (pre-fix the blind reverse plunged the gap negative).
+    assert!(
+        min_surface_gap > 0.0,
+        "the retreating ship never backs into the obstacle \
+         (min surface gap {min_surface_gap:.1})"
+    );
+    eprintln!("[r98f] retreat-mask: min x {min_x:.1}, min surface gap {min_surface_gap:.1}");
+}
+
+// ---------------------------------------------------------------------------
+// R97 Phase 1 Stage D — collision-imminence move-drive + channel fusion
+// determinism (closes Phase 1).
+// ---------------------------------------------------------------------------
+
+/// R97 Phase 1 Stage D — a `Kite`-stance ship with a target INSIDE its kite
+/// range opens distance (Stage C kite-flee) AND fires on the aligned ticks (the
+/// Stage-C weapons-free rule wired the kite arm's fire). With the kite ring set
+/// INSIDE the weapon envelope, the settled kiter holds facing the target within
+/// range, so its gun bears and `fire_decision` pulls the trigger.
+#[test]
+fn kite_while_firing() {
+    const TICKS: u64 = 1800;
+    const TAIL: u64 = 600; // The settled tail (kiter at its ring, holding + firing).
+    let (mut w, mut s) = obj2_world();
+    let stats = combat_stats(80.0, 30.0, 0.0); // Fast glass kiter (armed).
+    let range = weapon_range(Some(&stats)).expect("armed");
+    // Hold the kite ring WELL INSIDE the weapon envelope (0.6·range), so the
+    // settled, target-facing kiter is in range and its gun bears → it FIRES.
+    let kite_frac = 0.6;
+    w.insert_resource(AiTuning {
+        aoi_radius_active: 100_000.0,
+        aoi_radius_mid: 200_000.0,
+        kite_range_frac: kite_frac,
+        ..AiTuning::default()
+    });
+    w.spawn((PlayerShip, Position(Vec2::ZERO)));
+    let target_pos = Vec2::ZERO;
+    let target = w
+        .spawn((Position(target_pos), Velocity(Vec2::ZERO), Heading(0.0)))
+        .id();
+    let kite_ring = kite_frac * range;
+    // Start DEEP inside the ring → it must open distance to reach the ring.
+    let start = Vec2::new(kite_ring * 0.25, 0.0);
+    let ship = spawn_stance_combat_ship(
+        &mut w,
+        0,
+        start,
+        0.0, // facing +X — AWAY from the target at the origin (it flees first).
+        Vec2::ZERO,
+        target,
+        stats,
+        CombatStance::Kite,
+    );
+
+    let start_range = (start - target_pos).length();
+    let mut max_range = start_range;
+    let mut tail_fired = 0usize;
+    let mut tail_samples = 0usize;
+    for tick in 0..TICKS {
+        mirror_tick_and_run(&mut w, &mut s, tick);
+        assert_eq!(
+            brain_of(&w, ship).behavior,
+            Behavior::Engage,
+            "the kiter holds the Engage task (tick {tick})"
+        );
+        let r = (pos_of(&w, ship) - target_pos).length();
+        max_range = max_range.max(r);
+        if tick >= TICKS - TAIL {
+            tail_samples += 1;
+            if fires(&w, ship) {
+                tail_fired += 1;
+            }
+        }
+    }
+    let end_range = (pos_of(&w, ship) - target_pos).length();
+
+    // (a) It OPENED the distance (started deep inside the kite ring).
+    assert!(
+        end_range > start_range + 1.0,
+        "the kiter opened distance ({start_range:.1} → {end_range:.1})"
+    );
+    assert!(
+        max_range > start_range,
+        "range grew over the window (start {start_range:.1}, peak {max_range:.1})"
+    );
+    // (b) The settled kiter FIRES on the target it faces (Stage-C weapons-free,
+    // in range since the ring sits inside the weapon envelope).
+    assert!(
+        tail_fired > 0,
+        "the settled kiter fires on the target it holds ({tail_fired}/{tail_samples} fire-ticks)"
+    );
+    // The settled ring is inside weapon range (the precondition for firing).
+    assert!(
+        end_range <= range,
+        "the settled kiter holds inside its weapon envelope ({end_range:.1} ≤ {range:.1})"
+    );
+    eprintln!(
+        "[r97d] kite-fire: range {start_range:.1} → {end_range:.1} (peak {max_range:.1}), \
+         tail-fired {tail_fired}/{tail_samples}, ring {kite_ring:.1}, weapon-range {range:.1}"
+    );
+}
+
+/// R97 Phase 1 Stage D — THE TWO-LAYER SPLIT: an `Engage` ship charging a target
+/// with a large obstacle on a near-term collision course BETWEEN them DEVIATES
+/// (breaks off the straight charge) when the collision is imminent; the SAME
+/// obstacle placed FAR off the charge line (the ship never closes on it →
+/// non-imminent) leaves the charge essentially straight. Proves the higher
+/// collision-preempt layer overrides the attack-run's move direction only when
+/// imminent, while the always-on R96 reactive layer is unperturbed by a distant
+/// body.
+#[test]
+fn collision_preempts_attack_run() {
+    const TICKS: u64 = 600;
+    let start = Vec2::new(0.0, 0.0);
+    let target_pos = Vec2::new(400.0, 0.0);
+    let obstacle_radius = 50.0;
+
+    // One run: the obstacle at `obstacle_pos` (on-line → imminent; far off-axis
+    // → non-imminent). Returns the max lateral deviation off the straight
+    // ship→target (+X) line over the charge, plus the behavior staying Engage.
+    let run = |obstacle_pos: Vec2, query_radius: f32| -> f32 {
+        let (mut w, mut s) = obj2_world();
+        w.insert_resource(ObstacleField::default());
+        w.insert_resource(AiTuning {
+            aoi_radius_active: 10_000.0,
+            aoi_radius_mid: 20_000.0,
+            obstacle_clearance_pad: 40.0,
+            obstacle_query_radius: query_radius,
+            ..AiTuning::default()
+        });
+        w.spawn((PlayerShip, Position(start)));
+        spawn_obstacle(&mut w, obstacle_pos, obstacle_radius);
+        let target = w
+            .spawn((Position(target_pos), Velocity(Vec2::ZERO), Heading(0.0)))
+            .id();
+        // A Brawler (close-ring) so the engage arm CLOSES toward the target —
+        // it must transit the obstacle's line when the obstacle is on it.
+        let stats = combat_stats(80.0, 30.0, 200.0);
+        let ai = *w.resource::<AiTuning>();
+        assert_eq!(
+            sim::ai::classify_archetype(&stats, &ai),
+            FitArchetype::Brawler,
+            "the charging fighter is a close-ring Brawler"
+        );
+        let fighter = spawn_brain_combat_ship(&mut w, 0, start, 0.0, Vec2::ZERO, target, stats);
+        w.entity_mut(fighter).insert(CollisionRadius(4.0));
+
+        let mut max_lateral: f32 = 0.0;
+        for tick in 0..TICKS {
+            mirror_tick_and_run(&mut w, &mut s, tick);
+            // The MOVE channel breaks off, but the TASK stays Engage (the move
+            // channel prioritizes not-crashing; selection is unchanged).
+            assert_eq!(
+                brain_of(&w, fighter).behavior,
+                Behavior::Engage,
+                "stays on the Engage task while the move breaks off (tick {tick})"
+            );
+            let p = pos_of(&w, fighter);
+            max_lateral = max_lateral.max(p.y.abs());
+            // Stop once it has clearly passed the obstacle's x toward the target.
+            if p.x > 300.0 {
+                break;
+            }
+        }
+        max_lateral
+    };
+
+    // (a) IMMINENT: obstacle squarely on the charge line at the midpoint → the
+    // ship is closing straight at it → the move-drive override deflects it well
+    // off the line.
+    let imminent_lateral = run(Vec2::new(200.0, 0.0), 400.0);
+    // (b) FAR / NON-CLOSING: the SAME obstacle far off to the side, beyond the
+    // query radius the whole charge → never in range → `imm == 0` → the empty-
+    // field gate keeps the charge straight (the always-on reactive layer sees
+    // nothing).
+    let distant_lateral = run(Vec2::new(200.0, 5000.0), 200.0);
+
+    assert!(
+        imminent_lateral > 20.0,
+        "an IMMINENT collision breaks off the straight charge \
+         (max lateral {imminent_lateral:.1})"
+    );
+    // The distant / non-closing obstacle is OUT of query range the whole charge
+    // → the empty-field gate keeps the run byte-identical to a no-obstacle
+    // charge, so the only lateral is the Brawler's intrinsic range-band wobble
+    // (small). The PROOF is the dominance: the imminent break-off is many times
+    // larger than this residual.
+    assert!(
+        distant_lateral < 10.0,
+        "a distant / non-closing obstacle leaves the charge ~straight \
+         (only the intrinsic charge wobble — max lateral {distant_lateral:.1})"
+    );
+    assert!(
+        imminent_lateral > distant_lateral * 3.0,
+        "the imminent break-off DOMINATES the non-imminent charge \
+         (imminent {imminent_lateral:.1} ≫ distant {distant_lateral:.1})"
+    );
+    eprintln!(
+        "[r97d] collision-preempt: imminent lateral {imminent_lateral:.1}, \
+         distant lateral {distant_lateral:.1}"
+    );
+}
+
+/// R97 Phase 1 Stage D — channel-fusion DETERMINISM (mirrors
+/// `identical_state_yields_identical_selection_and_intents`): two worlds built
+/// identically — combat (an Engage fighter + a target) PLUS an obstacle in range
+/// (exercising the MOVE collision-imminence override) and the AIM/FIRE channels
+/// — stepped through the FULL fixed schedule, compared per tick at BIT level
+/// (behavior, intent f32 bits + discrete fire/group fields, and the resulting
+/// pos/vel/heading bits). The full MOVE/AIM/FIRE fusion + collision-imminence
+/// path is bit-identical across fresh rebuilds (V-3/V-6, strict-f32).
+#[test]
+fn channel_fusion_is_deterministic() {
+    const TICKS: u64 = 200;
+    let start = Vec2::new(0.0, 0.0);
+    let target_pos = Vec2::new(400.0, 0.0);
+    let obstacle_pos = Vec2::new(180.0, 0.0); // On the charge line → imminent.
+    let obstacle_radius = 50.0;
+
+    let run = || -> Vec<(Behavior, [u32; 3], ShipIntent, [u32; 6])> {
+        let (mut w, mut s) = obj2_world();
+        w.insert_resource(ObstacleField::default());
+        w.insert_resource(AiTuning {
+            aoi_radius_active: 10_000.0,
+            aoi_radius_mid: 20_000.0,
+            obstacle_clearance_pad: 40.0,
+            obstacle_query_radius: 400.0,
+            ..AiTuning::default()
+        });
+        w.spawn((PlayerShip, Position(start)));
+        spawn_obstacle(&mut w, obstacle_pos, obstacle_radius);
+        // A moving target so the AIM lead + FIRE solve are non-trivial.
+        let target = w
+            .spawn((
+                Position(target_pos),
+                Velocity(Vec2::new(0.0, 12.0)),
+                Heading(0.0),
+            ))
+            .id();
+        let stats = combat_stats(80.0, 30.0, 200.0); // armed Brawler (fires).
+        let fighter = spawn_brain_combat_ship(&mut w, 0, start, 0.0, Vec2::ZERO, target, stats);
+        w.entity_mut(fighter).insert(CollisionRadius(4.0));
+
+        let mut trace = Vec::with_capacity(TICKS as usize);
+        for tick in 0..TICKS {
+            mirror_tick_and_run(&mut w, &mut s, tick);
+            let intent = *w.get::<ShipIntent>(fighter).expect("ship has ShipIntent");
+            trace.push((
+                brain_of(&w, fighter).behavior,
+                [
+                    intent.forward.to_bits(),
+                    intent.strafe.to_bits(),
+                    intent.turn.to_bits(),
+                ],
+                intent, // PartialEq covers the discrete fire/group/assist fields.
+                state_bits(&w, fighter),
+            ));
+        }
+        trace
+    };
+
+    let trace_a = run();
+    let trace_b = run();
+    assert_eq!(
+        trace_a, trace_b,
+        "identical combat + threat + obstacle worlds fuse MOVE/AIM/FIRE + \
+         collision-imminence to bit-identical per-tick state (R97 Stage D determinism)"
+    );
+
+    // The fusion is MEANINGFUL: the fighter engaged, broke off around the
+    // obstacle (a lateral excursion off the straight line), and fired.
+    assert!(
+        trace_a.iter().any(|(b, ..)| *b == Behavior::Engage),
+        "the fighter engaged the target"
+    );
+    assert!(
+        trace_a.iter().any(|(.., intent, _)| intent.fire_primary),
+        "the fighter fired during the run (FIRE channel exercised)"
+    );
+    // Lateral = the world Y of the fighter's position (state_bits index 1 is
+    // `pos.y` bits): an excursion off the straight +X charge line proves the
+    // obstacle move-drive deflected it.
+    let max_lateral = trace_a
+        .iter()
+        .map(|(.., kin)| f32::from_bits(kin[1]).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        max_lateral > 5.0,
+        "the obstacle move-drive deflected the charge (max lateral {max_lateral:.1})"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // T031 — OBJ5: perception + faction sensor network through the FULL fixed
 // schedule (TR-013/TR-014, [COMPLETES TR-013]).
@@ -2785,8 +3287,8 @@ fn unseen_enemies_are_never_targeted() {
     let (mut w, mut s) = perception_world();
     w.spawn((PlayerShip, Position(Vec2::ZERO)));
 
-    // Active scanner inside aoi_radius_active (60) of the player; Dormant
-    // scanner far beyond aoi_radius_mid (240). Both ARMED (Engage-eligible).
+    // Active scanner inside aoi_radius_active (120) of the player; Dormant
+    // scanner far beyond aoi_radius_mid (520). Both ARMED (Engage-eligible).
     let near = spawn_perception_scanner(&mut w, 0, Faction::Red, Vec2::new(10.0, 0.0));
     w.entity_mut(near).insert(stats_with_top_speed(80.0));
     let far = spawn_perception_scanner(&mut w, 1, Faction::Red, Vec2::new(10_000.0, 0.0));
@@ -3991,7 +4493,7 @@ fn build_checksum_world() -> World {
     let (mut w, _schedule) = perception_world();
     w.spawn((PlayerShip, Position(Vec2::ZERO)));
 
-    // Red squad: inside aoi_radius_active (60) of the player, station-keeping.
+    // Red squad: inside aoi_radius_active (120) of the player, station-keeping.
     let red: Vec<Entity> = (0..3)
         .map(|i| spawn_squad_member(&mut w, Vec2::new(30.0 + i as f32 * 8.0, 0.0)))
         .collect();
@@ -4004,7 +4506,7 @@ fn build_checksum_world() -> World {
     }
     spawn_squad(&mut w, &red, FormationDef::wedge(3, 8.0), SquadOrder::Hold);
 
-    // Blue squad: far beyond aoi_radius_mid (240) → settles Dormant + glides;
+    // Blue squad: far beyond aoi_radius_mid (520) → settles Dormant + glides;
     // the MoveTo goal sits ON the Red squad, so the glide path closes the gap.
     let blue: Vec<Entity> = (0..3)
         .map(|i| spawn_squad_member(&mut w, Vec2::new(700.0 + i as f32 * 8.0, 0.0)))
@@ -4273,4 +4775,891 @@ fn stance_and_profile_precedence() {
         ),
         "the role override wins over the squad style for a roled member"
     );
+}
+
+// ---------------------------------------------------------------------------
+// R97 Phase 2 Stage E — STRATEGIC objective/planner tier (HTN) through the
+// FULL fixed schedule. The planner sets `squad.order` from the squad faction's
+// fused contact picture; `squad_think_system` (next in the set) translates it
+// to member brains. These tests drive the picture through REAL perception +
+// fusion (members carry a `Faction` + `ContactList`, hostiles are real bodies
+// in the coarse index), so the whole strategic→squad→member chain is exercised.
+// ---------------------------------------------------------------------------
+
+use sim::ai::{strategic_plan_system, wing_plan_system, Objective, SquadObjective, WingObjective};
+
+/// A wide-AOI full-schedule world with `SensorNetworks` (the
+/// `network_integration_world` pattern): a player at the origin and 10k/20k
+/// AOI radii keep every squad/member Active-tier, so scans + the network
+/// rebuild both run at the 15-tick mid cadence. `SquadObjective`-carrying
+/// squads in this world drive `strategic_plan_system`.
+fn strategy_world() -> (World, Schedule) {
+    let (mut w, s) = perception_world();
+    w.insert_resource(AiTuning {
+        aoi_radius_active: 10_000.0,
+        aoi_radius_mid: 20_000.0,
+        ..AiTuning::default()
+    });
+    w.spawn((PlayerShip, Position(Vec2::ZERO)));
+    (w, s)
+}
+
+/// A squad member that PERCEIVES: the standard squad-member stack plus a
+/// `Faction` (so the squad has a faction + the member feeds fusion) and a
+/// `ContactList` (so `perception_scan_system` scans real hostile bodies into
+/// it and `sensor_network_system` fuses them into the faction picture the
+/// planner reads). Active `AoiTier` so it scans every 15 ticks.
+fn spawn_perceiving_member(w: &mut World, faction: Faction, pos: Vec2) -> Entity {
+    w.init_resource::<AiIdAllocator>();
+    let id = w.resource_mut::<AiIdAllocator>().allocate();
+    let buckets = w.resource::<AiTuning>().fallback_bucket_count;
+    w.spawn((
+        Ship,
+        ShipIntent::default(),
+        Position(pos),
+        Velocity(Vec2::ZERO),
+        Heading(0.0),
+        AngularVelocity(0.0),
+        FlightAssist::On,
+        id,
+        AiBrain::new(id, buckets),
+        ContactList::default(),
+        faction,
+        AoiTier {
+            tier: Tier::Active,
+            since_tick: 0,
+        },
+    ))
+    .id()
+}
+
+/// Attach a `SquadObjective` to a squad entity (the planner's input).
+fn set_objective(w: &mut World, se: Entity, goal: Objective) {
+    w.entity_mut(se).insert(SquadObjective::new(goal));
+}
+
+fn objective_of(w: &World, se: Entity) -> SquadObjective {
+    w.get::<SquadObjective>(se)
+        .expect("squad carries a SquadObjective")
+        .clone()
+}
+
+/// OBJ (Stage E): a `DestroyTarget` squad clears a perceived ESCORT first, then
+/// switches to the target itself once the escort is gone. Real perception:
+/// the squad members scan the target + its escort (both real Blue bodies near
+/// the squad), fusion builds the Red picture, and the planner — seeing an
+/// escort within the screening ring of the target — engages the escort; once
+/// the escort despawns, the picture holds only the target, so the planner
+/// engages the target.
+#[test]
+fn destroy_target_plans_escorts_then_target() {
+    let (mut w, mut s) = strategy_world();
+
+    // A small Red squad — strong enough NOT to be outnumbered by two bodies.
+    let m0 = spawn_perceiving_member(&mut w, Faction::Red, Vec2::new(0.0, 0.0));
+    let m1 = spawn_perceiving_member(&mut w, Faction::Red, Vec2::new(12.0, 0.0));
+    let m2 = spawn_perceiving_member(&mut w, Faction::Red, Vec2::new(24.0, 0.0));
+    // Give each member a healthy hull so own_strength is solidly above the
+    // perceived two-body enemy strength (no outnumbered flip here).
+    for m in [m0, m1, m2] {
+        w.entity_mut(m).insert(Health(100.0));
+    }
+    let se = spawn_squad(
+        &mut w,
+        &[m0, m1, m2],
+        FormationDef::wedge(3, 12.0),
+        SquadOrder::Hold,
+    );
+
+    // The target + a screening escort within sensor range of the squad, close
+    // together (the escort sits inside the target's escort-screening ring,
+    // default defend_arrive_radius 50). Both signature 3 (CollisionRadius).
+    let target = spawn_hostile_body(&mut w, Faction::Blue, Vec2::new(150.0, 0.0), 3.0);
+    let escort = spawn_hostile_body(&mut w, Faction::Blue, Vec2::new(140.0, 20.0), 3.0);
+    set_objective(&mut w, se, Objective::DestroyTarget(target));
+
+    // Step past the first plan tick (tick 0: scan + fuse + plan all align on
+    // the %90/%15 multiple at phase-bucket 0; other buckets re-plan by tick 90).
+    for t in 0..=90 {
+        mirror_tick_and_run(&mut w, &mut s, t);
+    }
+
+    // The escort is perceived screening the target → engage the ESCORT first.
+    assert_eq!(
+        squad_of(&w, se).order,
+        SquadOrder::Engage(escort),
+        "a perceived escort near the target is cleared first"
+    );
+
+    // Remove the escort: the picture now holds only the target → engage it.
+    w.despawn(escort);
+    for t in 91..=181 {
+        mirror_tick_and_run(&mut w, &mut s, t);
+    }
+    assert_eq!(
+        squad_of(&w, se).order,
+        SquadOrder::Engage(target),
+        "escort gone → engage the target itself"
+    );
+}
+
+/// OBJ (Stage E): a SMALL `DestroyTarget` squad facing a much LARGER perceived
+/// enemy force flips its objective to `Withdraw` (order = `Withdraw`), and on
+/// arrival at the withdraw point regroups (`FormUp`, objective `Regroup`).
+#[test]
+fn outnumbered_squad_withdraws_then_regroups() {
+    let (mut w, mut s) = strategy_world();
+
+    // A lone weak member (own strength ~ 0.5 from a half-health hull).
+    let m0 = spawn_perceiving_member(&mut w, Faction::Red, Vec2::new(0.0, 0.0));
+    w.entity_mut(m0).insert(Health(50.0));
+    let se = spawn_squad(
+        &mut w,
+        &[m0],
+        FormationDef::wedge(1, 12.0),
+        SquadOrder::Hold,
+    );
+
+    // The target PLUS a wall of escorts — a big perceived force (≥ 1.5× the
+    // squad's ~0.5 own strength is trivially met by several signature-3 bodies).
+    let target = spawn_hostile_body(&mut w, Faction::Blue, Vec2::new(160.0, 0.0), 3.0);
+    for i in 0..6 {
+        spawn_hostile_body(
+            &mut w,
+            Faction::Blue,
+            Vec2::new(150.0 + i as f32 * 5.0, 15.0),
+            3.0,
+        );
+    }
+    set_objective(&mut w, se, Objective::DestroyTarget(target));
+
+    for t in 0..=90 {
+        mirror_tick_and_run(&mut w, &mut s, t);
+    }
+
+    // Outnumbered → the objective flipped to Withdraw and the order is Withdraw.
+    assert!(
+        matches!(objective_of(&w, se).goal, Objective::Withdraw(_)),
+        "an outnumbered DestroyTarget squad flips to Withdraw"
+    );
+    assert!(
+        matches!(squad_of(&w, se).order, SquadOrder::Withdraw(_)),
+        "the squad order is Withdraw"
+    );
+
+    // The squad-of-1 degrade flies the member to the withdraw point (a
+    // Waypoint, since Withdraw degrades to a solo waypoint). Drive it home by
+    // teleporting the member onto the rally so the arrival test trips, then let
+    // the next plan tick regroup. Capture the withdraw point first.
+    let rally = match objective_of(&w, se).goal {
+        Objective::Withdraw(p) => p,
+        _ => unreachable!("just asserted Withdraw"),
+    };
+    w.get_mut::<Position>(m0).unwrap().0 = rally;
+    // Also clear the perceived threat so Regroup can later complete; despawn the
+    // hostiles (the picture ages out / prunes via the V-1 sweep + staleness).
+    let blues: Vec<Entity> = {
+        let mut q = w.query::<(Entity, &Faction)>();
+        q.iter(&w)
+            .filter(|(_, f)| **f == Faction::Blue)
+            .map(|(e, _)| e)
+            .collect()
+    };
+    for b in blues {
+        w.despawn(b);
+    }
+    // Step until the objective first becomes Regroup — the arrival flip. The
+    // squad re-plans on its slow cadence (~every 90 ticks), so we look for the
+    // Regroup state in a bounded window AFTER the withdraw flip and BEFORE the
+    // subsequent Regroup-complete plan tick collapses it to Hold (a squad-of-1
+    // is trivially cohered, so Regroup auto-completes one cadence later).
+    let mut saw_regroup_formup = false;
+    for t in 91..=200 {
+        mirror_tick_and_run(&mut w, &mut s, t);
+        if matches!(objective_of(&w, se).goal, Objective::Regroup { .. }) {
+            // On the arrival flip the order is FormUp (re-form at the rally).
+            assert_eq!(
+                squad_of(&w, se).order,
+                SquadOrder::FormUp,
+                "the squad re-forms (FormUp) at the rally on the Withdraw→Regroup flip"
+            );
+            saw_regroup_formup = true;
+            break;
+        }
+    }
+    assert!(
+        saw_regroup_formup,
+        "arriving at the withdraw point flips the objective to Regroup (FormUp order)"
+    );
+}
+
+/// OBJ (Stage E): a `DefendZone` squad engages an intruder that enters the
+/// defended ring, then returns to holding station at the anchor once the
+/// intruder leaves (despawns).
+///
+/// R98 HOTFIX D: an intruder that withdraws to HOVER between the acquisition
+/// ring (`radius`) and the release ring (`radius × defend_release_factor`)
+/// does NOT flap the order — the engaged squad KEEPS engaging it across
+/// several plan cadences (the engage-release hysteresis); the return to
+/// station requires leaving the RELEASE ring or despawning (the despawn path
+/// kept below).
+#[test]
+fn defend_zone_engages_intruder_then_returns() {
+    let (mut w, mut s) = strategy_world();
+
+    let anchor = Vec2::new(0.0, 0.0);
+    let m0 = spawn_perceiving_member(&mut w, Faction::Red, Vec2::new(0.0, 0.0));
+    let m1 = spawn_perceiving_member(&mut w, Faction::Red, Vec2::new(12.0, 0.0));
+    for m in [m0, m1] {
+        w.entity_mut(m).insert(Health(100.0));
+    }
+    let se = spawn_squad(
+        &mut w,
+        &[m0, m1],
+        FormationDef::line_abreast(2, 12.0),
+        SquadOrder::Hold,
+    );
+    set_objective(
+        &mut w,
+        se,
+        Objective::DefendZone {
+            anchor,
+            radius: 120.0,
+        },
+    );
+
+    // No intruder yet → the planner holds station at the anchor (MoveTo).
+    for t in 0..=90 {
+        mirror_tick_and_run(&mut w, &mut s, t);
+    }
+    assert_eq!(
+        squad_of(&w, se).order,
+        SquadOrder::MoveTo(anchor),
+        "no intruder → hold station at the anchor"
+    );
+
+    // An intruder enters the ring (80 < 120 radius) within sensor range.
+    let intruder = spawn_hostile_body(&mut w, Faction::Blue, Vec2::new(80.0, 0.0), 3.0);
+    for t in 91..=181 {
+        mirror_tick_and_run(&mut w, &mut s, t);
+    }
+    assert_eq!(
+        squad_of(&w, se).order,
+        SquadOrder::Engage(intruder),
+        "an intruder inside the ring is engaged"
+    );
+
+    // R98 HOTFIX D — the HOVER case: the intruder withdraws to 140 u — OUTSIDE
+    // the 120 acquisition ring but INSIDE the 150 release ring (120 × 1.25).
+    // Pre-fix this exact geometry flapped Engage↔MoveTo every plan tick; the
+    // hysteresis must keep the order PINNED on Engage at every tick across
+    // several plan cadences (90 ticks each).
+    w.get_mut::<Position>(intruder).unwrap().0 = Vec2::new(140.0, 0.0);
+    for t in 182..=455 {
+        mirror_tick_and_run(&mut w, &mut s, t);
+        assert_eq!(
+            squad_of(&w, se).order,
+            SquadOrder::Engage(intruder),
+            "an engaged intruder hovering between the acquisition and release \
+             rings never flaps the order (tick {t})"
+        );
+    }
+
+    // The intruder leaves (despawns): the picture clears, the squad returns to
+    // holding station at the anchor (the release path the hysteresis allows).
+    w.despawn(intruder);
+    for t in 456..=636 {
+        mirror_tick_and_run(&mut w, &mut s, t);
+    }
+    assert_eq!(
+        squad_of(&w, se).order,
+        SquadOrder::MoveTo(anchor),
+        "intruder gone → return to holding station at the anchor"
+    );
+}
+
+/// OBJ (Stage E): the planner re-plans only at the SLOW `strategic_plan_ticks`
+/// cadence (not every tick), and two identical worlds produce identical
+/// `squad.order` sequences (determinism).
+#[test]
+fn strategic_planner_runs_at_slow_cadence_and_is_deterministic() {
+    let build = || {
+        let (mut w, s) = strategy_world();
+        let m0 = spawn_perceiving_member(&mut w, Faction::Red, Vec2::new(0.0, 0.0));
+        let m1 = spawn_perceiving_member(&mut w, Faction::Red, Vec2::new(12.0, 0.0));
+        for m in [m0, m1] {
+            w.entity_mut(m).insert(Health(100.0));
+        }
+        let route = vec![Vec2::new(300.0, 0.0), Vec2::new(300.0, 300.0)];
+        let se = spawn_squad(
+            &mut w,
+            &[m0, m1],
+            FormationDef::wedge(2, 12.0),
+            SquadOrder::Hold,
+        );
+        set_objective(&mut w, se, Objective::PatrolRoute(route));
+        (w, s, se)
+    };
+
+    // Run A: record the order + last_plan_tick each tick over a window that
+    // spans several plan cadences (90 ticks each).
+    let run = || {
+        let (mut w, mut s, se) = build();
+        let mut orders = Vec::new();
+        let mut plan_ticks = Vec::new();
+        for t in 0..=200 {
+            mirror_tick_and_run(&mut w, &mut s, t);
+            orders.push(squad_of(&w, se).order);
+            plan_ticks.push(objective_of(&w, se).last_plan_tick);
+        }
+        (orders, plan_ticks)
+    };
+
+    let (orders_a, plan_ticks_a) = run();
+    let (orders_b, plan_ticks_b) = run();
+
+    // Determinism: identical order + plan-tick sequences across two runs.
+    assert_eq!(
+        orders_a, orders_b,
+        "two identical worlds yield identical squad.order sequences"
+    );
+    assert_eq!(plan_ticks_a, plan_ticks_b, "identical plan-tick sequences");
+
+    // Slow cadence: `last_plan_tick` advances only when the planner actually
+    // re-plans — NOT every tick. Detect the real re-plan EVENTS as the ticks
+    // where the recorded value CHANGES from the previous tick's value (the
+    // `SquadObjective::new` default seeds it to 0 before the first real plan,
+    // so we track changes rather than raw distinct values). Each such event is
+    // a genuine slow-cadence re-plan.
+    let plan_cadence = u64::from(AiTuning::default().strategic_plan_ticks);
+    let mut replans: Vec<u64> = Vec::new();
+    let mut prev = 0u64;
+    for &pt in &plan_ticks_a {
+        // A change in the recorded `last_plan_tick` is a real re-plan event (the
+        // `SquadObjective::new` default seeds it to 0 before the first plan).
+        if pt != prev {
+            replans.push(pt);
+            prev = pt;
+        }
+    }
+    // The planner re-planned at least twice across the 200-tick window (the
+    // cadence really fired) but FAR fewer than 200 times (it is slow).
+    assert!(
+        replans.len() >= 2,
+        "the planner re-planned across the window on the slow cadence (got {replans:?})"
+    );
+    assert!(
+        replans.len() <= 4,
+        "the planner re-plans only on the slow cadence, not every tick (got {replans:?})"
+    );
+    // Consecutive real re-plans are exactly one plan cadence apart.
+    for w2 in replans.windows(2) {
+        assert_eq!(
+            w2[1] - w2[0],
+            plan_cadence,
+            "consecutive re-plans are exactly one plan cadence apart (events: {replans:?})"
+        );
+    }
+}
+
+/// A squad WITHOUT a `SquadObjective` is unaffected by the planner: its order
+/// stays whatever was authored (the Phase-1 behavior), proving the strategic
+/// tier is strictly additive and gated on the component.
+#[test]
+fn squad_without_objective_is_unaffected_by_planner() {
+    let (mut w, mut s) = strategy_world();
+    let m0 = spawn_perceiving_member(&mut w, Faction::Red, Vec2::new(0.0, 0.0));
+    let m1 = spawn_perceiving_member(&mut w, Faction::Red, Vec2::new(12.0, 0.0));
+    let goal = Vec2::new(400.0, 0.0);
+    let se = spawn_squad(
+        &mut w,
+        &[m0, m1],
+        FormationDef::wedge(2, 12.0),
+        SquadOrder::MoveTo(goal),
+    );
+    // A hostile is present and would trip a DefendZone/DestroyTarget planner —
+    // but with NO objective the planner skips this squad entirely.
+    spawn_hostile_body(&mut w, Faction::Blue, Vec2::new(60.0, 0.0), 3.0);
+
+    for t in 0..=180 {
+        mirror_tick_and_run(&mut w, &mut s, t);
+    }
+    assert_eq!(
+        squad_of(&w, se).order,
+        SquadOrder::MoveTo(goal),
+        "an objective-less squad keeps its authored order — the planner ignores it"
+    );
+    assert!(
+        w.get::<SquadObjective>(se).is_none(),
+        "no SquadObjective was ever attached"
+    );
+    // The planner system is genuinely registered (it ran on the schedule), but
+    // touched nothing — confirm via a quick direct-system smoke too.
+    let _ = strategic_plan_system; // referenced so the import is load-bearing.
+}
+
+/// R98 HOTFIX B1: the strategic planner SKIPS a squad whose ALIVE members ALL
+/// carry a `ScenarioRole`. Roled members are squad-order-exempt at the brain
+/// level (script > squad), so an order planned here could reach nothing but
+/// the dormant cheap-glide — which is exactly the playtest oscillation bug.
+/// The squad's authored order must never change and zero planning work must
+/// be done (`last_plan_tick` never stamped), even with an objective attached
+/// that would otherwise rewrite the order every plan tick.
+#[test]
+fn planner_skips_squad_of_all_roled_members() {
+    let (mut w, mut s) = strategy_world();
+    let anchor = Vec2::new(300.0, 0.0);
+
+    let m0 = spawn_perceiving_member(&mut w, Faction::Red, Vec2::new(0.0, 0.0));
+    let m1 = spawn_perceiving_member(&mut w, Faction::Red, Vec2::new(12.0, 0.0));
+    for m in [m0, m1] {
+        w.entity_mut(m).insert((
+            Health(100.0),
+            // EVERY member carries a role → the squad is uncommandable.
+            ScenarioRole::new(
+                RoleGoal::PatrolRoute(vec![Vec2::new(0.0, 200.0)]),
+                Posture::FreeEngage,
+            ),
+        ));
+    }
+    let se = spawn_squad(
+        &mut w,
+        &[m0, m1],
+        FormationDef::wedge(2, 12.0),
+        SquadOrder::Hold,
+    );
+    // A DefendZone objective that — on a COMMANDABLE squad — rewrites the order
+    // to MoveTo(anchor) on the very first plan tick (proven by
+    // `defend_zone_engages_intruder_then_returns`).
+    set_objective(
+        &mut w,
+        se,
+        Objective::DefendZone {
+            anchor,
+            radius: 120.0,
+        },
+    );
+
+    for t in 0..=180 {
+        mirror_tick_and_run(&mut w, &mut s, t);
+    }
+
+    assert_eq!(
+        squad_of(&w, se).order,
+        SquadOrder::Hold,
+        "an all-roled squad is invisible to the planner — the authored order \
+         never changes (no order can reach its role-exempt members)"
+    );
+    assert_eq!(
+        objective_of(&w, se).last_plan_tick,
+        0,
+        "zero planning work: last_plan_tick is never stamped for a skipped squad"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R97 Phase 2 Stage F — the THIN WING tier (wing_plan_system)
+// A wing groups role-coherent squads (Squad.wing == Some(wing)) under one brain;
+// wing_plan_system decomposes a WingObjective into each member squad's
+// SquadObjective at the slow strategic cadence. These tests step the FULL fixed
+// schedule (wing_plan runs BEFORE strategic_plan, which runs before squad_think).
+// ---------------------------------------------------------------------------
+
+/// Spawn a bare WING entity carrying a stable id + a `WingObjective` — the
+/// authoring shape the scenario uses (a wing has no body of its own).
+fn spawn_wing(w: &mut World, goal: Objective) -> Entity {
+    w.init_resource::<AiIdAllocator>();
+    let id = w.resource_mut::<AiIdAllocator>().allocate();
+    w.spawn((id, WingObjective::new(goal))).id()
+}
+
+/// Link an existing squad under `wing` (the `Squad.wing` hierarchy seam).
+fn set_wing(w: &mut World, squad: Entity, wing: Entity) {
+    w.get_mut::<Squad>(squad).expect("squad entity").wing = Some(wing);
+}
+
+/// OBJ (Stage F): a wing with TWO member squads + a `WingObjective::DefendZone`
+/// decomposes — after a wing-plan tick — into each member squad's
+/// `SquadObjective`: the LEAD squad (lowest stable id) defends the zone
+/// directly, the OTHER screens the perimeter (a `PatrolRoute` ring). A squad
+/// NOT in the wing keeps its own authored objective, untouched.
+#[test]
+fn wing_objective_assigns_squad_objectives() {
+    let (mut w, mut s) = strategy_world();
+    let anchor = Vec2::new(500.0, 0.0);
+    let radius = 400.0;
+
+    // Two RED member squads (each one perceiving member with a healthy hull),
+    // spawned lead-first so the lead squad has the lowest stable id.
+    let lead_m = spawn_perceiving_member(&mut w, Faction::Red, Vec2::new(0.0, 0.0));
+    w.entity_mut(lead_m).insert(Health(100.0));
+    let lead_sq = spawn_squad(
+        &mut w,
+        &[lead_m],
+        FormationDef::wedge(1, 12.0),
+        SquadOrder::Hold,
+    );
+    let scr_m = spawn_perceiving_member(&mut w, Faction::Red, Vec2::new(40.0, 0.0));
+    w.entity_mut(scr_m).insert(Health(100.0));
+    let screen_sq = spawn_squad(
+        &mut w,
+        &[scr_m],
+        FormationDef::wedge(1, 12.0),
+        SquadOrder::Hold,
+    );
+
+    // Both member squads enroll in the strategic tier with a placeholder
+    // objective (Hold) — the wing RE-TARGETS them. They join the wing.
+    set_objective(&mut w, lead_sq, Objective::Hold);
+    set_objective(&mut w, screen_sq, Objective::Hold);
+    let wing = spawn_wing(&mut w, Objective::DefendZone { anchor, radius });
+    set_wing(&mut w, lead_sq, wing);
+    set_wing(&mut w, screen_sq, wing);
+
+    // An INDEPENDENT squad (no wing) with its own DefendZone elsewhere — the
+    // wing must never touch it.
+    let free_m = spawn_perceiving_member(&mut w, Faction::Red, Vec2::new(0.0, 600.0));
+    w.entity_mut(free_m).insert(Health(100.0));
+    let free_sq = spawn_squad(
+        &mut w,
+        &[free_m],
+        FormationDef::wedge(1, 12.0),
+        SquadOrder::Hold,
+    );
+    let free_goal = Objective::DefendZone {
+        anchor: Vec2::new(0.0, 600.0),
+        radius: 50.0,
+    };
+    set_objective(&mut w, free_sq, free_goal.clone());
+
+    // Step past the first slow plan tick (wing re-plans on the bare
+    // strategic-cadence multiple; tick 0 is one such multiple).
+    for t in 0..=90 {
+        mirror_tick_and_run(&mut w, &mut s, t);
+    }
+
+    // The wing decomposed onto its members: lead anchors the zone, the screen
+    // squad patrols the perimeter ring.
+    assert_eq!(
+        objective_of(&w, lead_sq).goal,
+        Objective::DefendZone { anchor, radius },
+        "the LEAD squad (lowest stable id) defends the zone directly"
+    );
+    assert!(
+        matches!(
+            objective_of(&w, screen_sq).goal,
+            Objective::PatrolRoute(ref route) if route.len() == 4
+                && route.iter().all(|p| ((*p - anchor).length() - radius).abs() < 1e-3)
+        ),
+        "the non-lead member squad screens the perimeter (a ring patrol at `radius`): got {:?}",
+        objective_of(&w, screen_sq).goal
+    );
+
+    // The independent squad's objective is untouched by the wing.
+    assert_eq!(
+        objective_of(&w, free_sq).goal,
+        free_goal,
+        "a squad NOT in the wing keeps its own authored objective"
+    );
+
+    // The wing stamped its last_plan_tick on the slow cadence — by tick 90
+    // (one strategic cadence past the tick-0 plan) it re-planned at tick 90.
+    assert_eq!(
+        w.get::<WingObjective>(wing)
+            .expect("wing carries a WingObjective")
+            .last_plan_tick,
+        90,
+        "the wing re-planned on the slow cadence (last at tick 90)"
+    );
+}
+
+/// OBJ (Stage F): the wing planner is deterministic — two identical worlds yield
+/// identical member-squad objective sequences across the full schedule.
+#[test]
+fn wing_plan_is_deterministic() {
+    let build = || {
+        let (mut w, s) = strategy_world();
+        let m0 = spawn_perceiving_member(&mut w, Faction::Red, Vec2::new(0.0, 0.0));
+        w.entity_mut(m0).insert(Health(100.0));
+        let sq0 = spawn_squad(
+            &mut w,
+            &[m0],
+            FormationDef::wedge(1, 12.0),
+            SquadOrder::Hold,
+        );
+        let m1 = spawn_perceiving_member(&mut w, Faction::Red, Vec2::new(40.0, 0.0));
+        w.entity_mut(m1).insert(Health(100.0));
+        let sq1 = spawn_squad(
+            &mut w,
+            &[m1],
+            FormationDef::wedge(1, 12.0),
+            SquadOrder::Hold,
+        );
+        set_objective(&mut w, sq0, Objective::Hold);
+        set_objective(&mut w, sq1, Objective::Hold);
+        let wing = spawn_wing(
+            &mut w,
+            Objective::DefendZone {
+                anchor: Vec2::new(500.0, 0.0),
+                radius: 400.0,
+            },
+        );
+        set_wing(&mut w, sq0, wing);
+        set_wing(&mut w, sq1, wing);
+        (w, s, sq0, sq1)
+    };
+    let run = || {
+        let (mut w, mut s, sq0, sq1) = build();
+        let mut trace = Vec::new();
+        for t in 0..=200 {
+            mirror_tick_and_run(&mut w, &mut s, t);
+            trace.push((objective_of(&w, sq0).goal, objective_of(&w, sq1).goal));
+        }
+        trace
+    };
+    assert_eq!(
+        run(),
+        run(),
+        "the wing planner is deterministic across identical worlds"
+    );
+    // The import is load-bearing (the system is registered in the schedule).
+    let _ = wing_plan_system;
+}
+
+// ---------------------------------------------------------------------------
+// R99 Phase A — PlayerOrder: a USER command override at HIGHEST precedence
+// (player > squad > role > archetype), sticking through the think loop. These
+// run the FULL fixed schedule so the precedence integration in `ai_think_system`
+// + the squad-exempt / planner-skip / V-1 prune wiring are all exercised live.
+// ---------------------------------------------------------------------------
+
+use sim::ai::{OrderKind, PlayerOrder};
+
+/// R99 Phase A: a `PlayerOrder::move_to(P)` sticks ABOVE both a conflicting
+/// `ScenarioRole` (a PatrolRoute pointing one way) AND a squad `MoveTo` order
+/// pointing another way — every think the brain's waypoint is P, the ship flies
+/// to P, and neither the role nor the squad ever diverts it.
+#[test]
+fn player_order_moveto_sticks_over_role_and_squad() {
+    let (mut w, mut s) = roles_world();
+    let player_goal = Vec2::new(300.0, 0.0);
+    let route_decoy = Vec2::new(-400.0, 0.0); // The role would patrol the OTHER way.
+    let squad_decoy = Vec2::new(0.0, -500.0); // The squad order points elsewhere.
+
+    // A ship with a conflicting PatrolRoute role AND a PlayerOrder::move_to(P).
+    let ship = spawn_roled_ship(
+        &mut w,
+        0,
+        Faction::Red,
+        Vec2::ZERO,
+        ScenarioRole::new(
+            RoleGoal::PatrolRoute(vec![route_decoy, Vec2::new(-200.0, 0.0)]),
+            Posture::FreeEngage,
+        ),
+        true,
+    );
+    w.entity_mut(ship).insert(PlayerOrder::move_to(player_goal));
+
+    // Put it in a squad whose order points yet another way (the squad must NOT
+    // command a player-ordered member — it is squad-exempt).
+    let squad = spawn_squad(
+        &mut w,
+        &[ship],
+        FormationDef::wedge(1, 12.0),
+        SquadOrder::MoveTo(squad_decoy),
+    );
+    let _ = squad;
+
+    // Every think: the player's waypoint wins (not the role leg, not the squad).
+    let mut reached = false;
+    for t in 0..=2000 {
+        mirror_tick_and_run(&mut w, &mut s, t);
+        let b = brain_of(&w, ship);
+        assert_eq!(
+            b.waypoint,
+            Some(player_goal),
+            "the player MoveTo waypoint wins every think (tick {t})"
+        );
+        assert_ne!(b.waypoint, Some(route_decoy), "the role never diverts it");
+        assert_ne!(b.waypoint, Some(squad_decoy), "the squad never diverts it");
+        if (pos_of(&w, ship) - player_goal).length() <= 12.0 {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "the commanded ship flies to the player's point P");
+
+    // The squad never wrote a goal onto the exempt member (its brain leader/slot
+    // stay clear — the squad assignment was skipped).
+    let b = brain_of(&w, ship);
+    assert_eq!(b.leader, None, "no squad leader assigned (squad-exempt)");
+    assert_eq!(
+        b.formation_slot, None,
+        "no squad slot assigned (squad-exempt)"
+    );
+}
+
+/// R99 Phase A: `PlayerOrder::attack(t)` makes the ship select `Engage` with
+/// `target == t` and close on it; despawning `t` makes the V-1 sweep CLEAR the
+/// Attack command (kind → None, settings-only) so the ship stops engaging the
+/// ghost (degrades out of Engage at its next think).
+#[test]
+fn player_order_attack_engages_and_autoclears() {
+    let (mut w, mut s) = combat_world();
+    w.spawn((PlayerShip, Position(Vec2::ZERO))); // Keeps the bubble Active.
+
+    let target = spawn_weak_fitted_target(&mut w, Vec2::new(150.0, 0.0));
+    let stats = brawler_shooter_stats();
+    // An armed fighter with a DEFAULT brain (no target set) — the PlayerOrder is
+    // the ONLY thing that makes it engage.
+    let fighter = spawn_armed_ai_fighter(&mut w, 0, Vec2::ZERO, target, stats);
+    // Reset the brain target the helper pre-set, so only the PlayerOrder drives.
+    w.get_mut::<AiBrain>(fighter).unwrap().target = None;
+    w.entity_mut(fighter).insert(PlayerOrder::attack(target));
+
+    let start_dist = (pos_of(&w, fighter) - pos_of(&w, target)).length();
+
+    // Phase A — the command makes it Engage the target and close.
+    let mut engaged = false;
+    for t in 0..600 {
+        mirror_tick_and_run(&mut w, &mut s, t);
+        let b = brain_of(&w, fighter);
+        if b.behavior == Behavior::Engage {
+            assert_eq!(b.target, Some(target), "engages the COMMANDED target");
+            engaged = true;
+        }
+        if engaged && t > 30 {
+            break;
+        }
+    }
+    assert!(engaged, "PlayerOrder::attack(t) selects Engage on t");
+    let closed_dist = (pos_of(&w, fighter) - pos_of(&w, target)).length();
+    assert!(
+        closed_dist < start_dist,
+        "the commanded ship CLOSED on the target ({closed_dist} < {start_dist})"
+    );
+
+    // Phase B — despawn the target: the sweep clears the dangling Attack to
+    // settings-only (kind None), and the ship stops engaging the ghost.
+    w.despawn(target);
+    let mut stopped = false;
+    for t in 600..900 {
+        mirror_tick_and_run(&mut w, &mut s, t);
+        // The sweep cleared the dangling Attack command to settings-only.
+        let order = w
+            .get::<PlayerOrder>(fighter)
+            .expect("order kept (style survives)");
+        assert_eq!(
+            order.kind, None,
+            "the dangling Attack(t) cleared to settings-only (tick {t})"
+        );
+        let b = brain_of(&w, fighter);
+        if b.behavior != Behavior::Engage {
+            assert_eq!(b.target, None, "no ghost target");
+            stopped = true;
+            break;
+        }
+    }
+    assert!(stopped, "the ship stops engaging once the target despawns");
+}
+
+/// R99 Phase A: a roled ship whose role sets stance X is overridden by a
+/// `PlayerOrder` carrying stance Y — the resolved `combat_stance` is Y (the
+/// player wins the style chain over the role, which already wins over the
+/// archetype default).
+#[test]
+fn player_order_style_overrides_role_and_archetype() {
+    let (mut w, mut s) = roles_world();
+
+    // The role pins stance X = Charge (over the armed-fighter archetype default).
+    let role = ScenarioRole::new(
+        RoleGoal::PatrolRoute(vec![Vec2::new(200.0, 0.0)]),
+        Posture::FreeEngage,
+    )
+    .with_style(None, Some(CombatStance::Charge));
+    let ship = spawn_roled_ship(&mut w, 0, Faction::Red, Vec2::ZERO, role, true);
+
+    // The player overrides the STANCE to Y = Kite (and the profile to Rush, to
+    // show the profile channel wins too).
+    w.entity_mut(ship).insert(
+        PlayerOrder::settings_only()
+            .with_stance(CombatStance::Kite)
+            .with_profile(MovementProfile::Rush),
+    );
+
+    for t in 0..=2 {
+        mirror_tick_and_run(&mut w, &mut s, t);
+    }
+    let b = brain_of(&w, ship);
+    assert_eq!(
+        b.combat_stance,
+        CombatStance::Kite,
+        "the player stance Y wins over the role stance X and the archetype default"
+    );
+    assert_eq!(
+        b.movement_profile,
+        MovementProfile::Rush,
+        "the player profile wins the chain too"
+    );
+}
+
+/// R99 Phase A: a squad member under a `PlayerOrder` is squad-exempt — the squad
+/// order never moves it (its waypoint is the player's, not the squad's) — and
+/// the strategic planner SKIPS a squad whose members are all commanded/roled.
+#[test]
+fn player_order_ship_is_squad_exempt() {
+    let (mut w, mut s) = strategy_world();
+
+    let squad_goal = Vec2::new(0.0, 600.0); // Where the squad order would send it.
+    let player_goal = Vec2::new(400.0, 0.0); // Where the player commands it.
+
+    // A commandable squad member, commanded by the player to a DIFFERENT point.
+    let commanded = spawn_perceiving_member(&mut w, Faction::Red, Vec2::ZERO);
+    w.entity_mut(commanded).insert(Health(100.0));
+    w.entity_mut(commanded)
+        .insert(PlayerOrder::move_to(player_goal));
+    let squad = spawn_squad(
+        &mut w,
+        &[commanded],
+        FormationDef::wedge(1, 12.0),
+        SquadOrder::MoveTo(squad_goal),
+    );
+
+    // The planner objective would re-target this squad each plan tick — but the
+    // squad is all-commanded, so the planner must SKIP it (no last_plan_tick
+    // stamp), and the squad order never reaches the exempt member.
+    set_objective(&mut w, squad, Objective::PatrolRoute(vec![squad_goal]));
+
+    let mut saw_player_goal = false;
+    for t in 0..=200 {
+        mirror_tick_and_run(&mut w, &mut s, t);
+        let b = brain_of(&w, commanded);
+        // Before the first cadence-due think the waypoint is still unset; once
+        // set it is ALWAYS the player goal and NEVER the squad's.
+        assert_ne!(
+            b.waypoint,
+            Some(squad_goal),
+            "the squad order never reaches the commanded member (tick {t})"
+        );
+        if b.waypoint == Some(player_goal) {
+            saw_player_goal = true;
+        }
+    }
+    assert!(
+        saw_player_goal,
+        "the commanded member flies the PLAYER goal (squad-exempt)"
+    );
+
+    // The planner skipped the all-commanded squad: its objective was never
+    // planned (last_plan_tick stays at the never-planned 0 sentinel).
+    assert_eq!(
+        objective_of(&w, squad).last_plan_tick,
+        0,
+        "the planner skips an all-commanded squad (no plan stamp)"
+    );
+
+    // And the exempt member carries no squad leader/slot assignment.
+    let b = brain_of(&w, commanded);
+    assert_eq!((b.leader, b.formation_slot), (None, None), "squad-exempt");
+    let _ = OrderKind::MoveTo(player_goal); // OrderKind import is load-bearing.
 }

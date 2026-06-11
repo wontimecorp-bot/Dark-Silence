@@ -6,8 +6,10 @@
 //! math behind the `Physics` trait (ADR-0004). Same inputs → same outputs, so
 //! there is never per-frame flicker.
 
+use crate::ai::brain::{AiBrain, AiEvent, RethinkQueue};
+use crate::ai::tuning::AiTuning;
 use crate::broadphase::SpatialHash;
-use crate::clock::FixedDt;
+use crate::clock::{CurrentTick, FixedDt};
 use crate::combat::{self, HitFeedback};
 use crate::components::AngularVelocity;
 use crate::components::{
@@ -208,10 +210,22 @@ pub fn is_lethal_ram(closing_speed: f32, threshold: f32) -> bool {
 /// no target is processed by both. The `Without<FitLayout>` filter is a **no-op**
 /// for every existing unfitted target, so the E002/E003 behavior is byte-for-byte
 /// identical (the flat `apply_damage` clamp + despawn).
+#[allow(clippy::too_many_arguments)] // R97 adds two gated, self-degrading params.
 pub fn collision_detect_system(
     mut commands: Commands,
     mut feedback: ResMut<HitFeedback>,
     rules: Option<Res<CombatRules>>,
+    // R97 Phase 1 Stage A — gated damage-recency producer inputs. BOTH `Option`
+    // (graceful degradation, the codebase pattern): worlds without these
+    // resources — the determinism predicted world, the gameplay-test schedules —
+    // simply skip the stamp. The golden trio either lacks these resources OR
+    // spawns no `AiBrain` target, so this branch is never taken there → the
+    // emitted state is bit-identical.
+    tick: Option<Res<CurrentTick>>,
+    queue: Option<ResMut<RethinkQueue>>,
+    // R98 HOTFIX E — the DamageTaken rate-limit interval (`Option` with the
+    // pinned-default fallback, the same graceful-degradation pattern).
+    ai_tuning: Option<Res<AiTuning>>,
     projectiles: Query<
         (
             Entity,
@@ -234,15 +248,27 @@ pub fn collision_detect_system(
             &mut Health,
             Option<&Faction>,
             Option<&VoxelizeOnHit>,
+            // R97: the target's AI brain, if any — stamped with the current tick
+            // on a damaging hit. `Option` ⇒ `None` for every unfitted/dummy/asteroid
+            // target (none carry `AiBrain`), so the producer is inert in goldens.
+            Option<&mut AiBrain>,
         ),
         (With<Target>, Without<FitLayout>),
     >,
 ) {
     let friendly_fire = rules.is_some_and(|r| r.friendly_fire);
+    // R97 — resolve the producer inputs once; absent → no stamp (degrade quietly).
+    let now = tick.map(|t| t.0);
+    let mut queue = queue;
+    // R98 HOTFIX E — at most one DamageTaken re-think per brain per interval.
+    let rethink_interval = ai_tuning.map_or_else(
+        || AiTuning::default().damage_rethink_interval,
+        |t| t.damage_rethink_interval,
+    );
     let physics = RapierPhysics::new();
     for (projectile, pos, prev, dmg, proj_faction, proj_radius) in &projectiles {
         let proj_r = proj_radius.map(|r| r.0).unwrap_or(0.0);
-        for (tentity, tpos, radius, mut health, target_faction, voxelize) in &mut targets {
+        for (tentity, tpos, radius, mut health, target_faction, voxelize, brain) in &mut targets {
             // Mining-skirmish friend/foe gate: a FACTIONED shot skips a non-enemy target. A no-op
             // for an unfactioned shot (`proj_faction` is `None`) → today's free-for-all, so every
             // determinism/botkit/test world (no factioned projectiles) is byte-identical.
@@ -263,6 +289,26 @@ pub fn collision_detect_system(
                     commands.entity(tentity).insert(PendingVoxelize);
                 } else {
                     health.0 = combat::apply_damage(health.0, dmg.0);
+                    // R97 — damage-recency producer (ADDITIVE, gated): stamp the
+                    // struck AI ship + queue the `DamageTaken` re-think. Only fires
+                    // on a real damage hit (not the voxelize-tag branch) AND only
+                    // when the target carries an `AiBrain` (never in goldens).
+                    // R98 HOTFIX E — rate-limit the EVENT (not the stamp): the
+                    // push gate reads the PREVIOUS stamp BEFORE stamping, so the
+                    // first-ever hit (`last == 0`) and any hit a full interval
+                    // after the previous one push; sustained fire pushes at most
+                    // once per interval while `last_damaged_tick` stays per-hit
+                    // accurate for the threat-recency consideration.
+                    if let (Some(mut brain), Some(now)) = (brain, now) {
+                        let push = brain.last_damaged_tick == 0
+                            || now.saturating_sub(brain.last_damaged_tick) >= rethink_interval;
+                        brain.last_damaged_tick = now;
+                        if push {
+                            if let Some(queue) = queue.as_mut() {
+                                queue.push(tentity, AiEvent::DamageTaken);
+                            }
+                        }
+                    }
                 }
                 feedback.hit_flash = combat::FLASH_TIME;
                 commands.entity(projectile).despawn();
@@ -714,6 +760,35 @@ pub fn fitted_damage_system(world: &mut World) {
         }
 
         let outcome = apply_damage(world, target, event);
+
+        // R97 Phase 1 Stage A — damage-recency producer (ADDITIVE, gated): stamp
+        // the carved AI ship with the current tick + queue its `DamageTaken`
+        // re-think. Self-degrading via `get_resource`/`get_mut`: a world without
+        // `CurrentTick` OR a target without an `AiBrain` (every golden/E007
+        // fixture — they spawn no `AiBrain`) skips it entirely → bit-identical.
+        // Stamped BEFORE the destruction/despawn block while the brain still
+        // exists; a lethal carve still counts as "damaged this tick".
+        // R98 HOTFIX E — rate-limit the EVENT (not the stamp), mirroring the
+        // flat-path producer: the push gate reads the PREVIOUS stamp BEFORE
+        // stamping (first-ever hit / a hit ≥ one interval later pushes;
+        // sustained fire pushes at most once per interval), while the recency
+        // FIELD stays per-hit accurate for the threat consideration.
+        if let Some(now) = world.get_resource::<CurrentTick>().map(|t| t.0) {
+            let rethink_interval = world.get_resource::<AiTuning>().map_or_else(
+                || AiTuning::default().damage_rethink_interval,
+                |t| t.damage_rethink_interval,
+            );
+            if let Some(mut brain) = world.get_mut::<AiBrain>(target) {
+                let push = brain.last_damaged_tick == 0
+                    || now.saturating_sub(brain.last_damaged_tick) >= rethink_interval;
+                brain.last_damaged_tick = now;
+                if push {
+                    if let Some(mut queue) = world.get_resource_mut::<RethinkQueue>() {
+                        queue.push(target, AiEvent::DamageTaken);
+                    }
+                }
+            }
+        }
 
         // Feedback (FR-024): flash + the legibility tag the HUD reads.
         if let Some(mut feedback) = world.get_resource_mut::<HitFeedback>() {
@@ -1346,5 +1421,141 @@ mod tests {
             0.1,
         );
         assert!(hit.is_some(), "swept test must hit even a thin target");
+    }
+
+    /// R97 Phase 1 Stage A — the gated damage-recency producer: an `AiBrain`
+    /// ship hit on the flat (`collision_detect_system`) path gets its
+    /// `last_damaged_tick` stamped to the current tick AND a `DamageTaken`
+    /// re-think queued. This both proves the new producer and REPAIRS the latent
+    /// gap (`role.rs` DefensiveOnly consumes `DamageTaken` but nothing emitted it).
+    ///
+    /// R98 HOTFIX E — the rate limit: the FIRST hit still emits same-tick; a
+    /// second hit INSIDE `damage_rethink_interval` stamps the recency field but
+    /// does NOT push a second event; a hit AFTER the interval pushes again.
+    #[test]
+    fn damage_recency_stamps_and_emits_event() {
+        use crate::ai::brain::{AiBrain, AiEvent, RethinkQueue};
+        use crate::clock::CurrentTick;
+        use bevy_ecs::schedule::Schedule;
+
+        let mut w = World::new();
+        w.insert_resource(HitFeedback::default());
+        w.insert_resource(CurrentTick(42));
+        w.insert_resource(RethinkQueue::default());
+
+        // An unfitted target carrying an `AiBrain` (the case goldens never create).
+        let target = w
+            .spawn((
+                Target,
+                crate::components::TargetKind::Dummy,
+                Position(Vec2::ZERO),
+                CollisionRadius(2.0),
+                Health(100.0),
+                AiBrain::default(),
+            ))
+            .id();
+        // A projectile sweeping through it (damage 10 — non-lethal, so the brain
+        // survives to be inspected). Each phase below respawns one.
+        let spawn_shot = |w: &mut World| {
+            w.spawn((
+                Projectile,
+                Position(Vec2::new(0.0, 1.0)),
+                PrevPosition(Vec2::new(0.0, -1.0)),
+                Damage(10.0),
+            ));
+        };
+        spawn_shot(&mut w);
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(collision_detect_system);
+        schedule.run(&mut w);
+
+        // The hit applied flat damage AND stamped the brain with the current tick.
+        let brain = w.get::<AiBrain>(target).expect("target keeps its brain");
+        assert_eq!(
+            brain.last_damaged_tick, 42,
+            "the struck AI ship is stamped with the current tick"
+        );
+        assert!(
+            w.get::<Health>(target).unwrap().0 < 100.0,
+            "flat damage still applied (the producer is purely additive)"
+        );
+        // And a survival-grade re-think was queued for it (the repaired gap):
+        // the FIRST-ever hit always emits same-tick (R98 HOTFIX E unchanged).
+        assert_eq!(
+            w.resource::<RethinkQueue>().get(target),
+            Some(AiEvent::DamageTaken),
+            "a DamageTaken re-think is queued for the struck AI ship"
+        );
+
+        // R98 HOTFIX E — a SECOND hit INSIDE the interval (tick 50, < 42 + 15):
+        // the recency field stays per-hit accurate but NO second event pushes.
+        w.resource_mut::<RethinkQueue>().clear();
+        w.resource_mut::<CurrentTick>().0 = 50;
+        spawn_shot(&mut w);
+        schedule.run(&mut w);
+        assert_eq!(
+            w.get::<AiBrain>(target).unwrap().last_damaged_tick,
+            50,
+            "the recency stamp is per-hit accurate even inside the interval"
+        );
+        assert_eq!(
+            w.resource::<RethinkQueue>().get(target),
+            None,
+            "sustained fire inside damage_rethink_interval pushes no second event"
+        );
+
+        // A hit AFTER the interval (tick 65, ≥ 50 + 15) pushes again.
+        w.resource_mut::<CurrentTick>().0 = 65;
+        spawn_shot(&mut w);
+        schedule.run(&mut w);
+        assert_eq!(
+            w.get::<AiBrain>(target).unwrap().last_damaged_tick,
+            65,
+            "the post-interval hit stamps as usual"
+        );
+        assert_eq!(
+            w.resource::<RethinkQueue>().get(target),
+            Some(AiEvent::DamageTaken),
+            "a hit a full interval after the previous one pushes again"
+        );
+    }
+
+    /// R97 — graceful degradation: the producer self-skips when the producer
+    /// resources are ABSENT (the determinism predicted world / gameplay-test
+    /// schedules), so the flat damage path stays byte-identical and never panics.
+    #[test]
+    fn damage_recency_producer_degrades_without_resources() {
+        use bevy_ecs::schedule::Schedule;
+
+        let mut w = World::new();
+        w.insert_resource(HitFeedback::default());
+        // NO CurrentTick, NO RethinkQueue — and the target carries NO AiBrain
+        // (exactly the golden-world shape).
+        let target = w
+            .spawn((
+                Target,
+                crate::components::TargetKind::Dummy,
+                Position(Vec2::ZERO),
+                CollisionRadius(2.0),
+                Health(100.0),
+            ))
+            .id();
+        w.spawn((
+            Projectile,
+            Position(Vec2::new(0.0, 1.0)),
+            PrevPosition(Vec2::new(0.0, -1.0)),
+            Damage(10.0),
+        ));
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(collision_detect_system);
+        schedule.run(&mut w);
+
+        // The flat damage path ran exactly as before (no panic, no new state).
+        assert!(
+            w.get::<Health>(target).unwrap().0 < 100.0,
+            "flat damage still applies"
+        );
     }
 }

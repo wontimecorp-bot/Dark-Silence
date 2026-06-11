@@ -15,16 +15,18 @@
 //! depends on it; the new substrate runs parallel + gated, never through it.
 
 pub mod brain;
+pub mod command;
 pub mod ident;
 pub mod lod;
 pub mod perception;
 pub mod role;
 pub mod squad;
 pub mod steering;
+pub mod strategy;
 pub mod tuning;
 
 #[cfg(feature = "ai_debug")]
-pub use brain::debug_capture::AiDebugCapture;
+pub use brain::debug_capture::{AiDebugCapture, AimDrive, FireReason};
 pub use brain::{
     ai_execute_system, ai_think_system, archetype_refresh_system, cadence_for_tier,
     classify_archetype, default_combat_stance, default_movement_profile, hull_fraction,
@@ -32,6 +34,7 @@ pub use brain::{
     weapon_range, AiBrain, AiEvent, Behavior, CombatStance, FitArchetype, MovementProfile,
     RethinkQueue,
 };
+pub use command::{OrderKind, PlayerOrder};
 pub use ident::{ai_despawn_sweep_system, phase_bucket, AiIdAllocator, AiStableId};
 pub use lod::{
     classify_aoi_system, far_hostile_scan_system, glide_collapse_system, glide_motion_system,
@@ -45,6 +48,9 @@ pub use role::{
     role_trigger_system, sweep_route, Posture, RoleGoal, ScenarioRole, FIRED_UPON_WINDOW_TICKS,
 };
 pub use squad::{spawn_squad, squad_think_system, FormationDef, Squad, SquadOrder};
+pub use strategy::{
+    strategic_plan_system, wing_plan_system, Objective, SquadObjective, WingObjective,
+};
 pub use tuning::AiTuning;
 
 use crate::clock::FixedDt;

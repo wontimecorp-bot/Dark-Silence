@@ -17,6 +17,7 @@ use bevy_ecs::entity::Entities;
 use bevy_ecs::prelude::*;
 
 use crate::ai::brain::AiBrain;
+use crate::ai::command::{OrderKind, PlayerOrder};
 use crate::ai::perception::{ContactList, SensorNetworks};
 use crate::ai::squad::{Squad, SquadOrder};
 use crate::turret::splitmix64;
@@ -88,6 +89,11 @@ pub fn phase_bucket(id: AiStableId, bucket_count: u32) -> u16 {
 ///   system reads a dangling contact the tick its referent despawns). The
 ///   resource is `Option`al (graceful degradation in minimal test worlds) and
 ///   only written when something dangling was actually found.
+/// - **R99 Phase A**: a [`PlayerOrder`] whose `kind` is
+///   [`OrderKind::Attack`]`(t)` for a despawned `t` has its `kind` cleared to
+///   `None` (settings-only) — the user's STYLE overrides survive, but the ship
+///   stops chasing the ghost target. The whole component is kept (the user's
+///   pacing/stance/posture stand) — only the dangling attack command is dropped.
 ///
 /// Golden safety: in a world with no `AiBrain`/`Squad`/`ContactList` entities
 /// (every golden world, including the `demo_enemies_smoke` Sandbox where
@@ -100,6 +106,7 @@ pub fn ai_despawn_sweep_system(
     mut brains: Query<&mut AiBrain>,
     mut squads: Query<&mut Squad>,
     mut contact_lists: Query<&mut ContactList>,
+    mut player_orders: Query<&mut PlayerOrder>,
     networks: Option<ResMut<SensorNetworks>>,
 ) {
     for mut brain in &mut brains {
@@ -108,6 +115,14 @@ pub fn ai_despawn_sweep_system(
         }
         if brain.leader.is_some_and(|l| !entities.contains(l)) {
             brain.leader = None;
+        }
+    }
+    // R99 Phase A (V-1): a dangling `PlayerOrder::Attack(t)` clears to
+    // settings-only (kind = None) so the ship stops engaging the ghost while the
+    // user's style overrides survive. Same dangling-Entity check as the brain.
+    for mut order in &mut player_orders {
+        if matches!(order.kind, Some(OrderKind::Attack(t)) if !entities.contains(t)) {
+            order.kind = None;
         }
     }
     for mut squad in &mut squads {

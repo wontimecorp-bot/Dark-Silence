@@ -38,13 +38,14 @@ use std::collections::BTreeMap;
 use bevy_ecs::prelude::*;
 use glam::Vec2;
 
+use crate::ai::command::PlayerOrder;
 use crate::ai::ident::{phase_bucket, AiStableId};
 use crate::ai::lod::{AoiTier, Tier};
 use crate::ai::perception::{nearest_contact, ContactList};
-use crate::ai::role::{role_apply, RoleGoal, ScenarioRole};
+use crate::ai::role::{role_apply, Posture, RoleGoal, ScenarioRole};
 use crate::ai::steering::{
-    arrive, arrive_braked, compose_intent, formation_keep, pursue_intercept, range_band_radial,
-    steer_to_intent, waypoint_follow, ContextMap,
+    arrive, arrive_braked, compose_intent, compose_intent_aimed, formation_keep, pursue_intercept,
+    range_band_radial, steer_to_intent, waypoint_follow, ContextMap,
 };
 use crate::ai::tuning::AiTuning;
 use crate::broadphase::ObstacleField;
@@ -378,6 +379,15 @@ pub struct AiBrain {
     /// nothing on the decision path reads: T015's think-counter assertions
     /// observe it, and the T021 per-tier think counters aggregate it.
     pub thinks_total: u64,
+    /// R97 Phase 1 Stage A — the tick this brain last TOOK damage, stamped by
+    /// the gated damage-recency producer in `fitted_damage_system` /
+    /// `collision_detect_system` when a projectile (or ram) carves a target that
+    /// carries this component. `0` = never hit (the default; also the
+    /// `CurrentTick`-absent fallback). Read by survival-pressure considerations
+    /// (Stage B/C) as a recency window (`now − last_damaged_tick < window`).
+    /// Determinism-safe: golden worlds spawn no `AiBrain`, so this stays `0`
+    /// there and the producer branch is never taken.
+    pub last_damaged_tick: u64,
 }
 
 impl Default for AiBrain {
@@ -403,6 +413,7 @@ impl Default for AiBrain {
             phase_bucket: 0,
             throttle_cap: 1.0,
             thinks_total: 0,
+            last_damaged_tick: 0,
         }
     }
 }
@@ -601,7 +612,233 @@ pub fn ram_utility(
     score_behavior(&[c_hull, c_margin, c_close], tuning.compensation_k)
 }
 
+// ---------------------------------------------------------------------------
+// R97 Phase 1 Stage A — consideration library (TR-004, strict f32)
+// ---------------------------------------------------------------------------
+//
+// A small, documented library of single-input consideration curves that later
+// stages (B/C/D) combine through `score_behavior`. Each takes a NORMALIZED
+// `[0, 1]` input (the GEOMETRY that produces it — sqrt/normalize/length — lives
+// OUTSIDE these markers in the physics-scalar prep helpers below, exactly like
+// `ram_utility`'s "geometry outside, scalars in" pattern) and returns a
+// consideration in `[0, 1]`. NOTHING calls these yet — they are the primitives
+// Stage B/C/D consume. Strict f32: `+ - * /`, `min`/`max`/`clamp`, comparisons.
+
+/// Self-health consideration: rises with remaining hull fraction `frac` — a
+/// healthy ship is MORE willing to commit to a task (linear pass-through). The
+/// "I'm fine, press the attack" curve.
+pub fn con_health(frac: f32) -> f32 {
+    curve_linear(frac)
+}
+
+/// Low-health consideration: rises as the ship gets HURT — `curve_quadratic` of
+/// the inverted fraction, so it stays near zero while healthy and ramps up
+/// sharply as hull bleeds away (the survival-pressure / "break off" curve).
+pub fn con_health_low(frac: f32) -> f32 {
+    curve_quadratic(curve_inv(frac))
+}
+
+/// Energy consideration — **FLOORED** (the parity-plan keystone): a smoothstep
+/// of the energy fraction lifted onto `[0.3, 1.0]` (`0.3 + 0.7·curve_smooth`),
+/// so a low-energy ship still scores a non-zero willingness (it does not VETO a
+/// behavior — the fire/throttle gates downstream decide what it can actually
+/// do) while a charged ship scores full. Floored so a gated ship still ranks
+/// candidates instead of zeroing them all.
+pub fn con_energy(frac: f32) -> f32 {
+    0.3 + 0.7 * curve_smooth(frac)
+}
+
+/// Heat-headroom consideration — **FLOORED** inverse: `curve_inv` of the heat
+/// fraction (high heat → low score) but never a hard veto on its own; a cool
+/// ship scores ~1, an overheating one scores low-but-positive so heat shades a
+/// preference rather than nulling every option (parity with `con_energy`).
+pub fn con_heat_ok(frac: f32) -> f32 {
+    curve_inv(frac)
+}
+
+/// In-band consideration: a tent peaked at `range_norm == 1` (the ship is
+/// exactly on its standoff ring) falling to 0 a full band-width to either side
+/// — `1 − |range_norm − 1|` clamped to `[0, 1]`. `range_norm` is the caller's
+/// `distance / standoff` (the geometry is a single divide, done outside). High
+/// when at the preferred range, low when too close OR too far.
+pub fn con_in_band(range_norm: f32) -> f32 {
+    (1.0 - (range_norm - 1.0).abs()).clamp(0.0, 1.0)
+}
+
+/// Target-vulnerability consideration: rises as the target's hull `frac` falls
+/// (`curve_inv`) — a near-dead target is a more attractive finisher. The combat
+/// twin of `con_health_low`, read on the TARGET instead of self.
+pub fn con_target_vulnerable(frac: f32) -> f32 {
+    curve_inv(frac)
+}
+
+/// Incoming-threat consideration: an S-curve (`curve_smooth`) of a normalized
+/// threat scalar `[0, 1]` (recency × proximity × firepower, resolved outside),
+/// so a small threat is shrugged off and a building one ramps in smoothly — the
+/// pressure term that lifts `Evade`/`Retreat` as danger mounts.
+pub fn con_incoming_threat(threat_norm: f32) -> f32 {
+    curve_smooth(threat_norm)
+}
+
+/// Collision-imminence consideration: high when the normalized time-to-collision
+/// `ttc_norm` is SMALL (impact is near). `curve_quadratic(curve_inv(ttc_norm))`
+/// — `ttc_norm = 1` (a full horizon away) → 0, `ttc_norm = 0` (about to hit) →
+/// 1, ramping quadratically so only an imminent collision dominates. `ttc_norm`
+/// is `time_to_collision / horizon` clamped, computed outside via
+/// [`time_to_closest_approach`] / [`closest_approach_dist`].
+pub fn con_collision_imminence(ttc_norm: f32) -> f32 {
+    curve_quadratic(curve_inv(ttc_norm))
+}
+
+/// Weapon-ready consideration: the PRODUCT of three already-normalized gates —
+/// `in_arc` (the gunnery lead is within the firing arc, `[0, 1]`), `e_ok`
+/// (energy headroom, e.g. [`con_energy`]) and `h_ok` (heat headroom, e.g.
+/// [`con_heat_ok`]). A product so any one near-zero gate drags the readiness
+/// down (you can't usefully fire mis-aimed, drained, or overheated), without a
+/// hard veto when the floored energy/heat curves keep it positive.
+pub fn con_weapon_ready(in_arc: f32, e_ok: f32, h_ok: f32) -> f32 {
+    in_arc.clamp(0.0, 1.0) * e_ok.clamp(0.0, 1.0) * h_ok.clamp(0.0, 1.0)
+}
+
+/// Momentum-alignment consideration: an S-curve (`curve_smooth`) of a normalized
+/// alignment scalar `[0, 1]` (how well the ship's velocity already points where
+/// it wants to go — `(1 + v̂·d̂)/2` resolved outside). High when momentum is
+/// already carrying the ship toward its goal (cheap, reachable), low when it
+/// would have to fight its own inertia — the "is this maneuver in tune with my
+/// drift?" term.
+pub fn con_momentum_align(align_norm: f32) -> f32 {
+    curve_smooth(align_norm)
+}
+
 // STRICT-F32 SCORING END (TR-004)
+
+// ---------------------------------------------------------------------------
+// R97 Phase 1 Stage A — physics-scalar PREP helpers (OUTSIDE the markers)
+// ---------------------------------------------------------------------------
+//
+// The geometry that FEEDS the consideration library: closed-form, O(1)
+// kinematics that use sqrt/length/normalize (which are BANNED inside the
+// strict-f32 markers), then hand normalized scalars to the considerations —
+// exactly the pattern `ram_utility`'s caller uses. These are computed at THINK
+// time for the FEW relevant entities only (the current target, the nearest
+// obstacle), never per-tick over the whole world, so the cost is negligible.
+
+/// Time (s) to the closest approach of two bodies with relative position `r`
+/// (other − self) and relative velocity `v` (other − self), or `f32::INFINITY`
+/// when they are not converging.
+///
+/// **Model**: the squared separation `|r + v·t|²` is minimized at
+/// `t* = −(r·v)/(v·v)`. A non-positive `t*` (or a vanishing relative velocity)
+/// means the bodies are diverging / parallel / coincident-velocity — there is
+/// no future closest approach to react to, so this returns `INFINITY` (a clean
+/// "no collision pressure" sentinel the imminence curve maps to 0). O(1), no
+/// transcendentals beyond the dot products; never NaN (the `v·v` denominator is
+/// guarded by the `eps` check).
+pub fn time_to_closest_approach(r: Vec2, v: Vec2) -> f32 {
+    let vv = v.length_squared();
+    if vv < f32::EPSILON {
+        return f32::INFINITY; // No relative motion → never closes.
+    }
+    let t = -(r.dot(v)) / vv;
+    if t <= 0.0 {
+        f32::INFINITY // Diverging (or already at closest approach) → no pressure.
+    } else {
+        t
+    }
+}
+
+/// The closest-approach DISTANCE (world units) of two bodies with relative
+/// position `r` and relative velocity `v` — the separation at
+/// [`time_to_closest_approach`] (clamped at `t = 0` so a diverging pair reports
+/// its CURRENT separation, never a fictitious past one). The miss distance an
+/// avoidance check compares against the combined radii. O(1); the single
+/// `length()` is why this lives OUTSIDE the strict-f32 markers.
+pub fn closest_approach_dist(r: Vec2, v: Vec2) -> f32 {
+    let tca = time_to_closest_approach(r, v);
+    // A finite tca is already > 0; INFINITY (diverging) clamps to the present.
+    let t = if tca.is_finite() { tca } else { 0.0 };
+    (r + v * t).length()
+}
+
+/// Kinematic stopping distance (world units) for a body moving at `speed` under
+/// a constant deceleration `decel`: `speed² / (2·decel)`. The denominator is
+/// floored (`decel.max(eps)`) so a zero/negative decel never divides by zero
+/// (no NaN, no panic) — it yields `+∞`, the well-defined "can never stop"
+/// answer a brake check naturally treats as "too far to ever halt". Finite for
+/// any positive decel and monotonically increasing in `speed` — the "how far
+/// before I can stop" scalar an active-brake / collision-preempt check compares
+/// against the range to a body. O(1), no transcendentals.
+pub fn stopping_distance(speed: f32, decel: f32) -> f32 {
+    speed * speed / (2.0 * decel.max(f32::MIN_POSITIVE))
+}
+
+/// R97 Phase 1 Stage D — the DOMINANT collision-imminence scalar over the
+/// in-range obstacles: the [`con_collision_imminence`] consideration evaluated
+/// for the MOST imminent obstacle the ship is closing on (`[0, 1]`, `0` = no
+/// imminent collision). The two-layer split's decision half: a high value
+/// scales the obstacle danger weight so an IMMINENT crash DOMINATES the MOVE map
+/// (the ship breaks off even an attack run to avoid it), while a distant or
+/// non-closing obstacle yields `0` and the gentle R96 reactive weight stands.
+///
+/// **TTC units (documented, load-bearing)**: the flight model integrates
+/// `pos += vel·dt` with `dt` in SECONDS (`FixedDt`, [`crate::clock::FixedDt`]),
+/// so `Velocity` is world-units-PER-SECOND. The relative velocity an obstacle
+/// approaches the ship at is therefore `-ship_vel` in u/s (the obstacle is
+/// stationary in the [`ObstacleField`]; it carries no velocity), and
+/// [`time_to_closest_approach`] `(obs_pos − ship_pos, −ship_vel)` returns the
+/// time-to-closest-approach DIRECTLY in SECONDS — no tick conversion. It is
+/// normalized by [`AiTuning::collision_horizon_s`] (also seconds): `ttc_norm =
+/// (ttc / horizon).clamp(0, 1)`, so a collision beyond the horizon scores ~0
+/// imminence and one inside it ramps quadratically toward 1.
+///
+/// **Imminent test**: an obstacle contributes only when it is BOTH closing soon
+/// (finite ttc within the horizon) AND on a near-miss course — the
+/// [`closest_approach_dist`] is inside `obs_radius + own_radius + clearance_pad`
+/// (the same avoid ring [`add_obstacle_danger`] writes danger for). A glancing
+/// pass that clears the ring, or a diverging/parallel obstacle (`ttc = ∞`),
+/// contributes 0. Returns the MAXIMUM imminence over all qualifying in-range
+/// obstacles — the single most-urgent crash dominates the response. O(field);
+/// the field is a handful of bodies, scanned at think/execute time only.
+///
+/// Pure + deterministic: a linear `max`-fold over the position-sorted field
+/// (order-independent — `max` is associative/commutative), the geometry
+/// (`length`/dot) OUTSIDE the strict-f32 markers, then the strict-f32
+/// `con_collision_imminence` curve. No RNG, no HashMap, no transcendentals.
+pub fn obstacle_imminence(
+    field: &ObstacleField,
+    ship_pos: Vec2,
+    ship_vel: Vec2,
+    own_radius: f32,
+    tuning: &AiTuning,
+) -> f32 {
+    // Relative velocity of every (stationary) obstacle toward the ship.
+    let rel_vel = -ship_vel;
+    let horizon = tuning.collision_horizon_s.max(f32::MIN_POSITIVE);
+    let mut imm = 0.0_f32;
+    for &(obs_pos, obs_radius) in &field.obstacles {
+        let rel_pos = obs_pos - ship_pos;
+        // Only obstacles inside the query scope contribute (cheap linear gate,
+        // mirroring `obstacle_in_range`/`add_obstacle_danger`).
+        if rel_pos.length() > tuning.obstacle_query_radius {
+            continue;
+        }
+        let ttc = time_to_closest_approach(rel_pos, rel_vel);
+        if !ttc.is_finite() {
+            continue; // Diverging / parallel / not closing → no imminence.
+        }
+        // Near-miss test: the closest approach must breach the avoid ring, else
+        // a glancing pass that clears the body contributes nothing.
+        let miss = closest_approach_dist(rel_pos, rel_vel);
+        let avoid_radius = obs_radius + own_radius + tuning.obstacle_clearance_pad;
+        if miss >= avoid_radius {
+            continue;
+        }
+        // Normalize TTC by the (seconds) horizon and take the consideration.
+        let ttc_norm = (ttc / horizon).clamp(0.0, 1.0);
+        imm = imm.max(con_collision_imminence(ttc_norm));
+    }
+    imm
+}
 
 // ---------------------------------------------------------------------------
 // T012 — fit-archetype classification (TR-006)
@@ -849,6 +1086,71 @@ fn fire_decision(
     Some(group)
 }
 
+/// R97 Phase 1 Stage D (ai_debug only) — the diagnostic twin of
+/// [`fire_decision`]: it walks the SAME gate ladder in the SAME order but
+/// returns WHICH gate decided, so the dev panel can explain a non-firing ship
+/// ("not aligned", "out of energy", …). Compiled only under the feature, so the
+/// non-debug fire path is untouched; mirrors `fire_decision` line-for-line to
+/// stay in sync (a divergence would mislabel, never misfire — this never gates).
+#[cfg(feature = "ai_debug")]
+#[allow(clippy::too_many_arguments)] // Mirrors `fire_decision` 1:1.
+fn fire_reason(
+    pos: Vec2,
+    heading: f32,
+    stats: Option<&ShipStats>,
+    weapons: Option<&ShipWeapons>,
+    groups: Option<&WeaponGroups>,
+    energy: Option<&Energy>,
+    heat: Option<&Heat>,
+    target_pos: Vec2,
+    target_vel: Vec2,
+    sim: &SimTuning,
+) -> debug_capture::FireReason {
+    use debug_capture::FireReason;
+    let Some(stats) = stats else {
+        return FireReason::Unarmed;
+    };
+    let Some(profile) = stats.weapon else {
+        return FireReason::Unarmed;
+    };
+    if !stats.can_fire {
+        return FireReason::Unarmed;
+    }
+    let range = profile.muzzle_speed * profile.lifetime;
+    if range <= 0.0 || (target_pos - pos).length() > range {
+        return FireReason::OutOfRange;
+    }
+    let aim_dir = pursue_intercept(pos, profile.muzzle_speed, target_pos, target_vel);
+    if Vec2::from_angle(heading).dot(aim_dir) <= FIRE_ALIGN_COS {
+        return FireReason::NotAligned;
+    }
+    let group = primary_fire_group(weapons, groups);
+    let min_cost = match weapons {
+        Some(w) if !w.weapons.is_empty() => {
+            let mut cost: Option<f32> = None;
+            for (slot, p) in &w.weapons {
+                let map = groups.map(|g| g.for_slot(*slot)).unwrap_or_default();
+                if map.group == group && map.trigger == Trigger::Primary {
+                    let c = p.damage * sim.weapon_energy_per_damage;
+                    cost = Some(cost.map_or(c, |b| b.min(c)));
+                }
+            }
+            match cost {
+                Some(c) => c,
+                None => return FireReason::Unarmed, // No Primary weapon in the group.
+            }
+        }
+        _ => profile.damage * sim.weapon_energy_per_damage,
+    };
+    if !energy.is_none_or(|e| e.current >= min_cost) {
+        return FireReason::NoEnergy;
+    }
+    if !heat.is_none_or(|h| h.current < h.max) {
+        return FireReason::Overheated;
+    }
+    FireReason::Fired
+}
+
 /// +90° (counter-clockwise) rotation of `v` in the `0 = +X`, CCW-increasing
 /// heading convention (matching `steering.rs`/`flight.rs`): `perp(v) =
 /// (-v.y, v.x)`. The [`CombatStance::Orbit`] tangent rotates the OUTWARD radial
@@ -859,12 +1161,72 @@ fn perp(v: Vec2) -> Vec2 {
     Vec2::new(-v.y, v.x)
 }
 
-/// T025 / R96 Part C — Engage MOVEMENT: the archetype-flavored range-band
-/// controller over a small context map, shaped by the ship's [`CombatStance`].
-/// Every stance runs the SAME pipeline — build a [`ContextMap`] over the SAME
-/// `range_band_radial`/`standoff_distance`/`weapon_range`/`pursue_intercept`
-/// primitives, [`ContextMap::resolve`], [`steer_to_intent`] — and only the
-/// interest/danger terms (and, for `Orbit`, an optional lateral strafe) differ.
+/// R97 Phase 1 Stage B — the combat AIM channel: the gunnery-lead facing the
+/// fixed-forward gun wants so it bears on the target. Muzzle-speed
+/// [`pursue_intercept`] lead for an armed ship; the plain direction-to-target
+/// for an unarmed one (matching the on-ring "face the target" fallback). This is
+/// the SAME value [`engage_channels`] resolves as its `aim_dir` — extracted so
+/// the channel core and the live `Engage` arm (which composes MOVE via
+/// [`engage_motion`] and records AIM via this) never diverge. Stage B records
+/// it; Stage C composes the turn channel from it. Returns `Vec2::ZERO` only for
+/// a coincident target (no sensible facing).
+fn engage_aim_dir(
+    pos: Vec2,
+    stats: Option<&ShipStats>,
+    target_pos: Vec2,
+    target_vel: Vec2,
+) -> Vec2 {
+    let dir_to = (target_pos - pos).normalize_or_zero();
+    if dir_to == Vec2::ZERO {
+        return Vec2::ZERO; // Coincident: no facing.
+    }
+    match stats.and_then(|s| s.weapon) {
+        Some(w) => pursue_intercept(pos, w.muzzle_speed, target_pos, target_vel),
+        None => dir_to,
+    }
+}
+
+/// R97 Phase 1 Stage B — the MOVE/AIM channel split of [`engage_motion`].
+///
+/// The combat steering arm resolves into three channels (the Stage B channel
+/// model): a MOVE direction + throttle (where the ship translates), an AIM
+/// direction (where the ship points its fixed-forward gun — the gunnery lead),
+/// and an orbit `strafe` sidle. Stage B records all three but COMPOSES the
+/// final intent from MOVE only (via [`engage_motion`]'s today-exact path), so
+/// the output stays byte-identical; Stage C will compose from `aim_dir` to
+/// decouple facing from translation. The `move_dir == Vec2::ZERO` sentinel
+/// marks the coincident-target degenerate case (compose to the default intent).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EngageChannels {
+    /// MOVE channel: the resolved world-frame translate direction (the empty-map
+    /// hold case carries `aim_dir` here with `throttle == 0.0`). `Vec2::ZERO`
+    /// only for the coincident-target degenerate (compose to default).
+    move_dir: Vec2,
+    /// MOVE channel: the throttle the resolve produced (`0.0` on the hold case).
+    throttle: f32,
+    /// AIM channel: the gunnery-lead facing the gun wants (recorded for Stage C;
+    /// Stage B does not compose from it). `Vec2::ZERO` on the degenerate case.
+    aim_dir: Vec2,
+    /// The orbit sidle-strafe (R93) — non-zero only for an `Orbit` on a
+    /// `can_strafe` hull; every other stance keeps it `0.0`.
+    strafe: f32,
+}
+
+/// T025 / R96 Part C — Engage MOVEMENT channels (R97 Phase 1 Stage B): the
+/// archetype-flavored range-band controller over a small context map, shaped by
+/// the ship's [`CombatStance`], resolved into the MOVE/AIM/strafe channels of
+/// [`EngageChannels`]. Every stance runs the SAME pipeline — build a
+/// [`ContextMap`] over the SAME `range_band_radial`/`standoff_distance`/
+/// `weapon_range`/`pursue_intercept` primitives, [`ContextMap::resolve`] — and
+/// only the interest/danger terms (and, for `Orbit`, an optional lateral
+/// strafe) differ. The composition to a [`ShipIntent`] is the caller's (the
+/// `Engage` arm of [`ai_execute_system`]); this function is composition-free
+/// (the channel-only core, so Stage C can swap the composition — pointing the
+/// gun via `aim_dir` — without touching the controller). **Stage B parity**: the
+/// caller composes the MOVE channel via `steer_to_intent(move_dir, throttle, ..)`
+/// then sets `intent.strafe = strafe`, byte-for-byte the legacy `engage_motion`
+/// body (the empty-map hold case carries `aim_dir` as `move_dir` at zero
+/// throttle, reproducing the `steer_to_intent(aim_dir, 0.0, ..)` fallback).
 ///
 /// - **[`Charge`](CombatStance::Charge)** (PARITY default — the verbatim
 ///   pre-R96-C body): `radial > 0` (outside the standoff ring) → interest
@@ -891,40 +1253,43 @@ fn perp(v: Vec2) -> Vec2 {
 /// `add_obstacle_danger` into its map so the combat ship steers AROUND large
 /// neutral bodies between it and its target. With zero in-range obstacles (the
 /// empty-field gate) this writes nothing — `add_danger` with no obstacles is a
-/// no-op — so the resolved intent is BIT-identical to Part C's output and the
-/// Charge parity / combat fixtures stay byte-for-byte unchanged.
+/// no-op — so the resolved MOVE channel is BIT-identical to Part C's output and
+/// the Charge parity / combat fixtures stay byte-for-byte unchanged.
 #[allow(clippy::too_many_arguments)] // Mirrors the execute arm's locals 1:1.
-fn engage_motion(
+fn engage_channels(
     stance: CombatStance,
     archetype: FitArchetype,
     pos: Vec2,
     vel: Vec2,
-    heading: f32,
-    turn_authority: f32,
     stats: Option<&ShipStats>,
     target_pos: Vec2,
     target_vel: Vec2,
     ai: &AiTuning,
     obstacles: Option<&ObstacleField>,
     own_radius: f32,
-) -> ShipIntent {
+) -> EngageChannels {
     let range = weapon_range(stats).unwrap_or(FALLBACK_ENGAGE_RANGE);
     let to = target_pos - pos;
     let dist = to.length();
     let dir_to = to.normalize_or_zero();
     if dir_to == Vec2::ZERO {
-        return ShipIntent::default(); // Coincident: nothing sensible to steer.
+        // Coincident: nothing sensible to steer (compose to default).
+        return EngageChannels {
+            move_dir: Vec2::ZERO,
+            throttle: 0.0,
+            aim_dir: Vec2::ZERO,
+            strafe: 0.0,
+        };
     }
     let n = ai.slot_count as usize;
     // The lead the fixed-forward gun wants (top-speed pursuit toward the
     // intercept; muzzle-speed lead for the on-ring "face the target" fallback).
     let lead = |speed: f32| pursue_intercept(pos, speed, target_pos, target_vel);
     let top = stats.map_or(0.0, ShipStats::top_speed);
-    // The on-ring / hold facing direction — the gunnery lead so the gun bears.
-    let aim_dir = match stats.and_then(|s| s.weapon) {
-        Some(w) => lead(w.muzzle_speed),
-        None => dir_to,
-    };
+    // The on-ring / hold facing direction — the gunnery lead so the gun bears
+    // (the AIM channel; the same value `engage_aim_dir` exposes for the Stage B
+    // metadata thread, so the two never diverge).
+    let aim_dir = engage_aim_dir(pos, stats, target_pos, target_vel);
     // The standoff ring this stance holds (per the stance's own radius rule).
     let standoff = match stance {
         CombatStance::Orbit { .. } => ai.orbit_radius_frac * standoff_distance(archetype, range),
@@ -1003,43 +1368,97 @@ fn engage_motion(
     if let Some(field) = obstacles {
         if obstacle_in_range(field, pos, vel, own_radius, ai) {
             map.add_explore_floor(EXPLORE_FLOOR, n);
-            add_obstacle_danger(&mut map, field, pos, vel, own_radius, ai, n);
+            // R97 Phase 1 Stage D: scale the obstacle danger by the
+            // collision-imminence response so an IMMINENT crash DOMINATES the
+            // combat move map (the ship breaks off its attack run to avoid the
+            // collision); a non-closing/distant obstacle scores `imm == 0` →
+            // `weight_scale == 1.0` → the gentle R96 reactive weight.
+            let imm = obstacle_imminence(field, pos, vel, own_radius, ai);
+            let weight_scale = 1.0 + ai.collision_preempt_gain * imm;
+            add_obstacle_danger(&mut map, field, pos, vel, own_radius, ai, weight_scale, n);
         }
     }
 
-    let mut intent = match map.resolve(n, ai.danger_mask_floor) {
-        Some((dir, strength)) => steer_to_intent(dir, strength, heading, vel, turn_authority),
-        // Empty map → hold position (zero throttle) facing the gunnery lead.
-        None => steer_to_intent(aim_dir, 0.0, heading, vel, turn_authority),
+    // Resolve the map to the MOVE channel `(move_dir, throttle)`. The empty-map
+    // hold case carries `aim_dir` as the move_dir at zero throttle — exactly the
+    // `steer_to_intent(aim_dir, 0.0, ..)` legacy fallback, so today's composition
+    // path reproduces it. `aim_dir` is recorded separately for Stage C.
+    let (move_dir, throttle) = match map.resolve(n, ai.danger_mask_floor) {
+        Some((dir, strength)) => (dir, strength),
+        None => (aim_dir, 0.0),
     };
-    intent.strafe = strafe;
-    intent
+    EngageChannels {
+        move_dir,
+        throttle,
+        aim_dir,
+        strafe,
+    }
 }
 
-/// T025 — Evade MOVEMENT: break-off at full throttle, directly away from the
-/// threat, with the threat direction written as danger so the masked resolve
-/// deflects around it rather than ever turning back in. (A last-threat-dir
-/// memory for target-less evades arrives with perception, T029.)
-fn evade_motion(
+/// T025 / R96 Part C — Engage MOVEMENT: resolve the [`engage_channels`] combat
+/// channels and COMPOSE the [`ShipIntent`] (R97 Phase 1 Stage B).
+///
+/// **Stage B composition (the parity keystone)**: the final intent is composed
+/// from the MOVE channel via TODAY'S EXACT path — `steer_to_intent(move_dir,
+/// throttle, ..)` (which for the empty-map hold case is `steer_to_intent(aim_dir,
+/// 0.0, ..)`, byte-for-byte the legacy fallback) — then `intent.strafe = strafe`.
+/// The AIM channel (`aim_dir`) is computed by [`engage_channels`] and threaded
+/// (the `Engage` arm of [`ai_execute_system`] records it) but DELIBERATELY NOT
+/// used in composition yet; Stage C flips this to compose from `aim_dir`
+/// (decoupling facing from translation). Because the composition call is
+/// unchanged, the resolved intent is BIT-identical to the pre-Stage-B
+/// `engage_motion`, so the Charge parity / combat fixtures stay byte-for-byte
+/// identical. This wrapper is the bit-identity reference the
+/// `charge_stance_matches_legacy_engage_motion` parity guard checks; the live
+/// `Engage` arm composes the SAME channels inline (recording `aim_dir`).
+#[allow(clippy::too_many_arguments)] // Mirrors the execute arm's locals 1:1.
+fn engage_motion(
+    stance: CombatStance,
+    archetype: FitArchetype,
     pos: Vec2,
     vel: Vec2,
     heading: f32,
     turn_authority: f32,
-    threat_pos: Vec2,
+    stats: Option<&ShipStats>,
+    target_pos: Vec2,
+    target_vel: Vec2,
     ai: &AiTuning,
+    obstacles: Option<&ObstacleField>,
+    own_radius: f32,
 ) -> ShipIntent {
+    let ch = engage_channels(
+        stance, archetype, pos, vel, stats, target_pos, target_vel, ai, obstacles, own_radius,
+    );
+    if ch.move_dir == Vec2::ZERO && ch.throttle == 0.0 && ch.aim_dir == Vec2::ZERO {
+        return ShipIntent::default(); // Coincident-target degenerate.
+    }
+    // Stage B: compose from the MOVE channel via today's exact call path. AIM
+    // (`ch.aim_dir`) is recorded by the caller but not yet used in composition
+    // (Stage C flips this). Guarantees byte-identical output to the legacy body.
+    let mut intent = steer_to_intent(ch.move_dir, ch.throttle, heading, vel, turn_authority);
+    intent.strafe = ch.strafe;
+    intent
+}
+
+/// T025 / R97 Phase 1 Stage C — the Evade MOVE channel: the away-deflected
+/// break-off DIRECTION (full throttle), directly away from the threat with the
+/// threat direction written as danger so the masked resolve deflects around it
+/// rather than ever turning back in. `None` for a coincident threat (no sensible
+/// flee vector). Stage C composes this MOVE direction against the SEPARATE AIM
+/// channel (the threat facing) via [`compose_intent_aimed`], so an armed evader
+/// keeps its guns on the pursuer while running — the fighting-retreat emergence.
+/// (A last-threat-dir memory for target-less evades arrives with perception,
+/// T029.)
+fn evade_move_dir(pos: Vec2, threat_pos: Vec2, ai: &AiTuning) -> Option<Vec2> {
     let dir_to = (threat_pos - pos).normalize_or_zero();
     if dir_to == Vec2::ZERO {
-        return ShipIntent::default();
+        return None;
     }
     let n = ai.slot_count as usize;
     let mut map = ContextMap::default();
     map.add_interest_dir(-dir_to, 1.0, n);
     map.add_danger_dir(dir_to, 1.0, n);
-    match map.resolve(n, ai.danger_mask_floor) {
-        Some((dir, _)) => steer_to_intent(dir, 1.0, heading, vel, turn_authority),
-        None => ShipIntent::default(),
-    }
+    map.resolve(n, ai.danger_mask_floor).map(|(dir, _)| dir)
 }
 
 /// R96 Part D — the empty-field GATE for the move arm: `true` iff at least one
@@ -1093,9 +1512,23 @@ fn obstacle_in_range(
 /// linearly (it is tiny); only obstacles within `obstacle_query_radius` of the
 /// ship are considered.
 ///
+/// **R97 Phase 1 Stage D — collision-imminence weighting (the two-layer split,
+/// decision side)**: the per-obstacle danger weight is the R96 reactive
+/// `obstacle_danger_weight` SCALED by `weight_scale`. The caller passes `1 +
+/// collision_preempt_gain · imm` (`imm` = [`obstacle_imminence`]): a `weight_scale
+/// == 1.0` (no imminent collision — distant or non-closing obstacle) keeps the
+/// EXACT gentle R96 reactive weight (so a non-imminent obstacle steers with the
+/// same gentle term as before Stage D); an IMMINENT collision (`imm → 1`) lifts
+/// the danger far above the move map's interest, so the masked resolve DOMINATES
+/// — the ship breaks off (even an attack run) to avoid the crash. The
+/// always-on R96 reactive steering is the lower layer; this is the higher one,
+/// active only when imminent. `weight_scale == 1.0` is byte-identical to the
+/// pre-Stage-D call (`x · 1.0`).
+///
 /// Pure + deterministic (no RNG, no HashMap): the field is pre-sorted by
 /// position bits at build, and `add_danger_threat` combines per-slot by `max`,
 /// so the written danger is independent of obstacle order.
+#[allow(clippy::too_many_arguments)] // map + field + ship kinematics + tuning + scale + slots.
 fn add_obstacle_danger(
     map: &mut ContextMap,
     field: &ObstacleField,
@@ -1103,9 +1536,13 @@ fn add_obstacle_danger(
     ship_vel: Vec2,
     own_radius: f32,
     tuning: &AiTuning,
+    weight_scale: f32,
     n: usize,
 ) {
     let probe = ship_pos + ship_vel * tuning.obstacle_lookahead_s;
+    // Stage D: the R96 reactive weight scaled by the collision-imminence
+    // response (`weight_scale == 1.0` → the exact pre-Stage-D weight).
+    let danger_weight = tuning.obstacle_danger_weight * weight_scale;
     for &(obs_pos, obs_radius) in &field.obstacles {
         // Linear-scan gate: skip obstacles outside the query radius (cheap; the
         // field is a handful of bodies). Predictive: an obstacle is in scope if
@@ -1118,13 +1555,7 @@ fn add_obstacle_danger(
         }
         let avoid_radius = obs_radius + own_radius + tuning.obstacle_clearance_pad;
         // Closeness uses the predictive (smaller) range; direction stays present.
-        map.add_danger_threat(
-            obs_pos,
-            ship_pos,
-            avoid_radius,
-            tuning.obstacle_danger_weight,
-            n,
-        );
+        map.add_danger_threat(obs_pos, ship_pos, avoid_radius, danger_weight, n);
         if probe != ship_pos {
             // Also reckon the look-ahead position so a ship flying INTO an
             // obstacle (currently clear) still gets the danger written. Same
@@ -1134,7 +1565,7 @@ fn add_obstacle_danger(
             let dist = to.length();
             let probe_dist = (obs_pos - probe).length();
             if dist >= avoid_radius && probe_dist < avoid_radius && dist > f32::EPSILON {
-                let w = tuning.obstacle_danger_weight * (1.0 - probe_dist / avoid_radius);
+                let w = danger_weight * (1.0 - probe_dist / avoid_radius);
                 map.add_danger_dir(to / dist, w, n);
             }
         }
@@ -1263,6 +1694,22 @@ const MOVE_BASELINE: f32 = 1.0;
 /// an un-threatened recon ship always flies its coverage route.
 const RECON_BASELINE: f32 = 0.7;
 
+/// R99 Phase A — whether `posture` permits selecting `Engage`/`Ram` and firing
+/// at `now`, for a PLAYER-overridden posture. Mirrors
+/// [`ScenarioRole::allows_engage`](crate::ai::role::ScenarioRole::allows_engage)
+/// exactly, but the `DefensiveOnly` fired-upon window is read from the ship's
+/// role (if any) — a player can flip a ship to `DefensiveOnly` and the role's
+/// `fired_upon_until` (armed by the trigger pass on a damage event) still gates
+/// it; a ship with NO role under a player `DefensiveOnly` posture has no armed
+/// window, so it stays weapons-tight (deadline `0`, strict `<` → never).
+fn posture_allows_engage(posture: Posture, role: Option<&ScenarioRole>, now: u64) -> bool {
+    match posture {
+        Posture::FreeEngage => true,
+        Posture::DefensiveOnly => now < role.map_or(0, |r| r.fired_upon_until),
+        Posture::HoldFire => false,
+    }
+}
+
 /// The event-driven think scheduler (T011, TR-005, AD-003).
 ///
 /// For each brain, in [`AiStableId`] order (V-3 — v1 thinks are
@@ -1330,6 +1777,10 @@ pub fn ai_think_system(
         // posture gates veto Engage/Ram candidacy.
         Option<&mut ScenarioRole>,
         Option<&ContactList>,
+        // R99 Phase A: the user's DIRECT command override (mutable for the
+        // Patrol cursor advance). Applied at HIGHEST precedence — its nav goal
+        // overwrites the role's, and its style/posture win the resolution.
+        Option<&mut PlayerOrder>,
     )>,
     // T025/T027 target view (read-only, access-disjoint from `brains`' only
     // mutable component `AiBrain`): kinematics + the hull-state sources
@@ -1357,7 +1808,7 @@ pub fn ai_think_system(
     order.sort_unstable();
 
     for (_, entity) in order {
-        let Ok((_, _, mut brain, aoi, pos, vel, stats, mut role, contacts)) =
+        let Ok((_, _, mut brain, aoi, pos, vel, stats, mut role, contacts, mut player_order)) =
             brains.get_mut(entity)
         else {
             continue;
@@ -1420,6 +1871,28 @@ pub fn ai_think_system(
             }
         }
 
+        // R99 Phase A — PLAYER OVERRIDE (HIGHEST precedence). A present
+        // `PlayerOrder` with a `Some(kind)` nav command is applied AFTER
+        // `role_apply`, so its waypoint/home/target OVERWRITE the role's writes
+        // (the player wins the nav goal; a settings-only order leaves the goal
+        // to the role/squad). Its `profile`/`stance`/`posture` overrides are the
+        // TOP link of the resolved chains below. A commanded ship is also
+        // squad-exempt + planner-skipped (squad.rs / strategy.rs), so the order
+        // layer never stomps the command between thinks.
+        let mut player_profile: Option<MovementProfile> = None;
+        let mut player_stance: Option<CombatStance> = None;
+        if let Some(order) = player_order.as_mut() {
+            order.apply(&mut brain, pos.map_or(Vec2::ZERO, |p| p.0), now);
+            player_profile = order.profile;
+            player_stance = order.stance;
+            // The player posture (if set) wins over the role posture; the engage
+            // gate is re-derived from the resolved posture.
+            if let Some(posture) = order.posture {
+                let role_for_window = role.as_deref();
+                engage_allowed = posture_allows_engage(posture, role_for_window, now);
+            }
+        }
+
         // R96 STYLE RESOLUTION (do it ONCE per think, after `role_apply`): the
         // documented precedence chain `squad ← role ← archetype default`. Each
         // writer stores its `Option` LOCALLY — the squad's onto
@@ -1431,12 +1904,17 @@ pub fn ai_think_system(
         // squad-or-archetype (role `None`); lone ships get the archetype default.
         // Parity: a `Generic` archetype with no role/squad style resolves to
         // `Cruise`/`Charge` — today's intents, byte-for-byte.
-        brain.movement_profile = brain
-            .squad_profile
+        //
+        // R99 Phase A — the PLAYER link sits ABOVE the squad link: a
+        // `PlayerOrder.profile`/`.stance` override wins the whole chain
+        // (`player ← squad ← role ← archetype default`). `None` defers to the
+        // next link, so a settings-only/style-less order is transparent here.
+        brain.movement_profile = player_profile
+            .or(brain.squad_profile)
             .or(role_profile)
             .unwrap_or_else(|| default_movement_profile(brain.archetype));
-        brain.combat_stance = brain
-            .squad_stance
+        brain.combat_stance = player_stance
+            .or(brain.squad_stance)
             .or(role_stance)
             .unwrap_or_else(|| default_combat_stance(brain.archetype));
 
@@ -1555,6 +2033,40 @@ pub fn ai_think_system(
 // T013 — behavior execution: brain → steering → ShipIntent (TR-001, V-6)
 // ---------------------------------------------------------------------------
 
+/// R97 Phase 1 Stage B/C — the per-behavior MOVE/AIM/FIRE channel split of the
+/// execution arm. Each [`Behavior`] arm of [`ai_execute_system`] resolves into
+/// these three channels:
+///
+/// - **MOVE** (`intent`): WHERE the ship translates + how it turns. The combat/
+///   movement arms (`fly_to` / `arrive` / `formation_keep` / `engage_motion` —
+///   incl. the Charge/Standoff/Orbit/Kite stances — / the ram lead-pursuit) keep
+///   their TODAY-EXACT `steer_to_intent` composition (the parity keystone: those
+///   have passing parity fixtures). **Stage C** is where the SURVIVAL arms
+///   intentionally diverge: [`Evade`](Behavior::Evade)/[`Retreat`](Behavior::Retreat)
+///   compose MOVE (flee) against a SEPARATE AIM (the threat facing) via
+///   [`compose_intent_aimed`], so the nose tracks the pursuer while the ship runs.
+/// - **AIM** (`aim_dir`): WHERE the ship points. For the survival arms this is the
+///   nearest-hostile facing — DECOUPLED from MOVE and fed into the composition
+///   above; for every other arm it is the recorded move interest direction.
+///   `Vec2::ZERO` = "no aim".
+/// - **FIRE** (`fire`): WHETHER this arm has a hostile to bear its gun on — the
+///   WEAPONS-FREE allowlist (Stage C): `Engage`/`Ram` AND `Evade`/`Retreat` when a
+///   threat exists. The overlay below runs `fire_decision` (armed + in-range +
+///   aligned + energy/heat) and the posture gate; this flag records WHO may fire.
+struct ChannelIntent {
+    /// MOVE channel — the composed intent from this arm (today-exact for the
+    /// combat/movement arms; aim-decoupled `compose_intent_aimed` for the
+    /// survival arms — see the struct docs).
+    intent: ShipIntent,
+    /// AIM channel — the recorded facing. For the survival arms it is the
+    /// nearest-hostile facing already consumed by the composition; for the others
+    /// the move interest direction. `Vec2::ZERO` = "no aim".
+    aim_dir: Vec2,
+    /// FIRE channel — Stage C weapons-free: `true` for `Engage`/`Ram`, and for
+    /// `Evade`/`Retreat` when a hostile AIM target exists (fighting retreat).
+    fire: bool,
+}
+
 /// Arrive radius (world units) for `Waypoint`/`Patrol` goals: within this
 /// range the goal counts as reached — the brain emits [`AiEvent::Arrived`] and
 /// holds. A tuning-ish v1 const; `crate`-visible since T032, where the
@@ -1630,12 +2142,16 @@ const EXPLORE_FLOOR: f32 = 0.25;
 /// - [`Engage`](Behavior::Engage): [`engage_motion`] — the archetype-flavored
 ///   range-band standoff (Brawler close ring / Kiter long ring / medium
 ///   default) over a context map, facing the gunnery lead when on-ring.
-/// - [`Evade`](Behavior::Evade): [`evade_motion`] — full-throttle break-off
-///   away from the target with its direction danger-masked. Never fires
-///   (documented v1 simplification; opportunistic aligned fire is a later
-///   refinement).
-/// - [`Retreat`](Behavior::Retreat): run HOME (`brain.home`) when set, else
-///   directly away from the target. Never fires (per spec).
+/// - [`Evade`](Behavior::Evade) / [`Retreat`](Behavior::Retreat) (R97 Phase 1
+///   Stage C): the SURVIVAL arms. MOVE = the flee vector (Evade: the
+///   danger-masked break-off via [`evade_move_dir`]; Retreat: toward `brain.home`
+///   when set, else directly away). AIM = the nearest-hostile facing, composed
+///   DECOUPLED from MOVE via [`compose_intent_aimed`] — a forward-only hull
+///   reverse-drifts (retro nose-on) while the gun bears, a `can_strafe` hull
+///   sidles. **They fire when aimed at a hostile and aligned** (the weapons-free
+///   rule below): a FIGHTING RETREAT emerges — open range while facing and firing
+///   on the pursuer — with NO dedicated FightingRetreat behavior. An unarmed or
+///   unaligned survival ship just runs (and survives) — no fire.
 /// - [`Ram`](Behavior::Ram) (T027): full-throttle [`pursue_intercept`]
 ///   collision course; fire stays ALLOWED on the way in (a finisher, not a
 ///   ceasefire).
@@ -1643,14 +2159,17 @@ const EXPLORE_FLOOR: f32 = 0.25;
 ///   movement IDENTICAL to `Waypoint` — follow the role-asserted coverage leg
 ///   via [`waypoint_follow`], `Arrived` within the radius (the role cursor
 ///   advances at the next think). The recon difference is selection/veto, not
-///   motion. Neither ever fires (not in the fire-overlay allowlist below).
+///   motion. Neither fires (no hostile AIM target → `fire == false`).
 ///
-/// **Fire control (T026, TR-011)**: after the movement arm, Engage/Ram run
-/// [`fire_decision`] — in-range + aligned-to-lead + the energy/heat gates
+/// **Fire control (T026, TR-011; R97 Stage C weapons-free)**: after the movement
+/// arm, any arm with a hostile AIM target (Engage/Ram AND Evade/Retreat) runs
+/// [`fire_decision`] — armed + in-range + aligned-to-lead + the energy/heat gates
 /// MIRRORING `weapon_fire_system` (the AI *chooses* not to fire when gated) —
 /// and on a yes set `fire_primary` + the [`primary_fire_group`]-selected
-/// `active_group`. Every other behavior leaves the fire fields default
-/// (false): Evade/Retreat never fire.
+/// `active_group`. Survival modes fire when aimed at a hostile and aligned
+/// (fighting retreat emerges). The arms with no hostile target
+/// (Hold/Patrol/Waypoint/Follow/FormationKeep/Scout/Sweep) leave the fire fields
+/// default (false). The posture gate still suppresses (HoldFire never fires).
 ///
 /// **Determinism (V-3)**: per-entity independent — each ship reads its own
 /// brain + the leader's/target's kinematics (read-only) and writes its own
@@ -1666,6 +2185,11 @@ const EXPLORE_FLOOR: f32 = 0.25;
 /// Registered in the `ScenarioActive`-gated AI set AFTER [`ai_think_system`]
 /// and BEFORE `ship_motion_system`; no golden world spawns an `AiBrain`, so
 /// the goldens stay bit-identical.
+// The cfg'd `ai_debug` capture seam (the `captures` query + `commands`) tips the
+// already-wide system over clippy's arg limit ONLY under the feature; each param
+// is a distinct ECS read the system genuinely needs (the `weapon_fire_system`
+// query-width pattern). Bevy injects them — there is no caller to simplify.
+#[allow(clippy::too_many_arguments)]
 pub fn ai_execute_system(
     mut queue: ResMut<RethinkQueue>,
     // T026: shot-cost scale for the energy gate (Option → const defaults in
@@ -1701,9 +2225,20 @@ pub fn ai_execute_system(
         // R96 Part D: the ship's own collision radius sizes the avoid clearance
         // (absent = 0, so an unfitted/test ship still steers around with the pad).
         Option<&CollisionRadius>,
+        // R97 Phase 1 Stage C: the perception memory the survival arms read to
+        // face the NEAREST hostile when `brain.target` is unset (absent = no
+        // contact picture, so the arms fall back to `brain.target` alone).
+        Option<&ContactList>,
     )>,
     // Leader AND combat-target kinematics (read-only; see Determinism docs).
     others: Query<(&Position, &Velocity, &Heading)>,
+    // R97 Phase 1 Stage D (TR-020, AD-006): the per-channel capture seam exists
+    // ONLY under `ai_debug` — with the feature off these params (and every
+    // capture statement below) are compiled out, so headless/bench builds pay
+    // zero cost. The query is access-disjoint from `ships` (the brain query's
+    // only mutable component is `AiBrain` + `ShipIntent`; this is `AiDebugCapture`).
+    #[cfg(feature = "ai_debug")] mut captures: Query<&mut debug_capture::AiDebugCapture>,
+    #[cfg(feature = "ai_debug")] mut commands: Commands,
 ) {
     let sim = sim.map(|s| *s).unwrap_or_default();
     let ai = tuning.map(|t| *t).unwrap_or_default();
@@ -1724,6 +2259,7 @@ pub fn ai_execute_system(
         weapons,
         role,
         collision_radius,
+        contacts,
     ) in &mut ships
     {
         // Dormant: the glide aggregate owns it (T019) — leave its intent alone.
@@ -1746,6 +2282,30 @@ pub fn ai_execute_system(
         // clearance; absent (unfitted/test ship) → 0, so it still steers around
         // with the configured pad.
         let own_radius = collision_radius.map_or(0.0, |r| r.0);
+        // R93 — strafe authority: a `can_strafe` hull sidles laterally instead of
+        // turning to translate (drives `compose_intent_aimed`'s lateral channel).
+        let can_strafe = stats.is_some_and(|s| s.can_strafe);
+        // R97 Phase 1 Stage C — the AIM channel's threat picture for the survival
+        // arms (Retreat/Evade): the NEAREST hostile to point the fixed-forward gun
+        // at while fleeing, so a FIGHTING RETREAT emerges (open range while facing
+        // + firing on the pursuer) without any dedicated FightingRetreat behavior.
+        // Priority (documented): `brain.target` (the committed/perceived hostile,
+        // with full kinematics for the lead/fire solve), else the nearest
+        // `ContactList` contact's last-known position (zero velocity — a static
+        // facing the gun still bears on). `None` = no hostile to watch → the
+        // survival arms fall back to aim == move (run blind, never fire).
+        let threat = brain
+            .target
+            .and_then(|t| others.get(t).ok().map(|(p, v, _)| (p.0, v.0)))
+            .or_else(|| {
+                let list = contacts?;
+                let c = nearest_contact(&list.contacts, pos.0)?;
+                list.contacts
+                    .iter()
+                    .find(|x| x.target == c)
+                    .map(|x| (x.last_pos, Vec2::ZERO))
+            });
+        let threat_aim = threat.map(|(tpos, _)| (tpos - pos.0).normalize_or_zero());
         // R96 — the movement-profile triple for this ship's pace. Cruise is the
         // pinned parity triple (1.0, 1.0, 4.0); only Rush/Leisurely diverge.
         // Copied out so the `fly_to` closure never borrows `brain` (the Patrol
@@ -1809,14 +2369,26 @@ pub fn ai_execute_system(
                     // this is finite; a zero result is floored inside arrive_braked.
                     let decel = (s.reverse_force + s.linear_drag * speed) / s.total_mass;
                     let slow_radius = ARRIVE_RADIUS * slow_factor;
-                    let (dir, throttle) =
-                        arrive_braked(pos.0, vel.0, goal, slow_radius, decel, brake_aggr);
+                    let (dir, throttle) = arrive_braked(
+                        pos.0,
+                        vel.0,
+                        goal,
+                        slow_radius,
+                        decel,
+                        brake_aggr,
+                        ai.brake_ref_speed,
+                        ai.arrive_eps_speed,
+                    );
                     if throttle < 0.0 {
                         // Reverse-brake: keep the nose on the goal (turn channel
                         // via compose_intent with 0 forward), then drive forward
-                        // NEGATIVE — capped — so the retro thrusters brake nose-on.
+                        // NEGATIVE so the retro thrusters brake nose-on. R98
+                        // HOTFIX C: the burn is the PROPORTIONAL value
+                        // arrive_braked returned (scaled by the profile cap),
+                        // not a flat full reverse — the brake decays smoothly
+                        // into the arrive deadband instead of bang-banging.
                         let mut brake = compose_intent(dir, 0.0, heading.0);
-                        brake.forward = -profile_cap;
+                        brake.forward = (throttle * profile_cap).clamp(-1.0, 0.0);
                         // Best-effort: a braking ship skips avoidance (it is near
                         // its goal, not transiting past an obstacle).
                         return brake;
@@ -1841,7 +2413,23 @@ pub fn ai_execute_system(
             let mut map = ContextMap::default();
             map.add_interest_dir(seek_dir, seek_throttle.max(0.0), n_slots);
             map.add_explore_floor(EXPLORE_FLOOR, n_slots);
-            add_obstacle_danger(&mut map, field, pos.0, vel.0, own_radius, &ai, n_slots);
+            // R97 Phase 1 Stage D: scale the obstacle danger by the
+            // collision-imminence response — an IMMINENT collision (small ttc +
+            // a near-miss closest approach) DOMINATES the move map so the ship
+            // breaks off to avoid the crash; a distant/non-closing obstacle
+            // scores `imm == 0` → `weight_scale == 1.0` → the gentle R96 weight.
+            let imm = obstacle_imminence(field, pos.0, vel.0, own_radius, &ai);
+            let weight_scale = 1.0 + ai.collision_preempt_gain * imm;
+            add_obstacle_danger(
+                &mut map,
+                field,
+                pos.0,
+                vel.0,
+                own_radius,
+                &ai,
+                weight_scale,
+                n_slots,
+            );
             match map.resolve(n_slots, ai.danger_mask_floor) {
                 Some((dir, strength)) => {
                     let mut out = steer_to_intent(dir, strength, heading.0, vel.0, turn_authority);
@@ -1853,16 +2441,82 @@ pub fn ai_execute_system(
             }
         };
 
-        let mut next = match brain.behavior {
+        // R98 HOTFIX F — survival-arm obstacle masking: the Retreat/Evade arms
+        // compose their MOVE (flee) direction via `compose_intent_aimed`, which
+        // BYPASSES the move arm's obstacle ContextMap — a retreating ship would
+        // reverse blindly into a body directly behind it. When one or more
+        // obstacles are in range (`obstacle_in_range`, the SAME empty-field
+        // parity gate every other arm uses), resolve the flee direction through
+        // a danger-masked ContextMap first — interest = the flee dir, the
+        // explore floor (so a fully-masked flee heading still finds an open
+        // lane), and `add_obstacle_danger` at the Stage-D collision-imminence
+        // weight scale, exactly as in the move arms — and compose with the aim
+        // using the RESOLVED move dir. Zero in-range obstacles → the input dir
+        // unchanged, BIT-identical to the pre-fix path. The fire/aim channels
+        // are untouched (the threat facing still drives the nose/trigger).
+        let mask_move_dir = |move_dir: Vec2| -> Vec2 {
+            let Some(field) = field else {
+                return move_dir;
+            };
+            if !obstacle_in_range(field, pos.0, vel.0, own_radius, &ai) {
+                return move_dir;
+            }
+            let mut map = ContextMap::default();
+            map.add_interest_dir(move_dir, 1.0, n_slots);
+            map.add_explore_floor(EXPLORE_FLOOR, n_slots);
+            let imm = obstacle_imminence(field, pos.0, vel.0, own_radius, &ai);
+            let weight_scale = 1.0 + ai.collision_preempt_gain * imm;
+            add_obstacle_danger(
+                &mut map,
+                field,
+                pos.0,
+                vel.0,
+                own_radius,
+                &ai,
+                weight_scale,
+                n_slots,
+            );
+            match map.resolve(n_slots, ai.danger_mask_floor) {
+                Some((dir, _)) => dir,
+                // Fully masked (surrounded) → keep the raw flee direction (the
+                // pre-fix best effort; same fallback shape as the move arm).
+                None => move_dir,
+            }
+        };
+
+        // R97 Phase 1 Stage B — resolve the behavior into MOVE/AIM/FIRE channels.
+        // The MOVE channel (`intent`) is composed via each arm's TODAY-EXACT call
+        // path (so the output is byte-identical); AIM (`aim_dir`, Stage B
+        // invariant: aim == move interest direction) and FIRE (the `Engage`/`Ram`
+        // allowlist) are RECORDED but only consumed in Stage C. `aim_dir ==
+        // Vec2::ZERO` records "no aim" (a held/coasting arm). The composition is
+        // unchanged from pre-Stage-B; only the channel threading is new.
+        let channel = match brain.behavior {
             // Coast (v1 documented choice; brake-to-stop is a later refinement).
-            Behavior::Hold => ShipIntent::default(),
+            Behavior::Hold => ChannelIntent {
+                intent: ShipIntent::default(),
+                aim_dir: Vec2::ZERO,
+                fire: false,
+            },
             Behavior::Waypoint => match brain.waypoint {
                 Some(goal) if (goal - pos.0).length() <= ARRIVE_RADIUS => {
                     queue.push(entity, AiEvent::Arrived);
-                    ShipIntent::default()
+                    ChannelIntent {
+                        intent: ShipIntent::default(),
+                        aim_dir: Vec2::ZERO,
+                        fire: false,
+                    }
                 }
-                Some(goal) => fly_to(goal),
-                None => ShipIntent::default(), // Goal-less: the think degrades it.
+                Some(goal) => ChannelIntent {
+                    intent: fly_to(goal),
+                    aim_dir: (goal - pos.0).normalize_or_zero(),
+                    fire: false,
+                },
+                None => ChannelIntent {
+                    intent: ShipIntent::default(), // Goal-less: the think degrades it.
+                    aim_dir: Vec2::ZERO,
+                    fire: false,
+                },
             },
             Behavior::Patrol => match brain.waypoint {
                 Some(goal) if (goal - pos.0).length() <= ARRIVE_RADIUS => {
@@ -1874,17 +2528,37 @@ pub fn ai_execute_system(
                         brain.home = reached;
                     }
                     queue.push(entity, AiEvent::Arrived);
-                    ShipIntent::default()
+                    ChannelIntent {
+                        intent: ShipIntent::default(),
+                        aim_dir: Vec2::ZERO,
+                        fire: false,
+                    }
                 }
-                Some(goal) => fly_to(goal),
-                None => ShipIntent::default(),
+                Some(goal) => ChannelIntent {
+                    intent: fly_to(goal),
+                    aim_dir: (goal - pos.0).normalize_or_zero(),
+                    fire: false,
+                },
+                None => ChannelIntent {
+                    intent: ShipIntent::default(),
+                    aim_dir: Vec2::ZERO,
+                    fire: false,
+                },
             },
             Behavior::Follow => match brain.leader.and_then(|l| others.get(l).ok()) {
                 Some((lpos, _, _)) => {
                     let (dir, throttle) = arrive(pos.0, vel.0, lpos.0, FOLLOW_SLOW_RADIUS);
-                    steer_to_intent(dir, throttle, heading.0, vel.0, turn_authority)
+                    ChannelIntent {
+                        intent: steer_to_intent(dir, throttle, heading.0, vel.0, turn_authority),
+                        aim_dir: dir,
+                        fire: false,
+                    }
                 }
-                None => ShipIntent::default(), // Leader gone: sweep/think clean up.
+                None => ChannelIntent {
+                    intent: ShipIntent::default(), // Leader gone: sweep/think clean up.
+                    aim_dir: Vec2::ZERO,
+                    fire: false,
+                },
             },
             Behavior::FormationKeep => {
                 match (
@@ -1894,56 +2568,145 @@ pub fn ai_execute_system(
                     (Some((lpos, lvel, lheading)), Some(slot)) => {
                         let (dir, throttle) =
                             formation_keep(pos.0, vel.0, lpos.0, lvel.0, lheading.0, slot);
-                        steer_to_intent(dir, throttle, heading.0, vel.0, turn_authority)
+                        ChannelIntent {
+                            intent: steer_to_intent(
+                                dir,
+                                throttle,
+                                heading.0,
+                                vel.0,
+                                turn_authority,
+                            ),
+                            aim_dir: dir,
+                            fire: false,
+                        }
                     }
-                    _ => ShipIntent::default(),
+                    _ => ChannelIntent {
+                        intent: ShipIntent::default(),
+                        aim_dir: Vec2::ZERO,
+                        fire: false,
+                    },
                 }
             }
             // T025 combat arms (see system docs); target gone → zero intent
             // (the V-1 sweep clears the ref; the next think degrades).
             Behavior::Engage => match brain.target.and_then(|t| others.get(t).ok()) {
-                Some((tpos, tvel, _)) => engage_motion(
-                    brain.combat_stance,
-                    brain.archetype,
-                    pos.0,
-                    vel.0,
-                    heading.0,
-                    turn_authority,
-                    stats,
-                    tpos.0,
-                    tvel.0,
-                    &ai,
-                    field, // R96 Part D: empty-field gate keeps Part-C parity.
-                    own_radius,
-                ),
-                None => ShipIntent::default(),
-            },
-            Behavior::Evade => match brain.target.and_then(|t| others.get(t).ok()) {
-                Some((tpos, _, _)) => {
-                    evade_motion(pos.0, vel.0, heading.0, turn_authority, tpos.0, &ai)
-                }
-                None => ShipIntent::default(),
-            },
-            Behavior::Retreat => match brain.home {
-                // Run home: the waypoint arrive ramp stops the ship there.
-                Some(home) => fly_to(home),
-                // No home anchor: open the range directly away from the threat.
-                None => match brain.target.and_then(|t| others.get(t).ok()) {
-                    Some((tpos, _, _)) => {
-                        let away = (pos.0 - tpos.0).normalize_or_zero();
-                        steer_to_intent(away, 1.0, heading.0, vel.0, turn_authority)
+                Some((tpos, tvel, _)) => {
+                    // R97 Stage B — the combat arm's MOVE/AIM split. The MOVE
+                    // channel is composed via `engage_motion` (TODAY'S EXACT path,
+                    // byte-for-byte the pre-Stage-B body — the same wrapper the
+                    // `charge_stance_matches_legacy_engage_motion` parity guard
+                    // checks). The AIM channel is the gunnery-lead facing
+                    // (`engage_aim_dir`, the same `aim_dir` `engage_channels`
+                    // resolves) — recorded for Stage C, NOT used in composition.
+                    let intent = engage_motion(
+                        brain.combat_stance,
+                        brain.archetype,
+                        pos.0,
+                        vel.0,
+                        heading.0,
+                        turn_authority,
+                        stats,
+                        tpos.0,
+                        tvel.0,
+                        &ai,
+                        field, // R96 Part D: empty-field gate keeps Part-C parity.
+                        own_radius,
+                    );
+                    ChannelIntent {
+                        intent,
+                        aim_dir: engage_aim_dir(pos.0, stats, tpos.0, tvel.0),
+                        fire: true, // Engage is in the fire allowlist.
                     }
-                    None => ShipIntent::default(),
+                }
+                None => ChannelIntent {
+                    intent: ShipIntent::default(),
+                    aim_dir: Vec2::ZERO,
+                    fire: false,
                 },
             },
+            // R97 Phase 1 Stage C — Evade: MOVE = the away-deflected break-off,
+            // AIM = the nearest-hostile facing (NOT the move). Composed via
+            // `compose_intent_aimed` so the nose tracks the threat while the ship
+            // runs — a forward-only hull retro-drifts (reverse thrust) facing the
+            // threat, a `can_strafe` hull sidles. FIRE is weapons-free: armed +
+            // posture + in-range + aligned (the overlay's `fire_decision`) lets it
+            // shoot WHILE evading (the emergence; the Scout-superior-threat evader
+            // is unarmed, so it still just runs + survives — no fire). Threat-less
+            // → default coast.
+            Behavior::Evade => {
+                match threat.and_then(|(tpos, _)| evade_move_dir(pos.0, tpos, &ai)) {
+                    Some(move_dir) => {
+                        // R98 HOTFIX F: deflect the break-off around in-range
+                        // obstacles (empty field → `move_dir` unchanged).
+                        let move_dir = mask_move_dir(move_dir);
+                        let aim = threat_aim.unwrap_or(move_dir);
+                        ChannelIntent {
+                            intent: compose_intent_aimed(move_dir, 1.0, aim, heading.0, can_strafe),
+                            aim_dir: aim,
+                            fire: true,
+                        }
+                    }
+                    None => ChannelIntent {
+                        intent: ShipIntent::default(),
+                        aim_dir: Vec2::ZERO,
+                        fire: false,
+                    },
+                }
+            }
+            // R97 Phase 1 Stage C — Retreat: MOVE = the flee vector (toward
+            // `brain.home` when anchored, else directly AWAY from the nearest
+            // hostile), AIM = the threat facing (the pursuer). Composed via
+            // `compose_intent_aimed` so the nose stays on the threat while the
+            // ship withdraws — a forward-only hull reverses (retro nose-on) when
+            // home/away is behind the gun-line, a `can_strafe` hull strafes. FIRE
+            // is weapons-free (armed + posture + in-range + aligned), so a
+            // FIGHTING RETREAT emerges: open range while facing and firing on the
+            // pursuer — no dedicated FightingRetreat behavior. With no threat AND
+            // no home → default coast (the think degrades it).
+            Behavior::Retreat => {
+                let move_dir = match brain.home {
+                    Some(home) => (home - pos.0).normalize_or_zero(),
+                    None => threat
+                        .map(|(tpos, _)| (pos.0 - tpos).normalize_or_zero())
+                        .unwrap_or(Vec2::ZERO),
+                };
+                if move_dir == Vec2::ZERO {
+                    ChannelIntent {
+                        intent: ShipIntent::default(),
+                        aim_dir: Vec2::ZERO,
+                        fire: false,
+                    }
+                } else {
+                    // R98 HOTFIX F: deflect the withdrawal around in-range
+                    // obstacles — a forward-only hull otherwise reverses
+                    // STRAIGHT into a body behind it (empty field → unchanged).
+                    let move_dir = mask_move_dir(move_dir);
+                    let aim = threat_aim.unwrap_or(move_dir);
+                    ChannelIntent {
+                        intent: compose_intent_aimed(move_dir, 1.0, aim, heading.0, can_strafe),
+                        aim_dir: aim,
+                        // Weapons-free only when a hostile exists to bear on; a
+                        // pure run-home with no threat never fires (no AIM target).
+                        fire: threat.is_some(),
+                    }
+                }
+            }
             // T027 Ram: full-throttle lead-pursuit collision course.
             Behavior::Ram => match brain.target.and_then(|t| others.get(t).ok()) {
                 Some((tpos, tvel, _)) => {
                     let top = stats.map_or(0.0, ShipStats::top_speed);
                     let dir = pursue_intercept(pos.0, top, tpos.0, tvel.0);
-                    steer_to_intent(dir, 1.0, heading.0, vel.0, turn_authority)
+                    ChannelIntent {
+                        intent: steer_to_intent(dir, 1.0, heading.0, vel.0, turn_authority),
+                        aim_dir: dir,
+                        fire: true, // Ram is in the fire allowlist (a finisher).
+                    }
                 }
-                None => ShipIntent::default(),
+                None => ChannelIntent {
+                    intent: ShipIntent::default(),
+                    aim_dir: Vec2::ZERO,
+                    fire: false,
+                },
             },
             // T035 recon arms (TR-021): Scout/Sweep MOVE exactly like
             // Waypoint — fly `brain.waypoint` (the role-asserted coverage
@@ -1955,25 +2718,53 @@ pub fn ai_execute_system(
             Behavior::Scout | Behavior::Sweep => match brain.waypoint {
                 Some(goal) if (goal - pos.0).length() <= ARRIVE_RADIUS => {
                     queue.push(entity, AiEvent::Arrived);
-                    ShipIntent::default()
+                    ChannelIntent {
+                        intent: ShipIntent::default(),
+                        aim_dir: Vec2::ZERO,
+                        fire: false,
+                    }
                 }
-                Some(goal) => fly_to(goal),
-                None => ShipIntent::default(), // Goal-less: the think degrades it.
+                Some(goal) => ChannelIntent {
+                    intent: fly_to(goal),
+                    aim_dir: (goal - pos.0).normalize_or_zero(),
+                    fire: false,
+                },
+                None => ChannelIntent {
+                    intent: ShipIntent::default(), // Goal-less: the think degrades it.
+                    aim_dir: Vec2::ZERO,
+                    fire: false,
+                },
             },
         };
-        // T026 fire-control overlay (TR-011): only Engage and Ram (a finisher
-        // fires on the way in) ever pull the trigger; `fire_decision` owns the
-        // in-range/alignment checks + the energy/heat gates. All other
-        // behaviors keep the default fire fields — Evade/Retreat never fire.
-        // T032 (TR-015): the scenario posture gates the trigger itself —
-        // HoldFire NEVER fires, DefensiveOnly fires only inside its
-        // fired-upon window — even when the behavior is pinned to Engage/Ram.
-        if matches!(brain.behavior, Behavior::Engage | Behavior::Ram)
-            && role.is_none_or(|r| r.allows_engage(now))
-        {
-            if let Some((tpos, tvel, _)) = brain.target.and_then(|t| others.get(t).ok()) {
+        // Stage C: each arm now composes its MOVE+AIM inline (Engage/Charge/
+        // Standoff/Ram/Orbit keep `steer_to_intent`; Retreat/Evade compose the
+        // SEPARATE aim via `compose_intent_aimed`), so `aim_dir` is the recorded
+        // facing — bound to `_` (the composition already consumed it).
+        let ChannelIntent {
+            intent: mut next,
+            aim_dir: _aim_dir,
+            fire: fire_channel,
+        } = channel;
+        // R97 Phase 1 Stage C — WEAPONS-FREE fire (TR-011): the FIRE channel is
+        // set by any arm that has a hostile AIM target — Engage/Ram (allowlist),
+        // AND Retreat/Evade (the survival arms now bear their gun on the nearest
+        // hostile while fleeing). `fire_decision` owns the rest: armed (unarmed →
+        // None), in weapon range, aligned to the lead (`cos > FIRE_ALIGN_COS`),
+        // and the energy/heat gates MIRRORING `weapon_fire_system` (so a gated
+        // ship still CHOOSES not to fire — `gated_ship_never_fires` holds). This
+        // is what makes a FIGHTING RETREAT emerge: a Retreat/Evade ship fires on
+        // the ticks its nose tracks onto the pursuer. Hold/Patrol/Waypoint/Follow/
+        // FormationKeep/Scout/Sweep set `fire == false` (no hostile AIM target).
+        // T032 (TR-015): the scenario posture STILL gates the trigger —
+        // HoldFire NEVER fires, DefensiveOnly only inside its fired-upon window —
+        // unchanged. The fire SOLVE uses the SAME resolved `threat` the AIM
+        // channel faces (`brain.target` kinematics, else the nearest contact's
+        // last position at zero velocity), so the gun fires where the nose points.
+        let posture_ok = role.is_none_or(|r| r.allows_engage(now));
+        if fire_channel && posture_ok {
+            if let Some((tpos, tvel)) = threat {
                 if let Some(group) = fire_decision(
-                    pos.0, heading.0, stats, weapons, groups, energy, heat, tpos.0, tvel.0, &sim,
+                    pos.0, heading.0, stats, weapons, groups, energy, heat, tpos, tvel, &sim,
                 ) {
                     next.active_group = group;
                     next.fire_primary = true;
@@ -1985,6 +2776,74 @@ pub fn ai_execute_system(
         // so non-squad brains are untouched). Forward only: turn/strafe keep
         // full authority so a paced leader still maneuvers crisply.
         next.forward *= brain.throttle_cap;
+
+        // R97 Phase 1 Stage D — per-channel capture (ai_debug only): record this
+        // tick's MOVE/AIM/FIRE resolution + the collision imminence so a
+        // playtester can SEE why the ship chose its action. Compiled OUT of
+        // headless/bench (zero TR-017-path cost). Computed AFTER the fire overlay
+        // so the captured `fire`/reason match the intent actually emitted.
+        #[cfg(feature = "ai_debug")]
+        {
+            use debug_capture::{AimDrive, ChannelDebug, FireReason};
+            // MOVE channel (world frame): the flight model applies body-frame
+            // thrust `(forward, strafe)` rotated by heading; capture that as the
+            // resolved travel direction, and `forward` (pre-cap value is folded
+            // into `next.forward` already) as the throttle.
+            let move_throttle = next.forward;
+            let move_dir = Vec2::from_angle(heading.0).rotate(Vec2::new(next.forward, next.strafe));
+            // AIM drive: by arm — combat aims at the target lead, survival arms
+            // at the threat, movement arms along the move interest. `Vec2::ZERO`
+            // recorded aim = a held/coasting arm (None).
+            let aim_drive = if _aim_dir == Vec2::ZERO {
+                AimDrive::None
+            } else {
+                match brain.behavior {
+                    Behavior::Engage | Behavior::Ram => AimDrive::Target,
+                    Behavior::Evade | Behavior::Retreat => {
+                        // Survival arms face the threat when one exists; with no
+                        // hostile the aim falls back to the move (flee) direction.
+                        if threat.is_some() {
+                            AimDrive::Threat
+                        } else {
+                            AimDrive::Move
+                        }
+                    }
+                    _ => AimDrive::Move,
+                }
+            };
+            // FIRE reason: walk the same gate ladder `fire_decision` did.
+            let reason = if !fire_channel {
+                FireReason::NoTarget
+            } else if !posture_ok {
+                FireReason::PostureBlocked
+            } else if let Some((tpos, tvel)) = threat {
+                fire_reason(
+                    pos.0, heading.0, stats, weapons, groups, energy, heat, tpos, tvel, &sim,
+                )
+            } else {
+                FireReason::NoTarget
+            };
+            // Collision imminence: the dominant value over the in-range obstacles
+            // (the Stage-D move-drive override's input); 0 when no field/obstacle.
+            let collision_imminence = field.map_or(0.0, |f| {
+                obstacle_imminence(f, pos.0, vel.0, own_radius, &ai)
+            });
+            debug_capture::capture_channels(
+                &mut captures,
+                &mut commands,
+                entity,
+                ChannelDebug {
+                    move_dir,
+                    move_throttle,
+                    aim_dir: _aim_dir,
+                    aim_drive,
+                    fire: next.fire_primary,
+                    fire_reason: reason,
+                    collision_imminence,
+                },
+            );
+        }
+
         // `set_if_neq`: only flag the intent changed when the value moved —
         // a coasting ship's intent stays change-detection quiet.
         intent.set_if_neq(next);
@@ -2004,13 +2863,67 @@ pub mod debug_capture {
     use std::collections::VecDeque;
 
     use bevy_ecs::prelude::*;
+    use glam::Vec2;
 
     use super::{AiTuning, Behavior};
+
+    /// R97 Phase 1 Stage D — which aim-drive won the AIM channel (so a
+    /// playtester can SEE where a ship is pointing its gun and WHY). Recorded by
+    /// `ai_execute_system` alongside the resolved aim direction.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum AimDrive {
+        /// No aim this tick — a held/coasting arm (`aim_dir == Vec2::ZERO`).
+        #[default]
+        None,
+        /// The aim follows the MOVE interest direction (movement arms:
+        /// Waypoint/Patrol/Follow/FormationKeep/Scout/Sweep).
+        Move,
+        /// The aim is the combat gunnery LEAD on `brain.target` (Engage/Ram).
+        Target,
+        /// The aim is the nearest-hostile THREAT facing (the survival arms
+        /// Evade/Retreat bear their gun on the pursuer while fleeing).
+        Threat,
+    }
+
+    /// R97 Phase 1 Stage D — why the FIRE channel did (or did not) pull the
+    /// trigger this tick, mirroring `fire_decision`'s gate ladder so the dev
+    /// panel can explain a non-firing ship. Recorded by `ai_execute_system`.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum FireReason {
+        /// The arm has no hostile AIM target to bear on (Hold/Patrol/Waypoint/
+        /// Follow/FormationKeep/Scout/Sweep, or a threat-less Retreat).
+        #[default]
+        NoTarget,
+        /// The scenario posture suppressed fire (HoldFire always; DefensiveOnly
+        /// outside its fired-upon window).
+        PostureBlocked,
+        /// Unarmed / unfitted — nothing to fire (`fire_decision` armed gate).
+        Unarmed,
+        /// The target is outside the weapon envelope (range gate).
+        OutOfRange,
+        /// The gun is not pointed at the lead solution (`cos ≤ FIRE_ALIGN_COS`).
+        NotAligned,
+        /// Out of energy: the AI CHOSE not to fire (mirrors `weapon_fire_system`).
+        NoEnergy,
+        /// Overheated: the AI CHOSE not to fire (mirrors `weapon_fire_system`).
+        Overheated,
+        /// All gates passed — the trigger was pulled (the selected fire group).
+        Fired,
+    }
 
     /// Per-brain capture of the LAST completed think (component on the brain
     /// entity, inserted lazily by the first captured think): the dev panel's
     /// score-breakdown source (AD-006 — "without a score-breakdown view,
     /// tuning is blind"). Pure observability: nothing in the sim reads it.
+    ///
+    /// **Two writers, disjoint fields** (R97 Phase 1 Stage D): `ai_think_system`
+    /// writes the SELECTION fields ([`Self::last_scores`]/[`Self::winner`]/
+    /// [`Self::momentum_applied`]/[`Self::transitions`]) via [`Self::record`];
+    /// `ai_execute_system` writes the per-CHANNEL fields ([`Self::move_dir`] …
+    /// [`Self::collision_imminence`]) via [`Self::record_channels`] EVERY tick
+    /// (the execute arm runs per-tick, not on the think cadence), so a
+    /// playtester sees the live action a ship chose even between thinks. Each
+    /// writer touches only its own fields, so the two never race.
     #[derive(Component, Clone, Debug, Default, PartialEq)]
     pub struct AiDebugCapture {
         /// Final per-candidate scores of the last think — the exact values
@@ -2024,10 +2937,29 @@ pub mod debug_capture {
         /// Behavior-transition ring `(tick, from, to)` — recorded on CHANGE
         /// only, bounded by [`AiTuning::debug_history_len`] (oldest dropped).
         pub transitions: VecDeque<(u64, Behavior, Behavior)>,
+        // --- Per-channel capture (Stage D; written by `ai_execute_system`) ---
+        /// MOVE channel: the resolved world-frame translate direction this tick.
+        pub move_dir: Vec2,
+        /// MOVE channel: the resolved throttle this tick (post-cap, the value
+        /// composed into the intent's forward magnitude before the squad cap).
+        pub move_throttle: f32,
+        /// AIM channel: the resolved facing direction this tick (`Vec2::ZERO` =
+        /// no aim — a held/coasting arm).
+        pub aim_dir: Vec2,
+        /// AIM channel: which drive won the facing (target / threat / move).
+        pub aim_drive: AimDrive,
+        /// FIRE channel: whether the trigger was pulled this tick.
+        pub fire: bool,
+        /// FIRE channel: WHY fire was / was not taken (the gate that decided).
+        pub fire_reason: FireReason,
+        /// The dominant collision-imminence value `[0, 1]` over the in-range
+        /// obstacles this tick (`obstacle_imminence`): `0` = no imminent crash,
+        /// `1` = collision now. The Stage-D move-drive override's input.
+        pub collision_imminence: f32,
     }
 
     impl AiDebugCapture {
-        /// Fold one completed think into the capture.
+        /// Fold one completed think into the capture (SELECTION fields only).
         fn record(
             &mut self,
             tick: u64,
@@ -2048,6 +2980,30 @@ pub mod debug_capture {
                     self.transitions.pop_front();
                 }
             }
+        }
+
+        /// R97 Phase 1 Stage D — fold one tick's per-CHANNEL resolution into the
+        /// capture (the MOVE/AIM/FIRE fields + the collision imminence). Called
+        /// by `ai_execute_system` every tick; touches none of the selection
+        /// fields `record` owns.
+        #[allow(clippy::too_many_arguments)] // Mirrors the execute arm's channels 1:1.
+        fn record_channels(
+            &mut self,
+            move_dir: Vec2,
+            move_throttle: f32,
+            aim_dir: Vec2,
+            aim_drive: AimDrive,
+            fire: bool,
+            fire_reason: FireReason,
+            collision_imminence: f32,
+        ) {
+            self.move_dir = move_dir;
+            self.move_throttle = move_throttle;
+            self.aim_dir = aim_dir;
+            self.aim_drive = aim_drive;
+            self.fire = fire;
+            self.fire_reason = fire_reason;
+            self.collision_imminence = collision_imminence;
         }
     }
 
@@ -2090,6 +3046,57 @@ pub mod debug_capture {
         } else {
             let mut capture = AiDebugCapture::default();
             capture.record(tick, from, to, last_scores, momentum_applied, history_len);
+            commands.entity(entity).insert(capture);
+        }
+    }
+
+    /// R97 Phase 1 Stage D — the per-tick MOVE/AIM/FIRE + collision-imminence
+    /// resolution `ai_execute_system` hands to [`AiDebugCapture::record_channels`]
+    /// (bundled so the capture call stays one argument, not seven).
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(super) struct ChannelDebug {
+        pub move_dir: Vec2,
+        pub move_throttle: f32,
+        pub aim_dir: Vec2,
+        pub aim_drive: AimDrive,
+        pub fire: bool,
+        pub fire_reason: FireReason,
+        pub collision_imminence: f32,
+    }
+
+    /// Populate (insert-or-update) the brain entity's [`AiDebugCapture`] with one
+    /// tick's per-channel resolution — called by `ai_execute_system` under the
+    /// feature cfg, EVERY tick (the execute arm is per-tick, not on the think
+    /// cadence). The first capture for an entity that has never thought inserts
+    /// the component via `Commands`; otherwise it updates the channel fields in
+    /// place, leaving the selection fields (the think writer's) untouched.
+    pub(super) fn capture_channels(
+        captures: &mut Query<&mut AiDebugCapture>,
+        commands: &mut Commands,
+        entity: Entity,
+        ch: ChannelDebug,
+    ) {
+        if let Ok(mut capture) = captures.get_mut(entity) {
+            capture.record_channels(
+                ch.move_dir,
+                ch.move_throttle,
+                ch.aim_dir,
+                ch.aim_drive,
+                ch.fire,
+                ch.fire_reason,
+                ch.collision_imminence,
+            );
+        } else {
+            let mut capture = AiDebugCapture::default();
+            capture.record_channels(
+                ch.move_dir,
+                ch.move_throttle,
+                ch.aim_dir,
+                ch.aim_drive,
+                ch.fire,
+                ch.fire_reason,
+                ch.collision_imminence,
+            );
             commands.entity(entity).insert(capture);
         }
     }
@@ -2156,6 +3163,137 @@ mod tests {
         assert_eq!(curve_smooth(0.5), 0.5); // 0.25 · (3 − 1.0) = 0.5 exactly.
         assert!(curve_smooth(0.25) < 0.25, "S-curve suppresses low input");
         assert!(curve_smooth(0.75) > 0.75, "S-curve amplifies high input");
+    }
+
+    /// R97 Phase 1 Stage D — the collision-imminence consideration is bounded
+    /// `[0, 1]`, MONOTONE DECREASING in `ttc_norm` (a nearer collision scores
+    /// higher), pinned at the endpoints (`ttc_norm = 0` → 1 "impact now",
+    /// `ttc_norm = 1` → 0 "a horizon away"), and never NaN — for in-range AND
+    /// out-of-range inputs (the curve clamps).
+    #[test]
+    fn collision_imminence_curve_is_bounded_monotone_and_finite() {
+        // Endpoints: about-to-hit scores maximal, a full horizon away scores 0.
+        assert_eq!(con_collision_imminence(0.0), 1.0, "impact now → 1");
+        assert_eq!(con_collision_imminence(1.0), 0.0, "a horizon away → 0");
+        // Bounded + finite + monotone decreasing across a dense sweep, including
+        // out-of-range inputs (which clamp, never NaN).
+        let mut prev = f32::INFINITY;
+        for i in -2..=12 {
+            let x = i as f32 / 10.0; // −0.2 … 1.2 (spans the clamp edges).
+            let y = con_collision_imminence(x);
+            assert!(y.is_finite(), "imminence is finite at ttc_norm {x}");
+            assert!(
+                (0.0..=1.0).contains(&y),
+                "imminence in [0,1] at {x} (got {y})"
+            );
+            assert!(
+                y <= prev + 1e-7,
+                "monotone non-increasing in ttc_norm at {x}"
+            );
+            prev = y;
+        }
+        // A near-impact scores strictly higher than a distant one.
+        assert!(
+            con_collision_imminence(0.1) > con_collision_imminence(0.9),
+            "a nearer collision is more imminent"
+        );
+    }
+
+    /// R97 Phase 1 Stage D — the TTC prep helpers feeding the curve: a ship
+    /// closing head-on gets a finite, correctly-signed time-to-closest-approach
+    /// and a closest-approach distance under the avoid ring; a diverging /
+    /// non-closing pair gets the `INFINITY` sentinel (mapped to zero imminence),
+    /// and no path produces a NaN.
+    #[test]
+    fn ttc_helpers_close_in_finite_and_diverge_to_infinity() {
+        // A stationary obstacle 100 u dead-ahead (+X); the ship flies at +X 50 u/s
+        // → relative velocity of the obstacle toward the ship is −50 u/s in X.
+        let rel_pos = Vec2::new(100.0, 0.0);
+        let rel_vel = Vec2::new(-50.0, 0.0); // = -ship_vel for ship_vel = (50, 0).
+        let ttc = time_to_closest_approach(rel_pos, rel_vel);
+        assert!(
+            ttc.is_finite() && (ttc - 2.0).abs() < 1e-4,
+            "head-on closes in 2 s"
+        );
+        assert!(
+            closest_approach_dist(rel_pos, rel_vel) < 1e-3,
+            "a dead-ahead head-on passes through the centre (miss ≈ 0)"
+        );
+        // Diverging (ship moving AWAY from the obstacle) → no future approach.
+        let diverging = time_to_closest_approach(rel_pos, Vec2::new(50.0, 0.0));
+        assert!(diverging.is_infinite(), "a diverging pair never closes");
+        // The diverging closest-approach clamps to the present separation (no NaN,
+        // no fictitious past approach).
+        let miss = closest_approach_dist(rel_pos, Vec2::new(50.0, 0.0));
+        assert!(miss.is_finite() && (miss - 100.0).abs() < 1e-4);
+        // Zero relative velocity → never closes (guarded denominator, no NaN).
+        assert!(time_to_closest_approach(rel_pos, Vec2::ZERO).is_infinite());
+    }
+
+    /// R97 Phase 1 Stage D — `obstacle_imminence` over the field: a stationary
+    /// obstacle the ship is flying STRAIGHT INTO scores high imminence as the
+    /// time-to-impact falls inside the horizon; the SAME obstacle when the ship
+    /// is diverging (or parked) scores ZERO (the two-layer split's input — only
+    /// a closing, near-miss obstacle drives the preemptive override). Pure, no
+    /// world needed.
+    #[test]
+    fn obstacle_imminence_rises_closing_and_zero_diverging() {
+        let tuning = AiTuning::default();
+        let obs_radius = 50.0;
+        let own_radius = 4.0;
+        // The obstacle sits within the horizon at the ship's speed: ship at the
+        // origin, obstacle ahead at +X, distance chosen so ttc ≈ 0.5·horizon.
+        let speed = 80.0;
+        let dist = speed * tuning.collision_horizon_s * 0.5; // ttc ≈ 0.5·horizon
+        let field = ObstacleField {
+            obstacles: vec![(Vec2::new(dist, 0.0), obs_radius)],
+        };
+        // Flying STRAIGHT into it → a positive, dominant imminence.
+        let closing = obstacle_imminence(
+            &field,
+            Vec2::ZERO,
+            Vec2::new(speed, 0.0),
+            own_radius,
+            &tuning,
+        );
+        assert!(
+            closing > 0.0,
+            "a ship closing on an obstacle is imminent (got {closing})"
+        );
+        // Parked (zero velocity) → never closes → zero.
+        assert_eq!(
+            obstacle_imminence(&field, Vec2::ZERO, Vec2::ZERO, own_radius, &tuning),
+            0.0,
+            "a stationary ship has no collision pressure"
+        );
+        // Flying AWAY (diverging) → zero.
+        assert_eq!(
+            obstacle_imminence(
+                &field,
+                Vec2::ZERO,
+                Vec2::new(-speed, 0.0),
+                own_radius,
+                &tuning
+            ),
+            0.0,
+            "a diverging ship has no collision pressure"
+        );
+        // A glancing pass that clears the avoid ring (offset far on +Y, moving +X)
+        // → the closest approach exceeds the ring → zero imminence.
+        let glancing = ObstacleField {
+            obstacles: vec![(Vec2::new(dist, 10_000.0), obs_radius)],
+        };
+        assert_eq!(
+            obstacle_imminence(
+                &glancing,
+                Vec2::ZERO,
+                Vec2::new(speed, 0.0),
+                own_radius,
+                &tuning
+            ),
+            0.0,
+            "an obstacle the ship will cleanly miss is not imminent"
+        );
     }
 
     /// TR-004 strict-f32 determinism: the same inputs produce bit-identical
@@ -2986,6 +4124,174 @@ mod tests {
         assert_eq!(ram_utility(0.1, 60.0, 80.0, 0.0, 2.0, &t), 0.0);
     }
 
+    // --- R97 Stage A: consideration library (strict f32) ---
+
+    /// Every consideration is monotone in the documented direction, stays in
+    /// `[0, 1]`, clamps degenerate inputs, and is bit-stable across calls.
+    #[test]
+    fn considerations_have_documented_shape_and_range() {
+        // con_health: rises with hull (linear pass-through), clamped.
+        assert_eq!(con_health(0.0), 0.0);
+        assert_eq!(con_health(1.0), 1.0);
+        assert!(con_health(0.7) > con_health(0.3));
+        assert_eq!(con_health(2.0), 1.0, "clamps over-range");
+
+        // con_health_low: near 0 healthy, ramps as hull bleeds (quadratic of inv).
+        assert!(con_health_low(1.0).abs() < 1e-6, "healthy → ~0 pressure");
+        assert_eq!(con_health_low(0.0), 1.0, "dead → full pressure");
+        assert!(
+            con_health_low(0.2) > con_health_low(0.5),
+            "more hurt → more"
+        );
+
+        // con_energy: FLOORED at 0.3, full at 1, smooth between.
+        assert!(
+            (con_energy(0.0) - 0.3).abs() < 1e-6,
+            "floored so it never vetoes"
+        );
+        assert!((con_energy(1.0) - 1.0).abs() < 1e-6);
+        assert!(con_energy(0.8) > con_energy(0.2), "rises with energy");
+        assert!((0.3..=1.0).contains(&con_energy(0.5)));
+
+        // con_heat_ok: cool → ~1, hot → low (floored inverse, never < 0).
+        assert_eq!(con_heat_ok(0.0), 1.0, "cool → full");
+        assert_eq!(con_heat_ok(1.0), 0.0, "max heat → 0 headroom");
+        assert!(con_heat_ok(0.2) > con_heat_ok(0.8));
+
+        // con_in_band: tent peaked at range_norm == 1 (on the ring).
+        assert!((con_in_band(1.0) - 1.0).abs() < 1e-6, "on the ring → peak");
+        assert_eq!(con_in_band(0.0), 0.0, "too close → 0");
+        assert_eq!(con_in_band(2.0), 0.0, "too far → 0");
+        assert!((con_in_band(0.5) - 0.5).abs() < 1e-6, "half-band off → 0.5");
+        assert_eq!(con_in_band(5.0), 0.0, "way off clamps to 0, not negative");
+
+        // con_target_vulnerable: rises as the TARGET weakens (inverse).
+        assert_eq!(con_target_vulnerable(0.0), 1.0, "hulk → max desire");
+        assert_eq!(con_target_vulnerable(1.0), 0.0, "pristine → none");
+        assert!(con_target_vulnerable(0.1) > con_target_vulnerable(0.9));
+
+        // con_incoming_threat: S-curve, 0 at no threat, 1 at full.
+        assert_eq!(con_incoming_threat(0.0), 0.0);
+        assert_eq!(con_incoming_threat(1.0), 1.0);
+        assert!(con_incoming_threat(0.7) > con_incoming_threat(0.3));
+
+        // con_collision_imminence: high when ttc small (about to hit).
+        assert_eq!(con_collision_imminence(0.0), 1.0, "about to hit → max");
+        assert!(
+            con_collision_imminence(1.0).abs() < 1e-6,
+            "a horizon away → ~0"
+        );
+        assert!(
+            con_collision_imminence(0.2) > con_collision_imminence(0.8),
+            "nearer impact → higher"
+        );
+
+        // con_weapon_ready: product of three gates; any zero gate zeroes it.
+        assert_eq!(con_weapon_ready(1.0, 1.0, 1.0), 1.0);
+        assert_eq!(con_weapon_ready(0.0, 1.0, 1.0), 0.0, "mis-aimed → 0");
+        assert_eq!(con_weapon_ready(1.0, 0.0, 1.0), 0.0, "no energy → 0");
+        assert!(
+            (con_weapon_ready(0.5, 0.5, 0.5) - 0.125).abs() < 1e-6,
+            "product"
+        );
+        assert_eq!(
+            con_weapon_ready(2.0, 2.0, 2.0),
+            1.0,
+            "clamps over-range gates"
+        );
+
+        // con_momentum_align: S-curve, low when fighting inertia, high in tune.
+        assert_eq!(con_momentum_align(0.0), 0.0, "opposed → 0");
+        assert_eq!(con_momentum_align(1.0), 1.0, "aligned → 1");
+        assert!(con_momentum_align(0.7) > con_momentum_align(0.3));
+
+        // Strict-f32: identical inputs → identical bits (determinism).
+        assert_eq!(con_energy(0.5).to_bits(), con_energy(0.5).to_bits());
+        assert_eq!(con_in_band(0.5).to_bits(), con_in_band(0.5).to_bits());
+    }
+
+    // --- R97 Stage A: physics-scalar prep helpers (outside the markers) ---
+
+    /// TCA sign: a converging pair gives a positive FINITE time; a diverging
+    /// (or non-converging) pair gives INFINITY (the "no pressure" sentinel).
+    #[test]
+    fn time_to_closest_approach_sign_and_sentinel() {
+        // Other at +X 100 u, closing along -X at 10 u/s → meets in 10 s.
+        let tca = time_to_closest_approach(Vec2::new(100.0, 0.0), Vec2::new(-10.0, 0.0));
+        assert!(
+            tca.is_finite() && (tca - 10.0).abs() < 1e-4,
+            "converging → +finite"
+        );
+        // Same geometry but receding (+X) → never closes → INFINITY.
+        assert_eq!(
+            time_to_closest_approach(Vec2::new(100.0, 0.0), Vec2::new(10.0, 0.0)),
+            f32::INFINITY,
+            "diverging → INFINITY"
+        );
+        // Zero relative velocity → no future approach → INFINITY (no NaN divide).
+        assert_eq!(
+            time_to_closest_approach(Vec2::new(5.0, 0.0), Vec2::ZERO),
+            f32::INFINITY
+        );
+    }
+
+    /// Closest-approach distance on a crossing geometry: a body passing
+    /// perpendicular at offset `d` has a miss distance of exactly `d`.
+    #[test]
+    fn closest_approach_dist_on_a_crossing() {
+        // Other at (0, 3) moving +X across our path (we sit at origin, still):
+        // r = (0, 3), v = (10, 0). Closest approach holds the y-offset → 3.
+        let d = closest_approach_dist(Vec2::new(0.0, 3.0), Vec2::new(10.0, 0.0));
+        assert!(
+            (d - 3.0).abs() < 1e-4,
+            "perpendicular crossing misses by 3 (got {d})"
+        );
+        // Head-on closing toward the origin reaches distance ~0 at TCA.
+        let head_on = closest_approach_dist(Vec2::new(50.0, 0.0), Vec2::new(-10.0, 0.0));
+        assert!(head_on.abs() < 1e-3, "head-on closes to ~0 (got {head_on})");
+        // Diverging → reports the PRESENT separation (clamped at t = 0), never NaN.
+        let div = closest_approach_dist(Vec2::new(4.0, 0.0), Vec2::new(10.0, 0.0));
+        assert!(
+            (div - 4.0).abs() < 1e-4,
+            "diverging → present range (got {div})"
+        );
+    }
+
+    /// Stopping distance is monotone in speed, scales inversely with decel, and
+    /// floors the denominator (zero decel → finite, never NaN/∞-divide).
+    #[test]
+    fn stopping_distance_is_monotonic_and_safe() {
+        assert_eq!(
+            stopping_distance(0.0, 10.0),
+            0.0,
+            "stationary stops instantly"
+        );
+        // v²/(2a): 20²/(2·10) = 20.
+        assert!((stopping_distance(20.0, 10.0) - 20.0).abs() < 1e-4);
+        assert!(
+            stopping_distance(40.0, 10.0) > stopping_distance(20.0, 10.0),
+            "faster → longer stop"
+        );
+        assert!(
+            stopping_distance(20.0, 5.0) > stopping_distance(20.0, 20.0),
+            "weaker brake → longer stop"
+        );
+        // Finite for any positive decel; zero/negative decel floors the
+        // denominator → the well-defined "+∞ can-never-stop" answer, NEVER NaN.
+        assert!(
+            stopping_distance(20.0, 5.0).is_finite(),
+            "positive decel → finite"
+        );
+        assert!(
+            !stopping_distance(20.0, 0.0).is_nan(),
+            "zero decel → no NaN"
+        );
+        assert!(
+            !stopping_distance(20.0, -5.0).is_nan(),
+            "negative decel → no NaN"
+        );
+    }
+
     /// `hull_fraction`'s documented fallback chain: authored-cells baseline →
     /// flat health → healthy default.
     #[test]
@@ -3156,10 +4462,17 @@ mod tests {
         assert_eq!(kiter.turn.abs(), 1.0, "kiter turns hard to flee the ring");
     }
 
-    /// T025: Evade breaks off at full throttle; Retreat runs home (or directly
-    /// away); NEITHER ever fires — even with every fire gate wide open.
+    /// R97 Phase 1 Stage C (re-pins the old T025 "never fire" contract — behavior
+    /// INTENTIONALLY changed): the survival arms (Evade/Retreat) now AIM at the
+    /// nearest hostile while fleeing, so a FIGHTING RETREAT emerges — they fire
+    /// when armed + aligned + in range. The faithful new contract:
+    /// - an armed Retreater with a firable pursuer DEAD AHEAD fires while
+    ///   reverse-drifting toward home (open range, gun on the pursuer);
+    /// - an Evader forced to TURN to face a threat astern does NOT fire on the
+    ///   tick its nose is still off the threat (unaligned → no fire);
+    /// - an UNARMED retreater never fires (the `fire_decision` armed gate).
     #[test]
-    fn evade_and_retreat_break_off_and_never_fire() {
+    fn survival_arms_face_and_fire_on_the_threat_while_opening_range() {
         let (mut world, mut schedule) = exec_world();
         let astern = world
             .spawn((
@@ -3175,7 +4488,9 @@ mod tests {
                 Heading(0.0),
             ))
             .id();
-        // Evade a threat astern: straight-ahead escape at full burn.
+        // Evade a threat ASTERN (heading +X): MOVE away (≈+X), AIM at the threat
+        // behind (-X) → it must TURN to bring the gun to bear, so on this tick the
+        // nose is still off the threat (unaligned → no fire — a faithful case).
         let evader = world
             .spawn((
                 ship_bundle(
@@ -3191,8 +4506,9 @@ mod tests {
                 cold_heat(),
             ))
             .id();
-        // Retreat with a home anchor while a PERFECTLY firable target sits
-        // dead ahead (in range, aligned, charged, cold): still no fire.
+        // Retreat with a home anchor (astern) while a firable pursuer sits dead
+        // ahead (in range, aligned, charged, cold): the FIGHTING RETREAT — it
+        // reverse-drifts toward home while the gun bears on the pursuer, and FIRES.
         let retreater = world
             .spawn((
                 ship_bundle(
@@ -3209,7 +4525,8 @@ mod tests {
                 cold_heat(),
             ))
             .id();
-        // Retreat without a home: directly away from the threat.
+        // Retreat without a home: open range directly away from the pursuer ahead
+        // (MOVE -X, AIM +X) — same fighting retreat, reverse-drift + fire.
         let anchorless = world
             .spawn((
                 ship_bundle(
@@ -3225,19 +4542,66 @@ mod tests {
                 cold_heat(),
             ))
             .id();
+        // An UNARMED retreater with the SAME firable geometry: the armed gate in
+        // `fire_decision` means it never fires (it just runs).
+        let mut unarmed_stats = fighter_stats();
+        unarmed_stats.can_fire = false;
+        unarmed_stats.weapon = None;
+        let unarmed = world
+            .spawn((
+                ship_bundle(
+                    AiBrain {
+                        behavior: Behavior::Retreat,
+                        target: Some(ahead),
+                        ..AiBrain::default()
+                    },
+                    Vec2::ZERO,
+                ),
+                unarmed_stats,
+                full_energy(),
+                cold_heat(),
+            ))
+            .id();
         schedule.run(&mut world);
 
         let e = intent_of(&world, evader);
-        assert!(e.forward > 0.9, "evade burns away (got {})", e.forward);
-        assert!(!e.fire_primary, "Evade never fires (v1 documented rule)");
+        assert!(
+            e.turn.abs() > 0.5,
+            "evader turns to bring its gun onto the threat astern"
+        );
+        assert!(
+            !e.fire_primary,
+            "unaligned (nose still off the threat astern) → no fire"
+        );
         let r = intent_of(&world, retreater);
-        assert!(!r.fire_primary, "Retreat NEVER fires, gates open or not");
-        assert_eq!(r.forward, 0.0, "home is astern: turn first, then burn");
-        assert_eq!(r.turn.abs(), 1.0, "turning hard toward home");
+        assert!(
+            r.fire_primary,
+            "FIGHTING RETREAT: armed + aligned + in range → fire while withdrawing"
+        );
+        assert!(
+            r.forward < -0.9,
+            "reverse-drift toward home while facing the pursuer (got {})",
+            r.forward
+        );
+        assert!(
+            r.turn.abs() < 1e-5,
+            "nose stays on the dead-ahead pursuer (no turn)"
+        );
         let a = intent_of(&world, anchorless);
-        assert!(!a.fire_primary);
-        assert_eq!(a.forward, 0.0, "away-dir is astern: turn first");
-        assert_eq!(a.turn.abs(), 1.0);
+        assert!(
+            a.fire_primary,
+            "anchorless retreat fires on the pursuer too"
+        );
+        assert!(
+            a.forward < -0.9,
+            "opens range (reverse) while the gun bears"
+        );
+        assert!(a.turn.abs() < 1e-5, "faces the dead-ahead pursuer");
+        let u = intent_of(&world, unarmed);
+        assert!(
+            !u.fire_primary,
+            "an unarmed survival ship never fires (armed gate)"
+        );
     }
 
     /// T027: Ram execution is a full-throttle collision course with finisher
