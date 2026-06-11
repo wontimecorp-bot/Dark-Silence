@@ -20,7 +20,15 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 
-use sim::components::{Afterburner, ArmorHp, Energy, Heading, Health, Heat, Velocity};
+// T038 (TR-020a) — the per-brain score/transition capture, compiled only when the `ai_debug`
+// feature is on (the default `dev_panel` build enables it; see Cargo.toml).
+#[cfg(feature = "ai_debug")]
+use sim::ai::AiDebugCapture;
+use sim::ai::{
+    cadence_for_tier, AiBrain, AiStableId, AiTuning, AoiTier, ContactList, GlideState, LinkState,
+    SensorNetworks, Squad, Tier,
+};
+use sim::components::{Afterburner, ArmorHp, Energy, Heading, Health, Heat, Position, Velocity};
 use sim::damage::{
     default_resistance_matrix, HullStructure, PenetrationConfig, ResistanceMatrix, SalvageConfig,
     ShieldConfig, Shields, StatScalingConfig,
@@ -29,7 +37,7 @@ use sim::fitting::{
     derive_weapon, force_rederive_all, force_rederive_keep_health, seed_catalogs, Fit, FitLayout,
     HullCatalog, ModuleCatalog, ModuleId, ModuleKind, ModuleSpecifics, ShipStats, SlotId,
 };
-use sim::{MiningTuning, SimTuning, Tuning};
+use sim::{CurrentTick, FixedDt, MiningTuning, SimTuning, Tuning};
 
 use crate::hud_bars::HudLayout;
 use crate::net::{LoopbackHost, NetClientState};
@@ -858,6 +866,530 @@ fn build_equipment(fit: &Fit, catalog: Option<&ModuleCatalog>) -> (Vec<Equipment
     (rows, t)
 }
 
+// ---------------------------------------------------------------------------
+// T038/T039 (TR-020) — AI inspection + runtime metrics snapshot
+// ---------------------------------------------------------------------------
+
+/// One row of the AI-ship list (T038): every `AiBrain` carrier, sorted by distance to the player
+/// ship. Owned/pre-formatted so the egui closure holds no `host` borrow.
+struct AiShipRow {
+    entity: Entity,
+    /// Sim-stable spawn-order id (the selection key); `None` for a brain spawned outside the
+    /// allocator path (test-style worlds).
+    stable_id: Option<u64>,
+    /// Distance to the player ship; `INFINITY` when either position is missing.
+    dist: f32,
+    behavior: String,
+}
+
+/// One `ContactList` entry of the inspected ship, pre-formatted (T038).
+struct AiContactRow {
+    target: String,
+    /// Distance from the inspected ship to the contact's last-known position.
+    dist: f32,
+    last_seen_tick: u64,
+    signature: f32,
+}
+
+/// Squad/wing membership of the inspected ship (T038): the squad brain's order decision + lifecycle
+/// state (TR-020a "squad-driven ships show the squad/wing brain's order decision; dormant
+/// aggregates show tier + glide state").
+struct AiSquadInfo {
+    squad: String,
+    order: String,
+    members: usize,
+    pace_anchor: Option<String>,
+    anchor_speed: f32,
+    wing: Option<String>,
+    gliding: bool,
+    last_think_tick: u64,
+}
+
+/// The last-think score breakdown (T038, TR-020a) — a render copy of [`AiDebugCapture`], captured
+/// at the last ACTUAL think by `ai_think_system` (never a live recompute).
+#[cfg(feature = "ai_debug")]
+struct AiCaptureView {
+    /// Final per-candidate scores `select_behavior` compared (momentum included on the incumbent).
+    last_scores: Vec<(String, f32)>,
+    winner: String,
+    momentum_applied: f32,
+    /// Bounded transition ring, newest first: `(tick, from, to)`.
+    transitions: Vec<(u64, String, String)>,
+}
+
+/// Full detail of the selected AI ship (T038). All strings pre-formatted in the read phase.
+struct AiShipDetail {
+    entity: Entity,
+    stable_id: Option<u64>,
+    behavior: String,
+    archetype: String,
+    /// `"Active (since @123)"` — or the untiered note (absent `AoiTier` = treated Active).
+    tier: String,
+    throttle_cap: f32,
+    last_think_tick: u64,
+    commit_until_tick: u64,
+    thinks_total: u64,
+    target: Option<String>,
+    contacts_total: usize,
+    last_scan_tick: u64,
+    /// Nearest few contacts (by distance to the ship).
+    contacts: Vec<AiContactRow>,
+    /// `Some((jammed, severed))` when a `LinkState` is present; `None` = linked (no component).
+    link: Option<(bool, bool)>,
+    /// `(faction_key, component_index, member_count, fused_count)` of the sensor-network component
+    /// containing this ship, if any.
+    network: Option<(u8, usize, usize, usize)>,
+    squad: Option<AiSquadInfo>,
+    /// Active degraded-state cause (mirrors `ai_execute_system`'s guards).
+    degraded: &'static str,
+    #[cfg(feature = "ai_debug")]
+    capture: Option<AiCaptureView>,
+}
+
+/// Runtime AI metrics (T039, TR-020c) — cheap whole-world counts gathered each panel frame.
+#[derive(Default)]
+struct AiMetrics {
+    now: u64,
+    /// Fixed-step rate (Hz) for tick→seconds rate conversion.
+    tick_hz: f32,
+    brains: usize,
+    tier_active: usize,
+    tier_mid: usize,
+    tier_dormant: usize,
+    /// Σ `AiBrain::thinks_total` over all brains.
+    thinks_total: u64,
+    /// Brains whose `last_think_tick == now` (thought THIS tick — a sampled signal).
+    thinks_this_tick: usize,
+    /// Of those, thinks landing ON their fallback-cadence slot
+    /// (`(now + phase_bucket) % cadence_for_tier(think_tier) == 0` — the scheduler's rule).
+    thinks_cadence: usize,
+    /// Thinks OFF the cadence slot — only an event could have triggered them.
+    thinks_event: usize,
+    squads: usize,
+    /// Squads currently collapsed to a cheap-glide aggregate (`GlideState` present).
+    gliding_aggregates: usize,
+    /// STF-001 live signal: EXPANDED squads (no `GlideState`) farther from the player than
+    /// `AiTuning::aoi_radius_mid` — off-screen promoted battles.
+    offscreen_battles: usize,
+    /// `AoiTier` carriers (ships + squads) whose `since_tick == now` — promotions + demotions
+    /// landing this tick (the deterministic transition proxy).
+    tier_transitions_this_tick: usize,
+    /// Σ `ContactList` lengths (per-ship perception memory).
+    contact_sum: usize,
+    /// Ships whose own scan ran this tick (`ContactList::last_scan_tick == now`).
+    scans_this_tick: usize,
+    /// Sensor-network connected components across all factions.
+    network_components: usize,
+    /// Σ fused-picture contacts over all network components.
+    fused_total: usize,
+}
+
+/// Everything the AI panel sections render this frame.
+struct AiPanelData {
+    rows: Vec<AiShipRow>,
+    detail: Option<AiShipDetail>,
+    metrics: AiMetrics,
+}
+
+/// Gather the T038 inspection snapshot + T039 metrics from the embedded server world.
+///
+/// **Strictly read-only on sim state (TR-020)**: the `&mut World` is required only to construct
+/// `QueryState`s (Bevy registers query/archetype metadata — no component, resource, or tick is
+/// written), so viewing never triggers thinks or perturbs decision order/determinism.
+///
+/// `selected` is the panel's stable-id override text: blank/unparseable → the ship nearest the
+/// player (the TR-020a default).
+fn gather_ai(
+    world: &mut World,
+    player: Option<Entity>,
+    selected: &str,
+    tuning: &AiTuning,
+) -> AiPanelData {
+    let now = world.get_resource::<CurrentTick>().map_or(0, |t| t.0);
+    let tick_hz =
+        world
+            .get_resource::<FixedDt>()
+            .map_or(30.0, |d| if d.0 > 0.0 { 1.0 / d.0 } else { 30.0 });
+    let player_pos = player.and_then(|e| world.get::<Position>(e)).map(|p| p.0);
+
+    let mut metrics = AiMetrics {
+        now,
+        tick_hz,
+        ..AiMetrics::default()
+    };
+
+    // Pass 1 — every AiBrain carrier: the ship list + the per-brain metrics.
+    let mut rows: Vec<AiShipRow> = Vec::new();
+    let mut ships = world.query::<(
+        Entity,
+        &AiBrain,
+        Option<&AiStableId>,
+        Option<&AoiTier>,
+        Option<&Position>,
+    )>();
+    for (entity, brain, sid, aoi, pos) in ships.iter(world) {
+        metrics.brains += 1;
+        metrics.thinks_total += brain.thinks_total;
+        // Absent AoiTier = treated Active (the documented ai_execute/ai_think rule).
+        match aoi.map_or(Tier::Active, |a| a.tier) {
+            Tier::Active => metrics.tier_active += 1,
+            Tier::Mid => metrics.tier_mid += 1,
+            Tier::Dormant => metrics.tier_dormant += 1,
+        }
+        if brain.thinks_total > 0 && brain.last_think_tick == now {
+            metrics.thinks_this_tick += 1;
+            // Event-vs-cadence proxy: re-run the scheduler's fallback test for this tick. A think
+            // landing OFF its cadence slot can only have been event-triggered; an ON-slot think is
+            // counted as cadence (a coalesced same-tick event is indistinguishable — acceptable for
+            // a readout).
+            let cadence = cadence_for_tier(brain.think_tier, tuning);
+            if (now + u64::from(brain.phase_bucket)).is_multiple_of(cadence) {
+                metrics.thinks_cadence += 1;
+            } else {
+                metrics.thinks_event += 1;
+            }
+        }
+        let dist = match (player_pos, pos) {
+            (Some(pp), Some(p)) => (p.0 - pp).length(),
+            _ => f32::INFINITY,
+        };
+        rows.push(AiShipRow {
+            entity,
+            stable_id: sid.map(|s| s.0),
+            dist,
+            behavior: format!("{:?}", brain.behavior),
+        });
+    }
+    // Nearest-first; stable-id tiebreak so equal-distance (or player-less) lists don't jitter.
+    rows.sort_by(|a, b| {
+        a.dist
+            .total_cmp(&b.dist)
+            .then(a.stable_id.cmp(&b.stable_id))
+    });
+
+    // Selection: a parseable stable-id override pins that ship; else nearest (TR-020a default).
+    let chosen: Option<Entity> = match selected.trim().parse::<u64>() {
+        Ok(id) => rows
+            .iter()
+            .find(|r| r.stable_id == Some(id))
+            .or(rows.first())
+            .map(|r| r.entity),
+        Err(_) => rows.first().map(|r| r.entity),
+    };
+
+    // Pass 2 — AoiTier carriers (ships AND squads): transitions landing this tick.
+    let mut tiers = world.query::<&AoiTier>();
+    metrics.tier_transitions_this_tick = tiers
+        .iter(world)
+        .filter(|a| now > 0 && a.since_tick == now)
+        .count();
+
+    // Pass 3 — squads: counts, glide aggregates, off-screen battles + the selected ship's squad.
+    let mut squad_info: Option<AiSquadInfo> = None;
+    let mut squads = world.query::<(Entity, &Squad, Option<&GlideState>, Option<&Position>)>();
+    for (se, squad, glide, spos) in squads.iter(world) {
+        metrics.squads += 1;
+        if glide.is_some() {
+            metrics.gliding_aggregates += 1;
+        } else if let (Some(pp), Some(sp)) = (player_pos, spos) {
+            // STF-001: an EXPANDED (non-gliding) squad beyond the Mid radius is a promoted
+            // off-screen battle running full squad AI.
+            if (sp.0 - pp).length() > tuning.aoi_radius_mid {
+                metrics.offscreen_battles += 1;
+            }
+        }
+        if chosen.is_some_and(|c| squad.members.contains(&c)) {
+            squad_info = Some(AiSquadInfo {
+                squad: format!("{se:?}"),
+                order: format!("{:?}", squad.order),
+                members: squad.members.len(),
+                pace_anchor: squad.pace_anchor.map(|a| format!("{a:?}")),
+                anchor_speed: squad.anchor_speed,
+                wing: squad.wing.map(|w| format!("{w:?}")),
+                gliding: glide.is_some(),
+                last_think_tick: squad.last_think_tick,
+            });
+        }
+    }
+
+    // Pass 4 — perception: contact memory + own-scan counts.
+    let mut contact_lists = world.query::<&ContactList>();
+    for cl in contact_lists.iter(world) {
+        metrics.contact_sum += cl.contacts.len();
+        if now > 0 && cl.last_scan_tick == now {
+            metrics.scans_this_tick += 1;
+        }
+    }
+
+    // Pass 5 — sensor networks: component + fused totals.
+    if let Some(nets) = world.get_resource::<SensorNetworks>() {
+        for comps in nets.by_faction.values() {
+            metrics.network_components += comps.len();
+            metrics.fused_total += comps.iter().map(|c| c.fused.len()).sum::<usize>();
+        }
+    }
+
+    // Detail of the selected ship (plain immutable `world.get`s — the queries above are done).
+    let detail = chosen.map(|e| {
+        let brain = world.get::<AiBrain>(e).copied().unwrap_or_default();
+        let pos = world.get::<Position>(e).map(|p| p.0);
+        let aoi = world.get::<AoiTier>(e).copied();
+        let stats = world.get::<ShipStats>(e).copied();
+        let tier = aoi.map_or(Tier::Active, |a| a.tier);
+        // Degraded-state cause — mirrors ai_execute_system's guards in their exact order.
+        let degraded = match stats {
+            Some(s) if s.control_fitted && !s.has_control => {
+                "derelict (control fitted, none alive) → pinned Hold, zero intent"
+            }
+            Some(s) if s.power_supply <= 0.0 => {
+                "no power (dead reactor) → pinned Hold, zero intent"
+            }
+            _ if tier == Tier::Dormant => {
+                "dormant tier → execution skipped (glide aggregate owns it)"
+            }
+            _ => "none",
+        };
+        let mut contacts: Vec<AiContactRow> = Vec::new();
+        let (contacts_total, last_scan_tick) = world.get::<ContactList>(e).map_or((0, 0), |cl| {
+            contacts = cl
+                .contacts
+                .iter()
+                .map(|c| AiContactRow {
+                    target: format!("{:?}", c.target),
+                    dist: pos.map_or(f32::INFINITY, |p| (c.last_pos - p).length()),
+                    last_seen_tick: c.last_seen_tick,
+                    signature: c.signature,
+                })
+                .collect();
+            contacts.sort_by(|a, b| a.dist.total_cmp(&b.dist));
+            contacts.truncate(4);
+            (cl.contacts.len(), cl.last_scan_tick)
+        });
+        let network = world.get_resource::<SensorNetworks>().and_then(|nets| {
+            nets.by_faction.iter().find_map(|(fk, comps)| {
+                comps.iter().enumerate().find_map(|(i, c)| {
+                    c.members
+                        .contains(&e)
+                        .then_some((*fk, i, c.members.len(), c.fused.len()))
+                })
+            })
+        });
+        #[cfg(feature = "ai_debug")]
+        let capture = world.get::<AiDebugCapture>(e).map(|c| AiCaptureView {
+            last_scores: c
+                .last_scores
+                .iter()
+                .map(|(b, s)| (format!("{b:?}"), *s))
+                .collect(),
+            winner: format!("{:?}", c.winner),
+            momentum_applied: c.momentum_applied,
+            transitions: c
+                .transitions
+                .iter()
+                .rev()
+                .map(|(t, from, to)| (*t, format!("{from:?}"), format!("{to:?}")))
+                .collect(),
+        });
+        AiShipDetail {
+            entity: e,
+            stable_id: world.get::<AiStableId>(e).map(|s| s.0),
+            behavior: format!("{:?}", brain.behavior),
+            archetype: format!("{:?}", brain.archetype),
+            tier: aoi.map_or_else(
+                || "untiered (treated Active)".to_string(),
+                |a| format!("{:?} (since @{})", a.tier, a.since_tick),
+            ),
+            throttle_cap: brain.throttle_cap,
+            last_think_tick: brain.last_think_tick,
+            commit_until_tick: brain.commit_until_tick,
+            thinks_total: brain.thinks_total,
+            target: brain.target.map(|t| format!("{t:?}")),
+            contacts_total,
+            last_scan_tick,
+            contacts,
+            link: world.get::<LinkState>(e).map(|l| (l.jammed, l.severed)),
+            network,
+            squad: squad_info,
+            degraded,
+            #[cfg(feature = "ai_debug")]
+            capture,
+        }
+    });
+
+    AiPanelData {
+        rows,
+        detail,
+        metrics,
+    }
+}
+
+/// Render the selected ship's inspection detail (T038, TR-020a). Read-only rows via [`stat`].
+fn render_ai_detail(ui: &mut egui::Ui, d: &AiShipDetail, now: u64) {
+    stat(
+        ui,
+        "ship",
+        format!(
+            "{:?}  (stable id {})",
+            d.entity,
+            d.stable_id.map_or("—".to_string(), |i| i.to_string())
+        ),
+    )
+    .on_hover_text("The inspected AI ship: its ECS entity + sim-stable spawn-order id.");
+    stat(
+        ui,
+        "behavior",
+        format!(
+            "{}  ({} · throttle ×{:.2})",
+            d.behavior, d.archetype, d.throttle_cap
+        ),
+    )
+    .on_hover_text("Current behavior state, the cached fit-archetype, and the squad pace throttle cap applied to forward intent.");
+    stat(ui, "tier", &d.tier)
+        .on_hover_text("AOI sim-LOD tier (Active = full AI, Mid = squad-driven, Dormant = glide aggregate) + the tick it was entered.");
+    stat(
+        ui,
+        "staleness",
+        format!(
+            "think @{} (now @{})  commit→@{}  thinks {}",
+            d.last_think_tick, now, d.commit_until_tick, d.thinks_total
+        ),
+    )
+    .on_hover_text("last_think_tick vs the current tick (how stale the shown decision is) + the commitment window end + lifetime completed thinks.");
+    stat(
+        ui,
+        "target",
+        d.target.clone().unwrap_or_else(|| "none".to_string()),
+    )
+    .on_hover_text(
+        "The brain's current engage/follow target entity (pruned the tick it despawns).",
+    );
+    stat(
+        ui,
+        "link",
+        d.link.map_or("linked (no LinkState)".to_string(), |(j, s)| {
+            format!("jammed {j} · severed {s}")
+        }),
+    )
+    .on_hover_text("Datalink seam flags: EITHER true excludes the ship from sensor-network fusion (own picture only). No component = linked.");
+    stat(
+        ui,
+        "network",
+        d.network
+            .map_or("none (own picture only)".to_string(), |(fk, i, n, f)| {
+                format!("faction {fk} comp #{i}: {n} members · {f} fused")
+            }),
+    )
+    .on_hover_text("The sensor-network connected component containing this ship: faction key, component index, member count, fused-picture size.");
+    stat(ui, "degraded", d.degraded)
+        .on_hover_text("Active degraded-state cause, mirroring ai_execute_system's guards: derelict / dead reactor → pinned Hold; Dormant → execution skipped.");
+    // ContactList summary: count + the nearest few entries.
+    stat(
+        ui,
+        "contacts",
+        format!("{} (own scan @{})", d.contacts_total, d.last_scan_tick),
+    )
+    .on_hover_text("This ship's own ContactList: total known hostiles + the tick its own scan last ran. Nearest entries below.");
+    for c in &d.contacts {
+        let dist = if c.dist.is_finite() {
+            format!("{:.0}u", c.dist)
+        } else {
+            "—".to_string()
+        };
+        ui.label(
+            egui::RichText::new(format!(
+                "    {:<8} d {:<7} seen @{:<8} sig {:.2}",
+                c.target, dist, c.last_seen_tick, c.signature
+            ))
+            .monospace(),
+        );
+    }
+    // Squad/wing membership + the squad brain's order decision (TR-020a).
+    match &d.squad {
+        None => {
+            stat(ui, "squad", "none (solo brain)").on_hover_text(
+                "No squad's member list contains this ship — it thinks and steers solo.",
+            );
+        }
+        Some(s) => {
+            stat(
+                ui,
+                "squad",
+                format!(
+                    "{} order {} · {} members · think @{}",
+                    s.squad, s.order, s.members, s.last_think_tick
+                ),
+            )
+            .on_hover_text("The owning squad entity, its current order decision, member count, and the squad brain's last think tick.");
+            stat(
+                ui,
+                "squad pace",
+                format!(
+                    "anchor {} ({:.1} u/s) · wing {} · gliding {}",
+                    s.pace_anchor.clone().unwrap_or_else(|| "—".to_string()),
+                    s.anchor_speed,
+                    s.wing.clone().unwrap_or_else(|| "—".to_string()),
+                    if s.gliding { "yes" } else { "no" }
+                ),
+            )
+            .on_hover_text("Pace anchor (slowest essential member) + cached anchor speed, the parent wing (if any), and whether the squad is collapsed to a glide aggregate.");
+        }
+    }
+    // T038 score breakdown — the AiDebugCapture read, feature-gated exactly like the sim seam
+    // (AD-006): both cfg arms compile; the default dev_panel build enables ai_debug.
+    #[cfg(feature = "ai_debug")]
+    {
+        ui.separator();
+        ui.label(
+            egui::RichText::new("Score breakdown — captured at the LAST think (never recomputed)")
+                .strong(),
+        );
+        match &d.capture {
+            None => {
+                ui.label(
+                    egui::RichText::new("no capture yet (no completed think since spawn)").weak(),
+                );
+            }
+            Some(c) => {
+                stat(
+                    ui,
+                    "winner",
+                    format!(
+                        "{} (momentum +{:.0}% on incumbent)",
+                        c.winner,
+                        c.momentum_applied * 100.0
+                    ),
+                )
+                .on_hover_text("The behavior the last think selected + the momentum bonus that was applied to the incumbent's score (0% when the incumbent wasn't a candidate).");
+                for (b, s) in &c.last_scores {
+                    let marker = if *b == c.winner { "►" } else { " " };
+                    ui.label(egui::RichText::new(format!("  {marker} {b:<14} {s:.3}")).monospace());
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "transitions (newest first, ring of {}):",
+                        c.transitions.len()
+                    ))
+                    .weak(),
+                );
+                for (t, from, to) in &c.transitions {
+                    ui.label(egui::RichText::new(format!("    @{t}  {from} → {to}")).monospace());
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "ai_debug"))]
+    {
+        ui.separator();
+        ui.label(
+            egui::RichText::new(
+                "score breakdown unavailable — build with --features ai_debug \
+                 (the default dev_panel build enables it)",
+            )
+            .weak(),
+        );
+    }
+}
+
 /// Visibility of the two dev windows — the editable **Dev Tuning** panel and the read-only **Ship
 /// Stats** panel (Phase M6c). Backtick (`` ` ``) toggles both at once; each window's egui `[x]`
 /// closes just that one. Default **open** (this is the solo dev client).
@@ -869,6 +1401,20 @@ pub struct DevPanelState {
     pub save_status: String,
     /// Refinement 43: last result of the "Equip weapon → player ship" quick-swap (shown by it).
     pub equip_status: String,
+    /// T038 (TR-020a): AI-inspection stable-id override as typed text. Blank = the ship nearest the
+    /// player (the spec default); a parseable sim-stable id pins that ship. Applied at the NEXT
+    /// frame's read phase (the panel reads it before the UI edits it).
+    pub ai_selected: String,
+    /// T039 (TR-020c) rolling-rate bookkeeping: the last sampled `(tick, Σ thinks_total)` pair.
+    /// `None` until the first frame with AI data.
+    ai_rate_sample: Option<(u64, u64)>,
+    /// T039: latest derived thinks/second (sim time) between panel samples.
+    ai_thinks_per_s: f32,
+    /// T039: accumulated tier transitions OBSERVED at sampled ticks (the panel runs at render rate,
+    /// so ticks between frames are not seen — a sampled rolling signal, not an exact census).
+    ai_transitions_seen: u64,
+    /// T039: tick of the first metrics sample — the rolling-rate window anchor.
+    ai_metrics_since: Option<u64>,
 }
 
 impl Default for DevPanelState {
@@ -878,6 +1424,11 @@ impl Default for DevPanelState {
             stats_open: true,
             save_status: String::new(),
             equip_status: String::new(),
+            ai_selected: String::new(),
+            ai_rate_sample: None,
+            ai_thinks_per_s: 0.0,
+            ai_transitions_seen: 0,
+            ai_metrics_since: None,
         }
     }
 }
@@ -1310,6 +1861,12 @@ fn dev_panel_ui(
         .get_resource::<sim::fitting::CellMaterials>()
         .cloned()
         .unwrap_or_default();
+    // T038 (TR-020b): the live AI tuning (ServerApp::new inserts the pinned default, so the
+    // fallback only covers exotic test worlds).
+    let mut ai_tun = world
+        .get_resource::<AiTuning>()
+        .copied()
+        .unwrap_or_default();
 
     // M6b: snapshot the LOCAL player ship's derived stats + live state (read-only). Resolve the
     // server entity from the client's wire `local_id`; gather into an owned struct so the egui
@@ -1362,6 +1919,36 @@ fn dev_panel_ui(
     let equip_ship = net
         .as_ref()
         .and_then(|n| host.server.ship_entity_for(n.local_id));
+
+    // T038/T039 (TR-020): snapshot the AI inspection + runtime metrics. `world_mut()` is needed
+    // only to build the read-only QueryStates (see `gather_ai` docs) — nothing in the sim world is
+    // written, so viewing never perturbs decision order or determinism.
+    let ai_data = gather_ai(
+        host.server.world_mut(),
+        equip_ship,
+        &state.ai_selected,
+        &ai_tun,
+    );
+    // T039 rolling rates (the Local-snapshot trick, kept in DevPanelState): thinks/s from the
+    // Σ thinks_total delta between sampled ticks; tier transitions accumulated per sampled tick.
+    // Sampled at panel (render) rate — ticks between frames are not observed.
+    {
+        let m = &ai_data.metrics;
+        if state.ai_metrics_since.is_none() && m.brains > 0 {
+            state.ai_metrics_since = Some(m.now);
+        }
+        match state.ai_rate_sample {
+            Some((tick, thinks)) if m.now > tick => {
+                state.ai_thinks_per_s = m.thinks_total.saturating_sub(thinks) as f32
+                    / (m.now - tick) as f32
+                    * m.tick_hz;
+                state.ai_transitions_seen += m.tier_transitions_this_tick as u64;
+                state.ai_rate_sample = Some((m.now, m.thinks_total));
+            }
+            None => state.ai_rate_sample = Some((m.now, m.thinks_total)),
+            _ => {}
+        }
+    }
 
     // M6c — read-only Ship Stats in its OWN draggable window: derived stats + live state, then the
     // ship's installed equipment and its nominal summed contributions.
@@ -1537,6 +2124,222 @@ fn dev_panel_ui(
                         );
                     },
                 );
+
+                // T038 (TR-020b) — live AiTuning: EVERY field group, mirroring the
+                // SimTuning/MiningTuning pattern (read → sliders → write-phase insert_resource;
+                // "Save dev settings" persists it in render_tuning.ron). All tick counts @30 Hz.
+                egui::CollapsingHeader::new("AI tuning — AiTuning (live)").show(ui, |ui| {
+                    // u32 fields: a plain int slider (the ricochet_min_neighbors pattern).
+                    let int = |ui: &mut egui::Ui,
+                               label: &str,
+                               v: &mut u32,
+                               range: std::ops::RangeInclusive<u32>,
+                               tip: &str| {
+                        ui.add(egui::Slider::new(v, range).text(label))
+                            .on_hover_text(tip);
+                    };
+                    ui.label(egui::RichText::new("Think cadence (TR-005)").strong());
+                    int(ui, "think ticks Active", &mut ai_tun.think_ticks_active, 1..=120,
+                        "Active-tier FALLBACK think cadence, ticks. Events still trigger same-tick re-thinks.");
+                    int(ui, "think ticks Mid", &mut ai_tun.think_ticks_mid, 1..=120,
+                        "Mid-tier fallback think cadence, ticks.");
+                    int(ui, "think ticks Dormant", &mut ai_tun.think_ticks_dormant, 1..=600,
+                        "Dormant-tier fallback think cadence, ticks (the 2–5 s band; 90 = 3 s).");
+                    int(ui, "fallback buckets", &mut ai_tun.fallback_bucket_count, 1..=64,
+                        "Phase-bucket count spreading the fallback cadence — each tick services ≈ N/buckets brains.");
+                    ui.separator();
+                    ui.label(egui::RichText::new("AOI tiers (TR-007/TR-008)").strong());
+                    slider(ui, "AOI radius Active", &mut ai_tun.aoi_radius_active, 5.0..=500.0)
+                        .on_hover_text("Player-proximity radius of the Active tier (full per-ship AI), world units.");
+                    slider(ui, "AOI radius Mid", &mut ai_tun.aoi_radius_mid, 20.0..=2000.0)
+                        .on_hover_text("Player-proximity radius of the Mid tier (squad-driven AI); beyond = Dormant.");
+                    int(ui, "tier hysteresis", &mut ai_tun.tier_hysteresis_ticks, 0..=300,
+                        "Minimum ticks between tier changes per entity (no boundary thrash). Promotion is immediate.");
+                    slider(ui, "promote nudge max", &mut ai_tun.promote_nudge_max, 0.0..=50.0)
+                        .on_hover_text("TR-008 validity-nudge bound: max de-penetration distance applied at glide expansion, world units.");
+                    ui.separator();
+                    ui.label(egui::RichText::new("Squads (TR-010)").strong());
+                    int(ui, "max squad size", &mut ai_tun.max_squad_size, 1..=32,
+                        "Maximum members per squad; larger groups split.");
+                    int(ui, "wing split threshold", &mut ai_tun.wing_split_threshold, 1..=64,
+                        "Fleet size at/above which squads organize under a wing parent.");
+                    ui.separator();
+                    ui.label(egui::RichText::new("Utility scoring (TR-004)").strong());
+                    slider(ui, "momentum bonus", &mut ai_tun.momentum_bonus, 0.0..=1.0)
+                        .on_hover_text("Incumbent-behavior score multiplier bonus (~0.25 = +25%): hysteresis against behavior oscillation. Watch its effect in the inspection view's score breakdown.");
+                    slider(ui, "compensation k", &mut ai_tun.compensation_k, 0.1..=4.0)
+                        .on_hover_text("Mark's compensation factor for multiplied consideration curves (rescales so adding considerations doesn't starve a score).");
+                    ui.separator();
+                    ui.label(egui::RichText::new("Ramming (TR-012)").strong());
+                    slider(ui, "ram target hull frac", &mut ai_tun.ram_target_hull_frac, 0.0..=1.0)
+                        .on_hover_text("Target hull fraction at/below which it counts as near-dead/disabled for a ram.");
+                    slider(ui, "ram self margin", &mut ai_tun.ram_self_margin, 1.0..=10.0)
+                        .on_hover_text("Required ratio of projected dealt damage over projected self-damage (\"much weaker\").");
+                    slider(ui, "ram min closing frac", &mut ai_tun.ram_min_closing_frac, 0.0..=1.0)
+                        .on_hover_text("Minimum closing speed to commit, as a fraction of the attacker's top speed.");
+                    ui.separator();
+                    ui.label(egui::RichText::new("Fit archetypes (TR-006) ⟳ mass re-classify").strong());
+                    slider(ui, "arch speed hi", &mut ai_tun.arch_speed_hi, 0.0..=300.0)
+                        .on_hover_text("Top speed at/above which a fit reads as 'fast' (Kiter-leaning). Editing any cut re-classifies EVERY ship live (V-5; keeps damage).");
+                    slider(ui, "arch dps hi", &mut ai_tun.arch_dps_hi, 0.0..=200.0)
+                        .on_hover_text("Sustained DPS at/above which a fit reads as 'armed/heavy-hitting' (Brawler-leaning). Edit → live mass re-classification (V-5).");
+                    slider(ui, "arch armor hi", &mut ai_tun.arch_armor_hi, 0.0..=500.0)
+                        .on_hover_text("Armor/structure pool at/above which a fit reads as 'tanky' (Rammer/Brawler-leaning). Edit → live mass re-classification (V-5).");
+                    ui.separator();
+                    ui.label(egui::RichText::new("Sensors / perception (TR-013/TR-014)").strong());
+                    slider(ui, "base sensor range", &mut ai_tun.base_sensor_range, 0.0..=2000.0)
+                        .on_hover_text("Baseline own-ship sensor range, world units (v1 faction baseline).");
+                    slider(ui, "datalink radius", &mut ai_tun.datalink_radius, 0.0..=2000.0)
+                        .on_hover_text("Faction datalink connectivity radius for the sensor-network flood-fill.");
+                    slider(ui, "sig threshold", &mut ai_tun.sig_threshold, 0.0..=10.0)
+                        .on_hover_text("Minimum contact signature to detect (0 = everything visible in v1).");
+                    int(ui, "scan ticks Mid", &mut ai_tun.scan_ticks_mid, 1..=300,
+                        "Mid-tier scan cadence, ticks (~0.5 s fused query).");
+                    int(ui, "scan ticks Far", &mut ai_tun.scan_ticks_far, 1..=600,
+                        "Far-tier scan cadence, ticks (coarse-grid neighborhood; 90 = 3 s).");
+                    int(ui, "max fused contacts", &mut ai_tun.max_fused_contacts, 1..=256,
+                        "Cap per fused network picture (newest/highest-signature kept, deterministic cut).");
+                    ui.separator();
+                    ui.label(egui::RichText::new("Context steering (TR-002)").strong());
+                    int(ui, "steering slots", &mut ai_tun.slot_count, 8..=16,
+                        "Direction slots per context map (interest/danger), 8–16.");
+                    slider(ui, "danger mask floor", &mut ai_tun.danger_mask_floor, 0.0..=1.0)
+                        .on_hover_text("Floor a danger-masked slot is suppressed to (0 = fully blocked).");
+                    ui.separator();
+                    ui.label(egui::RichText::new("Debug (TR-020a)").strong());
+                    int(ui, "debug history len", &mut ai_tun.debug_history_len, 1..=128,
+                        "Per-brain behavior-transition ring length (capture is feature-gated OFF in headless/bench builds).");
+                });
+
+                // T038 (TR-020a) — per-ship AI inspection: STRICTLY read-only (selection only
+                // changes what the panel shows, never sim state).
+                egui::CollapsingHeader::new("AI inspection (per-ship, read-only)").show(ui, |ui| {
+                    if ai_data.rows.is_empty() {
+                        // TR-020: a world with AI gated off renders an empty AI section.
+                        ui.label(egui::RichText::new("no AI ships in this world").weak());
+                        return;
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("stable id");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.ai_selected)
+                                .hint_text("blank = nearest")
+                                .desired_width(72.0),
+                        )
+                        .on_hover_text("Pin the inspected ship by its sim-stable id (the # in the list). Blank or unparseable = the ship nearest the player (the default).");
+                        if ui.small_button("✕").clicked() {
+                            state.ai_selected.clear();
+                        }
+                    });
+                    for row in ai_data.rows.iter().take(12) {
+                        let selected =
+                            ai_data.detail.as_ref().is_some_and(|d| d.entity == row.entity);
+                        let id_txt =
+                            row.stable_id.map_or("#—".to_string(), |i| format!("#{i}"));
+                        let dist_txt = if row.dist.is_finite() {
+                            format!("{:.0}u", row.dist)
+                        } else {
+                            "—".to_string()
+                        };
+                        let text = egui::RichText::new(format!(
+                            "{id_txt:>5} {dist_txt:>7}  {:<13} {:?}",
+                            row.behavior, row.entity
+                        ))
+                        .monospace();
+                        if ui.selectable_label(selected, text).clicked() {
+                            if let Some(i) = row.stable_id {
+                                state.ai_selected = i.to_string();
+                            }
+                        }
+                    }
+                    if ai_data.rows.len() > 12 {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "… {} more (pin one via the stable-id field)",
+                                ai_data.rows.len() - 12
+                            ))
+                            .weak(),
+                        );
+                    }
+                    ui.separator();
+                    if let Some(d) = &ai_data.detail {
+                        render_ai_detail(ui, d, ai_data.metrics.now);
+                    }
+                });
+
+                // T039 (TR-020c) — runtime AI metrics: read-only whole-world counts, sampled at
+                // panel (render) rate over the embedded server world.
+                egui::CollapsingHeader::new("AI metrics (runtime, read-only)").show(ui, |ui| {
+                    let m = &ai_data.metrics;
+                    if m.brains == 0 {
+                        ui.label(egui::RichText::new("no AI ships in this world").weak());
+                        return;
+                    }
+                    stat(ui, "tick", m.now)
+                        .on_hover_text("Current sim tick of the embedded server (30 Hz fixed step).");
+                    stat(
+                        ui,
+                        "ai ships",
+                        format!(
+                            "{} (Active {} / Mid {} / Dormant {})",
+                            m.brains, m.tier_active, m.tier_mid, m.tier_dormant
+                        ),
+                    )
+                    .on_hover_text("AiBrain carriers per AOI tier (a ship with no AoiTier counts as Active — the execution rule).");
+                    stat(
+                        ui,
+                        "thinks Σ",
+                        format!("{} (~{:.1}/s)", m.thinks_total, state.ai_thinks_per_s),
+                    )
+                    .on_hover_text("Σ thinks_total over all brains + the rate derived from the delta between sampled ticks.");
+                    stat(
+                        ui,
+                        "thinks @tick",
+                        format!(
+                            "{} (cadence {} / event {})",
+                            m.thinks_this_tick, m.thinks_cadence, m.thinks_event
+                        ),
+                    )
+                    .on_hover_text("Brains that thought THIS tick, split by the scheduler's fallback-cadence test: an off-slot think can only be event-triggered. Sampled at panel rate.");
+                    stat(
+                        ui,
+                        "squads",
+                        format!("{} ({} gliding aggregates)", m.squads, m.gliding_aggregates),
+                    )
+                    .on_hover_text("Live squad entities; 'gliding' = collapsed to the cheap-glide aggregate (GlideState present).");
+                    stat(ui, "offscreen battles", m.offscreen_battles)
+                        .on_hover_text("STF-001 live signal: EXPANDED (non-gliding) squads farther from the player than the Mid AOI radius — promoted off-screen engagements running full squad AI.");
+                    let elapsed = m.now.saturating_sub(state.ai_metrics_since.unwrap_or(m.now));
+                    let trans_rate = if elapsed > 0 {
+                        state.ai_transitions_seen as f32 / elapsed as f32 * m.tick_hz
+                    } else {
+                        0.0
+                    };
+                    stat(
+                        ui,
+                        "tier transitions",
+                        format!(
+                            "{} this tick · ~{:.2}/s rolling",
+                            m.tier_transitions_this_tick, trans_rate
+                        ),
+                    )
+                    .on_hover_text("AoiTier carriers (ships + squads) whose since_tick == now: promotions + demotions landing this tick, plus a sampled rolling rate since the panel opened.");
+                    stat(
+                        ui,
+                        "contacts Σ",
+                        format!("{} ({} scans this tick)", m.contact_sum, m.scans_this_tick),
+                    )
+                    .on_hover_text("Σ ContactList lengths (per-ship perception memory) + ships whose own scan ran this tick.");
+                    stat(
+                        ui,
+                        "networks",
+                        format!(
+                            "{} components · {} fused Σ",
+                            m.network_components, m.fused_total
+                        ),
+                    )
+                    .on_hover_text("Sensor-network connected components across all factions + the summed fused-picture contact totals.");
+                });
 
                 egui::CollapsingHeader::new(
                     "Sim consts — SimTuning (carve / mass / projectile / wreck / ram)",
@@ -2372,6 +3175,7 @@ fn dev_panel_ui(
                     starfield: *starfield,
                     ship_visual: *ship_visual,
                     cell_materials: cell_materials.clone(),
+                    ai: ai_tun,
                 };
                 state.save_status = match tuning_io::save_dev_settings(&dev) {
                     Ok(m) => m,
@@ -2410,6 +3214,8 @@ fn dev_panel_ui(
         world.insert_resource(StatScalingConfig::default());
         world.insert_resource(default_resistance_matrix());
         world.insert_resource(MiningTuning::default());
+        // T038 (TR-020b): Reset-ALL also restores the pinned AiTuning defaults.
+        world.insert_resource(AiTuning::default());
         let (m, h) = seed_catalogs();
         world.insert_resource(m);
         world.insert_resource(h);
@@ -2427,6 +3233,17 @@ fn dev_panel_ui(
             || world.get_resource::<SimTuning>() != Some(&sim)
             // R66 — a hull/armor material HP or mass edit needs a re-derive (the gate reads live).
             || world.get_resource::<sim::fitting::CellMaterials>() != Some(&cell_materials);
+        // T038 (TR-020b, V-5): an ARCHETYPE-CUT edit must mass re-classify every brain. The
+        // classifier (`archetype_refresh_system`) keys off `Changed<ShipStats>`, so reuse the
+        // keep-health re-derive below: `force_rederive_keep_health` marks every `FitLayout`
+        // changed → `recompute_ship_stats_system` rebuilds `ShipStats` → `Changed<ShipStats>`
+        // fires → every archetype re-classifies against the new cuts (damage preserved). The
+        // other AiTuning fields are read live each tick and need no trigger.
+        let arch_cuts_changed = world.get_resource::<AiTuning>().is_some_and(|t| {
+            t.arch_speed_hi != ai_tun.arch_speed_hi
+                || t.arch_dps_hi != ai_tun.arch_dps_hi
+                || t.arch_armor_hi != ai_tun.arch_armor_hi
+        });
         world.insert_resource(tuning);
         world.insert_resource(sim);
         world.insert_resource(pen);
@@ -2435,13 +3252,14 @@ fn dev_panel_ui(
         world.insert_resource(scaling);
         world.insert_resource(mining);
         world.insert_resource(cell_materials);
+        world.insert_resource(ai_tun);
         if let Some(m) = modules {
             world.insert_resource(m);
         }
         if let Some(h) = hulls {
             world.insert_resource(h);
         }
-        if designs_changed && !rederive {
+        if (designs_changed || arch_cuts_changed) && !rederive {
             force_rederive_keep_health(world);
         }
     }

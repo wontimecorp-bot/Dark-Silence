@@ -265,6 +265,10 @@ fn setup_loopback_host(world: &mut World) {
         // R66 — the typed per-cell hull/armor materials catalog (windowed-only; headless keeps the
         // `ServerApp::new` default → bit-identical).
         w.insert_resource(dev.cell_materials);
+        // T038 (TR-020b) — the saved AI tuning override (windowed-only; headless/golden/bench worlds
+        // keep the pinned `AiTuning::default()` from `ServerApp::new`). Inserted BEFORE
+        // `spawn_scenario` so squad spawns read the dev `fallback_bucket_count`.
+        w.insert_resource(dev.ai);
     }
 
     // R65 — merge the per-ship hull files (`assets/content/ships/*.ron`) into the catalog as a WINDOWED
@@ -336,6 +340,11 @@ fn setup_loopback_host(world: &mut World) {
             let mut entity = server.world_mut().entity_mut(ship);
             entity.insert(faction);
             entity.insert(Position(spawns.for_faction(faction)));
+            // 00008-ship-ai T033 (TR-007/TR-015): mark the human's
+            // authoritative ship as the AOI anchor — the AI sim-LOD classifier
+            // keys Active/Mid/Dormant off `PlayerShip` proximity, so the
+            // scenario's authored AI squads wake up around the player.
+            entity.insert(sim::ai::PlayerShip);
         }
     }
 

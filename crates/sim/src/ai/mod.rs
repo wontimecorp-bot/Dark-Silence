@@ -1,7 +1,50 @@
-//! Seeking-target AI: a pure steering helper plus the fixed-step target-motion
-//! system. Seekers thrust toward the player; asteroids drift at constant
-//! velocity; dummies stay put. Observable behaviour (a thrust vector pointing
-//! at the target) is what the spec requires (CHK013).
+//! Ship AI (E011, 00008-ship-ai): tiered autonomous behaviors at scale.
+//!
+//! Module root for the new AI substrate — utility-FSM brains ([`brain`]),
+//! context-map steering ([`steering`]), perception + faction sensor networks
+//! ([`perception`]), squad/wing command ([`squad`]), AOI sim-LOD tiers
+//! ([`lod`]), and the live-editable [`AiTuning`] resource ([`tuning`]). All new
+//! systems are additive and `ScenarioActive`-gated (TR-016), registered in
+//! `add_fixed_step_systems`; the determinism/golden worlds never run them.
+//!
+//! This file ALSO retains the legacy seeking-target AI byte-frozen (AD-005,
+//! HINT-005): a pure steering helper plus the fixed-step target-motion system.
+//! Seekers thrust toward the player; asteroids drift at constant velocity;
+//! dummies stay put. Observable behaviour (a thrust vector pointing at the
+//! target) is what the spec requires (CHK013). The golden `demo_enemies_smoke`
+//! depends on it; the new substrate runs parallel + gated, never through it.
+
+pub mod brain;
+pub mod ident;
+pub mod lod;
+pub mod perception;
+pub mod role;
+pub mod squad;
+pub mod steering;
+pub mod tuning;
+
+#[cfg(feature = "ai_debug")]
+pub use brain::debug_capture::AiDebugCapture;
+pub use brain::{
+    ai_execute_system, ai_think_system, archetype_refresh_system, cadence_for_tier,
+    classify_archetype, hull_fraction, primary_fire_group, ram_utility, score_behavior,
+    select_behavior, standoff_distance, weapon_range, AiBrain, AiEvent, Behavior, FitArchetype,
+    RethinkQueue,
+};
+pub use ident::{ai_despawn_sweep_system, phase_bucket, AiIdAllocator, AiStableId};
+pub use lod::{
+    classify_aoi_system, far_hostile_scan_system, glide_collapse_system, glide_motion_system,
+    AoiTier, GlideState, Gliding, HostileContact, PlayerShip, Tier,
+};
+pub use perception::{
+    faction_key, perception_scan_system, scan_cadence_for_tier, sensor_network_system, Contact,
+    ContactList, LinkState, NetworkComponent, SensorNetworks,
+};
+pub use role::{
+    role_trigger_system, sweep_route, Posture, RoleGoal, ScenarioRole, FIRED_UPON_WINDOW_TICKS,
+};
+pub use squad::{spawn_squad, squad_think_system, FormationDef, Squad, SquadOrder};
+pub use tuning::AiTuning;
 
 use crate::clock::FixedDt;
 use crate::components::{Position, Ship, Target, TargetKind, Velocity};

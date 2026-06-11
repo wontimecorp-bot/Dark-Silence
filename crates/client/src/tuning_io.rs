@@ -128,6 +128,12 @@ pub struct DevSettings {
     /// armor). Applied windowed-only; material 0/0 = byte-identical to the globals.
     #[serde(default)]
     pub cell_materials: CellMaterials,
+    /// T038 (TR-020b, 00008-ship-ai) — the live-editable AI tuning (think cadences / AOI radii /
+    /// squads / utility / ram / archetype cuts / sensors / steering / debug history), persisted via
+    /// the same dev-settings RON as `SimTuning`/`MiningTuning`. Applied windowed-only — golden/bench
+    /// runs keep the pinned `AiTuning::default()` (a saved edit invalidates comparability, TR-020).
+    #[serde(default)]
+    pub ai: sim::ai::AiTuning,
 }
 
 impl Default for DevSettings {
@@ -144,6 +150,7 @@ impl Default for DevSettings {
             starfield: StarfieldTuning::default(),
             ship_visual: crate::ship_visuals::ShipVisualTuning::default(),
             cell_materials: CellMaterials::default(),
+            ai: sim::ai::AiTuning::default(),
         }
     }
 }

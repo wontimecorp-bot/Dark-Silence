@@ -15,8 +15,11 @@
 //! and explosions all query.
 
 use bevy_ecs::entity::Entity;
+use bevy_ecs::prelude::{Or, Query, ResMut, Resource, With, Without};
 use glam::Vec2;
 use std::collections::BTreeMap;
+
+use crate::components::{Position, Projectile, Ship, Target};
 
 /// Broad-phase grid cell size in world units. Independent of the carve `CELL_WORLD_SIZE`; sized so a
 /// typical body spans ~one cell and a per-tick projectile segment covers ~one or two. Tunable for
@@ -81,6 +84,101 @@ impl SpatialHash {
         out.dedup();
         out
     }
+}
+
+/// Coarse interest-tier grid cell size in world units (E011 / 00008-ship-ai, AD-002). Much
+/// larger than [`BROAD_CELL`] (4×): this tier answers *interest/proximity* questions (AOI/LOD
+/// classification, far sensor scans), not collision, so the default `AiTuning` AOI radii
+/// (60 / 240) resolve to small bounded neighborhoods (~3×3 up to ~9×9 cells).
+pub const COARSE_CELL_SIZE: f32 = 64.0;
+
+/// Integer coarse-grid coordinate of a world value along one axis.
+#[inline]
+fn coarse_axis_cell(v: f32) -> i32 {
+    (v / COARSE_CELL_SIZE).floor() as i32
+}
+
+/// The **coarse interest tier** beside the fine [`SpatialHash`] (E011 AD-002): a second flat
+/// sparse `BTreeMap` grid with much larger cells, rebuilt once per tick and read many times by
+/// the AOI/LOD classifier, far perception scans, and dormant-glide promotion triggers.
+///
+/// Unlike the fine hash, bodies are inserted as **points** (their centre cell only) — the coarse
+/// tier asks "what is *near* this position", not "what does this segment *hit*", so no radius
+/// inflation is needed; [`Self::near`] is conservative by covering the whole `pos ± radius` cell
+/// AABB instead.
+///
+/// **Determinism.** Same doctrine as [`SpatialHash`]: integer-keyed `BTreeMap`, per-cell `Vec`s
+/// sorted by `Entity` bits at build (independent of the caller's archetype iteration order), and
+/// query results sorted + de-duplicated — stable across runs/platforms.
+#[derive(Default, Debug)]
+pub struct CoarseGrid {
+    cells: BTreeMap<(i32, i32), Vec<Entity>>,
+}
+
+impl CoarseGrid {
+    /// The coarse cell containing world position `pos`. `pub` because the LOD classifier and
+    /// far-scan cadences key off coarse cell coordinates directly.
+    #[inline]
+    pub fn cell_of(pos: Vec2) -> (i32, i32) {
+        (coarse_axis_cell(pos.x), coarse_axis_cell(pos.y))
+    }
+
+    /// Build the grid from `(entity, position)` points — once per tick, then read-only. Each
+    /// per-cell bucket is sorted by `Entity` bits so the built structure (and every query over
+    /// it) is independent of the caller's iteration order.
+    pub fn build(items: impl Iterator<Item = (Entity, Vec2)>) -> Self {
+        let mut cells: BTreeMap<(i32, i32), Vec<Entity>> = BTreeMap::new();
+        for (entity, pos) in items {
+            cells.entry(Self::cell_of(pos)).or_default().push(entity);
+        }
+        for bucket in cells.values_mut() {
+            bucket.sort_unstable_by_key(|e| e.to_bits());
+        }
+        Self { cells }
+    }
+
+    /// Entities in every coarse cell the AABB `pos ± radius` covers, **sorted by entity bits +
+    /// de-duplicated**. A conservative superset of the entities truly within `radius` of `pos`
+    /// (never a false negative — a point body in range lies in a covered cell); consumers apply
+    /// their own exact distance/tier test over these candidates.
+    pub fn near(&self, pos: Vec2, radius: f32) -> Vec<Entity> {
+        let r = Vec2::splat(radius.max(0.0));
+        let lo = Self::cell_of(pos - r);
+        let hi = Self::cell_of(pos + r);
+        let mut out: Vec<Entity> = Vec::new();
+        for cy in lo.1..=hi.1 {
+            for cx in lo.0..=hi.0 {
+                if let Some(bucket) = self.cells.get(&(cx, cy)) {
+                    out.extend_from_slice(bucket);
+                }
+            }
+        }
+        out.sort_unstable_by_key(|e| e.to_bits());
+        out.dedup();
+        out
+    }
+}
+
+/// Build-once-read-many holder for the per-tick [`CoarseGrid`] (E011 TR-007). Inserted at
+/// server-world construction so it exists (inert, empty) in every world; only the
+/// `ScenarioActive`-gated [`build_coarse_index_system`] ever rebuilds it.
+#[derive(Resource, Default, Debug)]
+pub struct CoarseIndex(pub CoarseGrid);
+
+/// Rebuild the [`CoarseIndex`] from every interest-relevant body — ships and targets (the
+/// entities AI cares about being near), **projectiles excluded** — once per tick, before the
+/// AOI/LOD classifier consumes it (HINT-001).
+///
+/// Registered gated on `ScenarioActive` AND on the resource existing (belt-and-suspenders, the
+/// `recompute_ship_stats_system` double-gate pattern): a world that inserts `ScenarioActive`
+/// without the index (hand-rolled test worlds) skips it instead of panicking. It mutates ONLY
+/// this resource — no gameplay state — so golden worlds that do run it (`demo_enemies_smoke`
+/// spawns a scenario) remain bit-identical.
+pub fn build_coarse_index_system(
+    mut index: ResMut<CoarseIndex>,
+    bodies: Query<(Entity, &Position), (Or<(With<Ship>, With<Target>)>, Without<Projectile>)>,
+) {
+    index.0 = CoarseGrid::build(bodies.iter().map(|(e, p)| (e, p.0)));
 }
 
 #[cfg(test)]
@@ -157,5 +255,102 @@ mod tests {
         sorted.sort_unstable_by_key(|e| e.to_bits());
         sorted.dedup();
         assert_eq!(q1, sorted, "candidates must be sorted + de-duplicated");
+    }
+
+    /// An inserted entity is findable via `near` at its own position (even with a tiny radius),
+    /// and an entity far outside the queried range is absent.
+    #[test]
+    fn coarse_near_finds_resident_and_excludes_far() {
+        let mut world = World::new();
+        let here = world.spawn_empty().id();
+        let far = world.spawn_empty().id();
+        let pos = Vec2::new(37.0, -91.0);
+        let grid = CoarseGrid::build(
+            [
+                (here, pos),
+                (far, pos + Vec2::splat(10.0 * COARSE_CELL_SIZE)),
+            ]
+            .into_iter(),
+        );
+
+        let q = grid.near(pos, 1.0);
+        assert!(
+            q.contains(&here),
+            "entity must be findable at its own position"
+        );
+        assert!(
+            !q.contains(&far),
+            "entity ~10 cells away must not appear in a tiny-radius query"
+        );
+    }
+
+    /// A `near` query whose radius spans multiple coarse cells returns every in-range entity,
+    /// sorted by entity bits + de-duplicated, independent of build iteration order.
+    #[test]
+    fn coarse_near_spanning_cells_is_sorted_deduped_and_order_independent() {
+        let mut world = World::new();
+        // Three bodies in three different coarse cells around the origin, all within radius 100.
+        let a = world.spawn_empty().id();
+        let b = world.spawn_empty().id();
+        let c = world.spawn_empty().id();
+        let bodies = [
+            (a, Vec2::new(-70.0, 0.0)),
+            (b, Vec2::new(0.0, 0.0)),
+            (c, Vec2::new(70.0, 70.0)),
+        ];
+
+        let g1 = CoarseGrid::build(bodies.into_iter());
+        let mut rev = bodies;
+        rev.reverse();
+        let g2 = CoarseGrid::build(rev.into_iter());
+
+        let q1 = g1.near(Vec2::ZERO, 100.0);
+        let q2 = g2.near(Vec2::ZERO, 100.0);
+        assert_eq!(q1, q2, "results must be build-order independent");
+        for (e, p) in bodies {
+            assert!(
+                q1.contains(&e),
+                "in-range body at {p:?} missing from multi-cell query"
+            );
+        }
+        let mut sorted = q1.clone();
+        sorted.sort_unstable_by_key(|e| e.to_bits());
+        sorted.dedup();
+        assert_eq!(q1, sorted, "results must be sorted + de-duplicated");
+    }
+
+    /// `cell_of` floors (does not truncate toward zero): negative coordinates land in negative
+    /// cells, and exact cell-edge values belong to the cell they open.
+    #[test]
+    fn coarse_cell_of_boundary_and_negative_coords() {
+        assert_eq!(CoarseGrid::cell_of(Vec2::ZERO), (0, 0));
+        // Just inside cell (0, 0) on both axes.
+        assert_eq!(
+            CoarseGrid::cell_of(Vec2::new(
+                COARSE_CELL_SIZE - 0.001,
+                COARSE_CELL_SIZE - 0.001
+            )),
+            (0, 0)
+        );
+        // The exact edge opens the NEXT cell.
+        assert_eq!(
+            CoarseGrid::cell_of(Vec2::new(COARSE_CELL_SIZE, COARSE_CELL_SIZE)),
+            (1, 1)
+        );
+        // Negative values floor into cell -1 (truncation toward zero would give 0).
+        assert_eq!(CoarseGrid::cell_of(Vec2::new(-0.001, -0.001)), (-1, -1));
+        // A full negative cell width lands exactly on cell -1's opening edge.
+        assert_eq!(
+            CoarseGrid::cell_of(Vec2::new(-COARSE_CELL_SIZE, -COARSE_CELL_SIZE)),
+            (-1, -1)
+        );
+        // One step further opens cell -2.
+        assert_eq!(
+            CoarseGrid::cell_of(Vec2::new(
+                -COARSE_CELL_SIZE - 0.001,
+                -COARSE_CELL_SIZE - 0.001
+            )),
+            (-2, -2)
+        );
     }
 }

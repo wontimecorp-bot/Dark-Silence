@@ -170,7 +170,9 @@ fn slew(current: f32, desired: f32, max_step: f32) -> f32 {
 }
 
 /// The smallest **strictly-positive** real root of `a·t² + b·t + c = 0`, or `None`.
-fn smallest_positive_root(a: f32, b: f32, c: f32) -> Option<f32> {
+/// `pub(crate)` so the AI steering substrate's `intercept_point` (00008-ship-ai T006) runs the
+/// EXACT same root solve as gunnery — visibility-only change, `aim_angle`'s math is untouched.
+pub(crate) fn smallest_positive_root(a: f32, b: f32, c: f32) -> Option<f32> {
     if a.abs() < f32::EPSILON {
         // Degenerate to the linear case b·t + c = 0.
         if b.abs() < f32::EPSILON {
@@ -222,7 +224,9 @@ pub fn aim_angle(shooter: Vec2, tpos: Vec2, tvel: Vec2, tacc: Vec2, s: f32, lead
 }
 
 /// SplitMix64 — a deterministic, well-mixed 64-bit hash (no external RNG crate).
-fn splitmix64(seed: u64) -> u64 {
+/// `pub(crate)` so the AI substrate's `phase_bucket` (00008-ship-ai T003) reuses
+/// the exact same mix instead of duplicating the constants.
+pub(crate) fn splitmix64(seed: u64) -> u64 {
     let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);

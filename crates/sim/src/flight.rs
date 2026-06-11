@@ -7,6 +7,7 @@
 //! only on piloted ships, so projectiles and Tier-1 transit stay exactly
 //! ballistic and the integrator↔analytic invariant is untouched.
 
+use crate::ai::lod::Gliding;
 use crate::clock::FixedDt;
 use crate::components::{
     Afterburner, AngularVelocity, FlightAssist, Heading, Position, Ship, Velocity,
@@ -144,6 +145,14 @@ pub fn linear_accel(vel: Vec2, thrust: Vec2, drag: f32, mass: f32) -> Vec2 {
 /// shared step. A ship without the component is simply not piloted (no thrust);
 /// AI-driven ships are steered by [`crate::ai::seek_system`] instead.
 ///
+/// **Cheap-glide skip (T019, AD-001)**: a collapsed dormant-aggregate member
+/// carries the [`Gliding`] marker and is excluded from BOTH queries — its
+/// motion is owned by `ai::lod::glide_motion_system` (squad glide + offset
+/// projection), so the flight model never integrates it (the honest O-savings
+/// of the dormant tier). `Without<Gliding>` is an archetype-level filter: in
+/// every world with no `Gliding` entities (all goldens) the matched archetype
+/// set — and therefore iteration — is byte-identical to before.
+///
 /// **Override-or-fallback flight source** (FR-014, the E006 rewire): a ship that
 /// carries a fit-derived [`ShipStats`] component flies on **its** stats; a ship
 /// without one falls back to the global [`Tuning`] resource. The two paths run
@@ -168,7 +177,7 @@ pub fn ship_motion_system(
             // Phase F: the afterburner pool (only LIVE ships carry it; absent → no boost).
             Option<&Afterburner>,
         ),
-        With<Ship>,
+        (With<Ship>, Without<Gliding>),
     >,
     // Unfitted ships: fall back to the global Tuning (unchanged E001/E002/E003).
     mut unfitted: Query<
@@ -180,7 +189,7 @@ pub fn ship_motion_system(
             &mut AngularVelocity,
             &mut FlightAssist,
         ),
-        (With<Ship>, Without<ShipStats>),
+        (With<Ship>, Without<ShipStats>, Without<Gliding>),
     >,
 ) {
     let dt = dt.0;

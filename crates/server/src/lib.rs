@@ -538,6 +538,40 @@ impl ServerApp {
         // world: the faction gate is a no-op until a projectile carries a `ProjectileFaction`, which
         // only scenario shooters do — so determinism/botkit/Sandbox stay bit-identical.
         world.insert_resource(CombatRules::default());
+        // 00008-ship-ai (T003, V-4): the monotonic spawn-order id allocator behind every
+        // deterministic AI tiebreak/phase bucket. Inserted HERE (the one world-construction
+        // point shared by headless and the windowed loopback host) so it always exists;
+        // inert — pure data, read by nothing — until an AI spawn path allocates from it,
+        // so the determinism/botkit/demo goldens stay bit-identical.
+        world.insert_resource(sim::ai::AiIdAllocator::default());
+        // 00008-ship-ai (T004, TR-007): the coarse interest-tier index for AOI/LOD + far scans.
+        // Present (inert, empty) in EVERY server world; rebuilt per tick only when the
+        // `ScenarioActive`-gated build system runs. The build mutates only this resource — no
+        // gameplay state — so the golden determinism/botkit/demo comparisons stay bit-identical.
+        world.insert_resource(sim::broadphase::CoarseIndex::default());
+        // 00008-ship-ai (T005, TR-007): the AI tuning knobs + the monotonic sim
+        // tick the AOI/LOD classifier (and later the think scheduler) read.
+        // Inserted at this single world-construction point so they exist in
+        // every server world (headless + windowed loopback host). Both are
+        // inert config/bookkeeping — `AiTuning` is pure data and `CurrentTick`
+        // is only mirrored from `server_tick` before each step — read by
+        // nothing but the gated AI systems, which write only additive AI
+        // component state; the determinism/botkit/demo goldens stay
+        // bit-identical.
+        world.insert_resource(sim::ai::AiTuning::default());
+        world.insert_resource(sim::CurrentTick::default());
+        // 00008-ship-ai (T011, TR-005): the AI re-think event queue. Present
+        // (inert, empty) in every server world; only the gated AI systems
+        // push into / drain it, and the think system never flags an empty
+        // queue as mutated — the determinism/botkit/demo goldens stay
+        // bit-identical.
+        world.insert_resource(sim::ai::RethinkQueue::default());
+        // 00008-ship-ai (T030, TR-014): the per-faction fused sensor pictures.
+        // Present (inert, empty) in every server world; only the gated
+        // mid-cadence rebuild writes it, and the rebuild `!=`-guards the write
+        // so an unchanged (empty) map is never flagged mutated — the
+        // determinism/botkit/demo goldens stay bit-identical.
+        world.insert_resource(sim::ai::SensorNetworks::default());
 
         let mut schedule = Schedule::default();
         // The single shared entry point: server steps the SAME systems in the
@@ -971,6 +1005,12 @@ impl ServerApp {
     /// shared step (SC-001 / TR-002). The systems are unchanged (Principle II /
     /// HINT-003) — only the data they read is now sourced per-ship.
     fn step_sim(&mut self) {
+        // 00008-ship-ai (T005): publish the authoritative tick into the world
+        // before the step, so tick-stamped AI bookkeeping (`AoiTier.since_tick`
+        // hysteresis) reads "now". Mirrors `self.server_tick`, which increments
+        // after the step — so the schedule observes ticks 0, 1, 2, …
+        self.world.resource_mut::<sim::CurrentTick>().0 = u64::from(self.server_tick);
+
         // Push each client's latest staged intent onto its ship's component.
         let staged: Vec<(Entity, ShipIntent)> = self
             .links

@@ -43,8 +43,9 @@ pub(crate) const ASTEROID_MASS: f32 = 8.0;
 /// slam is dramatically more lethal than a gentle bump. The impact runs the full `apply_damage`
 /// pipeline (shields → armor → carve), and shields RESIST Kinetic heavily (~0.85), so the quadratic
 /// growth is what lets a high-speed ram overwhelm the shield + carve the craft apart while a slow
-/// nudge stays harmless. Tunable.
-const RAM_CARVE_K: f32 = 0.3;
+/// nudge stays harmless. Tunable. `pub(crate)`: the AI ram cost/benefit evaluation
+/// (`ai::brain::ram_utility`, 00008-ship-ai T027/TR-012) projects damage through this exact model.
+pub(crate) const RAM_CARVE_K: f32 = 0.3;
 /// Minimum closing speed for a ship↔structure contact to carve at all — below this it is purely a
 /// wall bounce (so easing/resting against a station does not grind the hull). Tunable.
 const RAM_MIN_CLOSING_SPEED: f32 = 8.0;

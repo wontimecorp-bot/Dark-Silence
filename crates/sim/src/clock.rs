@@ -16,3 +16,15 @@ impl Default for FixedDt {
         Self(1.0 / 60.0)
     }
 }
+
+/// The current authoritative fixed-step tick — monotonic from 0, published by
+/// the server (`ServerApp` mirrors its tick counter into this resource before
+/// each schedule step).
+///
+/// The AI substrate (00008-ship-ai) reads it for tick-stamped bookkeeping —
+/// `AoiTier.since_tick` hysteresis (T005) and, later, scheduler
+/// `last_think_tick` cadences. Pure data: nothing writes gameplay state from
+/// it, and every reader is `resource_exists`-gated, so worlds that never
+/// insert it (client prediction, legacy sim tests) simply skip those systems.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CurrentTick(pub u64);

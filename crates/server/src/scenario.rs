@@ -11,6 +11,10 @@ use bevy_ecs::entity::Entity;
 use bevy_ecs::prelude::With;
 use glam::{Vec2, Vec3};
 use serde::Deserialize;
+use sim::ai::{
+    spawn_squad, AiBrain, AiIdAllocator, AiTuning, AoiTier, ContactList, FormationDef, Posture,
+    RoleGoal, ScenarioRole, SquadOrder,
+};
 use sim::components::{
     AngularVelocity, BoxCollider, CollisionRadius, Faction, Heading, Health, Movable, Position,
     RamMass, RenderScale, Ship, Target, TargetKind, Velocity,
@@ -19,6 +23,7 @@ use sim::fitting::{
     disc_hull, hull_collision_radius, station_hull, HullCatalog, HullId, CELL_WORLD_SIZE,
     HULL_MINENODE, HULL_OUTPOST, HULL_TRANSPORT,
 };
+use sim::ShipIntent;
 use sim::{
     Cargo, FactionSpawns, MiningState, MiningTransport, MiningTuning, RefinedResources, Turret,
     TurretSpec, VoxelizeOnHit,
@@ -243,6 +248,105 @@ impl ServerApp {
             mine,
             &content,
         );
+
+        // 00008-ship-ai T033 (TR-015): the scenario's authored AI content —
+        // per-faction patrol squads + ambush pairs around the asteroid.
+        self.spawn_skirmish_ai(hw);
+    }
+
+    /// T033 (TR-015) — author the mining skirmish's AI ships: per faction one
+    /// 3-fighter PATROL squad sweeping its own half (route north of the
+    /// mining lane, so the new fighters never collide with the transport
+    /// economy) and one 2-fighter AMBUSH pair lying dark beside the central
+    /// asteroid (trigger circle radius 120 around the rock — the contested
+    /// ground; an enemy transport docking at the mine, or an enemy patrol leg
+    /// crossing the middle, springs it: a living skirmish, by design).
+    ///
+    /// Posture examples (so postures are exercised in-game): the BLUE patrol
+    /// is `DefensiveOnly` (it returns fire only while fired-upon — see
+    /// `FIRED_UPON_WINDOW_TICKS`); everything else is `FreeEngage`.
+    ///
+    /// 10 AI ships total — playtest content, not the bench. Additive only:
+    /// `Scenario::Sandbox` and every golden world are untouched, and the
+    /// Phase-1 arena lock (`mining_skirmish_scenario_spawns_the_static_arena`)
+    /// counts `Target` sub-kinds, which fitted `Ship`s never carry.
+    fn spawn_skirmish_ai(&mut self, hw: f32) {
+        use std::f32::consts::PI;
+        for (faction, sign, heading, patrol_posture) in [
+            (Faction::Red, -1.0_f32, 0.0_f32, Posture::FreeEngage),
+            (Faction::Blue, 1.0, PI, Posture::DefensiveOnly),
+        ] {
+            // PATROL: a 3-4 point loop over the faction's half, offset north
+            // (+Y) of the y = 0 transport lane. Mirrored per faction.
+            let route = vec![
+                Vec2::new(sign * (hw - 200.0), 150.0),
+                Vec2::new(sign * hw * 0.5, 250.0),
+                Vec2::new(sign * 200.0, 150.0),
+            ];
+            let mut members = Vec::with_capacity(3);
+            for i in 0..3 {
+                // Trail the spawn cluster behind route[0] so ships don't
+                // overlap (wedge-ish offsets; the brains sort themselves out).
+                let offset = Vec2::new(
+                    -sign * 15.0 * i as f32,
+                    if i == 2 { -12.0 } else { 12.0 * i as f32 },
+                );
+                let role = ScenarioRole::new(RoleGoal::PatrolRoute(route.clone()), patrol_posture);
+                members.push(self.spawn_ai_fighter(route[0] + offset, heading, faction, role));
+            }
+            spawn_squad(
+                &mut self.world,
+                &members,
+                FormationDef::wedge(members.len(), 12.0),
+                SquadOrder::Hold,
+            );
+
+            // AMBUSH: a dark pair flanking the asteroid (south of the lane),
+            // sprung by any hostile contact inside the 120-radius circle
+            // around the rock.
+            let ambush = RoleGoal::Ambush {
+                trigger_center: Vec2::ZERO,
+                trigger_radius: 120.0,
+            };
+            for j in 0..2 {
+                let pos = Vec2::new(sign * (80.0 + 15.0 * j as f32), -100.0 - 10.0 * j as f32);
+                let role = ScenarioRole::new(ambush.clone(), Posture::FreeEngage);
+                self.spawn_ai_fighter(pos, heading, faction, role);
+            }
+        }
+    }
+
+    /// One scenario AI fighter: the armed fitted `Ship` (`spawn_fitted_ship`,
+    /// the R56 combatant fit) plus the full AI stack — `AiBrain` (phase bucket
+    /// from a freshly allocated `AiStableId`, V-4), `AoiTier` (Dormant until
+    /// the classifier promotes it near the player), `ContactList` (perception)
+    /// and its `ScenarioRole`. The helper's always-firing `ShipIntent` is
+    /// reset: an AI ship's trigger belongs to its brain's `fire_decision`
+    /// (TR-011), not a spawn-time pin.
+    fn spawn_ai_fighter(
+        &mut self,
+        pos: Vec2,
+        heading: f32,
+        faction: Faction,
+        role: ScenarioRole,
+    ) -> Entity {
+        let entity = self.spawn_fitted_ship(pos, heading, faction);
+        let bucket_count = self.world.get_resource::<AiTuning>().map_or_else(
+            || AiTuning::default().fallback_bucket_count,
+            |t| t.fallback_bucket_count,
+        );
+        let id = self.world.resource_mut::<AiIdAllocator>().allocate();
+        self.world.entity_mut(entity).insert((
+            AiBrain::new(id, bucket_count),
+            id,
+            AoiTier::default(),
+            ContactList::default(),
+            role,
+        ));
+        if let Some(mut intent) = self.world.get_mut::<ShipIntent>(entity) {
+            intent.fire_primary = false; // The brain owns the trigger (TR-011).
+        }
+        entity
     }
 
     /// Spawn a faction's refinery outpost (Phase 4): the beefy `Health` structure + its turret

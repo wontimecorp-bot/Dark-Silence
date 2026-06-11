@@ -37,8 +37,14 @@ ron = { workspace = true }
 # fitting screen uses it always, so it's no longer gated here). The panel only functions on the
 # embedded-server solo path.
 default = ["dev_panel"]
+# T038 (TR-020 / AD-006, 00008-ship-ai): turn on `sim`'s per-brain utility-score + behavior-transition
+# capture for the dev panel's AI inspection view. A named CLIENT feature (not a bare `sim/ai_debug`
+# entry under `dev_panel`) so `#[cfg(feature = "ai_debug")]` in `dev_panel.rs` keys off a feature this
+# crate owns. Headless/bench builds (sim's default) never enable it — zero cost in the TR-017 path.
+ai_debug = ["sim/ai_debug"]
 # The egui-based runtime tuning panel (`crate::dev_panel`). egui (`bevy_egui`) is unconditional now.
-dev_panel = []
+# Pulls `ai_debug` so the panel's AI inspection always has the score-breakdown capture (T038).
+dev_panel = ["ai_debug"]
 # Dev-only convenience (AD-005): faster iterative linking. Never enabled in a
 # release/CI artifact.
 dynamic_linking = ["bevy/dynamic_linking"]
