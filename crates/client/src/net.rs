@@ -167,6 +167,16 @@ fn shield_radius_for(grid_dims: (u16, u16)) -> f32 {
 /// exists + switches cleanly when a ship crosses the threshold. Tunable for feel.
 pub const SHIP_VOXEL_LOD_DIST: f32 = 60.0;
 
+/// R95 — small LIVE hulls (≤ this many cells) ALWAYS build their voxel hull, regardless of
+/// distance. The 60u `SHIP_VOXEL_LOD_DIST` gate sat well inside the max-zoom view radius
+/// (~200u at camera height 240), so a visible-but-far AI fighter wore the coarse
+/// `ship_mesh` box and visibly POPPED to its hull on approach. A fighter is 51 cells
+/// (~400 tris one-time build, ~0.2–0.5 ms) — always building small hulls is negligible
+/// (off-screen ones are frustum-culled), and 128 leaves corvette-class headroom. Wrecks
+/// and big structures (`STRUCTURE_LOD_FOOTPRINT`) keep the distance gate so wreck fields
+/// and stations stay cheap at range.
+pub const SHIP_VOXEL_ALWAYS_CELLS: usize = 128;
+
 /// Refinement 6: a fitted entity whose hull footprint (`max(grid_dims) · CELL_SIZE`) exceeds this is
 /// a big STRUCTURE, not a ship. Its far-LOD placeholder is the unit [`RenderAssets::lod_box_mesh`]
 /// scaled to the footprint (so it reads at the right size), where a ship just uses `ship_mesh` at
@@ -940,7 +950,15 @@ fn sync_ship_hull(
     };
     let center = hull_mesh_center(e);
 
-    let near = e.pos.distance(lod_origin) <= SHIP_VOXEL_LOD_DIST;
+    // R95: small LIVE hulls (fighters/corvettes) are ALWAYS "near" — they build their voxel
+    // hull on first sight at any distance, killing the box→hull pop-in (the 60u gate sat well
+    // inside the ~200u max-zoom view radius). `near` feeds BOTH the build branch and the
+    // near→far teardown below, so one predicate keeps them consistent (no build/tear thrash).
+    // Wrecks + big structures keep the distance gate; the parent-scale LOD in
+    // `capture_render_state` already yields scale ONE for small fitted ships near AND far,
+    // so it needs no matching change.
+    let small_hull = !is_wreck && !e.cells.is_empty() && e.cells.len() <= SHIP_VOXEL_ALWAYS_CELLS;
+    let near = small_hull || e.pos.distance(lod_origin) <= SHIP_VOXEL_LOD_DIST;
     // A big STRUCTURE (its hull footprint exceeds the ship range) renders its near hull as a CHUNKED
     // mesh — split into tiles so a carve rebuilds only the touched tile, not its whole ~8k-cell hull.
     // Ships + wreck chunks keep the single merged-mesh path below.

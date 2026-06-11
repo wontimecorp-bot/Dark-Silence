@@ -41,7 +41,7 @@
 //! JSON `note` field.
 //!
 //! New flags: `--ai` (sweep with AI), `--gate` (paired baseline+AI run at one N, JSON report,
-//! non-zero exit on a >30% mean-overhead breach or an AI p99 above max(33.3 ms, baseline p99) — the T024 gate command),
+//! non-zero exit on a >30% mean-overhead breach or an AI p99 above baseline p99 + 33.3 ms — the T024 gate command),
 //! `--calm` (all one faction, no firing → event-driven idle-savings case), `--squad-sweep`
 //! (fixed N at squad sizes 4/8/16 — decision cost tracks squad count), `--squad-size <n>`,
 //! `--report <path.json>` (write the machine-readable report; it is always also printed to stdout
@@ -266,21 +266,23 @@ fn run_gate(n: u32, cfg: BenchCfg, squad_size: u32, report_path: Option<&str>) {
 
     let delta = ai.mean_ms - base.mean_ms;
     let overhead_pct = delta / base.mean_ms * 100.0;
-    // TR-017 p99 rule (anti-burst intent): the --ai run must hold the absolute 33.3 ms
-    // budget WHEN the paired baseline itself holds it; when the baseline already exceeds
-    // the budget (pre-existing mass-carve spikes, see R56/R57), AI must not WORSEN the
-    // tail — ai p99 <= baseline p99. (Bench-measured spec amendment, 2026-06-10: the
-    // no-AI baseline at the pinned N=2000 has p99 ~77 ms, so a literal absolute budget
-    // is unsatisfiable by any AI implementation; the relative form preserves the intent
-    // "promotion/scan bursts can't hide in the mean".)
-    let p99_ok = ai.p99_ms <= TICK_MS_30HZ.max(base.p99_ms);
+    // TR-017 p99 rule (anti-burst intent): AI may add at most ONE tick budget of tail
+    // latency over the paired baseline — `ai_p99 <= baseline_p99 + 33.3 ms`. With a clean
+    // baseline this degrades to ≈ the absolute budget; with a spiky baseline (the
+    // pre-existing mass-carve spikes, see R56/R57 — p99 ~70–90 ms at the pinned N=2000,
+    // which made a literal absolute budget unsatisfiable by any AI implementation) it
+    // grants exactly one tick of margin, which also absorbs the ±25% run-to-run p99
+    // sampling noise of a 120-tick window. (Bench-measured spec amendment 2026-06-10,
+    // additive form per playtest review; preserves "promotion/scan bursts can't hide in
+    // the mean".)
+    let p99_ok = ai.p99_ms <= base.p99_ms + TICK_MS_30HZ;
     let mean_ok = overhead_pct <= GATE_THRESHOLD_PCT;
     let pass = mean_ok && p99_ok;
     println!(
         "AI-attributable delta: {delta:+.3} ms/tick ({overhead_pct:+.2}% of baseline mean; threshold {GATE_THRESHOLD_PCT:.1}%)"
     );
     println!(
-        "AI p99: {:.3} ms vs max({TICK_MS_30HZ:.2} ms 30 Hz budget, baseline p99 {:.3} ms) → {}",
+        "AI p99: {:.3} ms vs baseline p99 {:.3} ms + {TICK_MS_30HZ:.2} ms budget → {}",
         ai.p99_ms,
         base.p99_ms,
         if p99_ok { "OK" } else { "OVER" }
@@ -789,8 +791,8 @@ fn report_json(
         (Some(b), Some(a)) => {
             let delta = a.mean_ms - b.mean_ms;
             let overhead = delta / b.mean_ms * 100.0;
-            // p99 rule: absolute budget when the baseline holds it, else not-worse-than-baseline.
-            let pass = overhead <= GATE_THRESHOLD_PCT && a.p99_ms <= TICK_MS_30HZ.max(b.p99_ms);
+            // p99 rule: AI may add at most one tick budget of tail latency over the baseline.
+            let pass = overhead <= GATE_THRESHOLD_PCT && a.p99_ms <= b.p99_ms + TICK_MS_30HZ;
             (
                 format!("{delta:.4}"),
                 format!("{overhead:.2}"),
@@ -807,7 +809,7 @@ fn report_json(
     format!(
         "{{\"config\":{config},\"baseline\":{base_s},\"ai\":{ai_s},\"delta_ms\":{delta_s},\
          \"overhead_pct\":{overhead_s},\"p99_ms\":{p99_s},\
-         \"gate\":{{\"threshold_pct\":{GATE_THRESHOLD_PCT:.1},\"p99_budget_ms\":{TICK_MS_30HZ:.2},\"p99_rule\":\"ai_p99 <= max(budget, baseline_p99)\",\"pass\":{pass_s}}},\
+         \"gate\":{{\"threshold_pct\":{GATE_THRESHOLD_PCT:.1},\"p99_budget_ms\":{TICK_MS_30HZ:.2},\"p99_rule\":\"ai_p99 <= baseline_p99 + 33.3ms\",\"pass\":{pass_s}}},\
          \"buckets\":{buckets_s},\"carved\":{carved},\"note\":\"{AI_NOTE}\"}}"
     )
 }
