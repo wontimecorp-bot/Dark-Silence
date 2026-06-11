@@ -55,7 +55,9 @@ use bevy_ecs::entity::Entities;
 use bevy_ecs::prelude::*;
 use glam::Vec2;
 
-use crate::ai::brain::{cadence_for_tier, AiBrain, AiEvent, Behavior, RethinkQueue};
+use crate::ai::brain::{
+    cadence_for_tier, AiBrain, AiEvent, Behavior, CombatStance, MovementProfile, RethinkQueue,
+};
 use crate::ai::ident::{phase_bucket, AiIdAllocator, AiStableId};
 use crate::ai::lod::{AoiTier, GlideState, Tier};
 use crate::ai::role::ScenarioRole;
@@ -161,6 +163,19 @@ pub struct Squad {
     pub formation: FormationDef,
     /// Cached pace: the anchor's estimated top speed (world units/s).
     pub anchor_speed: f32,
+    /// R96 precedence — the squad's optional [`MovementProfile`] OVERRIDE (the
+    /// HIGHEST link of the resolved chain `squad ← role ← archetype default`).
+    /// `Some(...)` makes every NON-roled member pace this way: the assignment
+    /// pass writes it onto each member's `brain.squad_profile` channel
+    /// (compare-before-write, riding the same `OrderChanged`), and
+    /// `ai_think_system` reads that channel as the top override. Roled members
+    /// are squad-exempt, so their role/archetype style wins. `None` (the
+    /// [`spawn_squad`] default) imposes no squad pace style.
+    pub movement_profile: Option<MovementProfile>,
+    /// R96 precedence — the squad's optional [`CombatStance`] OVERRIDE (the
+    /// [`Squad::movement_profile`] twin), written onto each non-roled member's
+    /// `brain.squad_stance` channel. `None` = no squad stance override.
+    pub combat_stance: Option<CombatStance>,
     /// Last tick this squad completed a think (scheduler bookkeeping).
     pub last_think_tick: u64,
     /// Fallback-cadence slot, derived from the squad's [`AiStableId`] (V-4).
@@ -221,6 +236,10 @@ pub fn spawn_squad(
                 wing: None,
                 formation,
                 anchor_speed: 0.0,
+                // R96: no style override by default — members resolve to their
+                // role/archetype style. Set these post-spawn to impose a squad pace.
+                movement_profile: None,
+                combat_stance: None,
                 last_think_tick: 0,
                 phase_bucket: phase_bucket(id, bucket_count),
                 last_member_count: u32::MAX, // Sentinel: first run always thinks.
@@ -246,6 +265,14 @@ struct MemberAssignment {
     leader: Option<Entity>,
     formation_slot: Option<Vec2>,
     throttle_cap: f32,
+    /// R96 precedence channel — the squad's [`Squad::movement_profile`] override
+    /// (or `None`) written onto `brain.squad_profile` for this NON-roled member;
+    /// `ai_think_system` reads it as the highest precedence link. Constant across
+    /// a squad's members (the per-member channel carries the squad-wide style).
+    squad_profile: Option<MovementProfile>,
+    /// R96 precedence channel — the squad's [`Squad::combat_stance`] override
+    /// written onto `brain.squad_stance` (the [`Self::squad_profile`] twin).
+    squad_stance: Option<CombatStance>,
 }
 
 /// The slot offset for member index `i`: direct index when the formation has
@@ -266,12 +293,17 @@ fn slot_offset(formation: &FormationDef, index: usize) -> Vec2 {
 /// with the pace throttle cap; `FormUp`/`Hold` → hold position; `Engage` →
 /// engage like everyone else. Wingmen: `Engage` → engage; any other order →
 /// `FormationKeep` on the leader at their slot offset.
+///
+/// R96: every variant carries the squad's `(profile, stance)` style overrides
+/// through to the brain channel (constant across members; the `idle` base seeds
+/// them and `..idle` spreads keep them on every arm).
 fn member_assignment(
     order: SquadOrder,
     index: usize,
     leader: Entity,
     slot: Vec2,
     leader_cap: f32,
+    style: (Option<MovementProfile>, Option<CombatStance>),
 ) -> MemberAssignment {
     let idle = MemberAssignment {
         behavior: Behavior::Hold,
@@ -280,6 +312,8 @@ fn member_assignment(
         leader: None,
         formation_slot: None,
         throttle_cap: 1.0,
+        squad_profile: style.0,
+        squad_stance: style.1,
     };
     if let SquadOrder::Engage(target) = order {
         // v1: distribute the target to EVERY member (execution arm = T025;
@@ -321,8 +355,12 @@ fn member_assignment(
 /// The solo degrade (T018, Q6): a squad of ONE translates its order into the
 /// last member's own individual goal — `MoveTo` → `Waypoint`, `Engage` →
 /// `Engage` + target, else `Hold` — with no leader and no slot (the documented
-/// squad-of-1 rule).
-fn solo_assignment(order: SquadOrder) -> MemberAssignment {
+/// squad-of-1 rule). R96: the squad style still rides through to the brain
+/// channel (a solo squad member is still squad-paced).
+fn solo_assignment(
+    order: SquadOrder,
+    style: (Option<MovementProfile>, Option<CombatStance>),
+) -> MemberAssignment {
     let idle = MemberAssignment {
         behavior: Behavior::Hold,
         target: None,
@@ -330,6 +368,8 @@ fn solo_assignment(order: SquadOrder) -> MemberAssignment {
         leader: None,
         formation_slot: None,
         throttle_cap: 1.0,
+        squad_profile: style.0,
+        squad_stance: style.1,
     };
     match order {
         SquadOrder::MoveTo(goal) => MemberAssignment {
@@ -494,13 +534,22 @@ pub fn squad_think_system(
             }
         }
 
+        // R96: the squad-wide style overrides (constant across members), passed
+        // to every assignment so non-roled members' brain channel carries them.
+        let style = (squad.movement_profile, squad.combat_stance);
+
         // Q6 squad-of-1 degrade: the last member becomes an individual brain.
         // (T032: a scenario-roled member keeps its script instead.)
         if squad.members.len() == 1 {
             let m = squad.members[0];
             if let Ok((_, _, mut brain, role)) = members.get_mut(m) {
                 if role.is_none() {
-                    apply_assignment(m, &mut brain, &solo_assignment(squad.order), &mut queue);
+                    apply_assignment(
+                        m,
+                        &mut brain,
+                        &solo_assignment(squad.order, style),
+                        &mut queue,
+                    );
                 }
             }
             continue;
@@ -521,7 +570,7 @@ pub fn squad_think_system(
         for index in 0..squad.members.len() {
             let m = squad.members[index];
             let slot = slot_offset(&squad.formation, index);
-            let desired = member_assignment(squad.order, index, leader, slot, leader_cap);
+            let desired = member_assignment(squad.order, index, leader, slot, leader_cap, style);
             if let Ok((_, _, mut brain, role)) = members.get_mut(m) {
                 // T032: scenario-roled members are exempt (script > squad).
                 if role.is_none() {
@@ -547,7 +596,12 @@ fn apply_assignment(
         && brain.waypoint == desired.waypoint
         && brain.leader == desired.leader
         && brain.formation_slot == desired.formation_slot
-        && brain.throttle_cap == desired.throttle_cap;
+        && brain.throttle_cap == desired.throttle_cap
+        // R96 precedence: the squad style channel is part of the assignment, so
+        // a squad whose style toggles writes it (and rides the OrderChanged) the
+        // same way a throttle_cap change does — `ai_think_system` then re-resolves.
+        && brain.squad_profile == desired.squad_profile
+        && brain.squad_stance == desired.squad_stance;
     if unchanged {
         return;
     }
@@ -557,6 +611,8 @@ fn apply_assignment(
     brain.leader = desired.leader;
     brain.formation_slot = desired.formation_slot;
     brain.throttle_cap = desired.throttle_cap;
+    brain.squad_profile = desired.squad_profile;
+    brain.squad_stance = desired.squad_stance;
     queue.push(member, AiEvent::OrderChanged);
 }
 
@@ -1025,6 +1081,8 @@ mod tests {
                 wing: Some(dead_wing),
                 formation: FormationDef::wedge(2, 10.0),
                 anchor_speed: 0.0,
+                movement_profile: None,
+                combat_stance: None,
                 last_think_tick: 0,
                 phase_bucket: 0,
                 last_member_count: 2,

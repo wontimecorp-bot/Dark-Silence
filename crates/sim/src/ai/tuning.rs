@@ -12,6 +12,7 @@
 
 use bevy_ecs::prelude::Resource;
 
+use crate::ai::brain::MovementProfile;
 use crate::fitting::CELL_WORLD_SIZE;
 
 /// Global AI tuning. Inserted by the scenario/server world (and edited live via
@@ -92,6 +93,76 @@ pub struct AiTuning {
     /// Floor subtracted-to value for danger-mask suppression (0.0 = full block).
     pub danger_mask_floor: f32,
 
+    // --- Movement profiles (R96 Part A) ---
+    // Each profile is a (forward cap, brake aggression, arrive slow-factor) triple
+    // read by `ai_execute_system`'s `fly_to` via `profile_params`. CRUISE values
+    // are PINNED to today's constants so `MovementProfile::Cruise` is byte-identical
+    // to the pre-R96 path (cap 1.0 = `*1.0` no-op; slow-factor 4.0 = the
+    // `steering::WAYPOINT_SLOW_FACTOR`); only Rush/Leisurely diverge.
+    /// Forward throttle cap for `Rush` (hot pace — full authority).
+    pub profile_rush_cap: f32,
+    /// Forward throttle cap for `Cruise` (PINNED 1.0 — the parity no-op).
+    pub profile_cruise_cap: f32,
+    /// Forward throttle cap for `Leisurely` (lazy pace — capped to half).
+    pub profile_leisurely_cap: f32,
+    /// Brake aggression for `Rush` (earlier-braking multiplier on stopping distance).
+    pub brake_aggression_rush: f32,
+    /// Brake aggression for `Cruise` (PINNED 1.0 — unused on the no-brake parity path).
+    pub brake_aggression_cruise: f32,
+    /// Brake aggression for `Leisurely` (brakes earliest — a long, gentle settle).
+    pub brake_aggression_leisurely: f32,
+    /// Arrive slow-radius factor for `Rush` (snug ramp — `× ARRIVE_RADIUS`).
+    pub arrive_slow_factor_rush: f32,
+    /// Arrive slow-radius factor for `Cruise` (PINNED 4.0 — the `WAYPOINT_SLOW_FACTOR`).
+    pub arrive_slow_factor_cruise: f32,
+    /// Arrive slow-radius factor for `Leisurely` (wide ramp — eases in early).
+    pub arrive_slow_factor_leisurely: f32,
+
+    // --- Combat stances (R96 Part C) ---
+    // The per-stance combat-steering knobs read by `engage_motion`. None of
+    // these touch the `CombatStance::Charge` path (the PARITY default reuses the
+    // legacy range-band controller verbatim), so existing combat fixtures are
+    // unaffected regardless of these values.
+    /// `Orbit` ring radius as a multiple of `standoff_distance` (1.0 = the
+    /// archetype standoff ring itself; > 1 orbits wider, < 1 tighter).
+    pub orbit_radius_frac: f32,
+    /// `Orbit` tangential interest weight: scales the around-the-target term
+    /// (`× (1 − radial.abs())`, so it DOMINATES on-ring and yields to the radial
+    /// correction off-ring).
+    pub orbit_tangential_weight: f32,
+    /// `Kite` standoff target as a multiple of `weapon_range` (1.1 = hold just
+    /// beyond the envelope edge, so the gun still bears while the target chases).
+    pub kite_range_frac: f32,
+    /// Lateral strafe magnitude (`0..=1`) a stance commands on the strafe
+    /// channel — applied ONLY when `ShipStats::can_strafe` is set (R93); a basic
+    /// fighter keeps `strafe = 0` and orbits by turning alone.
+    pub strafe_stance_lateral: f32,
+
+    // --- Obstacle avoidance (R96 Part D) ---
+    // The shared obstacle-avoidance knobs read by `ai_execute_system`'s move +
+    // combat arms via `add_obstacle_danger` over the per-tick `ObstacleField`.
+    // None touch the empty-field path (zero in-range obstacles is a no-op
+    // `add_danger_threat`), so an obstacle-free world is byte-identical to
+    // pre-R96-D regardless of these values.
+    /// Danger weight written for each in-range obstacle (`add_danger_threat`
+    /// `weight`): scales how strongly an obstacle masks the headings into it.
+    pub obstacle_danger_weight: f32,
+    /// Predictive lookahead (s) for the obstacle closeness test: a body is live
+    /// if the ship's CURRENT or `pos + vel·this` position is inside its avoid
+    /// radius (mirrors `steering::avoid`'s lookahead model).
+    pub obstacle_lookahead_s: f32,
+    /// Extra clearance pad (world units) added to `obstacle_radius + own_radius`
+    /// so the ship steers around with margin, not skimming the surface.
+    pub obstacle_clearance_pad: f32,
+    /// Scan radius (world units) around the ship: obstacles farther than this
+    /// are ignored (the field is tiny, so this is a linear-scan gate, not an
+    /// index query).
+    pub obstacle_query_radius: f32,
+    /// Minimum body radius (world units) to enter the `ObstacleField` — only
+    /// LARGE neutral bodies (asteroids/outposts/transports) are avoided; small
+    /// debris/ships are not.
+    pub obstacle_min_radius: f32,
+
     // --- Debug (TR-020a) ---
     /// Per-brain transition-history ring length (capture feature-gated off in
     /// headless/bench builds).
@@ -138,8 +209,75 @@ impl Default for AiTuning {
             // Steering: 16-slot context maps (AD-004); danger fully suppresses a slot.
             slot_count: 16,
             danger_mask_floor: 0.0,
+            // Movement profiles (R96): Cruise PINNED to the pre-R96 constants
+            // (cap 1.0, slow-factor 4.0 = WAYPOINT_SLOW_FACTOR) so it stays
+            // byte-identical; Rush brakes onto a snug ring, Leisurely paces slow
+            // and coasts wide.
+            profile_rush_cap: 1.0,
+            profile_cruise_cap: 1.0,
+            profile_leisurely_cap: 0.5,
+            brake_aggression_rush: 1.0,
+            brake_aggression_cruise: 1.0,
+            brake_aggression_leisurely: 1.6,
+            arrive_slow_factor_rush: 1.5,
+            arrive_slow_factor_cruise: 4.0,
+            arrive_slow_factor_leisurely: 8.0,
+            // Combat stances (R96 Part C): orbit at the standoff ring with a
+            // moderate tangential bank, kite just past the envelope edge, full
+            // lateral strafe for hulls that can. None affect the Charge parity path.
+            orbit_radius_frac: 1.0,
+            orbit_tangential_weight: 0.6,
+            kite_range_frac: 1.1,
+            strafe_stance_lateral: 1.0,
+            // Obstacle avoidance (R96 Part D): a full-weight danger per in-range
+            // obstacle, a 1.5 s lookahead, a 15-unit clearance pad, a 200-unit
+            // scan, and a 20-unit min radius (only large neutral bodies). The
+            // lookahead + pad were bumped from the original (0.5 s / 8 u) so a
+            // FAST fighter (top ~80 u/s) reacts well before it reaches a body and
+            // visibly clears the MiningSkirmish central asteroid (radius 30) with
+            // a clean margin (avoid radius ≈ 30 + own ~2 + 15 ≈ 47 u — a ~17 u
+            // surface gap, wide enough to SEE the detour, narrow enough that a
+            // combat ship still approaches a target orbiting near a structure).
+            // Determinism-safe: golden worlds have no `AiBrain` consuming the
+            // field, so these only affect scenario AI (no observable golden shift).
+            obstacle_danger_weight: 1.0,
+            obstacle_lookahead_s: 1.5,
+            obstacle_clearance_pad: 15.0,
+            obstacle_query_radius: 200.0,
+            obstacle_min_radius: 20.0,
             // Debug history ring (TR-020a).
             debug_history_len: 16,
+        }
+    }
+}
+
+impl AiTuning {
+    /// R96 Part A — the movement-profile `(forward_cap, brake_aggression,
+    /// arrive_slow_factor)` triple for `profile`. `ai_execute_system`'s `fly_to`
+    /// reads it: the cap limits forward intent (composed with the squad
+    /// `throttle_cap`), the brake aggression scales [`arrive_braked`]'s stopping
+    /// distance, and the slow factor sizes the arrive ramp
+    /// (`× ARRIVE_RADIUS`). Cruise returns the PINNED parity triple
+    /// `(1.0, 1.0, 4.0)`.
+    ///
+    /// [`arrive_braked`]: crate::ai::steering::arrive_braked
+    pub fn profile_params(&self, profile: MovementProfile) -> (f32, f32, f32) {
+        match profile {
+            MovementProfile::Rush => (
+                self.profile_rush_cap,
+                self.brake_aggression_rush,
+                self.arrive_slow_factor_rush,
+            ),
+            MovementProfile::Cruise => (
+                self.profile_cruise_cap,
+                self.brake_aggression_cruise,
+                self.arrive_slow_factor_cruise,
+            ),
+            MovementProfile::Leisurely => (
+                self.profile_leisurely_cap,
+                self.brake_aggression_leisurely,
+                self.arrive_slow_factor_leisurely,
+            ),
         }
     }
 }
@@ -166,6 +304,48 @@ mod tests {
         assert!(t.scan_ticks_mid > 0 && t.scan_ticks_far > 0 && t.max_fused_contacts > 0);
         assert!((8..=16).contains(&t.slot_count) && t.danger_mask_floor >= 0.0);
         assert!(t.debug_history_len > 0);
+        // R96 movement profiles: caps in [0,1], positive aggressions/factors.
+        assert!((0.0..=1.0).contains(&t.profile_rush_cap));
+        assert!((0.0..=1.0).contains(&t.profile_cruise_cap));
+        assert!((0.0..=1.0).contains(&t.profile_leisurely_cap));
+        assert!(t.brake_aggression_rush > 0.0 && t.brake_aggression_leisurely > 0.0);
+        assert!(t.arrive_slow_factor_rush > 0.0 && t.arrive_slow_factor_leisurely > 0.0);
+        // R96 Part C combat stances: positive ring/range fracs, a strafe magnitude in [0,1].
+        assert!(t.orbit_radius_frac > 0.0 && t.orbit_tangential_weight > 0.0);
+        assert!(t.kite_range_frac > 0.0 && (0.0..=1.0).contains(&t.strafe_stance_lateral));
+        // R96 Part D obstacle avoidance: positive weight/lookahead/pad/radii.
+        assert!(t.obstacle_danger_weight > 0.0 && t.obstacle_lookahead_s > 0.0);
+        assert!(t.obstacle_clearance_pad >= 0.0 && t.obstacle_query_radius > 0.0);
+        assert!(t.obstacle_min_radius > 0.0);
+    }
+
+    /// R96 Part A — Cruise's triple is PINNED to the pre-R96 constants (cap 1.0,
+    /// aggression 1.0, slow-factor 4.0 = `steering::WAYPOINT_SLOW_FACTOR`); the
+    /// other profiles map to their own knobs.
+    #[test]
+    fn profile_params_pins_cruise_to_baseline_constants() {
+        let t = AiTuning::default();
+        assert_eq!(
+            t.profile_params(MovementProfile::Cruise),
+            (1.0, 1.0, 4.0),
+            "Cruise is the byte-identical parity triple"
+        );
+        assert_eq!(
+            t.profile_params(MovementProfile::Rush),
+            (
+                t.profile_rush_cap,
+                t.brake_aggression_rush,
+                t.arrive_slow_factor_rush
+            )
+        );
+        assert_eq!(
+            t.profile_params(MovementProfile::Leisurely),
+            (
+                t.profile_leisurely_cap,
+                t.brake_aggression_leisurely,
+                t.arrive_slow_factor_leisurely
+            )
+        );
     }
 
     /// RON round-trip (the SimTuning dev-settings persistence pattern): defaults

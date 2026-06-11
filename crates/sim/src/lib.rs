@@ -165,6 +165,19 @@ pub fn add_fixed_step_systems(schedule: &mut Schedule) {
                 broadphase::build_coarse_index_system
                     .run_if(resource_exists::<scenario::ScenarioActive>)
                     .run_if(resource_exists::<broadphase::CoarseIndex>),
+                // R96 Part D: rebuild the per-tick `ObstacleField` (the large
+                // neutral bodies the move/combat arms steer around) right after
+                // the coarse-index build. Double-gated (the
+                // `build_coarse_index_system` pattern): a `ScenarioActive` world
+                // that never inserted the field skips it instead of panicking.
+                // It writes ONLY `ObstacleField` — no gameplay state — and no
+                // golden world spawns an `AiBrain` to CONSUME it, so even
+                // `demo_enemies_smoke` (which DOES populate the field from its
+                // `Target` bodies) stays bit-identical.
+                broadphase::build_obstacle_field_system
+                    .run_if(resource_exists::<scenario::ScenarioActive>)
+                    .run_if(resource_exists::<broadphase::ObstacleField>)
+                    .run_if(resource_exists::<ai::AiTuning>),
                 // T005 {TR-007}: classify each `AoiTier` carrier Active/Mid/
                 // Dormant from authoritative player proximity, with promotion-
                 // asymmetric hysteresis — after the coarse-index rebuild,

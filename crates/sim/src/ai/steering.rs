@@ -107,6 +107,61 @@ pub fn arrive(pos: Vec2, _vel: Vec2, target: Vec2, slow_radius: f32) -> (Vec2, f
     (dir, throttle)
 }
 
+/// Active-braking arrive (R96 Part B): unlike [`arrive`] — which only ramps the
+/// throttle DOWN inside the slow radius and lets linear drag do the braking —
+/// this variant computes the kinematic stopping distance from the ship's CLOSING
+/// speed and, once the ship is inside that distance, REQUESTS REVERSE THRUST so
+/// it actively decelerates onto the goal instead of coasting through it.
+///
+/// **Negative-throttle reverse-brake convention** (documented): the returned
+/// throttle is `-1.0` when the ship is inside its stopping distance — a NEGATIVE
+/// throttle is a request for REVERSE thrust. The caller maps it to a
+/// [`ShipIntent`] with `forward < 0`, keeping the nose pointed at the goal (the
+/// turn channel) so the ship brakes NOSE-ON via the retro thrusters
+/// (`flight.rs` routes `intent.forward < 0` to `reverse_force`, which is not
+/// strafe-gated, so this brakes any fit). Outside the stopping distance the
+/// throttle is a positive ramp: full burn to the brake point, then a short
+/// linear ease-in across `slow_radius` so the ship doesn't slam from full-burn
+/// straight to the brake transition.
+///
+/// **Model**: `dir` points at the goal; `dist` is the range; `v_close =
+/// max(0, vel·dir)` is the speed component CLOSING on the goal (receding/lateral
+/// motion never triggers a brake). The kinematic stopping distance under a
+/// constant deceleration `decel` is `v_close² / (2·decel)`, scaled by
+/// `brake_aggression` (> 1 brakes EARLIER, more conservatively; < 1 later). If
+/// `dist <= stop_dist` the ship is inside the braking range → `(dir, -1.0)`.
+/// Otherwise `throttle = ((dist − stop_dist) / slow_radius).clamp(0, 1)`.
+///
+/// **Determinism / no-NaN**: every denominator is floored
+/// (`decel.max(EPS)`, `slow_radius.max(EPS)`), `normalize_or_zero` handles a
+/// coincident goal, and `v_close` is non-negative — so degenerate inputs
+/// (`dist = 0`, `decel = 0`, zero velocity) yield finite results, never NaN.
+pub fn arrive_braked(
+    pos: Vec2,
+    vel: Vec2,
+    target: Vec2,
+    slow_radius: f32,
+    decel: f32,
+    brake_aggression: f32,
+) -> (Vec2, f32) {
+    let to = target - pos;
+    let dist = to.length();
+    let dir = to.normalize_or_zero();
+    // Closing-speed component only — receding or purely lateral motion (or a
+    // coincident goal where `dir == ZERO`) contributes no brake demand.
+    let v_close = vel.dot(dir).max(0.0);
+    let stop_dist = brake_aggression * v_close * v_close / (2.0 * decel.max(f32::MIN_POSITIVE));
+    if dist <= stop_dist {
+        // Inside the braking range → request REVERSE thrust (negative throttle).
+        (dir, -1.0)
+    } else {
+        // Full burn to the brake point, then a short linear ease across the
+        // slow radius (so the approach isn't a hard full-burn → brake snap).
+        let throttle = ((dist - stop_dist) / slow_radius.max(f32::MIN_POSITIVE)).clamp(0.0, 1.0);
+        (dir, throttle)
+    }
+}
+
 /// First-order intercept point for a chaser/projectile closing at `speed` on a
 /// target at `target_pos` moving at `target_vel`, or `None` when no positive
 /// intercept time exists (the target outruns the chaser).
@@ -322,6 +377,24 @@ impl ContextMap {
         }
     }
 
+    /// Write a uniform interest FLOOR `weight` across every active slot
+    /// (max-combined like the directional writes). An "explore" baseline: it
+    /// keeps SOME unmasked heading resolvable when the primary interest
+    /// direction is fully masked by a head-on danger (e.g. an obstacle dead
+    /// ahead) — so the ship picks a way AROUND instead of stalling. A `weight`
+    /// at/below 0 is a no-op (the determinism-safe default). Kept small by the
+    /// caller so it never overrides a real interest peak; equal-floor slots
+    /// break to the lowest index in [`Self::resolve`] (deterministic).
+    pub fn add_explore_floor(&mut self, weight: f32, n_slots: usize) {
+        if weight <= 0.0 {
+            return;
+        }
+        let n = active_slots(n_slots);
+        for slot in &mut self.interest[..n] {
+            *slot = slot.max(weight);
+        }
+    }
+
     /// Write danger toward `dir` with cosine falloff (same shape + max-combine
     /// as [`Self::add_interest_dir`], into the danger map).
     pub fn add_danger_dir(&mut self, dir: Vec2, weight: f32, n_slots: usize) {
@@ -478,6 +551,70 @@ mod tests {
         assert!(
             (near - 0.5).abs() < 1e-6,
             "halfway into the ramp → half throttle (got {near})"
+        );
+    }
+
+    #[test]
+    fn arrive_braked_cuts_to_reverse_inside_stopping_distance() {
+        let target = Vec2::new(100.0, 0.0);
+        let decel = 10.0;
+        // Fast-closing ship just OUTSIDE its stopping distance → positive ramp,
+        // not a brake. stop_dist = 1·40²/(2·10) = 80, so at dist 100 (pos x=20)
+        // the ship is 20 u outside → ramp over a 50 u slow radius = 0.4.
+        let fast = Vec2::new(40.0, 0.0);
+        let (dir_out, t_out) = arrive_braked(Vec2::new(0.0, 0.0), fast, target, 50.0, decel, 1.0);
+        assert!((dir_out - Vec2::X).length() < 1e-6, "steers at the goal");
+        assert!(
+            t_out > 0.0,
+            "outside the brake point → positive ramp (got {t_out})"
+        );
+        assert!(
+            (t_out - 0.4).abs() < 1e-5,
+            "linear ramp across the slow radius"
+        );
+
+        // SAME fast ship moved INSIDE the stopping distance (dist 70 < 80) →
+        // request reverse thrust (negative throttle).
+        let (dir_in, t_in) = arrive_braked(Vec2::new(30.0, 0.0), fast, target, 50.0, decel, 1.0);
+        assert!(
+            (dir_in - Vec2::X).length() < 1e-6,
+            "still steers at the goal"
+        );
+        assert_eq!(t_in, -1.0, "inside the brake point → reverse-brake request");
+
+        // Higher brake_aggression brakes EARLIER: at the same far position the
+        // stopping distance grows, so an aggression that pushes stop_dist past
+        // the range flips the ramp into a brake.
+        let (_, t_aggr) = arrive_braked(Vec2::new(0.0, 0.0), fast, target, 50.0, decel, 2.0);
+        assert_eq!(
+            t_aggr, -1.0,
+            "aggression 2 → stop_dist 160 > range 100 → brakes earlier"
+        );
+
+        // A ship moving AWAY from the goal never brakes (v_close = 0).
+        let (_, t_recede) = arrive_braked(
+            Vec2::new(30.0, 0.0),
+            Vec2::new(-40.0, 0.0),
+            target,
+            50.0,
+            decel,
+            1.0,
+        );
+        assert!(t_recede > 0.0, "receding → no brake demand, full ramp");
+
+        // Degenerate inputs never NaN: coincident goal, zero decel, zero vel.
+        let (d0, t0) = arrive_braked(target, fast, target, 50.0, decel, 1.0);
+        assert!(d0.is_finite() && t0.is_finite() && d0 == Vec2::ZERO);
+        let (_, t_z) = arrive_braked(Vec2::ZERO, fast, target, 50.0, 0.0, 1.0);
+        assert!(
+            t_z.is_finite(),
+            "zero decel floors the denominator (got {t_z})"
+        );
+        let (_, t_still) =
+            arrive_braked(Vec2::new(99.0, 0.0), Vec2::ZERO, target, 50.0, decel, 1.0);
+        assert!(
+            t_still.is_finite() && t_still >= 0.0,
+            "stationary → finite ramp"
         );
     }
 

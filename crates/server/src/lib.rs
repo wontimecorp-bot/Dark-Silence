@@ -549,6 +549,14 @@ impl ServerApp {
         // `ScenarioActive`-gated build system runs. The build mutates only this resource — no
         // gameplay state — so the golden determinism/botkit/demo comparisons stay bit-identical.
         world.insert_resource(sim::broadphase::CoarseIndex::default());
+        // R96 Part D: the per-tick obstacle field the ship-AI steers around
+        // (the large neutral bodies — asteroids/outposts/transports). Present
+        // (inert, empty) in EVERY server world; rebuilt per tick only when the
+        // `ScenarioActive`-gated build system runs. The build mutates only this
+        // resource — no gameplay state — and no golden world spawns an `AiBrain`
+        // to consume it, so the golden determinism/botkit/demo comparisons stay
+        // bit-identical even where the field populates (`demo_enemies_smoke`).
+        world.insert_resource(sim::broadphase::ObstacleField::default());
         // 00008-ship-ai (T005, TR-007): the AI tuning knobs + the monotonic sim
         // tick the AOI/LOD classifier (and later the think scheduler) read.
         // Inserted at this single world-construction point so they exist in

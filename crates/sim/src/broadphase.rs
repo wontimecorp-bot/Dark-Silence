@@ -15,11 +15,12 @@
 //! and explosions all query.
 
 use bevy_ecs::entity::Entity;
-use bevy_ecs::prelude::{Or, Query, ResMut, Resource, With, Without};
+use bevy_ecs::prelude::{Or, Query, Res, ResMut, Resource, With, Without};
 use glam::Vec2;
 use std::collections::BTreeMap;
 
-use crate::components::{Position, Projectile, Ship, Target};
+use crate::ai::tuning::AiTuning;
+use crate::components::{CollisionRadius, Position, Projectile, Ship, Target};
 
 /// Broad-phase grid cell size in world units. Independent of the carve `CELL_WORLD_SIZE`; sized so a
 /// typical body spans ~one cell and a per-tick projectile segment covers ~one or two. Tunable for
@@ -179,6 +180,67 @@ pub fn build_coarse_index_system(
     bodies: Query<(Entity, &Position), (Or<(With<Ship>, With<Target>)>, Without<Projectile>)>,
 ) {
     index.0 = CoarseGrid::build(bodies.iter().map(|(e, p)| (e, p.0)));
+}
+
+/// The per-tick **obstacle field** the ship-AI steers around (R96 Part D): a
+/// flat, deterministically-ordered list of `(centre, radius)` circles for the
+/// LARGE neutral bodies a ship should avoid colliding with — asteroids,
+/// outposts, transports — NOT other ships. A build-once-read-many `Resource`
+/// in the [`CoarseIndex`] mould: inserted (inert, empty) at world construction
+/// so it exists in every world, rebuilt each tick ONLY by the
+/// `ScenarioActive`-gated [`build_obstacle_field_system`], and consumed by the
+/// AI execute arm (move + combat) through `add_obstacle_danger`.
+///
+/// **Why a flat `Vec`, not a grid**: the obstacle set is tiny (a handful of
+/// neutral bodies per sector) and every consumer scans the WHOLE list against
+/// its own ship position, so a sparse grid would only add bookkeeping. The
+/// determinism doctrine is the same as [`CoarseGrid`] though — the `Vec` is
+/// sorted by POSITION bits at build (`(pos.x.to_bits(), pos.y.to_bits())`), so
+/// the list is identical across runs/platforms regardless of the caller's
+/// archetype iteration order.
+#[derive(Resource, Default, Debug)]
+pub struct ObstacleField {
+    /// `(centre, radius)` of each avoid-worthy body, sorted by position bits.
+    pub obstacles: Vec<(Vec2, f32)>,
+}
+
+impl ObstacleField {
+    /// Build the field from `(position, radius)` items, keeping only bodies with
+    /// `radius >= min_radius` (the large neutral bodies — small debris/ships are
+    /// not avoided here), then sort by `(pos.x bits, pos.y bits)` for cross-run
+    /// stability (mirrors [`CoarseGrid::build`]'s sort-at-build doctrine). Pure +
+    /// deterministic — no RNG, no HashMap iteration.
+    pub fn build(items: impl Iterator<Item = (Vec2, f32)>, min_radius: f32) -> Self {
+        let mut obstacles: Vec<(Vec2, f32)> =
+            items.filter(|&(_, radius)| radius >= min_radius).collect();
+        // Sort by position bits — stable across runs/platforms, independent of
+        // the source query's archetype iteration order (the CoarseGrid doctrine).
+        obstacles.sort_unstable_by_key(|&(pos, _)| (pos.x.to_bits(), pos.y.to_bits()));
+        Self { obstacles }
+    }
+}
+
+/// Rebuild the [`ObstacleField`] from every large neutral [`Target`] body
+/// (asteroid/outpost/transport — the things to AVOID, never ships or
+/// projectiles) once per tick, before the AI execute arm consumes it. Filtered
+/// to `radius >= AiTuning::obstacle_min_radius` so only sizeable bodies enter
+/// the field (small debris is not steered around).
+///
+/// Registered gated on `ScenarioActive` AND on the resource existing (the
+/// `build_coarse_index_system` double-gate), right after the coarse-index
+/// build. It mutates ONLY this resource — no gameplay state — so golden worlds
+/// that DO run it (`demo_enemies_smoke` spawns `Target`s with
+/// [`CollisionRadius`], so the field populates there) stay bit-identical: no
+/// `AiBrain` consumes the field in those worlds, so no intent changes.
+pub fn build_obstacle_field_system(
+    mut field: ResMut<ObstacleField>,
+    tuning: Res<AiTuning>,
+    bodies: Query<(&Position, &CollisionRadius), (With<Target>, Without<Projectile>)>,
+) {
+    *field = ObstacleField::build(
+        bodies.iter().map(|(p, r)| (p.0, r.0)),
+        tuning.obstacle_min_radius,
+    );
 }
 
 #[cfg(test)]
@@ -351,6 +413,69 @@ mod tests {
                 -COARSE_CELL_SIZE - 0.001
             )),
             (-2, -2)
+        );
+    }
+
+    /// R96 Part D — the [`ObstacleField`] build is deterministic: the output
+    /// `Vec` is sorted by position bits (so cross-run/platform stable), drops
+    /// sub-`min_radius` bodies (small debris is not an obstacle), and is
+    /// independent of the source iteration order (mirrors the coarse-grid
+    /// order-independence tests). A duplicate-position pair (two bodies stacked
+    /// on the same point) stays present but ADJACENT — the build does not dedup
+    /// distinct bodies, only orders them stably.
+    #[test]
+    fn obstacle_field_build_is_sorted_deduped_and_order_independent() {
+        let min_radius = 20.0;
+        // Three qualifying bodies in deliberately UNSORTED position order, plus
+        // one sub-min body that must be filtered out.
+        let big = [
+            (Vec2::new(70.0, 10.0), 30.0),
+            (Vec2::new(-40.0, 5.0), 25.0),
+            (Vec2::new(70.0, -10.0), 40.0), // same x as the first → y breaks the tie
+        ];
+        let small = (Vec2::new(0.0, 0.0), 5.0); // below min_radius → dropped
+
+        let forward: Vec<(Vec2, f32)> = big.iter().copied().chain(std::iter::once(small)).collect();
+        let mut reversed = forward.clone();
+        reversed.reverse();
+
+        let f1 = ObstacleField::build(forward.into_iter(), min_radius);
+        let f2 = ObstacleField::build(reversed.into_iter(), min_radius);
+
+        // (a) Build-order independence: same input set → identical output.
+        assert_eq!(
+            f1.obstacles, f2.obstacles,
+            "obstacle field is independent of source iteration order"
+        );
+        // (b) The sub-min body is filtered out; the three big ones survive.
+        assert_eq!(f1.obstacles.len(), 3, "small debris is not an obstacle");
+        assert!(
+            f1.obstacles.iter().all(|&(_, r)| r >= min_radius),
+            "every retained obstacle clears the min radius"
+        );
+        // (c) Sorted by (x bits, y bits): the canonical key the build uses — the
+        // determinism property is cross-run STABILITY, not numeric monotonicity
+        // (raw f32 bits order negatives after positives; that is fine — every run
+        // agrees).
+        let mut sorted = f1.obstacles.clone();
+        sorted.sort_by_key(|&(p, _)| (p.x.to_bits(), p.y.to_bits()));
+        assert_eq!(
+            f1.obstacles, sorted,
+            "obstacles are sorted by position bits"
+        );
+        // (d) The two same-x bodies are ordered by y BITS — for f32, +10 sorts
+        // before −10 (the sign bit lands negatives last). The exact order is
+        // immaterial; that it is DETERMINISTIC (matches the to_bits key) is.
+        let xs70: Vec<f32> = f1
+            .obstacles
+            .iter()
+            .filter(|&&(p, _)| p.x == 70.0)
+            .map(|&(p, _)| p.y)
+            .collect();
+        assert_eq!(
+            xs70,
+            vec![10.0, -10.0],
+            "the position-bits tiebreak orders equal-x bodies deterministically by y bits"
         );
     }
 }

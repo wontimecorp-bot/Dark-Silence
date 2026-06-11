@@ -27,8 +27,9 @@ pub mod tuning;
 pub use brain::debug_capture::AiDebugCapture;
 pub use brain::{
     ai_execute_system, ai_think_system, archetype_refresh_system, cadence_for_tier,
-    classify_archetype, hull_fraction, primary_fire_group, ram_utility, score_behavior,
-    select_behavior, standoff_distance, weapon_range, AiBrain, AiEvent, Behavior, FitArchetype,
+    classify_archetype, default_combat_stance, default_movement_profile, hull_fraction,
+    primary_fire_group, ram_utility, score_behavior, select_behavior, standoff_distance,
+    weapon_range, AiBrain, AiEvent, Behavior, CombatStance, FitArchetype, MovementProfile,
     RethinkQueue,
 };
 pub use ident::{ai_despawn_sweep_system, phase_bucket, AiIdAllocator, AiStableId};

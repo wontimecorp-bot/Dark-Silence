@@ -12,8 +12,8 @@ use bevy_ecs::prelude::With;
 use glam::{Vec2, Vec3};
 use serde::Deserialize;
 use sim::ai::{
-    spawn_squad, AiBrain, AiIdAllocator, AiTuning, AoiTier, ContactList, FormationDef, Posture,
-    RoleGoal, ScenarioRole, SquadOrder,
+    spawn_squad, AiBrain, AiIdAllocator, AiTuning, AoiTier, CombatStance, ContactList,
+    FormationDef, MovementProfile, Posture, RoleGoal, ScenarioRole, SquadOrder,
 };
 use sim::components::{
     AngularVelocity, BoxCollider, CollisionRadius, Faction, Heading, Health, Movable, Position,
@@ -266,15 +266,39 @@ impl ServerApp {
     /// is `DefensiveOnly` (it returns fire only while fired-upon — see
     /// `FIRED_UPON_WINDOW_TICKS`); everything else is `FreeEngage`.
     ///
+    /// R96 STYLE SHOWCASE (the precedence chain made visible): the patrols carry
+    /// a `MovementProfile` OVERRIDE on their `ScenarioRole` (patrols are roled, so
+    /// the role override is their live precedence link — the squad order is just
+    /// `Hold` and squad-exempt for roled members) — RED patrols
+    /// `Cruise` (purposeful, today's coast), BLUE patrols `Leisurely` (gentle,
+    /// energy-saving). The AMBUSH pairs carry a `CombatStance` override of
+    /// `Orbit{ccw:true}` (no movement override → archetype pace), so a sprung trap
+    /// banks AROUND its target near the asteroid instead of charging straight in.
+    /// The fighters' two-autocannon-plus-armor fit classifies as `Brawler`, whose
+    /// archetype default stance is `Charge`; the ambush role override flips that to
+    /// `Orbit`, showing the role-over-archetype contrast in-game.
+    ///
     /// 10 AI ships total — playtest content, not the bench. Additive only:
     /// `Scenario::Sandbox` and every golden world are untouched, and the
     /// Phase-1 arena lock (`mining_skirmish_scenario_spawns_the_static_arena`)
     /// counts `Target` sub-kinds, which fitted `Ship`s never carry.
     fn spawn_skirmish_ai(&mut self, hw: f32) {
         use std::f32::consts::PI;
-        for (faction, sign, heading, patrol_posture) in [
-            (Faction::Red, -1.0_f32, 0.0_f32, Posture::FreeEngage),
-            (Faction::Blue, 1.0, PI, Posture::DefensiveOnly),
+        for (faction, sign, heading, patrol_posture, patrol_profile) in [
+            (
+                Faction::Red,
+                -1.0_f32,
+                0.0_f32,
+                Posture::FreeEngage,
+                MovementProfile::Cruise,
+            ),
+            (
+                Faction::Blue,
+                1.0,
+                PI,
+                Posture::DefensiveOnly,
+                MovementProfile::Leisurely,
+            ),
         ] {
             // PATROL: a 3-4 point loop over the faction's half, offset north
             // (+Y) of the y = 0 transport lane. Mirrored per faction.
@@ -291,7 +315,11 @@ impl ServerApp {
                     -sign * 15.0 * i as f32,
                     if i == 2 { -12.0 } else { 12.0 * i as f32 },
                 );
-                let role = ScenarioRole::new(RoleGoal::PatrolRoute(route.clone()), patrol_posture);
+                // R96: the patrol role carries the faction's MovementProfile
+                // override (Red Cruise / Blue Leisurely). No combat stance
+                // override → the archetype default (Brawler → Charge) stands.
+                let role = ScenarioRole::new(RoleGoal::PatrolRoute(route.clone()), patrol_posture)
+                    .with_style(Some(patrol_profile), None);
                 members.push(self.spawn_ai_fighter(route[0] + offset, heading, faction, role));
             }
             spawn_squad(
@@ -310,7 +338,12 @@ impl ServerApp {
             };
             for j in 0..2 {
                 let pos = Vec2::new(sign * (80.0 + 15.0 * j as f32), -100.0 - 10.0 * j as f32);
-                let role = ScenarioRole::new(ambush.clone(), Posture::FreeEngage);
+                // R96: the ambush role carries a CombatStance override of
+                // Orbit{ccw:true} — a sprung trap ORBITS the target near the rock
+                // (the role override beats the archetype's Charge default). No
+                // movement-profile override → its archetype pace.
+                let role = ScenarioRole::new(ambush.clone(), Posture::FreeEngage)
+                    .with_style(None, Some(CombatStance::Orbit { ccw: true }));
                 self.spawn_ai_fighter(pos, heading, faction, role);
             }
         }

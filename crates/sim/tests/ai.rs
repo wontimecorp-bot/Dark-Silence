@@ -32,10 +32,10 @@ use sim::ai::steering::{
 };
 use sim::ai::{
     ai_think_system, cadence_for_tier, select_behavior, spawn_squad, AiBrain, AiEvent,
-    AiIdAllocator, AiStableId, AiTuning, AoiTier, Behavior, FormationDef, GlideState, Gliding,
-    HostileContact, PlayerShip, RethinkQueue, Squad, SquadOrder, Tier,
+    AiIdAllocator, AiStableId, AiTuning, AoiTier, Behavior, CombatStance, FormationDef, GlideState,
+    Gliding, HostileContact, MovementProfile, PlayerShip, RethinkQueue, Squad, SquadOrder, Tier,
 };
-use sim::broadphase::CoarseIndex;
+use sim::broadphase::{CoarseIndex, ObstacleField};
 use sim::components::*;
 use sim::{
     CurrentTick, FixedDt, HitFeedback, RefinedResources, ScenarioActive, ShipIntent, Tuning,
@@ -807,6 +807,489 @@ fn strict_f32_scoring_grep() {
             "TR-004 violation: `{banned}` found in the strict-f32 scoring region of brain.rs"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// R96 Part A+B — movement profiles (Cruise parity + active braking)
+// ---------------------------------------------------------------------------
+
+/// The brain.rs `ARRIVE_RADIUS` const is `pub(crate)`; the integration suite
+/// pins the same canonical value (also the steering-tests' radius).
+const R96_ARRIVE_RADIUS: f32 = 10.0;
+
+/// A fitted `ShipStats` with an explicit, strong retro (reverse) channel so the
+/// active-braking profiles have real brake authority to test. Built from the
+/// squad-test fighter fit (drag normalized to 1, top speed pinned) with the
+/// reverse force overridden to a fraction of forward thrust.
+fn stats_with_brake(top_speed: f32, reverse_force: f32) -> sim::fitting::ShipStats {
+    let mut s = stats_with_top_speed(top_speed);
+    s.reverse_force = reverse_force;
+    s
+}
+
+/// R96 PARITY KEYSTONE — a `MovementProfile::Cruise` ship flying a `Waypoint`
+/// goal through the FULL fixed schedule emits the EXACT pre-R96 trajectory:
+/// (a) byte-identical across two independent runs (determinism, V-3); and
+/// (b) byte-identical to a reference ship hand-driven by the pre-R96 primitives
+/// (`waypoint_follow` → `steer_to_intent`, the only intent the old `fly_to`
+/// produced) — proving Cruise emits the SAME intents as the old code.
+#[test]
+fn cruise_profile_is_byte_identical_to_baseline() {
+    const TICKS: u64 = 90;
+    let start = Vec2::new(10.0, 0.0);
+    let waypoint = Vec2::new(120.0, 40.0);
+
+    // The AI-driven Cruise ship through the full schedule (think + execute +
+    // flight), captured per tick at BIT level.
+    let cruise_run = || {
+        let (mut w, mut s) = obj2_world();
+        w.spawn((PlayerShip, Position(Vec2::ZERO))); // keep it Active-tier
+        let buckets = w.resource::<AiTuning>().fallback_bucket_count;
+        let brain = AiBrain {
+            waypoint: Some(waypoint),
+            think_tier: Tier::Active,
+            movement_profile: MovementProfile::Cruise,
+            ..AiBrain::new(AiStableId(0), buckets)
+        };
+        let ship = w
+            .spawn((
+                Ship,
+                ShipIntent::default(),
+                Position(start),
+                Velocity(Vec2::ZERO),
+                Heading(0.0),
+                AngularVelocity(0.0),
+                FlightAssist::On,
+                AiStableId(0),
+                brain,
+                AoiTier {
+                    tier: Tier::Active,
+                    since_tick: 0,
+                },
+            ))
+            .id();
+        let mut trace = Vec::with_capacity(TICKS as usize);
+        for tick in 0..TICKS {
+            mirror_tick_and_run(&mut w, &mut s, tick);
+            trace.push(state_bits(&w, ship));
+        }
+        trace
+    };
+
+    let run_a = cruise_run();
+    let run_b = cruise_run();
+    assert_eq!(
+        run_a, run_b,
+        "Cruise is deterministic across identical runs (V-3)"
+    );
+
+    // The pre-R96 reference: an UNFITTED ship hand-driven by exactly the intent
+    // the old `fly_to` emitted (`waypoint_follow` → `steer_to_intent`), through
+    // the flight model alone. The Cruise brain's `throttle_cap` is the default
+    // 1.0 (a `*1.0` no-op), so no cap scaling enters either path.
+    let mut rw = make_world();
+    let mut rs = make_schedule();
+    let reference = spawn_ai_ship(&mut rw, start, 0.0, Vec2::ZERO);
+    let mut ref_trace = Vec::with_capacity(TICKS as usize);
+    for _ in 0..TICKS {
+        let (p, v, h) = kinematics(&rw, reference);
+        // The Waypoint arm holds (zero intent) within ARRIVE_RADIUS, else flies.
+        let intent = if (waypoint - p).length() <= R96_ARRIVE_RADIUS {
+            ShipIntent::default()
+        } else {
+            let (dir, throttle, _) = waypoint_follow(p, v, &[waypoint], 0, R96_ARRIVE_RADIUS);
+            steer_to_intent(dir, throttle, h, v, 0.0) // unfitted → turn_authority 0
+        };
+        write_intent(&mut rw, reference, intent);
+        rs.run(&mut rw);
+        ref_trace.push(state_bits(&rw, reference));
+    }
+
+    assert_eq!(
+        run_a, ref_trace,
+        "Cruise emits the SAME trajectory as the pre-R96 hand-driven baseline \
+         (the determinism keystone — Cruise == old path, byte for byte)"
+    );
+}
+
+/// R96 Part B — Rush actively brakes onto its goal and settles CLOSER than
+/// Leisurely (which paces slower and coasts further), and NEITHER overshoots
+/// wildly. Both fly the SAME fitted ship + goal through the full schedule; only
+/// the `movement_profile` differs.
+#[test]
+fn rush_settles_on_goal_vs_leisurely_coasts_past() {
+    const TICKS: u64 = 400;
+    let start = Vec2::new(0.0, 0.0);
+    let goal = Vec2::new(220.0, 0.0);
+
+    // top_speed 80, a strong retro (reverse_force 60) so braking is decisive.
+    let stats = stats_with_brake(80.0, 60.0);
+
+    let rest_distance = |profile: MovementProfile| -> (f32, f32) {
+        let (mut w, mut s) = obj2_world();
+        w.spawn((PlayerShip, Position(start))); // keep the ship Active-tier
+        let buckets = w.resource::<AiTuning>().fallback_bucket_count;
+        let brain = AiBrain {
+            waypoint: Some(goal),
+            think_tier: Tier::Active,
+            // R96: pin the profile through the highest-precedence channel
+            // (`squad_profile`) so the think-time resolution preserves it (a bare
+            // `movement_profile` is a RESOLVED field — the think overwrites it
+            // each tick from squad ← role ← archetype default).
+            squad_profile: Some(profile),
+            ..AiBrain::new(AiStableId(0), buckets)
+        };
+        let ship = w
+            .spawn((
+                Ship,
+                ShipIntent::default(),
+                Position(start),
+                Velocity(Vec2::ZERO),
+                Heading(0.0),
+                AngularVelocity(0.0),
+                FlightAssist::On,
+                stats,
+                AiStableId(0),
+                brain,
+                AoiTier {
+                    tier: Tier::Active,
+                    since_tick: 0,
+                },
+            ))
+            .id();
+        let mut max_overshoot: f32 = 0.0;
+        for tick in 0..TICKS {
+            mirror_tick_and_run(&mut w, &mut s, tick);
+            let (p, ..) = kinematics(&w, ship);
+            // Overshoot = how far PAST the goal along the approach axis (+X).
+            max_overshoot = max_overshoot.max(p.x - goal.x);
+        }
+        let (p, ..) = kinematics(&w, ship);
+        ((goal - p).length(), max_overshoot)
+    };
+
+    let (rush_rest, rush_overshoot) = rest_distance(MovementProfile::Rush);
+    let (leisurely_rest, _) = rest_distance(MovementProfile::Leisurely);
+
+    assert!(
+        rush_rest < leisurely_rest,
+        "Rush actively brakes and settles closer ({rush_rest}) than Leisurely \
+         coasts ({leisurely_rest})"
+    );
+    // Neither overshoots wildly: Rush's active brake keeps it well shy of a full
+    // fly-through (a body length or two, not hundreds of units past).
+    assert!(
+        rush_overshoot < 40.0,
+        "Rush does not blow past the goal (max overshoot {rush_overshoot})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R96 Part D — obstacle avoidance through the FULL fixed schedule
+// (the ObstacleField + the move/combat avoidance arms; the empty-field gate)
+// ---------------------------------------------------------------------------
+
+/// Spawn a large neutral obstacle body: a static `Target` with a
+/// `CollisionRadius` ≥ the avoidance min radius, so the
+/// `build_obstacle_field_system` indexes it. Static (zero velocity) and
+/// `Dummy`-kind so the seek/target-motion systems leave it put.
+fn spawn_obstacle(w: &mut World, pos: Vec2, radius: f32) -> Entity {
+    w.spawn((
+        Target,
+        TargetKind::Dummy,
+        Position(pos),
+        Velocity(Vec2::ZERO),
+        Heading(0.0),
+        CollisionRadius(radius),
+    ))
+    .id()
+}
+
+/// R96 Part D — VC1 (move arm): a `Waypoint` ship with a LARGE obstacle parked
+/// on the straight line between it and its goal DETOURS around the obstacle
+/// (max lateral deviation from the straight start→goal line exceeds a clear
+/// threshold) yet still REACHES the goal — the real-ObstacleField analog of the
+/// `context_map_danger_deflects_around_a_blocked_path` steering unit test.
+#[test]
+fn ship_steers_around_obstacle_between_it_and_its_goal() {
+    const TICKS: u64 = 4000;
+    let start = Vec2::new(0.0, 0.0);
+    let goal = Vec2::new(600.0, 0.0);
+    // A big asteroid squarely on the +X line between the start and the goal —
+    // far enough from the goal that, once cleared, it drops out of the ship's
+    // avoidance scope so it settles cleanly (no phantom deflection on arrival).
+    let obstacle_pos = Vec2::new(250.0, 0.0);
+    let obstacle_radius = 50.0;
+
+    let (mut w, mut s) = obj2_world();
+    w.insert_resource(ObstacleField::default()); // enable the Part-D build system.
+                                                 // Wide AOI so the ship stays Active-tier across the whole 400-unit run; a
+                                                 // wide clearance pad + query radius so the ship begins its detour EARLY and
+                                                 // gives the big body a clear berth (exercising those Part-D knobs).
+    w.insert_resource(AiTuning {
+        aoi_radius_active: 10_000.0,
+        aoi_radius_mid: 20_000.0,
+        // Wide clearance + long predictive lookahead so a non-holonomic ship (it
+        // cannot snap its heading) begins turning FAR from the big body and
+        // clears it with margin instead of carving across it at speed.
+        obstacle_clearance_pad: 40.0,
+        obstacle_query_radius: 320.0,
+        obstacle_lookahead_s: 6.0,
+        ..AiTuning::default()
+    });
+    w.spawn((PlayerShip, Position(start)));
+    spawn_obstacle(&mut w, obstacle_pos, obstacle_radius);
+    let buckets = w.resource::<AiTuning>().fallback_bucket_count;
+    let brain = AiBrain {
+        waypoint: Some(goal),
+        think_tier: Tier::Active,
+        // Rush profile (active braking) so the ship paces + settles cleanly onto
+        // the goal rather than the fast unfitted ship's overshoot orbit — the
+        // detour is what is under test, not the flight model's coast.
+        movement_profile: MovementProfile::Rush,
+        ..AiBrain::new(AiStableId(0), buckets)
+    };
+    // A fitted ship with real top speed + retro brake (the Rush-test fighter).
+    let stats = stats_with_brake(80.0, 60.0);
+    let ship = w
+        .spawn((
+            Ship,
+            ShipIntent::default(),
+            Position(start),
+            Velocity(Vec2::ZERO),
+            Heading(0.0),
+            AngularVelocity(0.0),
+            FlightAssist::On,
+            stats,
+            CollisionRadius(4.0),
+            AiStableId(0),
+            brain,
+            AoiTier {
+                tier: Tier::Active,
+                since_tick: 0,
+            },
+        ))
+        .id();
+
+    // The obstacle field really populated (the build system ran + indexed it).
+    mirror_tick_and_run(&mut w, &mut s, 0);
+    assert_eq!(
+        w.resource::<ObstacleField>().obstacles.len(),
+        1,
+        "the large obstacle entered the field"
+    );
+
+    let mut max_lateral: f32 = 0.0;
+    let mut min_surface_gap = f32::INFINITY;
+    let mut closest_to_goal = f32::INFINITY;
+    for tick in 1..TICKS {
+        mirror_tick_and_run(&mut w, &mut s, tick);
+        let p = pos_of(&w, ship);
+        // Lateral deviation off the straight start→goal (+X) line.
+        max_lateral = max_lateral.max(p.y.abs());
+        // Surface-to-surface clearance from the obstacle (must never plunge in).
+        let gap = (p - obstacle_pos).length() - obstacle_radius - 4.0;
+        min_surface_gap = min_surface_gap.min(gap);
+        closest_to_goal = closest_to_goal.min((p - goal).length());
+    }
+
+    // (a) DETOUR: the ship swings well off the straight start→goal line to clear
+    // the radius-50 body (a deviation past 20 u is unambiguously around it, not
+    // a graze) — the move-arm analog of the steering deflection unit test.
+    assert!(
+        max_lateral > 20.0,
+        "the ship DETOURS off the straight line around the obstacle \
+         (max lateral deviation {max_lateral:.1})"
+    );
+    // (b) NEVER PLUNGES THROUGH: the avoidance keeps real surface clearance — the
+    // ship goes AROUND, never carving across the body.
+    assert!(
+        min_surface_gap > 0.0,
+        "the ship keeps clearance from the obstacle surface (min gap {min_surface_gap:.1})"
+    );
+    // (c) STILL REACHES the goal REGION: after clearing the body the ship arrives
+    // in the goal's neighborhood — a closest approach far smaller than the
+    // 600-unit start→goal span proves the detour is a way AROUND that completes
+    // the nav goal, not a dead end. (The fast fighter then orbits the goal a
+    // little, a flight-model coast trait — the avoidance carried it THERE.)
+    assert!(
+        closest_to_goal < 60.0,
+        "the ship still reaches the goal region past the obstacle \
+         (closest approach {closest_to_goal:.1})"
+    );
+    eprintln!(
+        "[r96d] move detour: max lateral {max_lateral:.1}, min surface gap {min_surface_gap:.1}, \
+         closest to goal {closest_to_goal:.1}"
+    );
+}
+
+/// R96 Part D — VC1 (combat arm): a fighter charging an enemy with a LARGE
+/// asteroid between them DETOURS around the asteroid (max lateral deviation off
+/// the ship→target line exceeds a threshold) rather than driving straight into
+/// it — the Engage analog of the move-arm detour, via the same shared
+/// `add_obstacle_danger` on `engage_motion`'s context map.
+#[test]
+fn ship_steers_around_obstacle_between_it_and_its_target() {
+    const TICKS: u64 = 2000;
+    let start = Vec2::new(0.0, 0.0);
+    // The (indestructible — no Health/FitLayout) enemy the fighter charges.
+    let target_pos = Vec2::new(400.0, 0.0);
+    // A big asteroid squarely on the line between the fighter and its target.
+    let obstacle_pos = Vec2::new(200.0, 0.0);
+    let obstacle_radius = 50.0;
+
+    let (mut w, mut s) = obj2_world();
+    w.insert_resource(ObstacleField::default());
+    w.insert_resource(AiTuning {
+        aoi_radius_active: 10_000.0,
+        aoi_radius_mid: 20_000.0,
+        obstacle_clearance_pad: 40.0,
+        obstacle_query_radius: 400.0,
+        ..AiTuning::default()
+    });
+    w.spawn((PlayerShip, Position(start)));
+    spawn_obstacle(&mut w, obstacle_pos, obstacle_radius);
+    let target = w
+        .spawn((Position(target_pos), Velocity(Vec2::ZERO), Heading(0.0)))
+        .id();
+    // A Brawler (close-ring) fit so the engage arm CLOSES toward the target
+    // (radial > 0 → lead pursuit) and thus must transit the obstacle's line.
+    let stats = combat_stats(80.0, 30.0, 200.0);
+    let ai = *w.resource::<AiTuning>();
+    assert_eq!(
+        sim::ai::classify_archetype(&stats, &ai),
+        FitArchetype::Brawler,
+        "the charging fighter is a close-ring Brawler"
+    );
+    let fighter = spawn_brain_combat_ship(&mut w, 0, start, 0.0, Vec2::ZERO, target, stats);
+    w.entity_mut(fighter).insert(CollisionRadius(4.0));
+
+    mirror_tick_and_run(&mut w, &mut s, 0);
+    assert_eq!(
+        w.resource::<ObstacleField>().obstacles.len(),
+        1,
+        "the asteroid entered the field"
+    );
+
+    let mut max_lateral: f32 = 0.0;
+    let mut min_surface_gap = f32::INFINITY;
+    for tick in 1..TICKS {
+        mirror_tick_and_run(&mut w, &mut s, tick);
+        assert_eq!(
+            brain_of(&w, fighter).behavior,
+            Behavior::Engage,
+            "the fighter stays on the Engage task (tick {tick})"
+        );
+        let p = pos_of(&w, fighter);
+        max_lateral = max_lateral.max(p.y.abs());
+        let gap = (p - obstacle_pos).length() - obstacle_radius - 4.0;
+        min_surface_gap = min_surface_gap.min(gap);
+        // Stop once it has clearly passed the obstacle's x toward the target.
+        if p.x > obstacle_pos.x + obstacle_radius + 20.0 {
+            break;
+        }
+    }
+
+    assert!(
+        max_lateral > 8.0,
+        "the charging fighter DETOURS around the asteroid between it and its \
+         target (max lateral deviation {max_lateral:.1})"
+    );
+    // The avoidance keeps real surface clearance — it goes AROUND, not through.
+    assert!(
+        min_surface_gap > 0.0,
+        "the fighter keeps clearance from the asteroid surface (min gap {min_surface_gap:.1})"
+    );
+    eprintln!(
+        "[r96d] combat detour: max lateral {max_lateral:.1}, min surface gap {min_surface_gap:.1}"
+    );
+}
+
+/// R96 Part D — THE EMPTY-FIELD GATE: a `Waypoint`/Cruise ship in a world with
+/// the `ObstacleField` ENABLED but holding NO qualifying obstacle emits intents
+/// and a trajectory BIT-identical to the same ship with NO `ObstacleField` at
+/// all (the pre-R96-D path). This is what guarantees determinism + parity — the
+/// avoidance code only ever runs when an obstacle is actually in range.
+#[test]
+fn no_obstacles_is_byte_identical() {
+    const TICKS: u64 = 120;
+    let start = Vec2::new(10.0, 0.0);
+    let waypoint = Vec2::new(120.0, 40.0);
+
+    // `with_field`: insert the ObstacleField resource (so the build system runs)
+    // but spawn no obstacle — the empty-field gate must make this a no-op.
+    let run = |with_field: bool| -> Vec<[u32; 6]> {
+        let (mut w, mut s) = obj2_world();
+        if with_field {
+            w.insert_resource(ObstacleField::default());
+        }
+        w.spawn((PlayerShip, Position(Vec2::ZERO)));
+        let buckets = w.resource::<AiTuning>().fallback_bucket_count;
+        let brain = AiBrain {
+            waypoint: Some(waypoint),
+            think_tier: Tier::Active,
+            movement_profile: MovementProfile::Cruise,
+            ..AiBrain::new(AiStableId(0), buckets)
+        };
+        let ship = w
+            .spawn((
+                Ship,
+                ShipIntent::default(),
+                Position(start),
+                Velocity(Vec2::ZERO),
+                Heading(0.0),
+                AngularVelocity(0.0),
+                FlightAssist::On,
+                // A CollisionRadius is present (real ships carry one), exercising
+                // the own_radius path — it must still be a no-op with no obstacle.
+                CollisionRadius(4.0),
+                AiStableId(0),
+                brain,
+                AoiTier {
+                    tier: Tier::Active,
+                    since_tick: 0,
+                },
+            ))
+            .id();
+        let mut trace = Vec::with_capacity(TICKS as usize);
+        for tick in 0..TICKS {
+            mirror_tick_and_run(&mut w, &mut s, tick);
+            trace.push(state_bits(&w, ship));
+        }
+        trace
+    };
+
+    let with_field = run(true);
+    let without_field = run(false);
+    assert_eq!(
+        with_field, without_field,
+        "an enabled-but-empty ObstacleField is BIT-identical to no field at all \
+         (the empty-field gate — the determinism keystone of R96 Part D)"
+    );
+
+    // And it matches the pre-R96 hand-driven Cruise baseline byte-for-byte (the
+    // same reference `cruise_profile_is_byte_identical_to_baseline` uses).
+    let mut rw = make_world();
+    let mut rs = make_schedule();
+    let reference = spawn_ai_ship(&mut rw, start, 0.0, Vec2::ZERO);
+    let mut ref_trace = Vec::with_capacity(TICKS as usize);
+    for _ in 0..TICKS {
+        let (p, v, h) = kinematics(&rw, reference);
+        let intent = if (waypoint - p).length() <= R96_ARRIVE_RADIUS {
+            ShipIntent::default()
+        } else {
+            let (dir, throttle, _) = waypoint_follow(p, v, &[waypoint], 0, R96_ARRIVE_RADIUS);
+            steer_to_intent(dir, throttle, h, v, 0.0)
+        };
+        write_intent(&mut rw, reference, intent);
+        rs.run(&mut rw);
+        ref_trace.push(state_bits(&rw, reference));
+    }
+    assert_eq!(
+        with_field, ref_trace,
+        "the empty-field move arm emits the SAME trajectory as the pre-R96 \
+         hand-driven Cruise baseline (byte for byte)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1993,6 +2476,225 @@ fn archetype_range_bands_differ() {
 }
 
 // ---------------------------------------------------------------------------
+// R96 Part C — combat stances (Charge parity + Orbit / Kite styles).
+// ---------------------------------------------------------------------------
+
+/// A combat ship like [`spawn_brain_combat_ship`] but flying a chosen
+/// [`CombatStance`] (the brain otherwise identical: target set, Active tier,
+/// phase bucket 0, no `Weapon` component so ballistics never confound motion).
+#[allow(clippy::too_many_arguments)] // Mirrors `spawn_brain_combat_ship` + the stance.
+fn spawn_stance_combat_ship(
+    w: &mut World,
+    id: u64,
+    pos: Vec2,
+    heading: f32,
+    vel: Vec2,
+    target: Entity,
+    stats: sim::fitting::ShipStats,
+    stance: CombatStance,
+) -> Entity {
+    let e = spawn_brain_combat_ship(w, id, pos, heading, vel, target, stats);
+    // R96: pin the stance through the highest-precedence channel (`squad_stance`)
+    // so the think-time resolution preserves it — `combat_stance` itself is a
+    // RESOLVED field the think overwrites each tick from squad ← role ← archetype.
+    w.get_mut::<AiBrain>(e).unwrap().squad_stance = Some(stance);
+    e
+}
+
+/// Signed bearing angle (rad) of `ship` around `target` — `atan2` of the line
+/// FROM the target TO the ship. Accumulating its UNWRAPPED delta over a window
+/// measures signed angular progress (orbit circulation direction + amount).
+fn bearing_around(target: Vec2, ship: Vec2) -> f32 {
+    (ship - target).to_angle()
+}
+
+/// R96 Part C — an `Orbit` ship curves AROUND a (stationary) target: over a
+/// settled window its bearing angle advances MONOTONICALLY in the orbit
+/// direction (CCW positive, CW negative) while it holds near
+/// `orbit_radius_frac · standoff`. The two circulation directions advance
+/// OPPOSITE ways — the defining orbit property (not a kill).
+#[test]
+fn orbit_stance_produces_tangential_curving_motion_at_standoff() {
+    const TICKS: u64 = 2400;
+    const SETTLE: u64 = 300; // Let the ship reach its ring before measuring.
+
+    // Run one circulation direction; return (signed angular progress over the
+    // measured tail, mean radius over that tail).
+    let run = |ccw: bool| -> (f32, f32) {
+        let (mut w, mut s) = obj2_world();
+        w.insert_resource(AiTuning {
+            aoi_radius_active: 10_000.0,
+            aoi_radius_mid: 20_000.0,
+            ..AiTuning::default()
+        });
+        w.spawn((PlayerShip, Position(Vec2::ZERO)));
+        let target_pos = Vec2::ZERO;
+        let target = w
+            .spawn((Position(target_pos), Velocity(Vec2::ZERO), Heading(0.0)))
+            .id();
+        // A slow, glass, armed fit → Orbiter (top 30 < fast-cut 60): it circles
+        // its weapon envelope. The orbit ring is built from its OWN archetype.
+        let stats = combat_stats(40.0, 30.0, 0.0);
+        let ai = *w.resource::<AiTuning>();
+        let archetype = sim::ai::classify_archetype(&stats, &ai);
+        assert_eq!(
+            archetype,
+            FitArchetype::Orbiter,
+            "the orbit test fit is an Orbiter"
+        );
+        let range = weapon_range(Some(&stats)).expect("armed");
+        let standoff = standoff_distance(archetype, range) * ai.orbit_radius_frac;
+        // Start ON the ring, off the +X axis, facing tangentially.
+        let start = Vec2::new(standoff, 0.0);
+        let ship = spawn_stance_combat_ship(
+            &mut w,
+            0,
+            start,
+            std::f32::consts::FRAC_PI_2,
+            Vec2::ZERO,
+            target,
+            stats,
+            CombatStance::Orbit { ccw },
+        );
+
+        let mut accum = 0.0f32;
+        let mut prev = bearing_around(target_pos, start);
+        let mut radii: Vec<f32> = Vec::new();
+        for tick in 0..TICKS {
+            mirror_tick_and_run(&mut w, &mut s, tick);
+            assert_eq!(
+                brain_of(&w, ship).behavior,
+                Behavior::Engage,
+                "the orbiter stays on the Engage task (tick {tick})"
+            );
+            let p = pos_of(&w, ship);
+            let b = bearing_around(target_pos, p);
+            if tick >= SETTLE {
+                // Unwrap the per-tick bearing delta into a continuous accumulation.
+                accum += wrap_angle(b - prev);
+                radii.push((p - target_pos).length());
+            }
+            prev = b;
+        }
+        let mean_r = radii.iter().copied().sum::<f32>() / radii.len() as f32;
+        (accum, mean_r)
+    };
+
+    let (ccw_prog, ccw_r) = run(true);
+    let (cw_prog, cw_r) = run(false);
+
+    // The orbit CURVES: clear signed angular progress, OPPOSITE signs for the
+    // two circulation directions (the defining orbiting property). The Orbiter's
+    // wide ring + modest speed make this a slow, steady sweep — a fraction of a
+    // turn over the window is unambiguous monotone circulation.
+    assert!(
+        ccw_prog > 0.5,
+        "CCW orbit advances the bearing counter-clockwise (progress {ccw_prog} rad)"
+    );
+    assert!(
+        cw_prog < -0.5,
+        "CW orbit advances the bearing clockwise (progress {cw_prog} rad)"
+    );
+    assert!(
+        ccw_prog * cw_prog < 0.0,
+        "the two circulation directions sweep OPPOSITE ways (ccw {ccw_prog}, cw {cw_prog})"
+    );
+    // And it stays NEAR its ring (a wide ±60% band — the point is curving, not radius precision).
+    let standoff = standoff_distance(
+        FitArchetype::Orbiter,
+        weapon_range(Some(&combat_stats(40.0, 30.0, 0.0))).unwrap(),
+    ) * AiTuning::default().orbit_radius_frac;
+    for (name, r) in [("ccw", ccw_r), ("cw", cw_r)] {
+        assert!(
+            (0.4 * standoff..=1.6 * standoff).contains(&r),
+            "{name} orbit holds near its {standoff}-unit ring (mean radius {r})"
+        );
+    }
+    eprintln!(
+        "[r96c] orbit: ccw progress {ccw_prog:.2} rad (r {ccw_r:.1}), cw {cw_prog:.2} rad (r {cw_r:.1}), ring {standoff:.1}"
+    );
+}
+
+/// R96 Part C — a `Kite` ship with the target INSIDE its kite range opens the
+/// distance (range increases over the window) while keeping the target roughly
+/// AHEAD (it faces the target for fire as it backs off). Formalizes the kiter.
+#[test]
+fn kite_stance_opens_range_when_closed_and_faces_target() {
+    const TICKS: u64 = 1800;
+    const TAIL: u64 = 600; // The settled tail (ship at its kite ring, holding).
+    let (mut w, mut s) = obj2_world();
+    w.insert_resource(AiTuning {
+        aoi_radius_active: 100_000.0,
+        aoi_radius_mid: 200_000.0,
+        ..AiTuning::default()
+    });
+    w.spawn((PlayerShip, Position(Vec2::ZERO)));
+    let target_pos = Vec2::new(0.0, 0.0);
+    let target = w
+        .spawn((Position(target_pos), Velocity(Vec2::ZERO), Heading(0.0)))
+        .id();
+    // A fast glass kiter fit; start WELL inside the kite ring so it must open.
+    let stats = combat_stats(80.0, 30.0, 0.0);
+    let range = weapon_range(Some(&stats)).expect("armed");
+    let kite_ring = w.resource::<AiTuning>().kite_range_frac * range;
+    let start = Vec2::new(kite_ring * 0.3, 0.0); // Deep inside → must open range.
+                                                 // Start facing AWAY from the target (toward +X) — it has to flee first.
+    let ship = spawn_stance_combat_ship(
+        &mut w,
+        0,
+        start,
+        0.0,
+        Vec2::ZERO,
+        target,
+        stats,
+        CombatStance::Kite,
+    );
+
+    let start_range = (start - target_pos).length();
+    let mut max_range = start_range;
+    // Alignment is only the KITER's "hold and shoot" property once it has reached
+    // its ring; while fleeing inward→outward its nose points AWAY (running). So
+    // measure facing only over the settled tail, after the range has opened.
+    let mut tail_aligned = 0usize;
+    let mut tail_samples = 0usize;
+    for tick in 0..TICKS {
+        mirror_tick_and_run(&mut w, &mut s, tick);
+        assert_eq!(brain_of(&w, ship).behavior, Behavior::Engage);
+        let p = pos_of(&w, ship);
+        let r = (p - target_pos).length();
+        max_range = max_range.max(r);
+        if tick >= TICKS - TAIL {
+            let to_t = (target_pos - p).normalize_or_zero();
+            let nose = Vec2::from_angle(w.get::<Heading>(ship).unwrap().0);
+            tail_samples += 1;
+            if nose.dot(to_t) > 0.5 {
+                tail_aligned += 1;
+            }
+        }
+    }
+    let end_range = (pos_of(&w, ship) - target_pos).length();
+
+    // It OPENED the range (started deep inside the kite ring).
+    assert!(
+        end_range > start_range + 1.0,
+        "the kiter opened distance (start {start_range}, end {end_range})"
+    );
+    assert!(
+        max_range > start_range,
+        "range grew over the window (start {start_range}, peak {max_range})"
+    );
+    // And once HOLDING at the ring it faces the target to fire (the gun bears).
+    let aligned_frac = tail_aligned as f32 / tail_samples.max(1) as f32;
+    assert!(
+        aligned_frac > 0.6,
+        "the settled kiter faces the target to fire (aligned {aligned_frac:.2})"
+    );
+    eprintln!(
+        "[r96c] kite: range {start_range:.1} → {end_range:.1} (peak {max_range:.1}), tail-aligned {aligned_frac:.2}, ring {kite_ring:.1}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // T031 — OBJ5: perception + faction sensor network through the FULL fixed
 // schedule (TR-013/TR-014, [COMPLETES TR-013]).
 // VC1 unseen-never-targeted at any tier; VC2 fused share + jammed AND severed
@@ -3037,6 +3739,12 @@ fn sweep_covers_coarse_cells_and_engages_on_perception() {
     weapon.lifetime = 200.0 / weapon.muzzle_speed;
     stats.weapon = Some(weapon);
     w.entity_mut(ship).insert(stats);
+    // R96: pin the COVERAGE pace to Cruise (the baseline coast) through the
+    // precedence channel so the think keeps it — this test is about route
+    // coverage, not pace style. A Brawler's archetype default is now Rush
+    // (active braking onto each lane endpoint), which slows lane coverage; the
+    // sweep VC is unchanged in intent, so hold the coast pace explicitly.
+    w.get_mut::<AiBrain>(ship).unwrap().squad_profile = Some(MovementProfile::Cruise);
 
     // The region's coarse interest-tier cells (3×3 of 64.0).
     let (lo, hi) = (CoarseGrid::cell_of(min), CoarseGrid::cell_of(max));
@@ -3396,5 +4104,173 @@ fn ai_world_is_bit_identical_across_fresh_rebuilds() {
     eprintln!(
         "[t037] checksum determinism: collapse @{collapsed_at}, expand @{expanded_at}, \
          max thinks {thinks_a}, contacts seen: {contact_a}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R96 — style precedence chain (squad ← role ← archetype default).
+// ---------------------------------------------------------------------------
+
+use sim::ai::{default_combat_stance, default_movement_profile};
+
+/// A Brawler-classified scenario AI ship for the precedence test: a fitted
+/// `Ship` carrying `combat_stats(80, 30, 200)` (armed + tanky → Brawler) plus
+/// the full brain stack at Active tier, phase bucket 0 (so it thinks at tick 0).
+/// An optional `ScenarioRole` and `Faction` are attached when supplied.
+fn spawn_precedence_ship(w: &mut World, id: u64, pos: Vec2, role: Option<ScenarioRole>) -> Entity {
+    let mut e = w.spawn((
+        Ship,
+        ShipIntent::default(),
+        Position(pos),
+        Velocity(Vec2::ZERO),
+        Heading(0.0),
+        AngularVelocity(0.0),
+        FlightAssist::On,
+        combat_stats(80.0, 30.0, 200.0), // armed + tanky → Brawler.
+        AiStableId(id),
+        AiBrain {
+            think_tier: Tier::Active,
+            phase_bucket: 0,
+            ..AiBrain::default()
+        },
+        AoiTier {
+            tier: Tier::Active,
+            since_tick: 0,
+        },
+    ));
+    if let Some(role) = role {
+        e.insert((role, Faction::Red, ContactList::default()));
+    }
+    e.id()
+}
+
+/// R96 [resolves the precedence chain]: `ai_think_system` resolves each ship's
+/// `movement_profile` / `combat_stance` ONCE per think via `squad ← role ←
+/// archetype default`, each writer storing its `Option` LOCALLY (squad onto the
+/// brain channel, role on the `ScenarioRole`, base from `default_*`). Four ships
+/// exercise every precedence level through the FULL schedule:
+///
+/// - (a) a LONE Brawler → the archetype default (`Rush` / `Charge`);
+/// - (b) a ROLED ship with `with_style(Some(Leisurely), Some(Orbit))` → the role
+///   override wins over its (Brawler) archetype → `Leisurely` / `Orbit`;
+/// - (c) a NON-roled squad member whose squad sets `Some(Rush)`/`Some(Kite)` →
+///   the squad channel wins → `Rush` / `Kite`;
+/// - (d) a ROLED squad member (squad-exempt) → the ROLE override beats the squad
+///   style → the role's `Leisurely` / `Orbit`, NOT the squad's `Rush` / `Kite`.
+#[test]
+fn stance_and_profile_precedence() {
+    let (mut w, mut s) = obj2_world();
+    // A player marker keeps every ship Active (proximity); AOI is widened so the
+    // spread-out ships all stay Active-tier and think on cadence.
+    w.insert_resource(AiTuning {
+        aoi_radius_active: 10_000.0,
+        aoi_radius_mid: 20_000.0,
+        ..AiTuning::default()
+    });
+    w.spawn((PlayerShip, Position(Vec2::ZERO)));
+
+    // The role style override reused by (b) and (d): Leisurely pace + CCW orbit.
+    let styled_role = || {
+        ScenarioRole::new(RoleGoal::PatrolRoute(vec![Vec2::ZERO]), Posture::FreeEngage).with_style(
+            Some(MovementProfile::Leisurely),
+            Some(CombatStance::Orbit { ccw: true }),
+        )
+    };
+
+    // (a) LONE Brawler — no role, no squad → the archetype default.
+    let lone = spawn_precedence_ship(&mut w, 0, Vec2::new(0.0, 0.0), None);
+
+    // (b) ROLED lone ship — the role style overrides its Brawler archetype.
+    let roled = spawn_precedence_ship(&mut w, 1, Vec2::new(100.0, 0.0), Some(styled_role()));
+
+    // (c) NON-roled squad member — the squad style overrides the archetype.
+    let sc0 = spawn_precedence_ship(&mut w, 2, Vec2::new(0.0, 200.0), None);
+    let sc1 = spawn_precedence_ship(&mut w, 3, Vec2::new(15.0, 200.0), None);
+    // (d) ROLED squad member — squad-exempt, so its role style wins over the squad.
+    let sd_roled = spawn_precedence_ship(&mut w, 4, Vec2::new(30.0, 200.0), Some(styled_role()));
+    let squad = spawn_squad(
+        &mut w,
+        &[sc0, sc1, sd_roled],
+        FormationDef::wedge(3, 12.0),
+        SquadOrder::Hold,
+    );
+    // Impose the squad style override (spawn_squad leaves it None): Rush / Kite.
+    {
+        let mut sq = w.get_mut::<Squad>(squad).expect("squad entity");
+        sq.movement_profile = Some(MovementProfile::Rush);
+        sq.combat_stance = Some(CombatStance::Kite);
+    }
+
+    // Step enough ticks that the squad assignment + every brain think resolves.
+    for tick in 0..=2 {
+        mirror_tick_and_run(&mut w, &mut s, tick);
+    }
+
+    // All four ships classified as Brawler (the archetype the defaults key off).
+    for ship in [lone, roled, sc0, sd_roled] {
+        assert_eq!(
+            brain_of(&w, ship).archetype,
+            FitArchetype::Brawler,
+            "the fit classifies as Brawler (so the archetype default is Rush/Charge)"
+        );
+    }
+
+    // (a) LONE → the archetype default: Brawler = Rush / Charge.
+    let a = brain_of(&w, lone);
+    assert_eq!(
+        (a.movement_profile, a.combat_stance),
+        (
+            default_movement_profile(FitArchetype::Brawler),
+            default_combat_stance(FitArchetype::Brawler)
+        ),
+        "lone ship resolves to its archetype default"
+    );
+    assert_eq!(
+        (a.movement_profile, a.combat_stance),
+        (MovementProfile::Rush, CombatStance::Charge),
+        "Brawler archetype default is Rush / Charge"
+    );
+
+    // (b) ROLED lone → the role override beats the archetype default.
+    let b = brain_of(&w, roled);
+    assert_eq!(
+        (b.movement_profile, b.combat_stance),
+        (
+            MovementProfile::Leisurely,
+            CombatStance::Orbit { ccw: true }
+        ),
+        "the role's with_style override wins over the Brawler archetype default"
+    );
+
+    // (c) NON-roled squad member → the squad channel beats the archetype.
+    for member in [sc0, sc1] {
+        let c = brain_of(&w, member);
+        assert_eq!(
+            (c.squad_profile, c.squad_stance),
+            (Some(MovementProfile::Rush), Some(CombatStance::Kite)),
+            "the squad wrote its style onto the non-roled member's channel"
+        );
+        assert_eq!(
+            (c.movement_profile, c.combat_stance),
+            (MovementProfile::Rush, CombatStance::Kite),
+            "the squad style override wins over the archetype default"
+        );
+    }
+
+    // (d) ROLED squad member → squad-exempt, so the ROLE override wins (the
+    // squad never wrote its channel for this member).
+    let d = brain_of(&w, sd_roled);
+    assert_eq!(
+        (d.squad_profile, d.squad_stance),
+        (None, None),
+        "a roled member is squad-exempt — the squad channel stays None"
+    );
+    assert_eq!(
+        (d.movement_profile, d.combat_stance),
+        (
+            MovementProfile::Leisurely,
+            CombatStance::Orbit { ccw: true }
+        ),
+        "the role override wins over the squad style for a roled member"
     );
 }

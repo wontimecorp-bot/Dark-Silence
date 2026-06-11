@@ -923,6 +923,10 @@ struct AiShipDetail {
     stable_id: Option<u64>,
     behavior: String,
     archetype: String,
+    /// R96 — the RESOLVED movement profile this brain executes (`brain.movement_profile`).
+    movement_profile: String,
+    /// R96 — the RESOLVED combat stance this brain executes (`brain.combat_stance`).
+    combat_stance: String,
     /// `"Active (since @123)"` — or the untiered note (absent `AoiTier` = treated Active).
     tier: String,
     throttle_cap: f32,
@@ -1195,6 +1199,8 @@ fn gather_ai(
             stable_id: world.get::<AiStableId>(e).map(|s| s.0),
             behavior: format!("{:?}", brain.behavior),
             archetype: format!("{:?}", brain.archetype),
+            movement_profile: format!("{:?}", brain.movement_profile),
+            combat_stance: format!("{:?}", brain.combat_stance),
             tier: aoi.map_or_else(
                 || "untiered (treated Active)".to_string(),
                 |a| format!("{:?} (since @{})", a.tier, a.since_tick),
@@ -1244,6 +1250,12 @@ fn render_ai_detail(ui: &mut egui::Ui, d: &AiShipDetail, now: u64) {
         ),
     )
     .on_hover_text("Current behavior state, the cached fit-archetype, and the squad pace throttle cap applied to forward intent.");
+    stat(
+        ui,
+        "style",
+        format!("move {} · stance {}", d.movement_profile, d.combat_stance),
+    )
+    .on_hover_text("R96 — the RESOLVED movement profile (how it paces/brakes onto nav goals: Rush/Cruise/Leisurely) and combat stance (how it fights: Charge/Orbit/Kite/Strafe) chosen this think (squad ← role ← archetype default).");
     stat(ui, "tier", &d.tier)
         .on_hover_text("AOI sim-LOD tier (Active = full AI, Mid = squad-driven, Dormant = glide aggregate) + the tick it was entered.");
     stat(
@@ -2205,6 +2217,48 @@ fn dev_panel_ui(
                         "Direction slots per context map (interest/danger), 8–16.");
                     slider(ui, "danger mask floor", &mut ai_tun.danger_mask_floor, 0.0..=1.0)
                         .on_hover_text("Floor a danger-masked slot is suppressed to (0 = fully blocked).");
+                    ui.separator();
+                    ui.label(egui::RichText::new("Movement profiles (R96)").strong());
+                    slider(ui, "rush cap", &mut ai_tun.profile_rush_cap, 0.0..=1.5)
+                        .on_hover_text("Forward throttle cap for the Rush profile (hot pace — full authority). Composed with the squad throttle_cap.");
+                    slider(ui, "cruise cap", &mut ai_tun.profile_cruise_cap, 0.0..=1.5)
+                        .on_hover_text("Forward throttle cap for the Cruise profile (PINNED 1.0 — the pre-R96 parity no-op).");
+                    slider(ui, "leisurely cap", &mut ai_tun.profile_leisurely_cap, 0.0..=1.5)
+                        .on_hover_text("Forward throttle cap for the Leisurely profile (lazy pace — capped to half by default).");
+                    slider(ui, "brake aggr rush", &mut ai_tun.brake_aggression_rush, 0.0..=3.0)
+                        .on_hover_text("Brake aggression for Rush — an earlier-braking multiplier on the arrive stopping distance.");
+                    slider(ui, "brake aggr cruise", &mut ai_tun.brake_aggression_cruise, 0.0..=3.0)
+                        .on_hover_text("Brake aggression for Cruise (PINNED 1.0 — unused on the no-brake parity path).");
+                    slider(ui, "brake aggr leisurely", &mut ai_tun.brake_aggression_leisurely, 0.0..=3.0)
+                        .on_hover_text("Brake aggression for Leisurely — brakes earliest for a long, gentle settle.");
+                    slider(ui, "slow factor rush", &mut ai_tun.arrive_slow_factor_rush, 0.5..=12.0)
+                        .on_hover_text("Arrive slow-radius factor for Rush (snug ramp — × ARRIVE_RADIUS).");
+                    slider(ui, "slow factor cruise", &mut ai_tun.arrive_slow_factor_cruise, 0.5..=12.0)
+                        .on_hover_text("Arrive slow-radius factor for Cruise (PINNED 4.0 — the WAYPOINT_SLOW_FACTOR).");
+                    slider(ui, "slow factor leisurely", &mut ai_tun.arrive_slow_factor_leisurely, 0.5..=12.0)
+                        .on_hover_text("Arrive slow-radius factor for Leisurely (wide ramp — eases in early).");
+                    ui.separator();
+                    ui.label(egui::RichText::new("Combat stances (R96)").strong());
+                    slider(ui, "orbit radius frac", &mut ai_tun.orbit_radius_frac, 0.0..=2.0)
+                        .on_hover_text("Orbit ring radius as a multiple of the archetype standoff_distance (1.0 = the standoff ring itself; >1 wider, <1 tighter).");
+                    slider(ui, "orbit tangential weight", &mut ai_tun.orbit_tangential_weight, 0.0..=2.0)
+                        .on_hover_text("Orbit tangential interest weight — scales the around-the-target term (dominates on-ring, yields to the radial correction off-ring).");
+                    slider(ui, "kite range frac", &mut ai_tun.kite_range_frac, 0.5..=2.0)
+                        .on_hover_text("Kite standoff target as a multiple of weapon_range (1.1 = hold just past the envelope edge so the gun still bears while the target chases).");
+                    slider(ui, "strafe stance lateral", &mut ai_tun.strafe_stance_lateral, 0.0..=1.0)
+                        .on_hover_text("Lateral strafe magnitude (0..1) a stance commands — applied ONLY when the hull can_strafe; a basic fighter orbits by turning alone.");
+                    ui.separator();
+                    ui.label(egui::RichText::new("Obstacle avoidance (R96)").strong());
+                    slider(ui, "obstacle danger weight", &mut ai_tun.obstacle_danger_weight, 0.0..=3.0)
+                        .on_hover_text("Danger weight written per in-range obstacle — scales how strongly an obstacle masks the headings into it.");
+                    slider(ui, "obstacle lookahead s", &mut ai_tun.obstacle_lookahead_s, 0.0..=4.0)
+                        .on_hover_text("Predictive lookahead (s) for the closeness test — a body is live if the ship's current OR pos+vel·this position is inside its avoid radius.");
+                    slider(ui, "obstacle clearance pad", &mut ai_tun.obstacle_clearance_pad, 0.0..=40.0)
+                        .on_hover_text("Extra clearance pad (world units) added to obstacle_radius + own_radius so the ship steers around with margin, not skimming the surface.");
+                    slider(ui, "obstacle query radius", &mut ai_tun.obstacle_query_radius, 0.0..=500.0)
+                        .on_hover_text("Scan radius (world units) around the ship — obstacles farther than this are ignored (a linear-scan gate over the tiny field).");
+                    slider(ui, "obstacle min radius", &mut ai_tun.obstacle_min_radius, 0.0..=100.0)
+                        .on_hover_text("Minimum body radius (world units) to enter the ObstacleField — only LARGE neutral bodies (asteroids/outposts/transports) are avoided.");
                     ui.separator();
                     ui.label(egui::RichText::new("Debug (TR-020a)").strong());
                     int(ui, "debug history len", &mut ai_tun.debug_history_len, 1..=128,

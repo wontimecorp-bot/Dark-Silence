@@ -69,7 +69,9 @@ use std::collections::BTreeMap;
 use bevy_ecs::prelude::*;
 use glam::Vec2;
 
-use crate::ai::brain::{AiBrain, AiEvent, RethinkQueue, ARRIVE_RADIUS};
+use crate::ai::brain::{
+    AiBrain, AiEvent, CombatStance, MovementProfile, RethinkQueue, ARRIVE_RADIUS,
+};
 use crate::ai::ident::AiStableId;
 use crate::ai::perception::{faction_key, ContactList};
 use crate::broadphase::COARSE_CELL_SIZE;
@@ -197,17 +199,53 @@ pub struct ScenarioRole {
     /// `now < fired_upon_until`. Armed by the trigger pass on a pending
     /// [`AiEvent::DamageTaken`].
     pub fired_upon_until: u64,
+    /// R96 precedence — the role's optional [`MovementProfile`] OVERRIDE (the
+    /// MIDDLE link of the resolved chain `squad ← role ← archetype default`).
+    /// `Some(...)` makes a roled ship pace this way regardless of its archetype;
+    /// `None` (the default) defers to the archetype default. Read by
+    /// `ai_think_system` after `role_apply` and folded into the brain's resolved
+    /// `movement_profile` (a squad override still wins — but roled members are
+    /// squad-exempt, so for them the role override is the highest live link).
+    /// Set via [`ScenarioRole::with_style`].
+    pub movement_profile: Option<MovementProfile>,
+    /// R96 precedence — the role's optional [`CombatStance`] OVERRIDE (the
+    /// [`ScenarioRole::movement_profile`] twin). `Some(...)` overrides the
+    /// archetype default combat style; `None` defers. Set via
+    /// [`ScenarioRole::with_style`].
+    pub combat_stance: Option<CombatStance>,
 }
 
 impl ScenarioRole {
-    /// A fresh role: cursor at the route start, never fired upon.
+    /// A fresh role: cursor at the route start, never fired upon, no style
+    /// override (both `Option` styles `None` → the brain resolves to the
+    /// archetype default unless a squad imposes one). Signature UNCHANGED so
+    /// every existing call site compiles; use [`ScenarioRole::with_style`] to
+    /// add an R96 style override.
     pub fn new(goal: RoleGoal, posture: Posture) -> Self {
         Self {
             goal,
             posture,
             route_index: 0,
             fired_upon_until: 0,
+            movement_profile: None,
+            combat_stance: None,
         }
+    }
+
+    /// R96 — set this role's optional style OVERRIDES (the MIDDLE link of the
+    /// resolved precedence chain). A builder over [`ScenarioRole::new`]: pass
+    /// `Some(...)` to pin a [`MovementProfile`] / [`CombatStance`] the roled
+    /// ship adopts regardless of its archetype, `None` to defer to the archetype
+    /// default. Roled members are squad-exempt, so a role override is the
+    /// highest live precedence link for them.
+    pub fn with_style(
+        mut self,
+        profile: Option<MovementProfile>,
+        stance: Option<CombatStance>,
+    ) -> Self {
+        self.movement_profile = profile;
+        self.combat_stance = stance;
+        self
     }
 
     /// Whether the posture permits selecting `Engage`/`Ram` and pulling the

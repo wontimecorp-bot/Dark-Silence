@@ -43,14 +43,16 @@ use crate::ai::lod::{AoiTier, Tier};
 use crate::ai::perception::{nearest_contact, ContactList};
 use crate::ai::role::{role_apply, RoleGoal, ScenarioRole};
 use crate::ai::steering::{
-    arrive, formation_keep, pursue_intercept, range_band_radial, steer_to_intent, waypoint_follow,
-    ContextMap,
+    arrive, arrive_braked, compose_intent, formation_keep, pursue_intercept, range_band_radial,
+    steer_to_intent, waypoint_follow, ContextMap,
 };
 use crate::ai::tuning::AiTuning;
+use crate::broadphase::ObstacleField;
 use crate::clock::CurrentTick;
 use crate::collision::{RAM_CARVE_K, SHIP_MASS};
 use crate::components::{
-    AuthoredCells, Energy, Heading, Health, Heat, Position, Trigger, Velocity, WeaponGroups,
+    AuthoredCells, CollisionRadius, Energy, Heading, Health, Heat, Position, Trigger, Velocity,
+    WeaponGroups,
 };
 use crate::fitting::{FitLayout, ShipStats, ShipWeapons};
 use crate::intent::ShipIntent;
@@ -150,6 +152,149 @@ pub enum FitArchetype {
     Generic,
 }
 
+/// Combat steering STYLE (R96 Part C): how a ship paces and shapes its motion
+/// while in the [`Engage`](Behavior::Engage) task. Cached on
+/// [`AiBrain::combat_stance`]; the EXECUTE-time [`engage_motion`] reads it and
+/// composes a per-stance context map over the SAME range-band / standoff /
+/// lead-pursuit primitives.
+///
+/// **Charge is the parity default** (the determinism keystone): a
+/// [`Charge`](CombatStance::Charge) ship flies the EXACT pre-R96-C
+/// `engage_motion` body — the range-band radial controller that closes toward
+/// the gunnery lead when outside the standoff ring, opens (danger-masked)
+/// inside it, and holds facing the lead on-ring — with NO new math, so
+/// `AiBrain::default()` and every existing combat fixture stay byte-for-byte
+/// identical. Only the other three stances add new interest/danger terms.
+///
+/// **Perp sign convention** (load-bearing for [`Orbit`](CombatStance::Orbit)):
+/// `perp(v) = Vec2::new(-v.y, v.x)` is the +90° (CCW) rotation of `v` in the
+/// heading convention `0 = +X`, increasing CCW (matching `steering.rs` /
+/// `flight.rs`). The orbit tangent is `±perp` of the OUTWARD radial (target →
+/// ship, i.e. `-dir_to_target`): a CCW orbit (bearing increasing) moves along
+/// `perp(outward) = perp(-dir_to) = -perp(dir_to)`. So `ccw = true` uses
+/// tangent `= -perp(dir_to)` and `intent.strafe = +strafe_stance_lateral`
+/// (strafe LEFT/port — the inside of a left-hand turn); `ccw = false` (CW) uses
+/// `+perp(dir_to)` and `intent.strafe = -...` (strafe RIGHT/starboard).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CombatStance {
+    /// PARITY default: the pre-R96-C range-band controller — close toward the
+    /// gunnery lead outside the standoff ring, open (danger-masked) inside it,
+    /// hold facing the lead on-ring. Byte-identical to the legacy `engage_motion`.
+    #[default]
+    Charge,
+    /// Bank/strafe AROUND the target at the standoff ring (`orbit_radius_frac ×
+    /// standoff`): a radial correction onto the ring PLUS a tangential interest
+    /// (signed by `ccw`) that DOMINATES on-ring, so forward-only fighters orbit
+    /// by turning and strafe-capable hulls sidle. See the perp-sign convention.
+    Orbit {
+        /// `true` = counter-clockwise (tangent `+perp`, strafe left); `false` =
+        /// clockwise (tangent `-perp`, strafe right).
+        ccw: bool,
+    },
+    /// HOLD the ring: face the gunnery lead at zero throttle within the band,
+    /// closing only when well outside — the explicit "hold position, guns on
+    /// target" stance (Charge's on-ring branch, applied throughout the band).
+    Standoff,
+    /// KITE: keep the target at arm's length (`kite_range_frac × weapon_range`)
+    /// — full interest AWAY plus the closing-vector danger when the target is
+    /// inside that range, face-and-hold (gun bears) at or beyond it.
+    Kite,
+}
+
+/// Movement pacing profile (R96 Part A): how aggressively a ship paces and
+/// brakes onto its nav goals. Cached on [`AiBrain::movement_profile`]; the
+/// EXECUTE-time `fly_to` path (`ai_execute_system`) reads it and pulls the
+/// matching `(cap, brake_aggression, slow_factor)` triple from [`AiTuning`].
+///
+/// **Cruise is the parity default** (the determinism keystone): a
+/// [`Cruise`](MovementProfile::Cruise) ship flies the EXACT pre-R96 path —
+/// `waypoint_follow` (drag-braked [`arrive`]) → `steer_to_intent` → the
+/// `throttle_cap` multiply — with NO new brake math, so `AiBrain::default()` and
+/// every existing brain stay byte-for-byte identical. Only
+/// [`Rush`](MovementProfile::Rush) and [`Leisurely`](MovementProfile::Leisurely)
+/// route through the active-braking [`arrive_braked`] path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MovementProfile {
+    /// Hot pace: full cap, actively BRAKES onto goals (tight, no overshoot) —
+    /// `arrive_braked` with a snug slow radius. For ships that want to arrive
+    /// settled and on-station.
+    Rush,
+    /// The pre-R96 default: today's drag-braked coast. The parity path — emits
+    /// the SAME intents as the old code. Reproduces baseline behavior exactly.
+    #[default]
+    Cruise,
+    /// Lazy pace: capped throttle, a wider slow radius and stronger brake
+    /// aggression that nonetheless COASTS further (lower top speed dominates) —
+    /// an unhurried, energy-saving approach.
+    Leisurely,
+}
+
+/// R96 precedence BASE — the archetype's default [`MovementProfile`] (the
+/// lowest-priority link in the resolved chain `squad ← role ← archetype`).
+/// Pure, deterministic match — no RNG, no allocation, no state. The table is a
+/// documented v1 tuning choice (overridable per-role / per-squad; tunable here
+/// later):
+///
+/// | archetype | profile  | rationale                                     |
+/// |-----------|----------|-----------------------------------------------|
+/// | `Brawler` | `Rush`   | wade in and slug — arrive on-station, settled |
+/// | `Rammer`  | `Rush`   | the hull IS the weapon — close hard, no coast |
+/// | `Kiter`   | `Cruise` | hit-and-run — the legacy coast (kite STYLE is the stance) |
+/// | `Orbiter` | `Cruise` | circle the envelope at the parity coast       |
+/// | `Support` | `Cruise` | screen/utility runner — the parity coast      |
+/// | `Generic` | `Cruise` | the parity default (byte-identical baseline)  |
+///
+/// **Determinism keystone**: every archetype except the two `Rush` brawlers/
+/// rammers maps to [`Cruise`](MovementProfile::Cruise) — the pre-R96 drag-braked
+/// coast — so a `Generic`/`Kiter`/`Orbiter`/`Support` ship with no role/squad
+/// style resolves to `Cruise` and emits today's intents exactly. Only the
+/// hard-charging brawler/rammer change pace; combat ships in golden worlds carry
+/// no `AiBrain`, so nothing observable shifts there.
+pub fn default_movement_profile(a: FitArchetype) -> MovementProfile {
+    match a {
+        FitArchetype::Brawler | FitArchetype::Rammer => MovementProfile::Rush,
+        FitArchetype::Kiter
+        | FitArchetype::Orbiter
+        | FitArchetype::Support
+        | FitArchetype::Generic => MovementProfile::Cruise,
+    }
+}
+
+/// R96 precedence BASE — the archetype's default [`CombatStance`] (the
+/// lowest-priority link in the resolved chain `squad ← role ← archetype`).
+/// Pure, deterministic match. The table is a documented v1 tuning choice
+/// (overridable per-role / per-squad):
+///
+/// | archetype | stance       | rationale                                    |
+/// |-----------|--------------|----------------------------------------------|
+/// | `Brawler` | `Charge`     | close to the short standoff and slug         |
+/// | `Rammer`  | `Charge`     | bear straight in (the ram arm finishes)      |
+/// | `Kiter`   | `Kite`       | keep the target at arm's length, open inside |
+/// | `Orbiter` | `Orbit{ccw}` | circle the weapon envelope                   |
+/// | `Support` | `Standoff`   | hold the ring, guns on target (no chase)     |
+/// | `Generic` | `Charge`     | the parity default — the legacy range-band controller |
+///
+/// **Parity keystone**: `Generic` → [`Charge`](CombatStance::Charge) (the
+/// verbatim legacy `engage_motion`), so a no-role/no-squad `Generic` ship is
+/// byte-identical to pre-R96-C. The other archetypes' stances formalize tactics
+/// the range-band controller already approximated (a `Kiter`'s long standoff
+/// ring IS a kite, a `Brawler`'s short ring IS a charge), so the
+/// `archetype_range_bands_differ` fixture (brawler-vs-kiter band occupancy)
+/// holds: `Charge` still charges the brawler to its short standoff, and `Kite`
+/// holds the kiter just past the envelope edge (`kite_range_frac · range`),
+/// which sits inside the ±40% tolerance of the kiter's `0.85 · range` standoff
+/// ring — both satisfy their range-band assertions.
+pub fn default_combat_stance(a: FitArchetype) -> CombatStance {
+    match a {
+        FitArchetype::Brawler | FitArchetype::Rammer | FitArchetype::Generic => {
+            CombatStance::Charge
+        }
+        FitArchetype::Kiter => CombatStance::Kite,
+        FitArchetype::Orbiter => CombatStance::Orbit { ccw: true },
+        FitArchetype::Support => CombatStance::Standoff,
+    }
+}
+
 /// The utility-FSM brain component — one per AI-controlled ship (data-model
 /// §`AiBrain`; enum-in-component per HINT-003, never per-state markers).
 ///
@@ -180,6 +325,38 @@ pub struct AiBrain {
     pub last_think_tick: u64,
     /// Cached tactic archetype (TR-006, V-5) — see [`FitArchetype`].
     pub archetype: FitArchetype,
+    /// Movement pacing profile (R96 Part A) — see [`MovementProfile`]. Default
+    /// [`Cruise`](MovementProfile::Cruise) keeps `AiBrain::default()` (and every
+    /// constructor that spreads `..default()`) byte-identical to pre-R96: only
+    /// `Rush`/`Leisurely` route through the active-braking path.
+    pub movement_profile: MovementProfile,
+    /// Combat steering style (R96 Part C) — see [`CombatStance`]. Default
+    /// [`Charge`](CombatStance::Charge) keeps `AiBrain::default()` (and every
+    /// constructor that spreads `..default()`) byte-identical to pre-R96-C: the
+    /// `Engage` arm flies the legacy range-band controller; only
+    /// `Orbit`/`Standoff`/`Kite` add new context-map terms.
+    ///
+    /// RESOLVED FIELD (R96 precedence chain): `ai_think_system` overwrites this
+    /// every think from `squad_stance.or(role stance).unwrap_or(archetype
+    /// default)` — never read it as authoritative input, set
+    /// [`AiBrain::squad_stance`] / the role's `combat_stance` to influence it.
+    pub combat_stance: CombatStance,
+    /// R96 precedence CHANNEL (squad → brain): a squad whose
+    /// [`Squad::movement_profile`](crate::ai::squad::Squad::movement_profile)
+    /// is `Some(...)` writes it here (via `apply_assignment`) onto each NON-roled
+    /// member; `ai_think_system` then reads it as the HIGHEST-priority override
+    /// in the resolved [`AiBrain::movement_profile`] chain (squad ← role ←
+    /// archetype default). `None` = the squad imposes no pace style (the default;
+    /// roled members are squad-exempt so this stays `None` for them and the role
+    /// override wins). Stored locally by its writer so the precedence is a single
+    /// `.or().unwrap_or()` in the think.
+    pub squad_profile: Option<MovementProfile>,
+    /// R96 precedence CHANNEL (squad → brain): the [`CombatStance`] twin of
+    /// [`AiBrain::squad_profile`] — a squad's
+    /// [`Squad::combat_stance`](crate::ai::squad::Squad::combat_stance) written
+    /// onto each non-roled member, read as the highest-priority override in the
+    /// resolved [`AiBrain::combat_stance`] chain. `None` = no squad stance override.
+    pub squad_stance: Option<CombatStance>,
     /// Mirror of the ship's [`AoiTier`] at its LAST think — drives the
     /// fallback cadence between thinks (a stale mirror self-corrects at the
     /// next think; promotion events wake brains faster in later tasks).
@@ -218,6 +395,10 @@ impl Default for AiBrain {
             commit_until_tick: 0,
             last_think_tick: 0,
             archetype: FitArchetype::Generic,
+            movement_profile: MovementProfile::Cruise,
+            combat_stance: CombatStance::Charge,
+            squad_profile: None,
+            squad_stance: None,
             think_tier: Tier::Dormant,
             phase_bucket: 0,
             throttle_cap: 1.0,
@@ -668,21 +849,53 @@ fn fire_decision(
     Some(group)
 }
 
-/// T025 — Engage MOVEMENT: the archetype-flavored range-band controller over
-/// a small context map.
+/// +90° (counter-clockwise) rotation of `v` in the `0 = +X`, CCW-increasing
+/// heading convention (matching `steering.rs`/`flight.rs`): `perp(v) =
+/// (-v.y, v.x)`. The [`CombatStance::Orbit`] tangent rotates the OUTWARD radial
+/// (`-dir_to_target`) by ±90° — a CCW orbit moves along `perp(outward) =
+/// -perp(dir_to)`, a CW orbit along `+perp(dir_to)` (see [`CombatStance`]'s sign
+/// convention). Execute-time geometry, OUTSIDE the strict-f32 scoring markers.
+fn perp(v: Vec2) -> Vec2 {
+    Vec2::new(-v.y, v.x)
+}
+
+/// T025 / R96 Part C — Engage MOVEMENT: the archetype-flavored range-band
+/// controller over a small context map, shaped by the ship's [`CombatStance`].
+/// Every stance runs the SAME pipeline — build a [`ContextMap`] over the SAME
+/// `range_band_radial`/`standoff_distance`/`weapon_range`/`pursue_intercept`
+/// primitives, [`ContextMap::resolve`], [`steer_to_intent`] — and only the
+/// interest/danger terms (and, for `Orbit`, an optional lateral strafe) differ.
 ///
-/// - `radial > 0` (outside the ring): interest toward the [`pursue_intercept`]
-///   point at the ship's top speed — lead pursuit, weight = how far out.
-/// - `radial < 0` (inside the ring): interest directly AWAY from the target;
-///   when the target is actively closing on us its approach direction is
-///   written as DANGER, so the masked resolve never flees *through* the
-///   threat. (Additional `avoid` threat sources wire in with perception,
-///   T029.)
-/// - On the ring (map empty → `None`): hold position (zero throttle) and FACE
-///   the gunnery lead so the fixed-forward gun connects — `compose_intent`
-///   turns toward a direction even at zero throttle.
+/// - **[`Charge`](CombatStance::Charge)** (PARITY default — the verbatim
+///   pre-R96-C body): `radial > 0` (outside the standoff ring) → interest
+///   toward the [`pursue_intercept`] lead at top speed, weight = how far out;
+///   `radial < 0` (inside) → interest directly AWAY, with the target's closing
+///   vector written as DANGER so the masked resolve never flees *through* the
+///   threat; on the ring (map empty → `None`) → hold (zero throttle) and FACE
+///   the gunnery lead so the fixed-forward gun connects.
+/// - **[`Orbit`](CombatStance::Orbit)** `{ ccw }`: the Charge radial correction
+///   onto the ring (sized by `orbit_radius_frac`) PLUS a tangential interest
+///   `±perp(dir_to)` weighted `orbit_tangential_weight · (1 − |radial|)` — so
+///   the tangent DOMINATES on-ring (the ship banks around the target) and the
+///   radial correction dominates off-ring (it eases back onto the ring). A
+///   `can_strafe` hull additionally sidles via the strafe channel.
+/// - **[`Standoff`](CombatStance::Standoff)**: hold the ring throughout the
+///   band — face the gunnery lead at zero throttle, closing only when well
+///   OUTSIDE (`radial > 0` → lead pursuit, exactly Charge's outside arm). The
+///   in-band/inside case is the explicit "hold position, guns on target".
+/// - **[`Kite`](CombatStance::Kite)**: standoff target `kite_range_frac ·
+///   weapon_range`; inside it → full interest AWAY + the closing-vector danger
+///   (Charge's inside arm); at/beyond it → face the target and hold (gun bears).
+///
+/// **R96 Part D obstacle avoidance**: before the resolve, every stance folds
+/// `add_obstacle_danger` into its map so the combat ship steers AROUND large
+/// neutral bodies between it and its target. With zero in-range obstacles (the
+/// empty-field gate) this writes nothing — `add_danger` with no obstacles is a
+/// no-op — so the resolved intent is BIT-identical to Part C's output and the
+/// Charge parity / combat fixtures stay byte-for-byte unchanged.
 #[allow(clippy::too_many_arguments)] // Mirrors the execute arm's locals 1:1.
 fn engage_motion(
+    stance: CombatStance,
     archetype: FitArchetype,
     pos: Vec2,
     vel: Vec2,
@@ -692,41 +905,115 @@ fn engage_motion(
     target_pos: Vec2,
     target_vel: Vec2,
     ai: &AiTuning,
+    obstacles: Option<&ObstacleField>,
+    own_radius: f32,
 ) -> ShipIntent {
     let range = weapon_range(stats).unwrap_or(FALLBACK_ENGAGE_RANGE);
-    let standoff = standoff_distance(archetype, range);
     let to = target_pos - pos;
     let dist = to.length();
     let dir_to = to.normalize_or_zero();
     if dir_to == Vec2::ZERO {
         return ShipIntent::default(); // Coincident: nothing sensible to steer.
     }
-    let radial = range_band_radial(dist, standoff, RANGE_BAND_FRAC);
     let n = ai.slot_count as usize;
+    // The lead the fixed-forward gun wants (top-speed pursuit toward the
+    // intercept; muzzle-speed lead for the on-ring "face the target" fallback).
+    let lead = |speed: f32| pursue_intercept(pos, speed, target_pos, target_vel);
+    let top = stats.map_or(0.0, ShipStats::top_speed);
+    // The on-ring / hold facing direction — the gunnery lead so the gun bears.
+    let aim_dir = match stats.and_then(|s| s.weapon) {
+        Some(w) => lead(w.muzzle_speed),
+        None => dir_to,
+    };
+    // The standoff ring this stance holds (per the stance's own radius rule).
+    let standoff = match stance {
+        CombatStance::Orbit { .. } => ai.orbit_radius_frac * standoff_distance(archetype, range),
+        CombatStance::Kite => ai.kite_range_frac * range,
+        _ => standoff_distance(archetype, range),
+    };
+    let radial = range_band_radial(dist, standoff, RANGE_BAND_FRAC);
+
     let mut map = ContextMap::default();
-    if radial > 0.0 {
-        let top = stats.map_or(0.0, ShipStats::top_speed);
-        map.add_interest_dir(
-            pursue_intercept(pos, top, target_pos, target_vel),
-            radial,
-            n,
-        );
-    } else if radial < 0.0 {
-        map.add_interest_dir(-dir_to, -radial, n);
-        if (target_vel - vel).dot(-dir_to) > 0.0 {
-            map.add_danger_dir(dir_to, 1.0, n); // The target's closing vector.
+    // `strafe` is set ONLY by an Orbit on a can_strafe hull (R93); every other
+    // stance / a basic fighter keeps it at 0 (the compose_intent v1 default).
+    let mut strafe = 0.0;
+    match stance {
+        // PARITY: the verbatim legacy range-band controller (Charge default).
+        CombatStance::Charge => {
+            if radial > 0.0 {
+                map.add_interest_dir(lead(top), radial, n);
+            } else if radial < 0.0 {
+                map.add_interest_dir(-dir_to, -radial, n);
+                if (target_vel - vel).dot(-dir_to) > 0.0 {
+                    map.add_danger_dir(dir_to, 1.0, n); // The target's closing vector.
+                }
+            }
+        }
+        // Bank/strafe AROUND the ring: radial correction + a dominating-on-ring tangent.
+        CombatStance::Orbit { ccw } => {
+            // Radial correction onto the ring (toward the lead outside, away inside).
+            if radial > 0.0 {
+                map.add_interest_dir(lead(top), radial, n);
+            } else if radial < 0.0 {
+                map.add_interest_dir(-dir_to, -radial, n);
+                if (target_vel - vel).dot(-dir_to) > 0.0 {
+                    map.add_danger_dir(dir_to, 1.0, n);
+                }
+            }
+            // Tangential interest — ±90° of the OUTWARD radial, dominant on-ring.
+            // CCW (bearing increasing) = perp(outward) = -perp(dir_to); CW = +perp(dir_to).
+            let tangent = if ccw { -perp(dir_to) } else { perp(dir_to) };
+            let tan_weight = ai.orbit_tangential_weight * (1.0 - radial.abs());
+            if tan_weight > 0.0 {
+                map.add_interest_dir(tangent, tan_weight, n);
+            }
+            // R93: a true sidle-strafe ONLY for hulls with strafe authority.
+            if stats.is_some_and(|s| s.can_strafe) {
+                let sign = if ccw { 1.0 } else { -1.0 };
+                strafe = sign * ai.strafe_stance_lateral;
+            }
+        }
+        // HOLD the ring: close only when well outside; otherwise hold facing.
+        CombatStance::Standoff => {
+            if radial > 0.0 {
+                map.add_interest_dir(lead(top), radial, n);
+            }
+            // radial <= 0 (in-band or inside): leave the map empty → the None
+            // arm below holds position at zero throttle, facing the lead.
+        }
+        // KITE: open AWAY when inside the kite ring; face-and-hold beyond it.
+        CombatStance::Kite => {
+            if radial < 0.0 {
+                map.add_interest_dir(-dir_to, -radial, n);
+                if (target_vel - vel).dot(-dir_to) > 0.0 {
+                    map.add_danger_dir(dir_to, 1.0, n);
+                }
+            }
+            // radial >= 0 (at/beyond kite range): empty map → face-and-hold (gun bears).
         }
     }
-    match map.resolve(n, ai.danger_mask_floor) {
+
+    // R96 Part D — fold in obstacle danger when a large neutral body is in
+    // range. THE EMPTY-FIELD GATE: with no in-range obstacle this whole block is
+    // skipped (no explore floor, no danger written), so the resolved intent is
+    // BIT-identical to Part C's output — the Charge parity + combat fixtures are
+    // unchanged. With an obstacle in range, an explore floor is added (like the
+    // move arm) so the masked direct lane still resolves to a way AROUND, plus
+    // the obstacle danger that masks the headings into it.
+    if let Some(field) = obstacles {
+        if obstacle_in_range(field, pos, vel, own_radius, ai) {
+            map.add_explore_floor(EXPLORE_FLOOR, n);
+            add_obstacle_danger(&mut map, field, pos, vel, own_radius, ai, n);
+        }
+    }
+
+    let mut intent = match map.resolve(n, ai.danger_mask_floor) {
         Some((dir, strength)) => steer_to_intent(dir, strength, heading, vel, turn_authority),
-        None => {
-            let aim = match stats.and_then(|s| s.weapon) {
-                Some(w) => pursue_intercept(pos, w.muzzle_speed, target_pos, target_vel),
-                None => dir_to,
-            };
-            steer_to_intent(aim, 0.0, heading, vel, turn_authority)
-        }
-    }
+        // Empty map → hold position (zero throttle) facing the gunnery lead.
+        None => steer_to_intent(aim_dir, 0.0, heading, vel, turn_authority),
+    };
+    intent.strafe = strafe;
+    intent
 }
 
 /// T025 — Evade MOVEMENT: break-off at full throttle, directly away from the
@@ -752,6 +1039,105 @@ fn evade_motion(
     match map.resolve(n, ai.danger_mask_floor) {
         Some((dir, _)) => steer_to_intent(dir, 1.0, heading, vel, turn_authority),
         None => ShipIntent::default(),
+    }
+}
+
+/// R96 Part D — the empty-field GATE for the move arm: `true` iff at least one
+/// obstacle is close enough to write danger (within `obstacle_query_radius` of
+/// the ship's current or look-ahead position AND inside its avoid radius). When
+/// this is `false` the move arm takes the EXACT pre-R96-D path bit-for-bit (no
+/// ContextMap is built), which is what preserves determinism + parity. Mirrors
+/// the gate inside [`add_obstacle_danger`] so the two never disagree.
+fn obstacle_in_range(
+    field: &ObstacleField,
+    ship_pos: Vec2,
+    ship_vel: Vec2,
+    own_radius: f32,
+    tuning: &AiTuning,
+) -> bool {
+    let probe = ship_pos + ship_vel * tuning.obstacle_lookahead_s;
+    field.obstacles.iter().any(|&(obs_pos, obs_radius)| {
+        let near = (obs_pos - ship_pos)
+            .length()
+            .min((obs_pos - probe).length());
+        let avoid_radius = obs_radius + own_radius + tuning.obstacle_clearance_pad;
+        // In scope (query radius) AND actually inside the avoid ring (so a far
+        // obstacle the gate would write nothing for does not flip the path).
+        near <= tuning.obstacle_query_radius && near < avoid_radius
+    })
+}
+
+/// R96 Part D — SHARED obstacle avoidance: write a danger term into `map` for
+/// every large neutral body (in the [`ObstacleField`]) close enough to matter,
+/// so the masked [`ContextMap::resolve`] deflects the ship AROUND it instead of
+/// through it. Reused by BOTH the move arm (`fly_to`) and the combat arm
+/// (`engage_motion`).
+///
+/// **Empty-field gate (the determinism keystone)**: with ZERO in-range
+/// obstacles this is a no-op — it writes nothing — so the caller's resulting
+/// map (and the intent it resolves to) is BIT-identical to the pre-R96-D
+/// output. `add_danger_threat` is itself a no-op for any obstacle whose
+/// avoid-radius the ship is outside of, so even an obstacle present but far
+/// away contributes nothing.
+///
+/// **Avoid radius**: each obstacle's danger radius is `obstacle_radius +
+/// own_radius + obstacle_clearance_pad` — the surface-to-surface gap plus a
+/// margin, so the ship steers around with clearance rather than skimming.
+///
+/// **Lookahead model** (mirrors [`crate::ai::steering::avoid`]): the closeness
+/// gate uses the SMALLER of the current range and the range from a predictive
+/// probe `ship_pos + ship_vel · obstacle_lookahead_s`, so a ship FLYING toward
+/// an obstacle reacts before it arrives. The danger DIRECTION is still
+/// `obstacle → ship_pos` (the present geometry — what the masking actually
+/// blocks); only the closeness test looks ahead. The whole field is scanned
+/// linearly (it is tiny); only obstacles within `obstacle_query_radius` of the
+/// ship are considered.
+///
+/// Pure + deterministic (no RNG, no HashMap): the field is pre-sorted by
+/// position bits at build, and `add_danger_threat` combines per-slot by `max`,
+/// so the written danger is independent of obstacle order.
+fn add_obstacle_danger(
+    map: &mut ContextMap,
+    field: &ObstacleField,
+    ship_pos: Vec2,
+    ship_vel: Vec2,
+    own_radius: f32,
+    tuning: &AiTuning,
+    n: usize,
+) {
+    let probe = ship_pos + ship_vel * tuning.obstacle_lookahead_s;
+    for &(obs_pos, obs_radius) in &field.obstacles {
+        // Linear-scan gate: skip obstacles outside the query radius (cheap; the
+        // field is a handful of bodies). Predictive: an obstacle is in scope if
+        // the CURRENT or the look-ahead position is within range.
+        let near = (obs_pos - ship_pos)
+            .length()
+            .min((obs_pos - probe).length());
+        if near > tuning.obstacle_query_radius {
+            continue;
+        }
+        let avoid_radius = obs_radius + own_radius + tuning.obstacle_clearance_pad;
+        // Closeness uses the predictive (smaller) range; direction stays present.
+        map.add_danger_threat(
+            obs_pos,
+            ship_pos,
+            avoid_radius,
+            tuning.obstacle_danger_weight,
+            n,
+        );
+        if probe != ship_pos {
+            // Also reckon the look-ahead position so a ship flying INTO an
+            // obstacle (currently clear) still gets the danger written. Same
+            // direction term (obstacle → present ship_pos), so the masking
+            // deflects the heading the ship is actually steering.
+            let to = obs_pos - ship_pos;
+            let dist = to.length();
+            let probe_dist = (obs_pos - probe).length();
+            if dist >= avoid_radius && probe_dist < avoid_radius && dist > f32::EPSILON {
+                let w = tuning.obstacle_danger_weight * (1.0 - probe_dist / avoid_radius);
+                map.add_danger_dir(to / dist, w, n);
+            }
+        }
     }
 }
 
@@ -1006,6 +1392,12 @@ pub fn ai_think_system(
         // stays live — flee-permitted).
         let mut engage_allowed = true;
         let mut recon: Option<Behavior> = None;
+        // R96 precedence — the ROLE link of the resolved style chain (the squad
+        // link rides `brain.squad_profile`/`_stance`, the base is the archetype
+        // default). Captured from the role here, folded into the final
+        // `.or().unwrap_or()` below. `None` when the ship carries no role.
+        let mut role_profile: Option<MovementProfile> = None;
+        let mut role_stance: Option<CombatStance> = None;
         if let Some(role) = role.as_mut() {
             role_apply(
                 role,
@@ -1015,6 +1407,8 @@ pub fn ai_think_system(
                 tuning.base_sensor_range,
                 now,
             );
+            role_profile = role.movement_profile;
+            role_stance = role.combat_stance;
             engage_allowed = role.allows_engage(now);
             match role.goal {
                 RoleGoal::SweepRegion { .. } => recon = Some(Behavior::Sweep),
@@ -1025,6 +1419,26 @@ pub fn ai_think_system(
                 _ => {}
             }
         }
+
+        // R96 STYLE RESOLUTION (do it ONCE per think, after `role_apply`): the
+        // documented precedence chain `squad ← role ← archetype default`. Each
+        // writer stores its `Option` LOCALLY — the squad's onto
+        // `brain.squad_profile`/`_stance` (via `apply_assignment`; `None` for
+        // roled members, who are squad-exempt), the role's read out into
+        // `role_profile`/`_stance` above, the base from `default_*` — so the
+        // precedence is exactly one `.or().or().unwrap_or()`. Roled members get
+        // role-or-archetype (squad channel `None`); squad non-roled members get
+        // squad-or-archetype (role `None`); lone ships get the archetype default.
+        // Parity: a `Generic` archetype with no role/squad style resolves to
+        // `Cruise`/`Charge` — today's intents, byte-for-byte.
+        brain.movement_profile = brain
+            .squad_profile
+            .or(role_profile)
+            .unwrap_or_else(|| default_movement_profile(brain.archetype));
+        brain.combat_stance = brain
+            .squad_stance
+            .or(role_stance)
+            .unwrap_or_else(|| default_combat_stance(brain.archetype));
 
         // Candidate set (see system docs): movement presence + combat.
         let k = tuning.compensation_k;
@@ -1153,6 +1567,19 @@ pub(crate) const ARRIVE_RADIUS: f32 = 10.0;
 /// follower decelerates onto its leader instead of orbiting through it.
 const FOLLOW_SLOW_RADIUS: f32 = 40.0;
 
+/// R96 Part D — the uniform interest floor the obstacle-avoidance move arm
+/// writes (`ContextMap::add_explore_floor`) so a goal direction fully masked by
+/// a head-on obstacle still resolves to an open lane AROUND it rather than
+/// stalling. Matches the proven `context_map_danger_deflects_around_a_blocked_path`
+/// explore ring (0.25): well below the seek interest (throttle, up to 1.0) so it
+/// never overrides a clear goal heading, but strong enough that when the goal
+/// hemisphere is masked the best OPEN lane wins decisively — and once the ship
+/// deflects, the danger hemisphere rotates off the goal, so the goal-side lane
+/// stays consistently chosen (a committed detour, not chatter). Only reached
+/// when an obstacle is in range (the empty-field gate), so it never perturbs the
+/// obstacle-free parity path.
+const EXPLORE_FLOOR: f32 = 0.25;
+
 /// The EXECUTION half of the brain (T013, TR-001): every tick, turn each
 /// Active/Mid ship's selected [`Behavior`] into a [`ShipIntent`] via the
 /// steering substrate. The think system SELECTS (event-driven, sparse); this
@@ -1250,6 +1677,10 @@ pub fn ai_execute_system(
     // T032: the DefensiveOnly fired-upon window compares against the current
     // tick (Option → 0 in minimal worlds, which carry no roles anyway).
     tick: Option<Res<CurrentTick>>,
+    // R96 Part D: the per-tick obstacle field the move + combat arms steer
+    // around (Option → no avoidance in worlds that never inserted it; the
+    // empty-field gate keeps that path byte-identical to pre-R96-D anyway).
+    obstacles: Option<Res<ObstacleField>>,
     mut ships: Query<(
         Entity,
         &mut AiBrain,
@@ -1267,6 +1698,9 @@ pub fn ai_execute_system(
         Option<&ShipWeapons>,
         // T032: the posture fire-gate overlay (read-only; absent = ungated).
         Option<&ScenarioRole>,
+        // R96 Part D: the ship's own collision radius sizes the avoid clearance
+        // (absent = 0, so an unfitted/test ship still steers around with the pad).
+        Option<&CollisionRadius>,
     )>,
     // Leader AND combat-target kinematics (read-only; see Determinism docs).
     others: Query<(&Position, &Velocity, &Heading)>,
@@ -1274,6 +1708,7 @@ pub fn ai_execute_system(
     let sim = sim.map(|s| *s).unwrap_or_default();
     let ai = tuning.map(|t| *t).unwrap_or_default();
     let now = tick.map_or(0, |t| t.0);
+    let field = obstacles.as_deref();
     for (
         entity,
         mut brain,
@@ -1288,6 +1723,7 @@ pub fn ai_execute_system(
         groups,
         weapons,
         role,
+        collision_radius,
     ) in &mut ships
     {
         // Dormant: the glide aggregate owns it (T019) — leave its intent alone.
@@ -1306,9 +1742,115 @@ pub fn ai_execute_system(
         // (no ShipStats) passes 0 = "unknown → maximum caution" (the
         // documented `reachability_bias` convention).
         let turn_authority = stats.map_or(0.0, ShipStats::max_turn_rate);
+        // R96 Part D — the ship's own collision radius sizes the obstacle avoid
+        // clearance; absent (unfitted/test ship) → 0, so it still steers around
+        // with the configured pad.
+        let own_radius = collision_radius.map_or(0.0, |r| r.0);
+        // R96 — the movement-profile triple for this ship's pace. Cruise is the
+        // pinned parity triple (1.0, 1.0, 4.0); only Rush/Leisurely diverge.
+        // Copied out so the `fly_to` closure never borrows `brain` (the Patrol
+        // arm mutates `brain.waypoint`/`brain.home` while the closure is live).
+        let profile = brain.movement_profile;
+        let (profile_cap, brake_aggr, slow_factor) = ai.profile_params(profile);
+        // R96 — profile-aware fly-to-goal (the move-arm seam).
+        //
+        // - Cruise: EXACTLY the pre-R96 path — `waypoint_follow` (drag-braked
+        //   `arrive` at WAYPOINT_SLOW_FACTOR) → `steer_to_intent`. No new math,
+        //   byte-identical (the determinism keystone). The `throttle_cap`
+        //   multiply below stays the only pace scaling, so Cruise == baseline.
+        // - Rush/Leisurely: ACTIVE braking via `arrive_braked`. The kinematic
+        //   decel is `(reverse_force + linear_drag·speed) / mass` from ShipStats
+        //   (retro thrust + the drag the ship already has at this speed). An
+        //   UNFITTED ship (no ShipStats) has no real brake authority → fall back
+        //   to the Cruise path (documented: profiles need a fit to brake). A
+        //   NEGATIVE throttle means "inside stopping distance" → emit a
+        //   reverse-brake intent: nose kept ON the goal (the turn channel) with
+        //   `forward < 0` so the retro thrusters decelerate nose-on (flight.rs
+        //   routes `forward < 0` to `reverse_force`, which is NOT strafe-gated).
+        //
+        // R96 Part D — obstacle avoidance (THE EMPTY-FIELD GATE): when one or
+        // more large neutral bodies are in range (`obstacle_in_range`), the move
+        // arm builds a ContextMap — the goal-seek `(dir, throttle)` written as
+        // INTEREST, a small explore floor so a fully-blocked dead-ahead still
+        // resolves to a way around, and `add_obstacle_danger` masking the
+        // headings into the obstacles — then resolves + steers (still profile-
+        // capped). When ZERO obstacles are in range, the arm FALLS THROUGH to the
+        // exact pre-R96-D path above, BIT-for-BIT — that gate is what keeps the
+        // determinism + parity (`no_obstacles_is_byte_identical`). The
+        // brake/reverse path stays best-effort: avoidance applies to the forward
+        // approach only (the reverse-brake intent is unchanged — a braking ship
+        // is near its goal, not transiting past an obstacle), documented.
+        //
+        // Cap composition (documented choice): `profile_cap` and the squad
+        // `throttle_cap` are BOTH pace limiters and compose multiplicatively —
+        // `throttle_cap` is applied to every arm uniformly below
+        // (`next.forward *= brain.throttle_cap`), and the profile cap is applied
+        // HERE as a symmetric clamp on the forward magnitude (so it also bounds
+        // the reverse-brake burn). The order is: build the profiled forward,
+        // clamp to ±profile_cap here, then the uniform `*throttle_cap` below.
+        let n_slots = ai.slot_count as usize;
         let fly_to = |goal: Vec2| {
-            let (dir, throttle, _) = waypoint_follow(pos.0, vel.0, &[goal], 0, ARRIVE_RADIUS);
-            steer_to_intent(dir, throttle, heading.0, vel.0, turn_authority)
+            // The profiled goal-seek `(dir, throttle)` + its capped intent — the
+            // EXACT pre-R96-D output. The obstacle path (when triggered) reuses
+            // the SAME `(dir, throttle)` as its interest, so an obstacle-free
+            // resolve would land on the same heading.
+            let cruise_seek = || waypoint_follow(pos.0, vel.0, &[goal], 0, ARRIVE_RADIUS);
+            let (seek_dir, seek_throttle, baseline) = match (profile, stats) {
+                // Parity path (and the unfitted/no-brake-authority fallback).
+                (MovementProfile::Cruise, _) | (_, None) => {
+                    let (dir, throttle, _) = cruise_seek();
+                    let intent = steer_to_intent(dir, throttle, heading.0, vel.0, turn_authority);
+                    (dir, throttle, intent)
+                }
+                (_, Some(s)) => {
+                    let speed = vel.0.length();
+                    // Kinematic decel from retro thrust + the drag at this speed.
+                    // `total_mass`/`reverse_force` are floored > 0 (INV-F07), so
+                    // this is finite; a zero result is floored inside arrive_braked.
+                    let decel = (s.reverse_force + s.linear_drag * speed) / s.total_mass;
+                    let slow_radius = ARRIVE_RADIUS * slow_factor;
+                    let (dir, throttle) =
+                        arrive_braked(pos.0, vel.0, goal, slow_radius, decel, brake_aggr);
+                    if throttle < 0.0 {
+                        // Reverse-brake: keep the nose on the goal (turn channel
+                        // via compose_intent with 0 forward), then drive forward
+                        // NEGATIVE — capped — so the retro thrusters brake nose-on.
+                        let mut brake = compose_intent(dir, 0.0, heading.0);
+                        brake.forward = -profile_cap;
+                        // Best-effort: a braking ship skips avoidance (it is near
+                        // its goal, not transiting past an obstacle).
+                        return brake;
+                    }
+                    // Normal approach: compose, then clamp forward to the cap.
+                    let mut out = steer_to_intent(dir, throttle, heading.0, vel.0, turn_authority);
+                    out.forward = out.forward.clamp(-profile_cap, profile_cap);
+                    (dir, throttle, out)
+                }
+            };
+            // THE EMPTY-FIELD GATE: no in-range obstacle → the exact baseline.
+            let Some(field) = field else {
+                return baseline;
+            };
+            if !obstacle_in_range(field, pos.0, vel.0, own_radius, &ai) {
+                return baseline;
+            }
+            // Obstacles in range → context-map detour. Interest toward the goal
+            // at the profiled throttle, a small explore floor (so a dead-ahead
+            // fully masked by a head-on obstacle still resolves to a way around),
+            // then the obstacle danger. Resolve + steer, profile-capped.
+            let mut map = ContextMap::default();
+            map.add_interest_dir(seek_dir, seek_throttle.max(0.0), n_slots);
+            map.add_explore_floor(EXPLORE_FLOOR, n_slots);
+            add_obstacle_danger(&mut map, field, pos.0, vel.0, own_radius, &ai, n_slots);
+            match map.resolve(n_slots, ai.danger_mask_floor) {
+                Some((dir, strength)) => {
+                    let mut out = steer_to_intent(dir, strength, heading.0, vel.0, turn_authority);
+                    out.forward = out.forward.clamp(-profile_cap, profile_cap);
+                    out
+                }
+                // Fully masked (surrounded) → fall back to the baseline approach.
+                None => baseline,
+            }
         };
 
         let mut next = match brain.behavior {
@@ -1361,6 +1903,7 @@ pub fn ai_execute_system(
             // (the V-1 sweep clears the ref; the next think degrades).
             Behavior::Engage => match brain.target.and_then(|t| others.get(t).ok()) {
                 Some((tpos, tvel, _)) => engage_motion(
+                    brain.combat_stance,
                     brain.archetype,
                     pos.0,
                     vel.0,
@@ -1370,6 +1913,8 @@ pub fn ai_execute_system(
                     tpos.0,
                     tvel.0,
                     &ai,
+                    field, // R96 Part D: empty-field gate keeps Part-C parity.
+                    own_radius,
                 ),
                 None => ShipIntent::default(),
             },
@@ -1747,6 +2292,144 @@ mod tests {
         ];
         for (stats, expected) in cases {
             assert_eq!(classify_archetype(&stats, &t), expected);
+        }
+    }
+
+    // --- R96 Part C: combat stances --------------------------------------
+
+    /// The `perp` helper is the +90° (CCW) rotation in the `0 = +X`, CCW heading
+    /// convention: `perp(+X) = +Y` (LEFT), `perp(+Y) = -X`. So `+perp` is the
+    /// CCW orbit tangent (strafe LEFT) and `-perp` the CW one (strafe RIGHT).
+    #[test]
+    fn orbit_tangent_is_perpendicular_with_correct_sign() {
+        // +perp rotates +X CCW to +Y (a quarter turn left).
+        assert!((perp(Vec2::X) - Vec2::Y).length() < 1e-6);
+        assert!((perp(Vec2::Y) - Vec2::NEG_X).length() < 1e-6);
+        // Perpendicular to its input and unit-length-preserving.
+        let v = Vec2::from_angle(0.9);
+        assert!(perp(v).dot(v).abs() < 1e-6, "perp ⟂ input");
+        assert!((perp(v).length() - v.length()).abs() < 1e-6);
+        // The orbit tangent rotates the OUTWARD radial (-dir_to) by ±90°. The
+        // CCW/CW tangents are exact opposites — opposite circulation.
+        let dir_to = Vec2::from_angle(-0.4); // ship→target.
+        let outward = -dir_to; // target→ship (the orbit radius).
+        let ccw_tan = -perp(dir_to); // = perp(outward).
+        let cw_tan = perp(dir_to);
+        assert!(
+            (ccw_tan + cw_tan).length() < 1e-6,
+            "ccw tangent = −cw tangent"
+        );
+        // The CCW tangent is +90° (LEFT) of the OUTWARD radial → bearing increases.
+        assert!(
+            crate::ai::steering::wrap_angle(
+                ccw_tan.to_angle() - outward.to_angle() - std::f32::consts::FRAC_PI_2
+            )
+            .abs()
+                < 1e-5,
+            "ccw tangent is +90° from the outward radial (bearing increases)"
+        );
+    }
+
+    /// PARITY: the new `engage_motion` Charge arm reproduces the legacy
+    /// range-band controller EXACTLY — for several hand-built geometries
+    /// (outside the ring, inside the ring with a closing target, and on the
+    /// ring) its output equals a reference computation of the pre-R96-C body.
+    #[test]
+    fn charge_stance_matches_legacy_engage_motion() {
+        let ai = AiTuning::default();
+        let stats = stats_with(80.0, 30.0, 200.0); // Brawler-ish armed fit.
+        let archetype = classify_archetype(&stats, &ai);
+        let range = weapon_range(Some(&stats)).expect("armed");
+        let standoff = standoff_distance(archetype, range);
+
+        // A verbatim reference of the legacy engage_motion body.
+        let legacy = |pos: Vec2, vel: Vec2, heading: f32, tpos: Vec2, tvel: Vec2| -> ShipIntent {
+            let turn_authority = stats.max_turn_rate();
+            let to = tpos - pos;
+            let dist = to.length();
+            let dir_to = to.normalize_or_zero();
+            if dir_to == Vec2::ZERO {
+                return ShipIntent::default();
+            }
+            let radial = range_band_radial(dist, standoff, RANGE_BAND_FRAC);
+            let n = ai.slot_count as usize;
+            let mut map = ContextMap::default();
+            if radial > 0.0 {
+                let top = stats.top_speed();
+                map.add_interest_dir(pursue_intercept(pos, top, tpos, tvel), radial, n);
+            } else if radial < 0.0 {
+                map.add_interest_dir(-dir_to, -radial, n);
+                if (tvel - vel).dot(-dir_to) > 0.0 {
+                    map.add_danger_dir(dir_to, 1.0, n);
+                }
+            }
+            match map.resolve(n, ai.danger_mask_floor) {
+                Some((dir, strength)) => {
+                    steer_to_intent(dir, strength, heading, vel, turn_authority)
+                }
+                None => {
+                    let aim = pursue_intercept(pos, stats.weapon.unwrap().muzzle_speed, tpos, tvel);
+                    steer_to_intent(aim, 0.0, heading, vel, turn_authority)
+                }
+            }
+        };
+
+        let cases = [
+            // OUTSIDE the ring (far) — closing arm.
+            (
+                Vec2::ZERO,
+                Vec2::ZERO,
+                0.0,
+                Vec2::new(range, 0.0),
+                Vec2::ZERO,
+            ),
+            // INSIDE the ring with a closing target — opening + danger arm.
+            (
+                Vec2::ZERO,
+                Vec2::new(0.0, 5.0),
+                0.3,
+                Vec2::new(standoff * 0.3, 0.0),
+                Vec2::new(-20.0, 0.0),
+            ),
+            // ON the ring — hold-facing arm (empty map → None).
+            (
+                Vec2::ZERO,
+                Vec2::ZERO,
+                1.0,
+                Vec2::new(standoff, 0.0),
+                Vec2::ZERO,
+            ),
+            // A crossing target off-axis, outside.
+            (
+                Vec2::new(10.0, -30.0),
+                Vec2::new(3.0, 1.0),
+                -0.7,
+                Vec2::new(range + 50.0, 40.0),
+                Vec2::new(0.0, 12.0),
+            ),
+        ];
+        for (pos, vel, heading, tpos, tvel) in cases {
+            let got = engage_motion(
+                CombatStance::Charge,
+                archetype,
+                pos,
+                vel,
+                heading,
+                stats.max_turn_rate(),
+                Some(&stats),
+                tpos,
+                tvel,
+                &ai,
+                None, // No obstacle field → the empty-field gate (parity).
+                0.0,
+            );
+            let want = legacy(pos, vel, heading, tpos, tvel);
+            assert_eq!(
+                got, want,
+                "Charge engage_motion is bit-identical to the legacy body \
+                 (pos {pos:?}, tpos {tpos:?})"
+            );
+            assert_eq!(got.strafe, 0.0, "Charge never strafes");
         }
     }
 
