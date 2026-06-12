@@ -95,73 +95,6 @@ pub struct AiTuning {
     /// Floor subtracted-to value for danger-mask suppression (0.0 = full block).
     pub danger_mask_floor: f32,
 
-    // --- Movement profiles (R96 Part A) ---
-    // Each profile is a (forward cap, brake aggression, arrive slow-factor) triple
-    // read by `ai_execute_system`'s `fly_to` via `profile_params`. CRUISE values
-    // are PINNED to today's constants so `MovementProfile::Cruise` is byte-identical
-    // to the pre-R96 path (cap 1.0 = `*1.0` no-op; slow-factor 4.0 = the
-    // `steering::WAYPOINT_SLOW_FACTOR`); only Rush/Leisurely diverge.
-    /// Forward throttle cap for `Rush` (hot pace — full authority).
-    pub profile_rush_cap: f32,
-    /// Forward throttle cap for `Cruise` (PINNED 1.0 — the parity no-op).
-    pub profile_cruise_cap: f32,
-    /// Forward throttle cap for `Leisurely` (lazy pace — capped to half).
-    pub profile_leisurely_cap: f32,
-    /// Brake aggression for `Rush` (earlier-braking multiplier on stopping distance).
-    pub brake_aggression_rush: f32,
-    /// Brake aggression for `Cruise` (PINNED 1.0 — unused on the no-brake parity path).
-    pub brake_aggression_cruise: f32,
-    /// Brake aggression for `Leisurely` (brakes earliest — a long, gentle settle).
-    pub brake_aggression_leisurely: f32,
-    /// Arrive slow-radius factor for `Rush` (snug ramp — `× ARRIVE_RADIUS`).
-    pub arrive_slow_factor_rush: f32,
-    /// Arrive slow-radius factor for `Cruise` (PINNED 4.0 — the `WAYPOINT_SLOW_FACTOR`).
-    pub arrive_slow_factor_cruise: f32,
-    /// Arrive slow-radius factor for `Leisurely` (wide ramp — eases in early).
-    pub arrive_slow_factor_leisurely: f32,
-    /// R98 HOTFIX C — proportional-brake reference speed (world units/s) for
-    /// [`arrive_braked`]: inside the stopping distance the reverse throttle is
-    /// `-(v_close / this).clamp(0, 1)`, so the brake force scales with the
-    /// closing speed and decays smoothly into the arrive deadband instead of
-    /// bang-banging full reverse at the goal.
-    ///
-    /// [`arrive_braked`]: crate::ai::steering::arrive_braked
-    pub brake_ref_speed: f32,
-    /// R98 HOTFIX C — arrive deadband speed (world units/s): inside the
-    /// stopping distance, a closing speed below this coasts (`throttle 0` —
-    /// drag finishes the settle) instead of braking, so reverse thrust can
-    /// never build backward speed at the goal (the anti-oscillation floor).
-    pub arrive_eps_speed: f32,
-
-    // --- R100 situational braking orientation ---
-    // The knobs `steering::brake_orientation` + the `fly_to` braking seam read to
-    // pick a braking ship's NOSE (goal-facing reverse-brake vs flip-and-burn
-    // retrograde vs threat-facing). With `brake_orient_enabled = false` the seam
-    // is the LITERAL R98 goal-facing primitive (the disabled-path parity guard).
-    /// R100 — master toggle for the situational braking-orientation decision.
-    /// `true` = pick the brake nose situationally (threat / flip / goal); `false`
-    /// = the pre-R100 goal-facing reverse-brake primitive, byte-for-byte.
-    pub brake_orient_enabled: bool,
-    /// R100 — flip-and-burn FORWARD/REVERSE acceleration RATIO gate: a braking
-    /// ship considers turning 180° to brake on its forward drive only when
-    /// `a_fwd / a_rev > this`. At/below it the retros are strong enough to
-    /// reverse-brake nose-on (no flip). `>= 1` (a flip never helps when forward is
-    /// weaker than reverse).
-    pub brake_flip_thrust_ratio: f32,
-    /// R100 — minimum CLOSING speed (world units/s) at which a flip-and-burn is
-    /// even considered: below it a short/slow approach never pays for the 180°
-    /// turn. Must exceed `arrive_eps_speed` (a sub-deadband approach already
-    /// coasts — there is nothing to brake).
-    pub brake_flip_min_speed: f32,
-    /// R100 — flip-decision MARGIN: flip iff the braking time SAVED by forward
-    /// braking exceeds `this ×` the turn time SPENT (`dt > margin · t_turn`). `> 1`
-    /// is conservative (demands a clear win before flipping); `< 1` flips eagerly.
-    pub brake_flip_turn_margin: f32,
-    /// R100 — threat-facing range (world units): while braking, a hostile within
-    /// this distance of the SHIP or the GOAL captures the AIM channel (nose on the
-    /// threat) so a braking ship still bears its fixed-forward gun. `> 0`.
-    pub brake_threat_range: f32,
-
     // --- Combat stances (R96 Part C) ---
     // The per-stance combat-steering knobs read by `engage_motion`. None of
     // these touch the `CombatStance::Charge` path (the PARITY default reuses the
@@ -174,9 +107,39 @@ pub struct AiTuning {
     /// (`× (1 − radial.abs())`, so it DOMINATES on-ring and yields to the radial
     /// correction off-ring).
     pub orbit_tangential_weight: f32,
+    /// R101 S5 — `Orbit` tangential speed as a fraction of the profile pace
+    /// `v_max` (the `combat_intent` controller path): the desired tangential
+    /// orbit velocity on-ring is `orbit_speed_frac · v_max · (1 − |radial|)`, so
+    /// the ship circles at a fraction of cruise on its ring and blends to the
+    /// radial correction off-ring. `(0, 1]` — 1.0 orbits at full pace. The
+    /// struct-level `#[serde(default)]` falls an absent field back to the pinned
+    /// default, so older RONs parse.
+    pub orbit_speed_frac: f32,
     /// `Kite` standoff target as a multiple of `weapon_range` (1.1 = hold just
     /// beyond the envelope edge, so the gun still bears while the target chases).
     pub kite_range_frac: f32,
+    /// R101 S5 — ON-BAND COMBAT WEAVE: the tangential weave speed (as a fraction
+    /// of the profile pace `v_max`) a `Charge`/`Standoff` ship circles its ring at
+    /// while ON-BAND, instead of dead-stopping (`v_des = 0`). A small, constant
+    /// TANGENTIAL drift keeps the ship from being a sitting duck (and lets a
+    /// `can_strafe` hull sidle so its bore rakes the hull), while keeping RANGE
+    /// ~constant (the weave is purely tangential — it holds the ring). Default
+    /// ~0.2 (a gentle circle, well inside the range band). `Orbit` already circles
+    /// at `orbit_speed_frac` (a bigger amplitude) — the weave does NOT apply there
+    /// (no double-apply). `Kite` opens/holds (never parks on-band), so it is
+    /// unweaved too. `0.0` restores the legacy dead-stop. The struct-level
+    /// `#[serde(default)]` falls an absent field back to the pinned default.
+    pub combat_weave_frac: f32,
+    /// R101 S5 — COMBAT RAKE: the gun's aim-jink half-amplitude as a fraction of
+    /// the target's hull half-width — a slow deterministic sweep of the bore ACROSS
+    /// the hull (perpendicular to the line of sight), so a parked combat ship's gun
+    /// carves FRESH cells across the full width instead of boring one fixed tunnel
+    /// that stalls. This is the half of the stationary-target fix that actually
+    /// kills (works for forward-only hulls too — it is a few-degrees nose sweep at
+    /// standoff range, far too small to perturb the ring-hold). Default ~0.6 (sweep
+    /// most of the half-width); `0.0` aims dead at the live-cell centroid (no rake).
+    /// `[0, ~1]`. The struct-level `#[serde(default)]` falls an absent field back.
+    pub combat_rake_frac: f32,
     /// Lateral strafe magnitude (`0..=1`) a stance commands on the strafe
     /// channel — applied ONLY when `ShipStats::can_strafe` is set (R93); a basic
     /// fighter keeps `strafe = 0` and orbits by turning alone.
@@ -268,6 +231,34 @@ pub struct AiTuning {
     /// stays per-hit accurate for the threat-recency consideration.
     pub damage_rethink_interval: u64,
 
+    // --- R101 unified motion controller (Stage S1) ---
+    // The per-profile desired-velocity projection read by
+    // [`AiTuning::control_params`]: a `(v_max, tau_track)` pair the R101
+    // controller (`ai::control::allocate_intent`) consumes — `v_max` caps a
+    // behavior's desired CLOSING/cruise speed (world units/s, on the seed
+    // fighter's ~80 u/s top-speed scale) and `tau_track` is the velocity-tracking
+    // time constant (s; smaller = snappier/harder accel, larger = gentler). These
+    // are pinned placeholders in S1 — NOTHING reads them on the execute path yet
+    // (the controller is wired in R101 S3/S5), so the golden trio is unaffected
+    // regardless of these values.
+    /// R101 — desired top speed (world units/s) for the `Rush` profile (hot pace
+    /// — most of the seed fighter's ~80 u/s envelope).
+    pub control_vmax_rush: f32,
+    /// R101 — desired top speed (world units/s) for the `Cruise` profile (a
+    /// moderate pace).
+    pub control_vmax_cruise: f32,
+    /// R101 — desired top speed (world units/s) for the `Leisurely` profile (a
+    /// lazy pace).
+    pub control_vmax_leisurely: f32,
+    /// R101 — velocity-tracking time constant (s) for the `Rush` profile (small —
+    /// snappy, hard acceleration onto the desired velocity).
+    pub control_tau_rush: f32,
+    /// R101 — velocity-tracking time constant (s) for the `Cruise` profile.
+    pub control_tau_cruise: f32,
+    /// R101 — velocity-tracking time constant (s) for the `Leisurely` profile
+    /// (large — gentle acceleration, a soft settle).
+    pub control_tau_leisurely: f32,
+
     // --- Debug (TR-020a) ---
     /// Per-brain transition-history ring length (capture feature-gated off in
     /// headless/bench builds).
@@ -317,39 +308,25 @@ impl Default for AiTuning {
             // Steering: 16-slot context maps (AD-004); danger fully suppresses a slot.
             slot_count: 16,
             danger_mask_floor: 0.0,
-            // Movement profiles (R96): Cruise PINNED to the pre-R96 constants
-            // (cap 1.0, slow-factor 4.0 = WAYPOINT_SLOW_FACTOR) so it stays
-            // byte-identical; Rush brakes onto a snug ring, Leisurely paces slow
-            // and coasts wide.
-            profile_rush_cap: 1.0,
-            profile_cruise_cap: 1.0,
-            profile_leisurely_cap: 0.5,
-            brake_aggression_rush: 1.0,
-            brake_aggression_cruise: 1.0,
-            brake_aggression_leisurely: 1.6,
-            arrive_slow_factor_rush: 1.5,
-            arrive_slow_factor_cruise: 4.0,
-            arrive_slow_factor_leisurely: 8.0,
-            // R98 HOTFIX C — proportional brake: full reverse only at/above
-            // 40 u/s closing speed, coast-settle below 2 u/s (the deadband).
-            brake_ref_speed: 40.0,
-            arrive_eps_speed: 2.0,
-            // R100 situational braking orientation: ON by default; flip-and-burn
-            // only when forward thrust is > 1.5× the retros AND the closing speed
-            // is worth the turn (>= 15 u/s) AND the saved braking time beats the
-            // turn time (margin 1.0 — break even). A hostile within 250 u of the
-            // ship or the goal captures the brake nose (threat-facing).
-            brake_orient_enabled: true,
-            brake_flip_thrust_ratio: 1.5,
-            brake_flip_min_speed: 15.0,
-            brake_flip_turn_margin: 1.0,
-            brake_threat_range: 250.0,
             // Combat stances (R96 Part C): orbit at the standoff ring with a
             // moderate tangential bank, kite just past the envelope edge, full
             // lateral strafe for hulls that can. None affect the Charge parity path.
             orbit_radius_frac: 1.0,
             orbit_tangential_weight: 0.6,
+            // R101 S5: orbit tangentially at ~70% of the profile pace on-ring —
+            // brisk enough to circulate clearly, slow enough to hold the ring
+            // (the radial correction blends in off-ring). A playtest-feel knob.
+            orbit_speed_frac: 0.7,
             kite_range_frac: 1.1,
+            // R101 S5: on-band combat weave at ~20% of the profile pace — a gentle
+            // tangential circle so a brawler/standoff ship is never a sitting duck
+            // (and a strafe hull sidles, raking its bore); purely tangential, so the
+            // range stays in-band. A playtest-feel knob (0.0 = the legacy dead-stop).
+            combat_weave_frac: 0.2,
+            // R101 S5: rake the gun across ~60% of the target's hull half-width — a
+            // slow deterministic bore sweep so the carve disconnects an off-centre
+            // core instead of stalling in one tunnel. A playtest-feel knob.
+            combat_rake_frac: 0.6,
             strafe_stance_lateral: 1.0,
             // Obstacle avoidance (R96 Part D): a full-weight danger per in-range
             // obstacle, a 1.5 s lookahead, a 15-unit clearance pad, a 200-unit
@@ -392,6 +369,17 @@ impl Default for AiTuning {
             // R98 HOTFIX E — at most one DamageTaken re-think per 15 ticks
             // (0.5 s at 30 Hz) of sustained fire.
             damage_rethink_interval: 15,
+            // R101 unified motion controller (Stage S1): per-profile
+            // (v_max, tau_track) for `control_params`. Tuned to the seed fighter's
+            // ~80 u/s top speed — Rush flies hot (60 u/s) and tracks hard (0.25 s),
+            // Cruise is moderate (45 / 0.35), Leisurely lazy (28 / 0.5). Pinned
+            // placeholders; nothing reads them on the execute path yet.
+            control_vmax_rush: 60.0,
+            control_vmax_cruise: 45.0,
+            control_vmax_leisurely: 28.0,
+            control_tau_rush: 0.25,
+            control_tau_cruise: 0.35,
+            control_tau_leisurely: 0.5,
             // Debug history ring (TR-020a).
             debug_history_len: 16,
         }
@@ -399,32 +387,17 @@ impl Default for AiTuning {
 }
 
 impl AiTuning {
-    /// R96 Part A — the movement-profile `(forward_cap, brake_aggression,
-    /// arrive_slow_factor)` triple for `profile`. `ai_execute_system`'s `fly_to`
-    /// reads it: the cap limits forward intent (composed with the squad
-    /// `throttle_cap`), the brake aggression scales [`arrive_braked`]'s stopping
-    /// distance, and the slow factor sizes the arrive ramp
-    /// (`× ARRIVE_RADIUS`). Cruise returns the PINNED parity triple
-    /// `(1.0, 1.0, 4.0)`.
-    ///
-    /// [`arrive_braked`]: crate::ai::steering::arrive_braked
-    pub fn profile_params(&self, profile: MovementProfile) -> (f32, f32, f32) {
+    /// R101 Stage S1 — the unified-controller `(v_max, tau_track)` projection for
+    /// `profile`: `v_max` is the desired CLOSING/cruise speed cap (world units/s)
+    /// and `tau_track` is the velocity-tracking time constant (s) the R101
+    /// controller (`ai::control::allocate_intent`) consumes. One `(v_max, tau)`
+    /// preset per [`MovementProfile`]; read live by the nav/combat/survival arms
+    /// (R101 S3/S5/S6).
+    pub fn control_params(&self, profile: MovementProfile) -> (f32, f32) {
         match profile {
-            MovementProfile::Rush => (
-                self.profile_rush_cap,
-                self.brake_aggression_rush,
-                self.arrive_slow_factor_rush,
-            ),
-            MovementProfile::Cruise => (
-                self.profile_cruise_cap,
-                self.brake_aggression_cruise,
-                self.arrive_slow_factor_cruise,
-            ),
-            MovementProfile::Leisurely => (
-                self.profile_leisurely_cap,
-                self.brake_aggression_leisurely,
-                self.arrive_slow_factor_leisurely,
-            ),
+            MovementProfile::Rush => (self.control_vmax_rush, self.control_tau_rush),
+            MovementProfile::Cruise => (self.control_vmax_cruise, self.control_tau_cruise),
+            MovementProfile::Leisurely => (self.control_vmax_leisurely, self.control_tau_leisurely),
         }
     }
 }
@@ -451,25 +424,17 @@ mod tests {
         assert!(t.scan_ticks_mid > 0 && t.scan_ticks_far > 0 && t.max_fused_contacts > 0);
         assert!((8..=16).contains(&t.slot_count) && t.danger_mask_floor >= 0.0);
         assert!(t.debug_history_len > 0);
-        // R96 movement profiles: caps in [0,1], positive aggressions/factors.
-        assert!((0.0..=1.0).contains(&t.profile_rush_cap));
-        assert!((0.0..=1.0).contains(&t.profile_cruise_cap));
-        assert!((0.0..=1.0).contains(&t.profile_leisurely_cap));
-        assert!(t.brake_aggression_rush > 0.0 && t.brake_aggression_leisurely > 0.0);
-        assert!(t.arrive_slow_factor_rush > 0.0 && t.arrive_slow_factor_leisurely > 0.0);
-        // R98 HOTFIX C — proportional brake: a positive reference speed and a
-        // deadband strictly below it (otherwise the brake could never engage).
-        assert!(t.brake_ref_speed > 0.0 && t.arrive_eps_speed > 0.0);
-        assert!(t.arrive_eps_speed < t.brake_ref_speed);
-        // R100 situational braking orientation: a flip-thrust ratio >= 1 (a flip
-        // never helps when forward is weaker than reverse), a flip-min speed above
-        // the arrive deadband (a sub-deadband approach already coasts), and
-        // positive ranges/margin.
-        assert!(t.brake_flip_thrust_ratio >= 1.0);
-        assert!(t.brake_flip_min_speed > t.arrive_eps_speed);
-        assert!(t.brake_flip_turn_margin > 0.0 && t.brake_threat_range > 0.0);
         // R96 Part C combat stances: positive ring/range fracs, a strafe magnitude in [0,1].
         assert!(t.orbit_radius_frac > 0.0 && t.orbit_tangential_weight > 0.0);
+        // R101 S5: the orbit tangential-speed fraction is a positive `(0, 1]` knob.
+        assert!(t.orbit_speed_frac > 0.0 && t.orbit_speed_frac <= 1.0);
+        // R101 S5: the on-band combat weave is a gentle `[0, 1)` fraction of pace —
+        // non-negative (0 = legacy dead-stop) and well below full pace (a small
+        // tangential drift that holds the range band, never an orbit-scale circle).
+        assert!((0.0..1.0).contains(&t.combat_weave_frac));
+        // R101 S5: the combat rake jink is a `[0, 1]` fraction of the hull half-
+        // width (0 = no rake; ~1 = sweep the full half-width).
+        assert!((0.0..=1.0).contains(&t.combat_rake_frac));
         assert!(t.kite_range_frac > 0.0 && (0.0..=1.0).contains(&t.strafe_stance_lateral));
         // R96 Part D obstacle avoidance: positive weight/lookahead/pad/radii.
         assert!(t.obstacle_danger_weight > 0.0 && t.obstacle_lookahead_s > 0.0);
@@ -493,35 +458,17 @@ mod tests {
         assert!(t.defend_release_factor >= 1.0);
         // R98 HOTFIX E — a positive damage re-think interval.
         assert!(t.damage_rethink_interval > 0);
-    }
-
-    /// R96 Part A — Cruise's triple is PINNED to the pre-R96 constants (cap 1.0,
-    /// aggression 1.0, slow-factor 4.0 = `steering::WAYPOINT_SLOW_FACTOR`); the
-    /// other profiles map to their own knobs.
-    #[test]
-    fn profile_params_pins_cruise_to_baseline_constants() {
-        let t = AiTuning::default();
-        assert_eq!(
-            t.profile_params(MovementProfile::Cruise),
-            (1.0, 1.0, 4.0),
-            "Cruise is the byte-identical parity triple"
-        );
-        assert_eq!(
-            t.profile_params(MovementProfile::Rush),
-            (
-                t.profile_rush_cap,
-                t.brake_aggression_rush,
-                t.arrive_slow_factor_rush
-            )
-        );
-        assert_eq!(
-            t.profile_params(MovementProfile::Leisurely),
-            (
-                t.profile_leisurely_cap,
-                t.brake_aggression_leisurely,
-                t.arrive_slow_factor_leisurely
-            )
-        );
+        // R101 unified controller: positive desired speeds + tracking time
+        // constants, ordered by pace (Rush fastest/snappiest → Leisurely
+        // slowest/gentlest).
+        assert!(t.control_vmax_rush > 0.0 && t.control_vmax_cruise > 0.0);
+        assert!(t.control_vmax_leisurely > 0.0);
+        assert!(t.control_vmax_rush >= t.control_vmax_cruise);
+        assert!(t.control_vmax_cruise >= t.control_vmax_leisurely);
+        assert!(t.control_tau_rush > 0.0 && t.control_tau_cruise > 0.0);
+        assert!(t.control_tau_leisurely > 0.0);
+        assert!(t.control_tau_rush <= t.control_tau_cruise);
+        assert!(t.control_tau_cruise <= t.control_tau_leisurely);
     }
 
     /// RON round-trip (the SimTuning dev-settings persistence pattern): defaults
@@ -556,16 +503,23 @@ mod tests {
         assert_eq!(t.defend_arrive_radius, d.defend_arrive_radius);
         // R98 HOTFIX fields are also `#[serde(default)]`: absent from an
         // older/partial RON, they fall back to the pinned defaults.
-        assert_eq!(t.brake_ref_speed, d.brake_ref_speed);
-        assert_eq!(t.arrive_eps_speed, d.arrive_eps_speed);
         assert_eq!(t.defend_release_factor, d.defend_release_factor);
         assert_eq!(t.damage_rethink_interval, d.damage_rethink_interval);
-        // R100 situational braking-orientation fields are also `#[serde(default)]`:
-        // absent from this older/partial RON, they fall back to the pinned defaults.
-        assert_eq!(t.brake_orient_enabled, d.brake_orient_enabled);
-        assert_eq!(t.brake_flip_thrust_ratio, d.brake_flip_thrust_ratio);
-        assert_eq!(t.brake_flip_min_speed, d.brake_flip_min_speed);
-        assert_eq!(t.brake_flip_turn_margin, d.brake_flip_turn_margin);
-        assert_eq!(t.brake_threat_range, d.brake_threat_range);
+        // R101 unified-controller fields are also `#[serde(default)]`: absent from
+        // this older/partial RON, they fall back to the pinned defaults.
+        assert_eq!(t.control_vmax_rush, d.control_vmax_rush);
+        assert_eq!(t.control_vmax_cruise, d.control_vmax_cruise);
+        assert_eq!(t.control_vmax_leisurely, d.control_vmax_leisurely);
+        assert_eq!(t.control_tau_rush, d.control_tau_rush);
+        assert_eq!(t.control_tau_cruise, d.control_tau_cruise);
+        assert_eq!(t.control_tau_leisurely, d.control_tau_leisurely);
+        // R101 S5 — the orbit-speed-fraction knob is `#[serde(default)]` via the
+        // struct attribute: absent from this older/partial RON, it falls back.
+        assert_eq!(t.orbit_speed_frac, d.orbit_speed_frac);
+        // R101 S5 — the on-band combat-weave + rake knobs are `#[serde(default)]`
+        // too: absent from this older/partial RON, they fall back to the pinned
+        // defaults.
+        assert_eq!(t.combat_weave_frac, d.combat_weave_frac);
+        assert_eq!(t.combat_rake_frac, d.combat_rake_frac);
     }
 }

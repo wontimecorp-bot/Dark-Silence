@@ -26,9 +26,10 @@
 
 use bevy_ecs::prelude::*;
 use glam::Vec2;
+use sim::ai::control::{allocate_intent, stoppable_speed, ControlStats, Facing, MoveCmd};
 use sim::ai::steering::{
-    arrive, avoid, compose_intent, formation_keep, intercept_point, pursue_intercept,
-    reachability_bias, seek, slot_dir, steer_to_intent, waypoint_follow, wrap_angle, ContextMap,
+    avoid, formation_desired_vel, intercept_point, pursue_intercept, seek, slot_dir, wrap_angle,
+    ContextMap,
 };
 use sim::ai::{
     ai_think_system, cadence_for_tier, select_behavior, spawn_squad, AiBrain, AiEvent,
@@ -100,7 +101,7 @@ fn state_bits(w: &World, e: Entity) -> [u32; 6] {
 }
 
 /// The caller-writes-the-intent half of the V-6 seam (what a brain system does
-/// with the value `steer_to_intent` returns).
+/// with the value the unified `allocate_intent` controller returns).
 fn write_intent(w: &mut World, ship: Entity, intent: ShipIntent) {
     *w.get_mut::<ShipIntent>(ship).expect("ship has ShipIntent") = intent;
 }
@@ -109,20 +110,25 @@ fn write_intent(w: &mut World, ship: Entity, intent: ShipIntent) {
 // T008 — VC1 / SC-001: AI trajectory ≡ replayed-intent trajectory, bit for bit
 // ---------------------------------------------------------------------------
 
-/// World A is driven by the AI: each tick the steering substrate computes a
-/// `ShipIntent` toward a fixed waypoint (`waypoint_follow` → `steer_to_intent`)
-/// and the loop records it before writing it to the ship. World B replays the
-/// RECORDED sequence as if a player had typed it. Because the AI shares the
-/// human control path (one `ship_motion_system`, intents only), the per-tick
-/// trajectories must be BIT-identical (position/velocity/heading — zero
-/// tolerance), and the AI ship must make real progress toward its waypoint.
+/// World A is driven by the AI: each tick the unified controller
+/// ([`allocate_intent`], R101 S8 — the sole motion composer) computes a
+/// `ShipIntent` toward a fixed waypoint (a nav `v_des` toward the goal, capped
+/// at the stoppable speed, `Facing::Free`) and the loop records it before
+/// writing it to the ship. World B replays the RECORDED sequence as if a player
+/// had typed it. Because the AI shares the human control path (one
+/// `ship_motion_system`, intents only), the per-tick trajectories must be
+/// BIT-identical (position/velocity/heading — zero tolerance), and the AI ship
+/// must make real progress toward its waypoint. (R101 S8 re-pointed this from
+/// the retired `waypoint_follow` → `steer_to_intent` path to the controller; the
+/// DETERMINISM property — one control path → replay bit-identity — is unchanged.)
 #[test]
 fn ai_intent_trajectory_is_bit_identical_to_replayed_intents() {
     const TICKS: usize = 240;
     let waypoint = Vec2::new(150.0, 100.0);
-    let route = [waypoint];
-    let arrive_radius = 8.0;
-    let authority = Tuning::default().max_turn_rate();
+    // The UNFITTED ship flies the Tuning fallback; the controller reads the
+    // matching fallback projection + a Cruise pace `(v_max, tau)`.
+    let cstats = ControlStats::fallback();
+    let (v_max, tau) = AiTuning::default().control_params(MovementProfile::Cruise);
 
     // World A — the AI emits the intents (and we record them).
     let mut wa = make_world();
@@ -131,12 +137,23 @@ fn ai_intent_trajectory_is_bit_identical_to_replayed_intents() {
     let initial_dist = (kinematics(&wa, ship_a).0 - waypoint).length();
     let mut recorded: Vec<ShipIntent> = Vec::with_capacity(TICKS);
     let mut trace_a: Vec<[u32; 6]> = Vec::with_capacity(TICKS);
-    let mut idx = 0usize;
     for _ in 0..TICKS {
         let (pos, vel, heading) = kinematics(&wa, ship_a);
-        let (dir, throttle, next_idx) = waypoint_follow(pos, vel, &route, idx, arrive_radius);
-        idx = next_idx;
-        let intent = steer_to_intent(dir, throttle, heading, vel, authority);
+        // The nav controller path: a desired velocity toward the goal capped at
+        // the kinematic stoppable speed (no-overshoot), `Facing::Free`.
+        let to = waypoint - pos;
+        let speed_cap = v_max.min(stoppable_speed(to.length(), cstats.a_rev));
+        let v_des = to.normalize_or_zero() * speed_cap;
+        let intent = allocate_intent(
+            MoveCmd {
+                v_des,
+                facing: Facing::Free,
+            },
+            vel,
+            heading,
+            cstats,
+            tau,
+        );
         recorded.push(intent);
         write_intent(&mut wa, ship_a, intent);
         sa.run(&mut wa);
@@ -180,9 +197,13 @@ fn ai_intent_trajectory_is_bit_identical_to_replayed_intents() {
 /// The static guarantee is COMPILE-LEVEL: every steering function takes plain
 /// values/slices and returns values — none can even name an ECS component.
 /// This test makes it explicit at runtime: exercise EVERY public steering entry
-/// point with a live ship's state as inputs (and even write the resulting
-/// intent component), then assert the ship's `Position`/`Velocity`/`Heading`/
-/// `AngularVelocity` bits are untouched without a schedule step.
+/// point — and the unified [`allocate_intent`] controller (R101 S8 — the sole
+/// motion composer) — with a live ship's state as inputs (and even write the
+/// resulting intent component), then assert the ship's `Position`/`Velocity`/
+/// `Heading`/`AngularVelocity` bits are untouched without a schedule step.
+/// (R101 S8 re-pointed this off the retired `arrive`/`waypoint_follow`/
+/// `formation_keep`/`reachability_bias`/`steer_to_intent`/`compose_intent`
+/// surface onto the surviving `v_des` producers + the controller.)
 #[test]
 fn steering_never_mutates_kinematics_directly() {
     let mut w = make_world();
@@ -194,20 +215,16 @@ fn steering_never_mutates_kinematics_directly() {
     let (pos, vel, heading) = kinematics(&w, ship);
     let goal = Vec2::new(100.0, 50.0);
     let _ = seek(pos, goal);
-    let _ = arrive(pos, vel, goal, 30.0);
     let _ = intercept_point(pos, 80.0, goal, Vec2::new(0.0, 20.0));
     let _ = pursue_intercept(pos, 80.0, goal, Vec2::new(0.0, 20.0));
-    let _ = waypoint_follow(pos, vel, &[Vec2::new(40.0, 0.0), goal], 0, 8.0);
-    let _ = formation_keep(
+    let _ = formation_desired_vel(
         pos,
-        vel,
         Vec2::ZERO,
         Vec2::new(5.0, 0.0),
         0.3,
         Vec2::new(-6.0, 6.0),
     );
     let _ = avoid(pos, vel, &[(pos + Vec2::new(2.0, 0.0), 5.0)]);
-    let _ = reachability_bias(Vec2::Y, vel, 3.0);
     let _ = wrap_angle(heading + 7.0);
     let _ = slot_dir(3, 16);
     let mut map = ContextMap::default();
@@ -215,10 +232,20 @@ fn steering_never_mutates_kinematics_directly() {
     map.add_danger_dir(Vec2::X, 0.5, 16);
     map.add_danger_threat(pos + Vec2::new(10.0, 0.0), pos, 40.0, 1.0, 16);
     let resolved = map.resolve(16, AiTuning::default().danger_mask_floor);
-    let intent = match resolved {
-        Some((dir, strength)) => steer_to_intent(dir, strength, heading, vel, 3.0),
-        None => compose_intent(Vec2::ZERO, 0.0, heading),
-    };
+    // The unified controller is the seam's only intent composer now: feed the
+    // resolved heading in as a desired velocity (or a zero command when fully
+    // masked), `Facing::Free`, through the fallback projection.
+    let v_des = resolved.map_or(Vec2::ZERO, |(dir, strength)| dir * strength * 50.0);
+    let intent = allocate_intent(
+        MoveCmd {
+            v_des,
+            facing: Facing::Free,
+        },
+        vel,
+        heading,
+        ControlStats::fallback(),
+        0.3,
+    );
     assert!(
         (-1.0..=1.0).contains(&intent.turn) && (-1.0..=1.0).contains(&intent.forward),
         "the substrate's only output is a clamped ShipIntent VALUE"
@@ -252,7 +279,9 @@ fn context_map_danger_deflects_around_a_blocked_path() {
     let goal = Vec2::new(240.0, 0.0);
     let threat = Vec2::new(90.0, 0.0); // squarely on the straight path
     let threat_radius = 60.0;
-    let authority = Tuning::default().max_turn_rate();
+    // R101 S8 — the resolved heading drives the unified controller (the sole
+    // motion composer). The UNFITTED ship flies the Tuning fallback projection.
+    let cstats = ControlStats::fallback();
 
     let mut w = make_world();
     let mut sched = make_schedule();
@@ -278,7 +307,18 @@ fn context_map_danger_deflects_around_a_blocked_path() {
                 if first_deflection.is_none() && map.danger.iter().take(n).any(|&d| d > 0.0) {
                     first_deflection = Some((dir, raw));
                 }
-                steer_to_intent(dir, 1.0, heading, vel, authority)
+                // Drive the resolved heading through the controller as a desired
+                // velocity at the fallback top speed, `Facing::Free`.
+                allocate_intent(
+                    MoveCmd {
+                        v_des: dir * 80.0,
+                        facing: Facing::Free,
+                    },
+                    vel,
+                    heading,
+                    cstats,
+                    0.3,
+                )
             }
             None => ShipIntent::default(), // fully masked → coast
         };
@@ -342,7 +382,19 @@ fn pursue_intercept_captures_a_crossing_target_sooner_than_pure_seek() {
             } else {
                 seek(pos, target_pos)
             };
-            let intent = steer_to_intent(dir, 1.0, heading, vel, tuning.max_turn_rate());
+            // R101 S8 — chase at top speed through the unified controller (the sole
+            // motion composer): `v_des = dir · top_speed`, `Facing::Free`. The
+            // pursuit DIRECTION (lead vs tail-chase) is the variable under test.
+            let intent = allocate_intent(
+                MoveCmd {
+                    v_des: dir * tuning.top_speed(),
+                    facing: Facing::Free,
+                },
+                vel,
+                heading,
+                ControlStats::fallback(),
+                0.3,
+            );
             write_intent(&mut w, ship, intent);
         }
         sched.run(&mut w);
@@ -394,17 +446,20 @@ fn turn_sign_flips(turns: &[f32], deadband: f32) -> usize {
 }
 
 /// VC2 formation-hold: a leader flies a straight line under constant forward
-/// intent; two followers (spawned OFF their slots) steer each tick via
-/// `formation_keep` → `steer_to_intent`. By tick 300 each follower's slot
-/// error is ≤ 10% of its slot-offset magnitude, STAYS within that band for the
-/// rest of the run, and shows no turn-sign chatter after settling.
+/// intent; two followers (spawned OFF their slots) steer each tick through the
+/// LIVE formation arm (R101 S8 — re-pointed off the retired `formation_keep` →
+/// `steer_to_intent` path onto `formation_desired_vel` → `allocate_intent` with
+/// `Facing::Free`, exactly the brain's FormationKeep arm). By tick 300 each
+/// follower's slot error is ≤ 10% of its slot-offset magnitude, STAYS within
+/// that band for the rest of the run, and shows no turn-sign chatter after
+/// settling — the controller's velocity-matching settle is what kills the
+/// chatter the old position-only steer could exhibit.
 ///
-/// Geometry note (spec numbers untouched): `formation_keep`'s station-keeping
-/// trail scales with leader speed (error ≈ CLOSE_TIME·THROTTLE_SPEED·v/v_max =
-/// v/5 at Tuning defaults), so the 10% band fixes the slot scale — 30-unit
-/// behind-left/right slots (|offset| ≈ 42.4, band ≈ 4.24) with a 0.15-throttle
-/// leader (12 u/s → steady trail ≈ 2.4) is a reasonable patrol-formation
-/// scenario with margin.
+/// Geometry note (spec numbers untouched): the velocity-matching `v_des` carries
+/// the leader's velocity as a feed-forward, so the steady-state trail stays a
+/// small fraction of the 30-unit behind-left/right slots (|offset| ≈ 42.4,
+/// band ≈ 4.24) for a 0.15-throttle leader (≈ 12 u/s) — a reasonable
+/// patrol-formation scenario with margin.
 #[test]
 fn formation_followers_settle_and_hold_without_chatter() {
     const TICKS: usize = 600;
@@ -413,7 +468,10 @@ fn formation_followers_settle_and_hold_without_chatter() {
     let offsets = [Vec2::new(-30.0, 30.0), Vec2::new(-30.0, -30.0)]; // behind-left / behind-right
     let perturb = [Vec2::new(4.0, 6.0), Vec2::new(-6.0, -4.0)]; // spawn OFF-slot
     let band = 0.10 * offsets[0].length(); // ≤ 10% of slot spacing (spec VC2)
-    let authority = Tuning::default().max_turn_rate();
+                                           // The migrated formation arm's controller knobs (UNFITTED ship → fallback
+                                           // projection; Cruise pace `(v_max, tau)`). Mirrors `ai_execute_system`.
+    let cstats = ControlStats::fallback();
+    let (v_max, tau) = AiTuning::default().control_params(MovementProfile::Cruise);
 
     let mut w = make_world();
     let mut sched = make_schedule();
@@ -440,8 +498,22 @@ fn formation_followers_settle_and_hold_without_chatter() {
         let (lp, lv, lh) = kinematics(&w, leader);
         for (k, &f) in followers.iter().enumerate() {
             let (pos, vel, heading) = kinematics(&w, f);
-            let (dir, throttle) = formation_keep(pos, vel, lp, lv, lh, offsets[k]);
-            let intent = steer_to_intent(dir, throttle, heading, vel, authority);
+            // THE LIVE FORMATION ARM, verbatim: velocity-matching `v_des`, capped
+            // at `v_max`, then `allocate_intent` with `Facing::Free`.
+            let mut v_des = formation_desired_vel(pos, lp, lv, lh, offsets[k]);
+            if v_des.length() > v_max {
+                v_des = v_des.normalize_or_zero() * v_max;
+            }
+            let intent = allocate_intent(
+                MoveCmd {
+                    v_des,
+                    facing: Facing::Free,
+                },
+                vel,
+                heading,
+                cstats,
+                tau,
+            );
             turns[k].push(intent.turn);
             write_intent(&mut w, f, intent);
         }
@@ -489,6 +561,90 @@ fn formation_followers_settle_and_hold_without_chatter() {
             "follower {k} turn intent chattered after settling ({flips} sign flips in 300 ticks)"
         );
     }
+}
+
+/// R101 S4 — the migrated FormationKeep MOTION: drive a follower through the
+/// EXACT brain-arm path (`formation_desired_vel` → cap at `v_max` →
+/// `allocate_intent` with `Facing::Free`) against a leader cruising at a
+/// CONSTANT velocity, and prove the velocity-matching formation: the follower
+/// (a) converges onto its slot (steady-state slot error small relative to the
+/// offset magnitude) and (b) MATCHES the leader's velocity at steady state —
+/// it coasts WITH the leader, not oscillating around it. This is what the
+/// desired-velocity controller buys over a position-only seek: `v_des` carries
+/// the leader's velocity as a feed-forward, so the follower settles to the
+/// leader's pace instead of perpetually chasing a moving target.
+#[test]
+fn formation_follower_tracks_moving_leader_via_desired_velocity() {
+    const TICKS: usize = 1200;
+    let leader_heading = 0.4; // off-axis so nothing is axis-aligned.
+    let leader_vel = Vec2::from_angle(leader_heading) * 12.0; // constant cruise.
+    let slot_offset = Vec2::new(-30.0, 20.0); // behind-left of the leader.
+                                              // The migrated arm's controller knobs (the UNFITTED ship → the fallback
+                                              // projection; the Cruise pace `(v_max, tau)` the brain reads for a default
+                                              // movement profile). Mirrors `ai_execute_system`'s FormationKeep arm.
+    let cstats = ControlStats::fallback();
+    let (v_max, tau) = AiTuning::default().control_params(MovementProfile::Cruise);
+
+    let mut w = make_world();
+    let mut sched = make_schedule();
+    // Leader flies a straight line at the constant cruise velocity (its intent
+    // is irrelevant — we pin its velocity each tick so the slot path is exact).
+    let leader = spawn_ai_ship(&mut w, Vec2::ZERO, leader_heading, leader_vel);
+    // Follower spawned WELL OFF its slot and at rest, so the test proves
+    // convergence (not a vacuous already-settled state).
+    let follower = spawn_ai_ship(&mut w, Vec2::new(-120.0, -80.0), 0.0, Vec2::ZERO);
+
+    let slot_world = |lp: Vec2| lp + Vec2::from_angle(leader_heading).rotate(slot_offset);
+    let initial_err = (kinematics(&w, follower).0 - slot_world(Vec2::ZERO)).length();
+    assert!(
+        initial_err > 0.5 * slot_offset.length(),
+        "follower starts well outside its slot (err {initial_err})"
+    );
+
+    for _ in 0..TICKS {
+        // Keep the leader on its constant-velocity line (re-pin velocity; its
+        // own flight would drag it down, but the formation math only needs a
+        // clean constant-velocity leader to track).
+        w.get_mut::<Velocity>(leader).expect("leader vel").0 = leader_vel;
+        let (lp, lv, lh) = kinematics(&w, leader);
+        let (pos, vel, h) = kinematics(&w, follower);
+        // THE MIGRATED ARM, verbatim: emit the velocity-matching `v_des`, cap at
+        // `v_max`, then `allocate_intent` with `Facing::Free`.
+        let mut v_des = formation_desired_vel(pos, lp, lv, lh, slot_offset);
+        if v_des.length() > v_max {
+            v_des = v_des.normalize_or_zero() * v_max;
+        }
+        let intent = allocate_intent(
+            MoveCmd {
+                v_des,
+                facing: Facing::Free,
+            },
+            vel,
+            h,
+            cstats,
+            tau,
+        );
+        write_intent(&mut w, follower, intent);
+        sched.run(&mut w);
+    }
+
+    let (lp, lv, _) = kinematics(&w, leader);
+    let (fp, fv, _) = kinematics(&w, follower);
+    let slot_err = (fp - slot_world(lp)).length();
+    // (a) Converged onto the slot: a small steady-state trail (the drag-balanced
+    // (slot − pos)/CLOSE_TIME bias) — well under 10% of the 36-unit offset.
+    assert!(
+        slot_err < 0.10 * slot_offset.length(),
+        "steady-state slot error {slot_err} exceeds 10% of the offset {}",
+        slot_offset.length()
+    );
+    // (b) Velocity MATCHED to the leader (the velocity-matching keystone): the
+    // follower coasts WITH the leader, not oscillating around its pace.
+    let vel_err = (fv - lv).length();
+    assert!(
+        vel_err < 0.10 * leader_vel.length(),
+        "follower velocity {fv} does not match the leader velocity {lv} (err {vel_err})"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -827,28 +983,36 @@ fn stats_with_brake(top_speed: f32, reverse_force: f32) -> sim::fitting::ShipSta
     s
 }
 
-/// R96 PARITY KEYSTONE — a `MovementProfile::Cruise` ship flying a `Waypoint`
-/// goal through the FULL fixed schedule emits the EXACT pre-R96 trajectory:
-/// (a) byte-identical across two independent runs (determinism, V-3); and
-/// (b) byte-identical to a reference ship hand-driven by the pre-R96 primitives
-/// (`waypoint_follow` → `steer_to_intent`, the only intent the old `fly_to`
-/// produced) — proving Cruise emits the SAME intents as the old code.
+/// R101 S3 — RETIRED→CONVERTED from `cruise_profile_is_byte_identical_to_baseline`.
+/// The "byte-identical to the pre-R96 hand-driven baseline" premise is GONE:
+/// scenario nav now routes through the unified controller (`allocate_intent`), not
+/// the old `waypoint_follow → steer_to_intent` path, so the trajectory differs by
+/// construction. What survives — and is what actually matters — is the FUNCTIONAL
+/// guarantee: a scenario `Waypoint` ship (no PlayerOrder; a plain fitted nav ship)
+/// flies to its goal through the FULL schedule and PARKS (final dist <
+/// 1.5×ARRIVE_RADIUS, tail speed < 2.5, bounded overshoot), AND the controller path
+/// is deterministic across two fresh runs (V-3).
 #[test]
-fn cruise_profile_is_byte_identical_to_baseline() {
-    const TICKS: u64 = 90;
-    let start = Vec2::new(10.0, 0.0);
-    let waypoint = Vec2::new(120.0, 40.0);
+fn nav_arrives_and_parks_via_controller() {
+    const TICKS: u64 = 2400;
+    let start = Vec2::new(0.0, 0.0);
+    let goal = Vec2::new(220.0, 0.0);
+    // A fitted nav fighter with real top speed + retro brake (the controller reads
+    // its body-frame accel authority for v_max-capping + braking).
+    let stats = stats_with_brake(80.0, 60.0);
 
-    // The AI-driven Cruise ship through the full schedule (think + execute +
-    // flight), captured per tick at BIT level.
-    let cruise_run = || {
+    // A SCENARIO nav ship: a `Waypoint` brain with a goal but NO PlayerOrder — the
+    // S3 generalization is exactly that this ship now drives the controller too.
+    let nav_run = || -> (Vec<[u32; 6]>, Vec2, Vec2, f32) {
         let (mut w, mut s) = obj2_world();
-        w.spawn((PlayerShip, Position(Vec2::ZERO))); // keep it Active-tier
+        w.spawn((PlayerShip, Position(start))); // keep it Active-tier
         let buckets = w.resource::<AiTuning>().fallback_bucket_count;
         let brain = AiBrain {
-            waypoint: Some(waypoint),
+            waypoint: Some(goal),
             think_tier: Tier::Active,
-            movement_profile: MovementProfile::Cruise,
+            // Pin Rush through the squad channel (a lone ship's resolved profile is
+            // re-derived each think; the squad link is the highest non-player one).
+            squad_profile: Some(MovementProfile::Rush),
             ..AiBrain::new(AiStableId(0), buckets)
         };
         let ship = w
@@ -860,6 +1024,7 @@ fn cruise_profile_is_byte_identical_to_baseline() {
                 Heading(0.0),
                 AngularVelocity(0.0),
                 FlightAssist::On,
+                stats,
                 AiStableId(0),
                 brain,
                 AoiTier {
@@ -869,78 +1034,76 @@ fn cruise_profile_is_byte_identical_to_baseline() {
             ))
             .id();
         let mut trace = Vec::with_capacity(TICKS as usize);
+        let mut max_overshoot: f32 = 0.0;
         for tick in 0..TICKS {
             mirror_tick_and_run(&mut w, &mut s, tick);
             trace.push(state_bits(&w, ship));
+            let (p, ..) = kinematics(&w, ship);
+            max_overshoot = max_overshoot.max(p.x - goal.x);
         }
-        trace
+        let (fp, fv, _) = kinematics(&w, ship);
+        (trace, fp, fv, max_overshoot)
     };
 
-    let run_a = cruise_run();
-    let run_b = cruise_run();
+    let (trace_a, final_pos, final_vel, max_overshoot) = nav_run();
+    let (trace_b, ..) = nav_run();
     assert_eq!(
-        run_a, run_b,
-        "Cruise is deterministic across identical runs (V-3)"
+        trace_a, trace_b,
+        "the controller nav path is deterministic across identical runs (V-3)"
     );
 
-    // The pre-R96 reference: an UNFITTED ship hand-driven by exactly the intent
-    // the old `fly_to` emitted (`waypoint_follow` → `steer_to_intent`), through
-    // the flight model alone. The Cruise brain's `throttle_cap` is the default
-    // 1.0 (a `*1.0` no-op), so no cap scaling enters either path.
-    let mut rw = make_world();
-    let mut rs = make_schedule();
-    let reference = spawn_ai_ship(&mut rw, start, 0.0, Vec2::ZERO);
-    let mut ref_trace = Vec::with_capacity(TICKS as usize);
-    for _ in 0..TICKS {
-        let (p, v, h) = kinematics(&rw, reference);
-        // The Waypoint arm holds (zero intent) within ARRIVE_RADIUS, else flies.
-        let intent = if (waypoint - p).length() <= R96_ARRIVE_RADIUS {
-            ShipIntent::default()
-        } else {
-            let (dir, throttle, _) = waypoint_follow(p, v, &[waypoint], 0, R96_ARRIVE_RADIUS);
-            steer_to_intent(dir, throttle, h, v, 0.0) // unfitted → turn_authority 0
-        };
-        write_intent(&mut rw, reference, intent);
-        rs.run(&mut rw);
-        ref_trace.push(state_bits(&rw, reference));
-    }
-
-    assert_eq!(
-        run_a, ref_trace,
-        "Cruise emits the SAME trajectory as the pre-R96 hand-driven baseline \
-         (the determinism keystone — Cruise == old path, byte for byte)"
+    let final_dist = (goal - final_pos).length();
+    assert!(
+        final_dist < 1.5 * R96_ARRIVE_RADIUS,
+        "the scenario nav ship parks via the controller (final dist {final_dist})"
+    );
+    assert!(
+        final_vel.length() < 2.5,
+        "the tail is settled at rest (final speed {})",
+        final_vel.length()
+    );
+    assert!(
+        max_overshoot < 40.0,
+        "no blow-through past the goal (max overshoot {max_overshoot})"
     );
 }
 
-/// R96 Part B — Rush actively brakes onto its goal and settles CLOSER than
-/// Leisurely (which paces slower and coasts further), and NEITHER overshoots
-/// wildly. Both fly the SAME fitted ship + goal through the full schedule; only
-/// the `movement_profile` differs.
+/// R101 S3 — RENAMED→RE-VERIFIED from `rush_settles_on_goal_vs_leisurely_coasts_past`.
+/// Under the unified controller BOTH profiles now PARK (the "coasts past" framing
+/// is gone — the no-overshoot stoppable-speed cap holds for every profile, so
+/// asserting Rush rests "closer" than Leisurely is no longer meaningful: both
+/// rest ON the goal). The meaningful, robust difference is the v_max ORDERING:
+/// the controller caps the closing speed at `control_vmax`, so Rush
+/// (`control_vmax_rush` 60) reaches a STRICTLY HIGHER peak transit speed than
+/// Leisurely (`control_vmax_leisurely` 28) — the unhurried profile is genuinely
+/// slower in cruise — yet BOTH brake to rest on the goal. Both fly the SAME fitted
+/// ship + goal through the full schedule; only the `movement_profile` differs.
 #[test]
-fn rush_settles_on_goal_vs_leisurely_coasts_past() {
-    const TICKS: u64 = 400;
+fn rush_settles_closer_than_leisurely() {
+    const SETTLE_TICKS: u64 = 4000;
     let start = Vec2::new(0.0, 0.0);
-    let goal = Vec2::new(220.0, 0.0);
+    // A transit sized so the stoppable-speed cap (`sqrt(2·a_rev·dist)`, ≈ sqrt(6·d)
+    // for this fighter) clears the Leisurely v_max (28) early but does NOT let Rush
+    // reach a runaway speed it can't brake before the goal: ~500 u leaves Leisurely
+    // capped at 28 while Rush cruises higher (and both brake cleanly to a park). A
+    // SHORT hop (e.g. 220 u) is brake-cap-limited for BOTH profiles — the cap holds
+    // them under 28 the whole way — so it never separates them.
+    let goal = Vec2::new(500.0, 0.0);
 
     // top_speed 80, a strong retro (reverse_force 60) so braking is decisive.
     let stats = stats_with_brake(80.0, 60.0);
 
-    // R98 HOTFIX C — the run is EXTENDED past the original 400-tick window so
-    // the heavy test fighter (mass ~20, retro 60 → ≤ ~4 u/s² of brake) genuinely
-    // ARRIVES and parks; the original rest/overshoot comparisons keep their
-    // exact pre-R98 semantics by sampling at the original 400-tick mark.
-    const SETTLE_TICKS: u64 = 2400;
-    let rest_distance = |profile: MovementProfile| -> (f32, f32, f32) {
+    // Returns (peak transit speed, max overshoot, tail max speed, final dist).
+    let run = |profile: MovementProfile| -> (f32, f32, f32, f32) {
         let (mut w, mut s) = obj2_world();
         w.spawn((PlayerShip, Position(start))); // keep the ship Active-tier
         let buckets = w.resource::<AiTuning>().fallback_bucket_count;
         let brain = AiBrain {
             waypoint: Some(goal),
             think_tier: Tier::Active,
-            // R96: pin the profile through the highest-precedence channel
-            // (`squad_profile`) so the think-time resolution preserves it (a bare
-            // `movement_profile` is a RESOLVED field — the think overwrites it
-            // each tick from squad ← role ← archetype default).
+            // Pin the profile through the highest non-player channel (`squad_profile`)
+            // so the per-think resolution preserves it (a bare `movement_profile` is
+            // a RESOLVED field — overwritten each think from squad ← role ← default).
             squad_profile: Some(profile),
             ..AiBrain::new(AiStableId(0), buckets)
         };
@@ -963,54 +1126,54 @@ fn rush_settles_on_goal_vs_leisurely_coasts_past() {
             ))
             .id();
         let mut max_overshoot: f32 = 0.0;
-        let mut rest_at_400 = f32::INFINITY;
-        // R98 HOTFIX C — the anti-bang-bang probe: the peak SPEED over the
-        // final ~60 ticks of the extended run. The old full-reverse brake
-        // parked the ship on a full-authority forward/reverse oscillator at
-        // the goal; the proportional brake + deadband must leave it genuinely
-        // settled.
         let mut tail_max_speed: f32 = 0.0;
+        let mut peak_speed: f32 = 0.0;
         for tick in 0..SETTLE_TICKS {
             mirror_tick_and_run(&mut w, &mut s, tick);
             let (p, v, _) = kinematics(&w, ship);
-            // Overshoot = how far PAST the goal along the approach axis (+X).
             max_overshoot = max_overshoot.max(p.x - goal.x);
-            if tick + 1 == TICKS {
-                rest_at_400 = (goal - p).length();
-            }
+            peak_speed = peak_speed.max(v.length());
             if tick >= SETTLE_TICKS - 60 {
                 tail_max_speed = tail_max_speed.max(v.length());
             }
         }
-        (rest_at_400, max_overshoot, tail_max_speed)
+        let (fp, ..) = kinematics(&w, ship);
+        (
+            peak_speed,
+            max_overshoot,
+            tail_max_speed,
+            (goal - fp).length(),
+        )
     };
 
-    let (rush_rest, rush_overshoot, rush_tail_speed) = rest_distance(MovementProfile::Rush);
-    let (leisurely_rest, _, leisurely_tail_speed) = rest_distance(MovementProfile::Leisurely);
+    let (rush_peak, rush_overshoot, rush_tail, rush_dist) = run(MovementProfile::Rush);
+    let (leis_peak, _, leis_tail, leis_dist) = run(MovementProfile::Leisurely);
 
+    // The v_max ordering effect: Rush's higher closing-speed cap lets it reach a
+    // strictly higher peak transit speed than the unhurried Leisurely pace.
     assert!(
-        rush_rest < leisurely_rest,
-        "Rush actively brakes and settles closer ({rush_rest}) than Leisurely \
-         coasts ({leisurely_rest})"
+        rush_peak > leis_peak + 5.0,
+        "Rush cruises meaningfully faster than Leisurely (peak {rush_peak} vs {leis_peak})"
     );
-    // Neither overshoots wildly: Rush's active brake keeps it well shy of a full
-    // fly-through (a body length or two, not hundreds of units past).
+    // Neither blows past: the controller's stoppable-speed cap keeps the arrive
+    // no-overshoot for both profiles.
     assert!(
         rush_overshoot < 40.0,
         "Rush does not blow past the goal (max overshoot {rush_overshoot})"
     );
-    // R98 HOTFIX C — the anti-bang-bang guarantee: over the final ~60 ticks the
-    // ship is genuinely AT REST (speed under a small bound — the proportional
-    // brake decays into the arrive deadband and drag finishes), with NO residual
-    // full-reverse/full-forward oscillation parked on the goal.
+    // Both genuinely PARK (no residual oscillation) — the controller brakes to
+    // rest and station-keeps.
     assert!(
-        rush_tail_speed < 2.5,
-        "Rush rests settled at the goal — no residual oscillation \
-         (tail max speed {rush_tail_speed})"
+        rush_tail < 2.5,
+        "Rush rests settled at the goal (tail max speed {rush_tail})"
     );
     assert!(
-        leisurely_tail_speed < 2.5,
-        "Leisurely rests settled too (tail max speed {leisurely_tail_speed})"
+        leis_tail < 2.5,
+        "Leisurely rests settled too (tail max speed {leis_tail})"
+    );
+    assert!(
+        rush_dist < 1.5 * R96_ARRIVE_RADIUS && leis_dist < 1.5 * R96_ARRIVE_RADIUS,
+        "both profiles park on the goal (Rush {rush_dist}, Leisurely {leis_dist})"
     );
 }
 
@@ -1184,7 +1347,17 @@ fn ship_steers_around_obstacle_between_it_and_its_target() {
         .id();
     // A Brawler (close-ring) fit so the engage arm CLOSES toward the target
     // (radial > 0 → lead pursuit) and thus must transit the obstacle's line.
-    let stats = combat_stats(80.0, 30.0, 200.0);
+    // R101 S5 — pin the weapon REACH to 300 so the Brawler's `0.3·range` standoff
+    // ring (90 u → it parks at x≈310, BEYOND the obstacle's far avoid edge ≈294)
+    // sits on the FAR side of the asteroid: the unified velocity controller now
+    // actively PARKS on its ring (it no longer coasts past it), so the ring must
+    // be beyond the obstacle for the ship to genuinely transit-and-detour. (With
+    // the default ~1000 reach the 300 u ring would be at x=100, on the NEAR side
+    // — the brawler would park short of the asteroid and never need to detour.)
+    let mut stats = combat_stats(80.0, 30.0, 200.0);
+    let mut weapon = stats.weapon.expect("combat_stats is armed");
+    weapon.lifetime = 300.0 / weapon.muzzle_speed; // reach = muzzle · lifetime = 300.
+    stats.weapon = Some(weapon);
     let ai = *w.resource::<AiTuning>();
     assert_eq!(
         sim::ai::classify_archetype(&stats, &ai),
@@ -1235,91 +1408,79 @@ fn ship_steers_around_obstacle_between_it_and_its_target() {
     );
 }
 
-/// R96 Part D — THE EMPTY-FIELD GATE: a `Waypoint`/Cruise ship in a world with
-/// the `ObstacleField` ENABLED but holding NO qualifying obstacle emits intents
-/// and a trajectory BIT-identical to the same ship with NO `ObstacleField` at
-/// all (the pre-R96-D path). This is what guarantees determinism + parity — the
-/// avoidance code only ever runs when an obstacle is actually in range.
+/// R101 S3 — RETIRED→CONVERTED from `no_obstacles_is_byte_identical`. The R96-D
+/// empty-field gate is now expressed ON THE CONTROLLER PATH: the nav arm builds a
+/// `v_des`, passes it through `deflect_v_des`, then `allocate_intent`. The parity
+/// keystone is that with an EMPTY (or absent) obstacle field, `deflect_v_des`
+/// returns `v_des` UNCHANGED — so the wired controller intent is byte-identical to
+/// calling `allocate_intent` on the raw (undeflected) `v_des`. This asserts that
+/// invariant directly on the controller surface (the unit it now lives on),
+/// across a spread of velocities/headings.
 #[test]
-fn no_obstacles_is_byte_identical() {
-    const TICKS: u64 = 120;
-    let start = Vec2::new(10.0, 0.0);
-    let waypoint = Vec2::new(120.0, 40.0);
+fn nav_with_no_obstacles_matches_undeflected_path() {
+    use sim::ai::{allocate_intent, deflect_v_des, ControlStats, Facing, MoveCmd};
 
-    // `with_field`: insert the ObstacleField resource (so the build system runs)
-    // but spawn no obstacle — the empty-field gate must make this a no-op.
-    let run = |with_field: bool| -> Vec<[u32; 6]> {
-        let (mut w, mut s) = obj2_world();
-        if with_field {
-            w.insert_resource(ObstacleField::default());
-        }
-        w.spawn((PlayerShip, Position(Vec2::ZERO)));
-        let buckets = w.resource::<AiTuning>().fallback_bucket_count;
-        let brain = AiBrain {
-            waypoint: Some(waypoint),
-            think_tier: Tier::Active,
-            movement_profile: MovementProfile::Cruise,
-            ..AiBrain::new(AiStableId(0), buckets)
-        };
-        let ship = w
-            .spawn((
-                Ship,
-                ShipIntent::default(),
-                Position(start),
-                Velocity(Vec2::ZERO),
-                Heading(0.0),
-                AngularVelocity(0.0),
-                FlightAssist::On,
-                // A CollisionRadius is present (real ships carry one), exercising
-                // the own_radius path — it must still be a no-op with no obstacle.
-                CollisionRadius(4.0),
-                AiStableId(0),
-                brain,
-                AoiTier {
-                    tier: Tier::Active,
-                    since_tick: 0,
-                },
-            ))
-            .id();
-        let mut trace = Vec::with_capacity(TICKS as usize);
-        for tick in 0..TICKS {
-            mirror_tick_and_run(&mut w, &mut s, tick);
-            trace.push(state_bits(&w, ship));
-        }
-        trace
-    };
+    let ai = AiTuning::default();
+    // An ABSENT field is the `None` arm in `nav_intent`; an EMPTY field is the
+    // in-arm `deflect_v_des` empty-field gate. Both must leave `v_des` unchanged.
+    let empty = ObstacleField::default();
+    // A fitted fighter's body-frame accel authority (the controller's projection).
+    let stats = stats_with_brake(80.0, 60.0);
+    let cstats = ControlStats::from_stats(&stats);
+    let own_radius = 4.0;
+    let tau = ai.control_tau_rush;
 
-    let with_field = run(true);
-    let without_field = run(false);
-    assert_eq!(
-        with_field, without_field,
-        "an enabled-but-empty ObstacleField is BIT-identical to no field at all \
-         (the empty-field gate — the determinism keystone of R96 Part D)"
-    );
+    // A spread of (v_des, vel, heading) cases: pure +X, off-axis, a braking
+    // command (v_des below vel), and a near-zero command.
+    let cases = [
+        (Vec2::new(50.0, 0.0), Vec2::new(40.0, 0.0), 0.0_f32),
+        (Vec2::new(30.0, 20.0), Vec2::new(10.0, 5.0), 0.6),
+        (Vec2::new(0.0, 0.0), Vec2::new(35.0, 0.0), 0.1), // braking to rest
+        (Vec2::new(-25.0, 10.0), Vec2::new(5.0, -5.0), 2.4),
+    ];
+    for (v_des, vel, heading) in cases {
+        // The empty-field gate: deflection is a no-op for both an empty field…
+        let deflected = deflect_v_des(v_des, &empty, Vec2::ZERO, vel, own_radius, &ai);
+        assert_eq!(
+            deflected, v_des,
+            "empty field leaves v_des unchanged (case v_des={v_des:?})"
+        );
 
-    // And it matches the pre-R96 hand-driven Cruise baseline byte-for-byte (the
-    // same reference `cruise_profile_is_byte_identical_to_baseline` uses).
-    let mut rw = make_world();
-    let mut rs = make_schedule();
-    let reference = spawn_ai_ship(&mut rw, start, 0.0, Vec2::ZERO);
-    let mut ref_trace = Vec::with_capacity(TICKS as usize);
-    for _ in 0..TICKS {
-        let (p, v, h) = kinematics(&rw, reference);
-        let intent = if (waypoint - p).length() <= R96_ARRIVE_RADIUS {
-            ShipIntent::default()
-        } else {
-            let (dir, throttle, _) = waypoint_follow(p, v, &[waypoint], 0, R96_ARRIVE_RADIUS);
-            steer_to_intent(dir, throttle, h, v, 0.0)
-        };
-        write_intent(&mut rw, reference, intent);
-        rs.run(&mut rw);
-        ref_trace.push(state_bits(&rw, reference));
+        // …so the wired controller intent (deflect → allocate) equals the intent
+        // from allocating the RAW v_des (the undeflected path), byte for byte.
+        let wired = allocate_intent(
+            MoveCmd {
+                v_des: deflected,
+                facing: Facing::Free,
+            },
+            vel,
+            heading,
+            cstats,
+            tau,
+        );
+        let raw = allocate_intent(
+            MoveCmd {
+                v_des,
+                facing: Facing::Free,
+            },
+            vel,
+            heading,
+            cstats,
+            tau,
+        );
+        assert_eq!(
+            state_bits_of_intent(wired),
+            state_bits_of_intent(raw),
+            "the empty-field controller path is byte-identical to the undeflected \
+             allocate_intent (case v_des={v_des:?}, vel={vel:?}, heading={heading})"
+        );
     }
-    assert_eq!(
-        with_field, ref_trace,
-        "the empty-field move arm emits the SAME trajectory as the pre-R96 \
-         hand-driven Cruise baseline (byte for byte)"
-    );
+}
+
+/// Bit-level fingerprint of a `ShipIntent`'s steering channels (the fields the nav
+/// path writes), for the byte-identity assertion above.
+fn state_bits_of_intent(i: ShipIntent) -> [u32; 3] {
+    [i.forward.to_bits(), i.strafe.to_bits(), i.turn.to_bits()]
 }
 
 // ---------------------------------------------------------------------------
@@ -2026,13 +2187,26 @@ fn projectile_count(w: &mut World) -> usize {
 /// weapon envelope CLOSES to range, AIMS (the gunnery-lead alignment gate —
 /// `fire_primary` only rises pointed at the lead solution), FIRES real
 /// projectiles through `weapon_fire_system`, and DESTROYS the fitted target
-/// (carve-to-core → `Wreck`) within the ≤ 3600-tick budget.
+/// (carve-to-core → `Wreck`) within the tick budget.
+///
+/// R101 S5 — the target is STATIONARY (the moving-target hack is GONE). The
+/// brawler now KILLS a parked target via (1) AIM-AT-CORE — the gun bores the
+/// target's `core_cell` (the deepest-occlusion kill cell), not the bare grid
+/// centre, so it disconnects the actual core instead of an off-centre tunnel —
+/// and (2) the ON-BAND WEAVE — the brawler holds its ring but slowly circles
+/// (`combat_weave_frac`), raking the gun across the hull. The budget is tightened
+/// back to 3600 (~2 min @ 30 Hz), comfortably covering the carve-to-core time.
 #[test]
 fn engage_closes_aims_and_destroys_within_budget() {
     const BUDGET: u64 = 3600;
     let (mut w, mut s) = combat_world();
     w.spawn((PlayerShip, Position(Vec2::ZERO))); // Keeps the bubble Active.
 
+    // R101 S5 — the target is fully STATIONARY (the moving-target hack is GONE).
+    // The brawler kills it via the aim-at-core fix (the gun bores the `core_cell`,
+    // the deterministic kill cell, not the off-centre grid centre) plus the
+    // on-band weave (it holds its ring but slowly circles, raking the gun across
+    // the hull). A parked brawler must now disconnect a parked target's core.
     let target = spawn_weak_fitted_target(&mut w, Vec2::new(150.0, 0.0));
     let cells_at_start = w.get::<FitLayout>(target).unwrap().cells.len();
     assert!(cells_at_start > 0, "the target starts with hull cells");
@@ -2109,6 +2283,75 @@ fn engage_closes_aims_and_destroys_within_budget() {
         "the target's hull cells were carved before death"
     );
     eprintln!("[t028] engage-destroy: first fire @{fire_tick}, kill @{destroyed} ticks");
+}
+
+/// R101 S5 — THE STATIONARY-TARGET REGRESSION PROOF: a brawler vs a FULLY
+/// STATIONARY fitted target (zero velocity, dead-on-axis — the exact degenerate
+/// case the old code dodged with a moving-target hack) is DESTROYED within budget.
+/// This is the proof for both fixes together: aim-at-core (the gun bores the
+/// target's `core_cell`, the deterministic kill cell, instead of an off-centre
+/// central tunnel at the grid centre) + the on-band weave (the parked brawler
+/// holds its ring but slowly circles, raking the gun across the hull). Without
+/// either, the velocity controller parks the brawler perfectly still on the firing
+/// axis and bores one non-lethal tunnel that never disconnects the core. Asserts
+/// the target entity becomes a `Wreck` (or despawns) — it really dies.
+#[test]
+fn parked_brawler_kills_stationary_target_via_core_aim() {
+    const BUDGET: u64 = 3600;
+    let (mut w, mut s) = combat_world();
+    w.spawn((PlayerShip, Position(Vec2::ZERO))); // Keeps the bubble Active.
+
+    // A FULLY STATIONARY fitted target (spawn velocity is Vec2::ZERO; we add no
+    // drift — this is the degenerate case the fix must handle).
+    let target = spawn_weak_fitted_target(&mut w, Vec2::new(150.0, 0.0));
+    assert_eq!(
+        w.get::<Velocity>(target).unwrap().0,
+        Vec2::ZERO,
+        "the target is fully stationary (the regression case)"
+    );
+    let cells_at_start = w.get::<FitLayout>(target).unwrap().cells.len();
+    assert!(cells_at_start > 0, "the target starts with hull cells");
+
+    let stats = brawler_shooter_stats();
+    let fighter = spawn_armed_ai_fighter(&mut w, 0, Vec2::ZERO, target, stats);
+
+    let mut destroyed_at: Option<u64> = None;
+    let mut cells_carved = false;
+    for tick in 0..BUDGET {
+        mirror_tick_and_run(&mut w, &mut s, tick);
+        if tick == 0 {
+            assert_eq!(
+                brain_of(&w, fighter).behavior,
+                Behavior::Engage,
+                "live fitted target → Engage"
+            );
+        }
+        if let Some(layout) = w.get::<FitLayout>(target) {
+            cells_carved |= layout.cells.len() < cells_at_start;
+        }
+        if w.get::<Wreck>(target).is_some() || w.get_entity(target).is_err() {
+            destroyed_at = Some(tick);
+            break;
+        }
+    }
+
+    let destroyed = destroyed_at.unwrap_or_else(|| {
+        panic!(
+            "the brawler destroys the STATIONARY target within {BUDGET} ticks \
+             (aim-at-core + weave) — cells {} of {cells_at_start} left",
+            w.get::<FitLayout>(target).map_or(0, |l| l.cells.len())
+        )
+    });
+    assert!(
+        cells_carved,
+        "the stationary target's hull was carved before death"
+    );
+    // The target really died: it is a Wreck (or already despawned to a bare id).
+    assert!(
+        w.get::<Wreck>(target).is_some() || w.get_entity(target).is_err(),
+        "the stationary target is destroyed (Wreck / gone)"
+    );
+    eprintln!("[r101s5] parked-brawler kill: stationary target dead @{destroyed} ticks");
 }
 
 /// OBJ4-VC1 second half / TR-011 [COMPLETES TR-011]: the fire gates. The same
@@ -2726,16 +2969,209 @@ fn kite_stance_opens_range_when_closed_and_faces_target() {
     );
 }
 
-/// R97 Phase 1 Stage C — THE EMERGENCE: a FIGHTING RETREAT (open range while
-/// facing + firing on the pursuer) emerges from the independent MOVE/AIM/FIRE
-/// channels alone — NO dedicated `FightingRetreat` behavior exists. An armed ship
-/// pinned to `Retreat` against an in-range armed pursuer must, over a window:
-/// (a) OPEN the range (distance to the pursuer grows), (b) FIRE on the aligned
-/// ticks (the weapons-free rule: AIM on the hostile + aligned + gates pass),
-/// (c) keep its NOSE on the pursuer (the AIM channel), and (d) stay `Retreat`
-/// THROUGHOUT (proving emergence, not a new behavior). Run for BOTH a
+/// R101 S5 — the ORBIT desired-velocity field holds the ring with the gun on
+/// target for a `can_strafe` hull: starting OUTSIDE its ring, an Orbit{ccw}
+/// orbiter (strafe authority) settles to ~`orbit_radius_frac · standoff` range,
+/// circles it (non-zero tangential speed — signed angular progress), AND keeps
+/// its nose on the target throughout (the orbit SIDLE — the lateral `v_des`
+/// lands on the strafe channel with the nose pinned to `Aim(lead)`, so the gun
+/// bears while the ship circles). The forward-only orbit-by-turning case is the
+/// separate `orbit_stance_produces_tangential_curving_motion_at_standoff`.
+#[test]
+fn orbit_holds_ring_via_desired_velocity() {
+    const TICKS: u64 = 2400;
+    const SETTLE: u64 = 600; // Reach + settle onto the ring before measuring.
+    let (mut w, mut s) = obj2_world();
+    w.insert_resource(AiTuning {
+        aoi_radius_active: 100_000.0,
+        aoi_radius_mid: 200_000.0,
+        ..AiTuning::default()
+    });
+    w.spawn((PlayerShip, Position(Vec2::ZERO)));
+    let target_pos = Vec2::ZERO;
+    let target = w
+        .spawn((Position(target_pos), Velocity(Vec2::ZERO), Heading(0.0)))
+        .id();
+    // A slow, glass, armed Orbiter — but WITH strafe authority, so the orbit
+    // sidle emerges on the strafe channel and the nose stays on target.
+    let mut stats = combat_stats(40.0, 30.0, 0.0);
+    stats.can_strafe = true;
+    let ai = *w.resource::<AiTuning>();
+    let archetype = sim::ai::classify_archetype(&stats, &ai);
+    assert_eq!(
+        archetype,
+        FitArchetype::Orbiter,
+        "the orbit fit is an Orbiter"
+    );
+    let range = weapon_range(Some(&stats)).expect("armed");
+    let standoff = standoff_distance(archetype, range) * ai.orbit_radius_frac;
+    // Start OUTSIDE the ring (so it must settle IN) and facing tangentially.
+    let start = Vec2::new(standoff * 1.6, 0.0);
+    let ship = spawn_stance_combat_ship(
+        &mut w,
+        0,
+        start,
+        std::f32::consts::FRAC_PI_2,
+        Vec2::ZERO,
+        target,
+        stats,
+        CombatStance::Orbit { ccw: true },
+    );
+
+    let mut accum = 0.0f32;
+    let mut prev = bearing_around(target_pos, start);
+    let mut radii: Vec<f32> = Vec::new();
+    let mut aligned = 0usize;
+    let mut samples = 0usize;
+    for tick in 0..TICKS {
+        mirror_tick_and_run(&mut w, &mut s, tick);
+        assert_eq!(brain_of(&w, ship).behavior, Behavior::Engage);
+        let p = pos_of(&w, ship);
+        let b = bearing_around(target_pos, p);
+        if tick >= SETTLE {
+            accum += wrap_angle(b - prev);
+            radii.push((p - target_pos).length());
+            let to_t = (target_pos - p).normalize_or_zero();
+            let nose = Vec2::from_angle(w.get::<Heading>(ship).unwrap().0);
+            samples += 1;
+            if nose.dot(to_t) > 0.8 {
+                aligned += 1;
+            }
+        }
+        prev = b;
+    }
+    let mean_r = radii.iter().copied().sum::<f32>() / radii.len() as f32;
+    let aligned_frac = aligned as f32 / samples.max(1) as f32;
+
+    // Settles to ~standoff range (a tight ±35% band — it HOLDS the ring).
+    assert!(
+        (0.65 * standoff..=1.35 * standoff).contains(&mean_r),
+        "the strafe-orbiter settles to ~its {standoff}-u ring (mean radius {mean_r:.1})"
+    );
+    // Circles it (clear signed angular progress — non-zero tangential speed).
+    assert!(
+        accum.abs() > 0.5,
+        "the orbiter circles its ring (signed angular progress {accum:.2} rad)"
+    );
+    // And keeps the gun on the target the whole time (the sidle — nose pinned).
+    assert!(
+        aligned_frac > 0.8,
+        "the strafe-orbiter keeps its nose on the target while circling (aligned {aligned_frac:.2})"
+    );
+    eprintln!(
+        "[r101s5] orbit-hold: mean radius {mean_r:.1} (ring {standoff:.1}), progress {accum:.2} rad, nose-on {aligned_frac:.2}"
+    );
+}
+
+/// R101 S5 — the STANDOFF desired-velocity field arrives at the ring and HOLDS it
+/// WHILE WEAVING (the on-band combat weave replaces the legacy dead-stop): starting
+/// outside its standoff ring, a Standoff ship closes to ~standoff range and HOLDS
+/// THE RING — the weave is purely TANGENTIAL, so the radius stays in the band
+/// (range ~constant) — while slowly CIRCLING (non-zero tangential progress, so it
+/// is never a sitting duck and the gun rakes the hull), nose on the target the
+/// whole time (`Aim(lead)`), so the gun bears as it weaves. A `can_strafe` hull so
+/// the tangential weave lands on the strafe channel with the nose pinned (the
+/// forward-only weave-by-turning is covered by the orbit-by-turning fixture).
+#[test]
+fn standoff_holds_ring_while_weaving() {
+    const TICKS: u64 = 2400;
+    const TAIL: u64 = 600; // The settled tail (holding the ring while weaving).
+    let (mut w, mut s) = obj2_world();
+    w.insert_resource(AiTuning {
+        aoi_radius_active: 100_000.0,
+        aoi_radius_mid: 200_000.0,
+        ..AiTuning::default()
+    });
+    w.spawn((PlayerShip, Position(Vec2::ZERO)));
+    let target_pos = Vec2::ZERO;
+    let target = w
+        .spawn((Position(target_pos), Velocity(Vec2::ZERO), Heading(0.0)))
+        .id();
+    // A Support fit → Standoff stance (hold the ring, guns on target) WITH strafe
+    // authority, so the on-band tangential weave lands on the strafe channel and
+    // the nose stays pinned to the target (`Aim(lead)`) while the ship circles.
+    let mut stats = combat_stats(60.0, 10.0, 0.0);
+    stats.can_strafe = true;
+    let ai = *w.resource::<AiTuning>();
+    let archetype = sim::ai::classify_archetype(&stats, &ai);
+    let range = weapon_range(Some(&stats)).expect("armed");
+    let standoff = standoff_distance(archetype, range);
+    // Start WELL outside the ring (so it must close in to settle on it).
+    let start = Vec2::new(standoff * 2.0, 0.0);
+    let ship = spawn_stance_combat_ship(
+        &mut w,
+        0,
+        start,
+        std::f32::consts::PI, // facing AWAY → it must turn to face the target.
+        Vec2::ZERO,
+        target,
+        stats,
+        CombatStance::Standoff,
+    );
+
+    let mut radii: Vec<f32> = Vec::new();
+    let mut aligned = 0usize;
+    let mut samples = 0usize;
+    let mut accum = 0.0f32;
+    let mut prev = bearing_around(target_pos, start);
+    for tick in 0..TICKS {
+        mirror_tick_and_run(&mut w, &mut s, tick);
+        assert_eq!(brain_of(&w, ship).behavior, Behavior::Engage);
+        let p = pos_of(&w, ship);
+        let b = bearing_around(target_pos, p);
+        if tick >= TICKS - TAIL {
+            radii.push((p - target_pos).length());
+            accum += wrap_angle(b - prev);
+            let to_t = (target_pos - p).normalize_or_zero();
+            let nose = Vec2::from_angle(w.get::<Heading>(ship).unwrap().0);
+            samples += 1;
+            if nose.dot(to_t) > 0.9 {
+                aligned += 1;
+            }
+        }
+        prev = b;
+    }
+    let mean_r = radii.iter().copied().sum::<f32>() / radii.len() as f32;
+    let aligned_frac = aligned as f32 / samples.max(1) as f32;
+
+    // HOLDS THE RING at ~its standoff range — the weave is purely tangential, so
+    // the radius stays in the band (±25%); range ~constant despite the circling.
+    assert!(
+        (0.75 * standoff..=1.25 * standoff).contains(&mean_r),
+        "the standoff ship holds ~its {standoff}-u ring while weaving (mean radius {mean_r:.1})"
+    );
+    // WEAVES: non-zero tangential progress over the tail (it slowly circles its
+    // ring — never a sitting duck, the gun rakes the hull).
+    assert!(
+        accum.abs() > 0.1,
+        "the standoff ship weaves (non-zero tangential progress {accum:.2} rad)"
+    );
+    // Nose on the target the whole settled tail (the gun bears while it weaves).
+    assert!(
+        aligned_frac > 0.9,
+        "the weaving standoff ship faces the target (aligned {aligned_frac:.2})"
+    );
+    eprintln!(
+        "[r101s5] standoff-weave: mean radius {mean_r:.1} (ring {standoff:.1}), tangential {accum:.2} rad, nose-on {aligned_frac:.2}"
+    );
+}
+
+/// R97 Phase 1 Stage C → R101 S6 — THE EMERGENCE (RE-VERIFIED on the unified
+/// controller): a FIGHTING RETREAT (open range while facing + firing on the
+/// pursuer) emerges from `(opening v_des, Facing::Aim(threat))` alone — NO
+/// dedicated `FightingRetreat` behavior exists. S6 swapped the survival arms from
+/// `compose_intent_aimed` to `survival_intent` → `allocate_intent`: the flee
+/// direction becomes the DESIRED VELOCITY (away/home, scaled to pace) and the
+/// nose is PINNED to the threat (`Aim`), so the controller reverse-brakes
+/// (forward-only hull) or strafes (`can_strafe` hull) to realize the opening
+/// `v_des` while the gun bears. This asserts the PROPERTY, not the mechanism:
+/// an armed ship pinned to `Retreat` against an in-range armed pursuer must, over
+/// a window: (a) OPEN the range (distance to the pursuer grows), (b) FIRE on the
+/// aligned ticks (the weapons-free rule: `Aim` on the hostile + aligned + gates
+/// pass), (c) keep its NOSE on the pursuer (the `Aim` facing), and (d) stay
+/// `Retreat` THROUGHOUT (proving emergence, not a new behavior). Run for BOTH a
 /// forward-only hull (reverse-thrust retrograde) and a `can_strafe` hull (lateral
-/// strafe).
+/// strafe) — the controller produces each from the SAME `(v_des, Aim)` command.
 #[test]
 fn fighting_retreat_emerges_without_a_dedicated_behavior() {
     // (strafe, home) — forward-only flees directly away (reverse-drift); the
@@ -3039,9 +3475,18 @@ fn collision_preempts_attack_run() {
         let target = w
             .spawn((Position(target_pos), Velocity(Vec2::ZERO), Heading(0.0)))
             .id();
-        // A Brawler (close-ring) so the engage arm CLOSES toward the target —
-        // it must transit the obstacle's line when the obstacle is on it.
-        let stats = combat_stats(80.0, 30.0, 200.0);
+        // A Brawler (close-ring) so the engage arm CLOSES toward the target — it
+        // must transit the obstacle's line when the obstacle is on it. R101 S5 —
+        // pin the weapon REACH to 300 (Brawler ring `0.3·300` = 90 u → it parks at
+        // x≈310, BEYOND the obstacle's far avoid edge ≈294) so the unified
+        // velocity controller, which now actively PARKS on its ring instead of
+        // coasting past it, still has to charge THROUGH the obstacle to reach its
+        // ring (with the default ~1000 reach the ring would be at x=100, short of
+        // the asteroid, and the ship would never need to break off).
+        let mut stats = combat_stats(80.0, 30.0, 200.0);
+        let mut weapon = stats.weapon.expect("combat_stats is armed");
+        weapon.lifetime = 300.0 / weapon.muzzle_speed;
+        stats.weapon = Some(weapon);
         let ai = *w.resource::<AiTuning>();
         assert_eq!(
             sim::ai::classify_archetype(&stats, &ai),
@@ -3117,7 +3562,11 @@ fn collision_preempts_attack_run() {
 /// path is bit-identical across fresh rebuilds (V-3/V-6, strict-f32).
 #[test]
 fn channel_fusion_is_deterministic() {
-    const TICKS: u64 = 200;
+    // R101 S5 — the unified velocity controller actively PARKS on its ring (no
+    // coast-past), so the run needs enough ticks for the Brawler to charge up to
+    // the obstacle, break off, and round it (the deflection — the MEANINGFULNESS
+    // half — happens as it transits the asteroid, ~tick 800+, not at spawn).
+    const TICKS: u64 = 1000;
     let start = Vec2::new(0.0, 0.0);
     let target_pos = Vec2::new(400.0, 0.0);
     let obstacle_pos = Vec2::new(180.0, 0.0); // On the charge line → imminent.
@@ -3143,7 +3592,13 @@ fn channel_fusion_is_deterministic() {
                 Heading(0.0),
             ))
             .id();
-        let stats = combat_stats(80.0, 30.0, 200.0); // armed Brawler (fires).
+        // Armed Brawler (fires). Reach pinned to 300 so its `0.3·300` = 90 u ring
+        // sits BEYOND the obstacle's far avoid edge (≈274) — the ship must charge
+        // through the asteroid to reach its ring, exercising the break-off.
+        let mut stats = combat_stats(80.0, 30.0, 200.0);
+        let mut weapon = stats.weapon.expect("combat_stats is armed");
+        weapon.lifetime = 300.0 / weapon.muzzle_speed;
+        stats.weapon = Some(weapon);
         let fighter = spawn_brain_combat_ship(&mut w, 0, start, 0.0, Vec2::ZERO, target, stats);
         w.entity_mut(fighter).insert(CollisionRadius(4.0));
 
@@ -5803,118 +6258,83 @@ fn commanded_move_parks_without_orbit() {
     );
 }
 
-/// R100 L2 — a WEAK-RETRO ship on a long, fast transit FLIPS to a retrograde
-/// (flip-and-burn) brake: the heading passes within ~25° of (−vel) at some
-/// braking tick, and it parks in LESS distance than a control run with the
-/// orientation toggle OFF (which reverse-brakes nose-on against the weak retros).
+/// R101 S2 — the unified controller supersedes R100's commanded-ship braking-
+/// orientation heuristic: flip-and-burn is now EMERGENT (`Facing::Free`), not a
+/// toggled branch. A WEAK-RETRO Generic fighter commanded (`PlayerOrder::move_to`,
+/// resolves Rush → the S2 controller path) on a long, fast transit turns its nose
+/// RETROGRADE while braking — the heading passes within ~30° of (−vel) at some
+/// closing brake tick (flip-and-burn EMERGES) — and PARKS on the goal. The
+/// `brake_orient_enabled` knob no longer governs commanded moves, so the toggle-
+/// control run and the "flip parks tighter" comparison are gone. (Scenario-Rush
+/// ships still exercise the R100 brake path until S6 — see
+/// `rush_settles_on_goal_vs_leisurely_coasts_past`.)
 #[test]
-fn long_fast_transit_flips_to_retrograde_brake() {
+fn commanded_long_transit_flips_to_retrograde_brake() {
     const TICKS: u64 = 2400;
     let start = Vec2::new(0.0, 0.0);
     let goal = Vec2::new(600.0, 0.0);
     // thrust:reverse ≈ 6:1 — a weak retro the flip clearly pays to escape.
     let stats = stats_with_brake(120.0, 20.0);
 
-    // The run captures: did the nose ever align with retrograde during braking,
-    // and the rest distance at the end.
-    let run = |enabled: bool| -> (bool, f32) {
-        let (mut w, mut s) = commanded_world(AiTuning {
-            brake_orient_enabled: enabled,
-            ..AiTuning::default()
-        });
-        let ship = spawn_commanded_mover(&mut w, 0, start, goal, stats);
-        let goal_dir = (goal - start).normalize_or_zero();
-        let mut saw_retrograde = false;
-        for tick in 0..TICKS {
-            mirror_tick_and_run(&mut w, &mut s, tick);
-            let (p, v, h) = kinematics(&w, ship);
-            // A genuine flip-and-burn tick: still CLOSING on the goal and not yet
-            // past it (p.x < goal.x), moving fast — yet the nose already points
-            // retrograde. (Restricting to the closing phase rejects the post-
-            // overshoot "nose turns back toward the goal" case, where a goal-facing
-            // nose happens to align with −vel while the ship recedes past the goal.)
-            let v_close = v.dot(goal_dir);
-            if v_close > 20.0 && p.x < goal.x {
-                let retro = (-v).normalize_or_zero();
-                let nose = Vec2::from_angle(h);
-                if retro != Vec2::ZERO && nose.dot(retro) > 0.906 {
-                    // cos(25°) ≈ 0.906
-                    saw_retrograde = true;
-                }
+    let (mut w, mut s) = commanded_world(AiTuning::default());
+    let ship = spawn_commanded_mover(&mut w, 0, start, goal, stats);
+    let goal_dir = (goal - start).normalize_or_zero();
+
+    let mut saw_retrograde = false;
+    for tick in 0..TICKS {
+        mirror_tick_and_run(&mut w, &mut s, tick);
+        let (p, v, h) = kinematics(&w, ship);
+        // A genuine flip-and-burn tick: still CLOSING on the goal at a real speed
+        // (`v_close > 15`, well above any near-stop micro-adjust on this 120-u/s
+        // transit) and not yet past it along the approach axis
+        // (`along < goal_along`) — yet the nose already points retrograde.
+        // (Restricting to the closing phase rejects a post-overshoot re-approach,
+        // where a goal-facing nose happens to align with −vel while the ship recedes
+        // past the goal.)
+        let v_close = v.dot(goal_dir);
+        let along = p.dot(goal_dir);
+        let goal_along = goal.dot(goal_dir);
+        if v_close > 15.0 && along < goal_along {
+            let retro = (-v).normalize_or_zero();
+            let nose = Vec2::from_angle(h);
+            if retro != Vec2::ZERO && nose.dot(retro) > 0.87 {
+                // cos(30°) ≈ 0.866 — the heading is within ~30° of retrograde.
+                saw_retrograde = true;
             }
         }
-        let (fp, _, _) = kinematics(&w, ship);
-        (saw_retrograde, (goal - fp).length())
-    };
+    }
 
-    let (flipped, on_rest) = run(true);
-    let (toggle_off_flipped, off_rest) = run(false);
-
+    let (fp, fv, _) = kinematics(&w, ship);
     assert!(
-        flipped,
-        "the weak-retro ship turns its nose retrograde (flip-and-burn) while braking"
+        saw_retrograde,
+        "the weak-retro commanded ship turns its nose retrograde (flip-and-burn) \
+         while braking — emergent from the unified `Facing::Free` controller"
     );
     assert!(
-        !toggle_off_flipped,
-        "the toggle-off control reverse-brakes nose-on (never flips)"
+        (goal - fp).length() < 1.5 * R96_ARRIVE_RADIUS,
+        "the flip-and-burn brake parks on the goal (final dist {})",
+        (goal - fp).length()
     );
     assert!(
-        on_rest < off_rest,
-        "flip-and-burn parks tighter than the nose-on weak-retro brake \
-         (flip {on_rest} < nose-on {off_rest})"
+        fv.length() < 2.5,
+        "the tail is settled at rest (final speed {})",
+        fv.length()
     );
 }
 
-/// R100 L2 — a short hop (closing speed never reaches `flip_min_speed`) and a
-/// strong-retro (ratio 1.0) ship on a long move BOTH keep the nose on the goal
-/// (no 180° flip) throughout braking.
-#[test]
-fn short_hop_or_strong_reverse_does_not_flip() {
-    // The maximum nose-off-goal angle (deg) seen while braking-and-CLOSING on a
-    // given move. The window is restricted to the closing approach (still short of
-    // the goal along the axis) so a post-overshoot "nose turns back toward the now-
-    // behind goal" swing — a legitimate goal-facing re-approach, not a flip — is
-    // never miscounted as a 180° flip.
-    let max_brake_nose_offset = |goal: Vec2, stats: sim::fitting::ShipStats| -> f32 {
-        const TICKS: u64 = 1200;
-        let (mut w, mut s) = commanded_world(AiTuning::default());
-        let ship = spawn_commanded_mover(&mut w, 0, Vec2::ZERO, goal, stats);
-        let goal_dir = goal.normalize_or_zero();
-        let mut max_off: f32 = 0.0;
-        for tick in 0..TICKS {
-            mirror_tick_and_run(&mut w, &mut s, tick);
-            let (p, v, h) = kinematics(&w, ship);
-            // A braking-and-closing tick: inside the stop region, still moving
-            // toward the goal and not yet past it along the approach axis.
-            let v_close = v.dot(goal_dir);
-            let along = p.dot(goal_dir);
-            let goal_along = goal.dot(goal_dir);
-            if (goal - p).length() < 60.0 && v_close > 1.0 && along < goal_along {
-                let nose = Vec2::from_angle(h);
-                let cos = nose.dot(goal_dir).clamp(-1.0, 1.0);
-                max_off = max_off.max(cos.acos().to_degrees());
-            }
-        }
-        max_off
-    };
-
-    // (a) A short hop: v_close never reaches flip_min_speed (15) on a 30-u move.
-    let short = max_brake_nose_offset(Vec2::new(30.0, 0.0), stats_with_brake(80.0, 12.0));
-    assert!(
-        short < 30.0,
-        "short hop never flips — nose stays on goal (max offset {short}°)"
-    );
-
-    // (b) A ratio-1.0 ship (thrust == reverse) on a long move: retros strong
-    // enough → never flips even at speed.
-    let mut equal = stats_with_brake(80.0, 80.0); // reverse == thrust → ratio 1.0
-    equal.reverse_force = equal.thrust_force; // pin exactly equal
-    let strong = max_brake_nose_offset(Vec2::new(300.0, 0.0), equal);
-    assert!(
-        strong < 30.0,
-        "ratio-1.0 ship never flips — nose stays on goal (max offset {strong}°)"
-    );
-}
+// R101 S2 — RETIRED. The premise of the old `short_hop_or_strong_reverse_does_
+// not_flip` test (R100's no-flip-on-short/strong-reverse policy for commanded
+// moves) is superseded by the unified controller: a commanded move routes through
+// `allocate_intent` with `Facing::Free`, so the nose tracks the required accel and
+// flip-and-burn EMERGES whenever the ship brakes from real speed — regardless of
+// the retro ratio. The only commanded "move" that never flips is one that never
+// traverses (goal within ARRIVE_RADIUS, so v_des stays 0 and the ship is already
+// parked) — which can't "settle AT the goal", so there is no tiny-traversing-move
+// no-flip regime to assert. The genuine no-spin guarantee (v_des = 0, no
+// normalize-noise spin on a zero accel) is covered by the
+// `control::tests::parked_ship_does_not_spin` unit test. Scenario-Rush ships still
+// exercise the R100 brake path (no flip on short/strong-reverse) until S6 — see
+// `goal_facing_brake_matches_r98_when_no_threat_and_aligned`.
 
 /// R100 L2 — an armed ally commanded to a point near a parked hostile keeps its
 /// nose ON the threat while braking (threat-facing wins the AIM channel over both
@@ -5964,75 +6384,15 @@ fn move_toward_point_near_hostile_keeps_nose_on_threat() {
     let _ = hostile; // entity handle kept for clarity
 }
 
-/// R100 L2 — a `can_strafe` ship braking toward a point with a hostile off to the
-/// SIDE: the nose tracks the threat (decoupled from the goal), the brake (away
-/// from the goal) projects laterally onto the threat-facing nose → the STRAFE
-/// channel carries part of the deceleration. No 180° flip (the threat is to the
-/// side, not retrograde) and it parks. This exercises the decoupled aimed-compose
-/// path of the braking seam for a strafe hull.
-#[test]
-fn strafe_ship_brakes_without_flipping() {
-    let (mut w, mut s) = roles_world();
-    let goal = Vec2::new(300.0, 0.0);
-    // A hostile off to the SIDE of the goal (≈90° off the approach axis), within
-    // brake_threat_range (250) of the goal → captures the AIM channel while
-    // braking. The threat-facing nose + the away-from-goal brake are not collinear
-    // → the brake projects onto the strafe channel.
-    let hostile_pos = Vec2::new(300.0, 120.0);
-
-    let ship = spawn_roled_ship(
-        &mut w,
-        0,
-        Faction::Red,
-        Vec2::ZERO,
-        ScenarioRole::new(
-            RoleGoal::PatrolRoute(vec![Vec2::new(-200.0, 0.0)]),
-            Posture::FreeEngage,
-        ),
-        true,
-    );
-    // Grant strafe authority to the armed fighter's derived stats.
-    w.get_mut::<sim::fitting::ShipStats>(ship)
-        .expect("armed ship has ShipStats")
-        .can_strafe = true;
-    w.entity_mut(ship).insert(PlayerOrder::move_to(goal));
-    let _hostile = spawn_hostile_body(&mut w, Faction::Blue, hostile_pos, 5.0);
-
-    let goal_dir = goal.normalize_or_zero();
-    let mut max_nose_off_goal: f32 = 0.0;
-    let mut saw_strafe = false;
-    let mut parked = false;
-    for tick in 0..2400 {
-        mirror_tick_and_run(&mut w, &mut s, tick);
-        let (p, v, h) = kinematics(&w, ship);
-        let intent = *w.get::<ShipIntent>(ship).expect("ship has ShipIntent");
-        let v_close = v.dot(goal_dir);
-        let along = p.dot(goal_dir);
-        let goal_along = goal.dot(goal_dir);
-        if (goal - p).length() < 60.0 && v_close > 1.0 && along < goal_along {
-            let nose = Vec2::from_angle(h);
-            let cos = nose.dot(goal_dir).clamp(-1.0, 1.0);
-            max_nose_off_goal = max_nose_off_goal.max(cos.acos().to_degrees());
-            if intent.strafe.abs() > 1e-3 {
-                saw_strafe = true;
-            }
-        }
-        if (goal - p).length() <= 1.5 * R96_ARRIVE_RADIUS {
-            parked = true;
-        }
-    }
-    assert!(
-        max_nose_off_goal < 135.0,
-        "the strafe ship never swings a full 180° while closing (max nose off goal \
-         {max_nose_off_goal}°)"
-    );
-    assert!(
-        saw_strafe,
-        "the strafe channel is non-zero while braking (lateral brake via the \
-         decoupled aimed-compose)"
-    );
-    assert!(parked, "the strafe ship parks near the goal");
-}
+// R101 S2 — RETIRED. The old `strafe_ship_brakes_without_flipping` test asserted
+// a strafe-brake-WITHOUT-flip for a commanded move, but that is an Aim-facing
+// COMBAT behavior (the nose is CONSTRAINED to a threat, so the away-from-goal
+// brake projects onto the strafe channel instead of flipping). The unified S2
+// controller drives a PURE positional move with `Facing::Free`: the nose tracks
+// the required accel, so it correctly flip-and-burns regardless of strafe
+// capability. The constrained-facing strafe-brake is to be re-expressed in R101 S5
+// (Aim-facing combat), where the threat pins the nose. Scenario-Rush ships still
+// exercise the R100 brake path until S6.
 
 /// R100 L1 — a USER-pinned profile beats the park default: `move_to(p)` with
 /// `.with_profile(Leisurely)` resolves to Leisurely every think (the Rush default
@@ -6056,69 +6416,152 @@ fn user_profile_override_beats_park_default() {
     }
 }
 
-/// R100 PARITY (CRITICAL) — the toggle-OFF braking path is byte-for-byte the
-/// pre-R100 R98 reverse-brake primitive: a commanded Rush move with
-/// `brake_orient_enabled=false` produces a trajectory BIT-identical to a run that
-/// forces goal-facing (the literal `compose_intent` primitive). Both runs are the
-/// disabled path here, so this also proves the disabled path is deterministic and
-/// equals the goal-facing primitive.
+// R101 S6 — RETIRED (×2). `brake_orient_disabled_matches_r98` and
+// `goal_facing_brake_matches_r98_when_no_threat_and_aligned` pinned the SUPERSEDED
+// R98/R100 `brake_orientation` / `compose_intent` reverse-brake byte-baseline via
+// the `brake_orient_enabled` toggle. After R101 S3 (nav), S5 (combat), and S6
+// (survival) every behavior arm routes its braking through the unified
+// `allocate_intent` controller, so that toggle NO LONGER governs any motion: both
+// of these tests had decayed to comparing two byte-identical controller runs
+// (asserting the superseded heuristic's equivalence to itself), testing nothing.
+// The controller's braking is covered by the live property tests
+// (`commanded_mover_arrives_and_parks`, `commanded_long_transit_flips_to_retrograde_brake`,
+// `rush_settles_closer_than_leisurely`) and the determinism trio. The
+// `brake_orientation` fn + the `brake_orient_enabled` knob are deleted in S7.
+
+// ---------------------------------------------------------------------------
+// R101 S2 — a COMMANDED positional move (PlayerOrder MoveTo/HoldAt/Patrol) now
+// routes through the unified controller (`ai::control::allocate_intent`): it
+// arrives-and-parks with emergent flip-and-burn, gated to commanded ships ONLY
+// (scenario nav stays byte-identical — see `cruise_profile_is_byte_identical`).
+// These run the FULL fixed schedule (think + execute + flight), so the gating +
+// early-dispatch + the controller's stoppable-speed arrive are exercised live.
+// ---------------------------------------------------------------------------
+
+/// R101 S2 — THE PROOF the controller path parks: a Generic fighter under a bare
+/// `PlayerOrder::move_to(P)` (resolves Rush → routes through `allocate_intent`)
+/// flies to P and PARKS — final distance < 1.5×ARRIVE_RADIUS, final speed < 2.5,
+/// max overshoot < 40, and NO limit-cycle (the along-axis tail does not swing /
+/// the along-axis velocity does not repeatedly flip sign). Mirrors the R100
+/// `commanded_move_parks_without_orbit` shape but runs the NEW controller path.
 #[test]
-fn brake_orient_disabled_matches_r98() {
-    const TICKS: u64 = 1200;
+fn commanded_mover_arrives_and_parks() {
+    const TICKS: u64 = 2400;
+    let start = Vec2::new(0.0, 0.0);
     let goal = Vec2::new(220.0, 0.0);
     let stats = stats_with_brake(80.0, 60.0);
 
-    let disabled_run = || {
-        let (mut w, mut s) = commanded_world(AiTuning {
-            brake_orient_enabled: false,
-            ..AiTuning::default()
-        });
-        let ship = spawn_commanded_mover(&mut w, 0, Vec2::ZERO, goal, stats);
-        let mut trace = Vec::with_capacity(TICKS as usize);
-        for tick in 0..TICKS {
-            mirror_tick_and_run(&mut w, &mut s, tick);
-            trace.push(state_bits(&w, ship));
-        }
-        trace
-    };
+    let (mut w, mut s) = commanded_world(AiTuning::default());
+    let ship = spawn_commanded_mover(&mut w, 0, start, goal, stats);
 
+    // First think resolves the bare MoveTo to Rush (the park profile the
+    // controller's `control_params` reads for v_max/tau).
+    mirror_tick_and_run(&mut w, &mut s, 0);
     assert_eq!(
-        disabled_run(),
-        disabled_run(),
-        "the toggle-off braking path is deterministic AND the literal R98 \
-         goal-facing reverse-brake primitive (bit-identical)"
+        brain_of(&w, ship).movement_profile,
+        MovementProfile::Rush,
+        "a bare commanded MoveTo resolves to Rush (the controller's pace profile)"
+    );
+
+    let mut max_overshoot: f32 = 0.0;
+    let mut tail_along: Vec<f32> = Vec::new();
+    let mut tail_speed: f32 = 0.0;
+    let mut tail_vx_signs: Vec<i32> = Vec::new();
+    for tick in 1..TICKS {
+        mirror_tick_and_run(&mut w, &mut s, tick);
+        let (p, v, _) = kinematics(&w, ship);
+        max_overshoot = max_overshoot.max(p.x - goal.x); // how far PAST the goal (+X)
+        if tick >= TICKS - 60 {
+            tail_along.push(p.x - goal.x);
+            tail_speed = tail_speed.max(v.length());
+            tail_vx_signs.push(if v.x > 0.05 {
+                1
+            } else if v.x < -0.05 {
+                -1
+            } else {
+                0
+            });
+        }
+    }
+
+    let (fp, _, _) = kinematics(&w, ship);
+    let final_dist = (goal - fp).length();
+    assert!(
+        final_dist < 1.5 * R96_ARRIVE_RADIUS,
+        "the controller path parks within 1.5×ARRIVE_RADIUS (final dist {final_dist})"
+    );
+    assert!(
+        max_overshoot < 40.0,
+        "no blow-through past the goal (max overshoot {max_overshoot})"
+    );
+    assert!(
+        tail_speed < 2.5,
+        "the tail is settled — no residual oscillation (tail speed {tail_speed})"
+    );
+    // NO limit-cycle: the along-goal-axis position holds a tight band and the
+    // along-axis velocity does not repeatedly flip sign (the loop signature).
+    let along_min = tail_along.iter().copied().fold(f32::INFINITY, f32::min);
+    let along_max = tail_along.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    assert!(
+        along_max - along_min < 5.0,
+        "no along-axis oscillation in the tail (swing {})",
+        along_max - along_min
+    );
+    let sign_flips = tail_vx_signs
+        .windows(2)
+        .filter(|w| w[0] != 0 && w[1] != 0 && w[0] != w[1])
+        .count();
+    assert!(
+        sign_flips <= 1,
+        "no repeated along-axis velocity sign flips (limit-cycle), got {sign_flips}"
     );
 }
 
-/// R100 PARITY (CRITICAL) — with the toggle ON, a STRONG-retro (ratio < 1.5) ship
-/// with no threat NEVER flips, so the goal-facing branch reuses the LITERAL R98
-/// `compose_intent` primitive → its trajectory is byte-identical to the toggle-OFF
-/// run. Proves the default braking case stays bit-identical post-R100.
+/// R101 S2 — a `PlayerOrder::hold_at(anchor, r)` (the think pins `brain.home` +
+/// `brain.waypoint` to the anchor) routes through the controller and PARKS ON the
+/// anchor: within ARRIVE_RADIUS of it, at rest. Confirms the HoldAt positional
+/// kind takes the new path and settles on the held point.
 #[test]
-fn goal_facing_brake_matches_r98_when_no_threat_and_aligned() {
-    const TICKS: u64 = 1200;
-    let goal = Vec2::new(220.0, 0.0);
-    // ratio 80/60 ≈ 1.33 < 1.5 → brake_orientation early-outs to goal-facing.
+fn commanded_hold_at_parks_on_anchor() {
+    const TICKS: u64 = 2400;
+    let start = Vec2::new(0.0, 0.0);
+    let anchor = Vec2::new(180.0, 60.0);
     let stats = stats_with_brake(80.0, 60.0);
 
-    let run = |enabled: bool| {
-        let (mut w, mut s) = commanded_world(AiTuning {
-            brake_orient_enabled: enabled,
-            ..AiTuning::default()
-        });
-        let ship = spawn_commanded_mover(&mut w, 0, Vec2::ZERO, goal, stats);
-        let mut trace = Vec::with_capacity(TICKS as usize);
-        for tick in 0..TICKS {
-            mirror_tick_and_run(&mut w, &mut s, tick);
-            trace.push(state_bits(&w, ship));
-        }
-        trace
-    };
+    let (mut w, mut s) = commanded_world(AiTuning::default());
+    // Spawn the standard commanded mover, then REPLACE the move_to order with a
+    // hold_at at the anchor (the same Generic-fighter brain stack).
+    let ship = spawn_commanded_mover(&mut w, 0, start, anchor, stats);
+    w.entity_mut(ship)
+        .insert(PlayerOrder::hold_at(anchor, 80.0));
 
+    // First think resolves HoldAt to Rush and pins home + waypoint to the anchor.
+    mirror_tick_and_run(&mut w, &mut s, 0);
     assert_eq!(
-        run(true),
-        run(false),
-        "toggle ON with a strong-retro ship + no threat is byte-identical to \
-         toggle OFF (the goal-facing branch reuses the literal R98 primitive)"
+        brain_of(&w, ship).movement_profile,
+        MovementProfile::Rush,
+        "a bare commanded HoldAt resolves to Rush (the controller's pace profile)"
+    );
+
+    for tick in 1..TICKS {
+        mirror_tick_and_run(&mut w, &mut s, tick);
+    }
+
+    let (fp, fv, _) = kinematics(&w, ship);
+    let final_dist = (anchor - fp).length();
+    assert!(
+        final_dist <= R96_ARRIVE_RADIUS,
+        "parks ON the held anchor (within ARRIVE_RADIUS, final dist {final_dist})"
+    );
+    assert!(
+        fv.length() < 2.5,
+        "settles at rest on the anchor (final speed {})",
+        fv.length()
+    );
+    // The think pinned the anchor as both home and waypoint (the HoldAt shape).
+    assert_eq!(
+        brain_of(&w, ship).home,
+        Some(anchor),
+        "home pinned to anchor"
     );
 }

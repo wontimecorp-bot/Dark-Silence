@@ -2463,26 +2463,6 @@ fn dev_panel_ui(
                     slider(ui, "danger mask floor", &mut ai_tun.danger_mask_floor, 0.0..=1.0)
                         .on_hover_text("Floor a danger-masked slot is suppressed to (0 = fully blocked).");
                     ui.separator();
-                    ui.label(egui::RichText::new("Movement profiles (R96)").strong());
-                    slider(ui, "rush cap", &mut ai_tun.profile_rush_cap, 0.0..=1.5)
-                        .on_hover_text("Forward throttle cap for the Rush profile (hot pace — full authority). Composed with the squad throttle_cap.");
-                    slider(ui, "cruise cap", &mut ai_tun.profile_cruise_cap, 0.0..=1.5)
-                        .on_hover_text("Forward throttle cap for the Cruise profile (PINNED 1.0 — the pre-R96 parity no-op).");
-                    slider(ui, "leisurely cap", &mut ai_tun.profile_leisurely_cap, 0.0..=1.5)
-                        .on_hover_text("Forward throttle cap for the Leisurely profile (lazy pace — capped to half by default).");
-                    slider(ui, "brake aggr rush", &mut ai_tun.brake_aggression_rush, 0.0..=3.0)
-                        .on_hover_text("Brake aggression for Rush — an earlier-braking multiplier on the arrive stopping distance.");
-                    slider(ui, "brake aggr cruise", &mut ai_tun.brake_aggression_cruise, 0.0..=3.0)
-                        .on_hover_text("Brake aggression for Cruise (PINNED 1.0 — unused on the no-brake parity path).");
-                    slider(ui, "brake aggr leisurely", &mut ai_tun.brake_aggression_leisurely, 0.0..=3.0)
-                        .on_hover_text("Brake aggression for Leisurely — brakes earliest for a long, gentle settle.");
-                    slider(ui, "slow factor rush", &mut ai_tun.arrive_slow_factor_rush, 0.5..=12.0)
-                        .on_hover_text("Arrive slow-radius factor for Rush (snug ramp — × ARRIVE_RADIUS).");
-                    slider(ui, "slow factor cruise", &mut ai_tun.arrive_slow_factor_cruise, 0.5..=12.0)
-                        .on_hover_text("Arrive slow-radius factor for Cruise (PINNED 4.0 — the WAYPOINT_SLOW_FACTOR).");
-                    slider(ui, "slow factor leisurely", &mut ai_tun.arrive_slow_factor_leisurely, 0.5..=12.0)
-                        .on_hover_text("Arrive slow-radius factor for Leisurely (wide ramp — eases in early).");
-                    ui.separator();
                     ui.label(egui::RichText::new("Combat stances (R96)").strong());
                     slider(ui, "orbit radius frac", &mut ai_tun.orbit_radius_frac, 0.0..=2.0)
                         .on_hover_text("Orbit ring radius as a multiple of the archetype standoff_distance (1.0 = the standoff ring itself; >1 wider, <1 tighter).");

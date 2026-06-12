@@ -16,6 +16,7 @@
 
 pub mod brain;
 pub mod command;
+pub mod control;
 pub mod ident;
 pub mod lod;
 pub mod perception;
@@ -35,6 +36,7 @@ pub use brain::{
     RethinkQueue,
 };
 pub use command::{OrderKind, PlayerOrder};
+pub use control::{allocate_intent, deflect_v_des, stoppable_speed, ControlStats, Facing, MoveCmd};
 pub use ident::{ai_despawn_sweep_system, phase_bucket, AiIdAllocator, AiStableId};
 pub use lod::{
     classify_aoi_system, far_hostile_scan_system, glide_collapse_system, glide_motion_system,

@@ -1,29 +1,29 @@
 //! AI steering substrate (00008-ship-ai T006/T007, OBJ1): inertia-aware
-//! steering primitives + 16-slot context maps that emit **`ShipIntent` only**.
+//! steering primitives + 16-slot context maps.
 //!
 //! Everything here is a PURE deterministic function — no systems, no queries.
-//! Brains (T010+) call the primitives / build a [`ContextMap`], resolve a
-//! desired world-frame direction + throttle, and convert it through
-//! [`steer_to_intent`] into a [`ShipIntent`] value that the CALLER writes to
-//! the ship's component. Steering never touches `Velocity`/`Heading`/
-//! `Position` (TR-001, V-6) — the real flight model (`ship_motion_system`)
-//! consumes the intent exactly as it would a player's.
+//! Brains call the primitives / build a [`ContextMap`] to produce a DESIRED
+//! WORLD-FRAME VELOCITY (`v_des`); the unified
+//! [`allocate_intent`](crate::ai::control::allocate_intent) controller — the
+//! SOLE motion composer since R101 S8 — turns that `v_des` + a facing into the
+//! [`ShipIntent`](crate::intent::ShipIntent) the caller writes to the ship's
+//! component. Steering never
+//! touches `Velocity`/`Heading`/`Position` (TR-001, V-6) — the real flight model
+//! (`ship_motion_system`) consumes the intent exactly as it would a player's.
+//!
+//! **R101 history**: the legacy `compose_intent` / `steer_to_intent` /
+//! `reachability_bias` composer triad (and the test-only `arrive` /
+//! `waypoint_follow` / `formation_keep` primitives) were RETIRED in R101 S8 once
+//! every behavior arm routed its motion through `allocate_intent`. What remains
+//! here is purely `v_des` PRODUCERS ([`seek`], [`intercept_point`],
+//! [`pursue_intercept`], [`range_band_radial`], [`formation_desired_vel`]) plus
+//! geometry/context utilities ([`wrap_angle`], [`slot_dir`], [`avoid`], the
+//! [`ContextMap`]) the producers and the controller's obstacle deflection share.
 //!
 //! **Conventions** (matching `flight.rs` / `intent.rs`): heading `0` = +X,
 //! increasing CCW; `ShipIntent.turn > 0` = turn left (CCW, the `turn_ccw`
 //! torque channel); throttle/forward in `0..=1`. Slot `i` of an `n`-slot
 //! context map points along world angle `2π·i/n`.
-//!
-//! **Inertia awareness** (TR-003): ships are non-holonomic — they cannot snap
-//! their heading, and at speed their momentum carries them along the velocity
-//! vector regardless of where the nose points. Two mechanisms account for it:
-//! [`compose_intent`] gates forward throttle by nose alignment (turn first,
-//! then burn — the proven mining-transport nav pattern), and
-//! [`reachability_bias`] blends the desired direction toward the current
-//! velocity direction when speed is high, the desired direction is far off the
-//! velocity vector, and the ship's turn authority is low — so a fast, sluggish
-//! ship swings through reachable headings instead of chattering on a heading
-//! its momentum cannot honor.
 //!
 //! **Context maps** (TR-002, AD-004, research "Context Steering"): 8–16 slot
 //! interest + danger maps. Behaviors combine per-slot with `max`; resolution
@@ -36,47 +36,18 @@
 
 use glam::Vec2;
 
-use crate::intent::ShipIntent;
-
 /// Maximum context-map slots (AD-004). `AiTuning.slot_count` selects the
 /// ACTIVE count `n ≤ MAX_SLOTS`; the arrays are always full-size so the type
 /// is `Copy` and allocation-free.
 pub const MAX_SLOTS: usize = 16;
 
-/// Proportional gain mapping heading error (rad) to turn input (clamped ±1),
-/// matching the mining transport's nav feel (`mining::TURN_GAIN`).
-const TURN_GAIN: f32 = 2.5;
-
-/// Reachability bias — speed soft-knee (world u/s): the momentum bias ramps in
-/// as `speed / (speed + this)`, ≈half strength at this speed (~¼ of the seed
-/// fighter's 80 u/s top speed).
-const REACH_SPEED_SOFT: f32 = 20.0;
-
-/// Reachability bias — turn-authority soft-knee (rad/s): agile ships (high
-/// `turn/angular_drag`) get LESS momentum bias, as `this / (this + authority)`.
-const REACH_TURN_SOFT: f32 = 2.0;
-
-/// Reachability bias — cap on the velocity-direction blend weight, so the
-/// desired direction always dominates (a biased heading, never a hijacked one).
-const REACH_BIAS_MAX: f32 = 0.5;
-
 /// Formation keeping — time constant (s) to close the slot error: desired
 /// velocity = leader velocity + slot_error / this.
 const FORMATION_CLOSE_TIME: f32 = 2.0;
 
-/// Formation keeping — velocity-error magnitude (u/s) at which the throttle
-/// saturates to 1. Near the slot with matched velocity the error → 0, so the
-/// throttle → 0 and station-keeping is quiet (no chatter).
-const FORMATION_THROTTLE_SPEED: f32 = 8.0;
-
 /// Avoid — predictive lookahead (s): a threat is live if the CURRENT position
 /// or the position `vel · this` ahead is inside the threat radius.
 const AVOID_LOOKAHEAD: f32 = 0.5;
-
-/// Waypoint following — the arrive slow-radius as a multiple of the caller's
-/// `arrive_radius` on the FINAL waypoint (intermediate waypoints are flown at
-/// full throttle).
-const WAYPOINT_SLOW_FACTOR: f32 = 4.0;
 
 /// Wrap an angle to `(-π, π]` (same convention as `mining`/`turret`).
 pub fn wrap_angle(a: f32) -> f32 {
@@ -92,182 +63,6 @@ pub fn wrap_angle(a: f32) -> f32 {
 /// (never NaN).
 pub fn seek(pos: Vec2, target: Vec2) -> Vec2 {
     (target - pos).normalize_or_zero()
-}
-
-/// Seek with an arrival deceleration ramp: full throttle outside
-/// `slow_radius`, ramping down linearly with distance inside it (the mining
-/// transport's arrive feel — linear drag does the actual braking, so the ramp
-/// only has to stop ADDING energy). `_vel` is reserved for closing-speed
-/// damping; v1 matches the drag-braked mining nav exactly.
-pub fn arrive(pos: Vec2, _vel: Vec2, target: Vec2, slow_radius: f32) -> (Vec2, f32) {
-    let to = target - pos;
-    let dist = to.length();
-    let dir = to.normalize_or_zero();
-    let throttle = (dist / slow_radius.max(f32::MIN_POSITIVE)).min(1.0);
-    (dir, throttle)
-}
-
-/// Active-braking arrive (R96 Part B): unlike [`arrive`] — which only ramps the
-/// throttle DOWN inside the slow radius and lets linear drag do the braking —
-/// this variant computes the kinematic stopping distance from the ship's CLOSING
-/// speed and, once the ship is inside that distance, REQUESTS REVERSE THRUST so
-/// it actively decelerates onto the goal instead of coasting through it.
-///
-/// **Negative-throttle reverse-brake convention** (documented): the returned
-/// throttle is NEGATIVE when the ship is inside its stopping distance — a
-/// NEGATIVE throttle is a request for REVERSE thrust. The caller maps it to a
-/// [`ShipIntent`] with `forward < 0`, keeping the nose pointed at the goal (the
-/// turn channel) so the ship brakes NOSE-ON via the retro thrusters
-/// (`flight.rs` routes `intent.forward < 0` to `reverse_force`, which is not
-/// strafe-gated, so this brakes any fit). Outside the stopping distance the
-/// throttle is a positive ramp: full burn to the brake point, then a short
-/// linear ease-in across `slow_radius` so the ship doesn't slam from full-burn
-/// straight to the brake transition.
-///
-/// **R98 HOTFIX C — proportional brake + arrive deadband (anti-bang-bang)**:
-/// the old inside-stop-dist response was a flat `-1.0` (full reverse). Once
-/// the velocity reversed, `v_close → 0` → `stop_dist → 0` → full FORWARD →
-/// a full-authority bang-bang oscillator parked on the goal. Now, inside the
-/// stopping distance:
-/// - `v_close < arrive_eps_speed` → `(dir, 0.0)` — the DEADBAND: coast and let
-///   linear drag finish the settle; reverse thrust can never build backward
-///   speed at the goal.
-/// - else → `(dir, -(v_close / brake_ref_speed).clamp(0, 1))` — a PROPORTIONAL
-///   reverse: the brake force scales with the closing speed and decays
-///   smoothly into the deadband instead of slamming full retro.
-///
-/// **Model**: `dir` points at the goal; `dist` is the range; `v_close =
-/// max(0, vel·dir)` is the speed component CLOSING on the goal (receding/lateral
-/// motion never triggers a brake). The stopping distance is the kinematic
-/// `v_close² / (2·decel_eff)`, scaled by `brake_aggression` (> 1 brakes
-/// EARLIER, more conservatively; < 1 later), where `decel_eff` is the
-/// deceleration the PROPORTIONAL controller will actually command —
-/// `decel · (v_close / brake_ref_speed).clamp(0, 1)` — i.e.
-/// `stop_dist = aggression · v_close · max(v_close, brake_ref_speed) /
-/// (2·decel)`. (The CONSISTENCY condition of the R98 proportional brake:
-/// computing the stop distance against FULL reverse authority while only
-/// commanding the `v/ref` fraction of it would start every sub-reference-speed
-/// brake too late — a guaranteed overshoot that re-thrusts, flips around, and
-/// limit-cycles through the goal. At/above the reference speed the brake
-/// saturates at full reverse and the formula reduces to the classic
-/// `v²/(2·decel)`, so far approaches are unchanged.) Outside the stopping
-/// distance, `throttle = ((dist − stop_dist) / slow_radius).clamp(0, 1)`.
-///
-/// **Determinism / no-NaN**: every denominator is floored
-/// (`decel.max(EPS)`, `slow_radius.max(EPS)`, `brake_ref_speed.max(EPS)`),
-/// `normalize_or_zero` handles a coincident goal, and `v_close` is
-/// non-negative — so degenerate inputs (`dist = 0`, `decel = 0`, zero
-/// velocity) yield finite results, never NaN.
-#[allow(clippy::too_many_arguments)] // One scalar per physical knob (pure function).
-pub fn arrive_braked(
-    pos: Vec2,
-    vel: Vec2,
-    target: Vec2,
-    slow_radius: f32,
-    decel: f32,
-    brake_aggression: f32,
-    brake_ref_speed: f32,
-    arrive_eps_speed: f32,
-) -> (Vec2, f32) {
-    let to = target - pos;
-    let dist = to.length();
-    let dir = to.normalize_or_zero();
-    // Closing-speed component only — receding or purely lateral motion (or a
-    // coincident goal where `dir == ZERO`) contributes no brake demand.
-    let v_close = vel.dot(dir).max(0.0);
-    // R98 HOTFIX C — the stop distance assumes the deceleration the
-    // PROPORTIONAL brake will actually command (`v/ref` of full reverse below
-    // the reference speed): `v · max(v, ref) / (2·decel)`. See the model docs.
-    let stop_dist = brake_aggression * v_close * v_close.max(brake_ref_speed)
-        / (2.0 * decel.max(f32::MIN_POSITIVE));
-    if dist <= stop_dist {
-        if v_close < arrive_eps_speed {
-            // Deadband: settled enough — coast, drag finishes (never reverse).
-            (dir, 0.0)
-        } else {
-            // Proportional reverse: brake scales with closing speed, decaying
-            // smoothly toward the deadband (no full-reverse bang-bang).
-            let brake = (v_close / brake_ref_speed.max(f32::MIN_POSITIVE)).clamp(0.0, 1.0);
-            (dir, -brake)
-        }
-    } else {
-        // Full burn to the brake point, then a short linear ease across the
-        // slow radius (so the approach isn't a hard full-burn → brake snap).
-        let throttle = ((dist - stop_dist) / slow_radius.max(f32::MIN_POSITIVE)).clamp(0.0, 1.0);
-        (dir, throttle)
-    }
-}
-
-/// R100 — desired NOSE direction while braking onto a goal: an EMERGENT AIM
-/// decision between **goal-facing** (a nose-on reverse-brake, the default and the
-/// EXACT R98 primitive) and **retrograde** (flip-and-burn — turn 180° to brake on
-/// the stronger FORWARD thrust). Threat-facing is decided by the CALLER, not here.
-///
-/// **The flip pays off only when the physics earns it.** The forward drive is
-/// stronger than the retros (`reverse_force ≈ ½·thrust_force` by default, R92), so
-/// flipping to brake forward decelerates harder — but the 180° turn COSTS time the
-/// ship is not braking. The decision compares the braking time SAVED against the
-/// turn time SPENT:
-/// - `dt = v_close · (1/a_rev − 1/a_fwd)` — the seconds of braking saved by
-///   decelerating on `a_fwd` instead of `a_rev` (positive iff `a_fwd > a_rev`).
-/// - `t_turn = misalign · π / turn_rate` — a π-BOUNDED, monotone turn-cost
-///   estimate (no `acos`): `misalign = (1 − nose·retro)/2 ∈ [0,1]` is `0` when the
-///   nose already points retrograde, `1` at a full 180°. Flip iff
-///   `dt > flip_turn_margin · t_turn`.
-///
-/// **Early outs (cheap, monotone gates)**: a short/slow approach
-/// (`v_close < flip_min_speed`) never flips (no speed worth the turn); a ship whose
-/// retros are already strong enough (`a_fwd / a_rev <= flip_thrust_ratio`) never
-/// flips (reverse-brake nose-on is fine); a zero goal or zero velocity falls back
-/// to goal-facing.
-///
-/// Pure + deterministic, no `acos`/RNG/NaN: every denominator is floored
-/// (`a_rev`/`a_fwd`/`turn_rate` via `f32::MIN_POSITIVE`), `normalize_or_zero`
-/// handles degenerate vectors, and `v_close = max(0, vel·goal)` is non-negative.
-/// The returned vector is the desired NOSE (unit `goal` or unit `retro`); the
-/// caller composes the actual brake intent around it.
-#[allow(clippy::too_many_arguments)] // One scalar per physical knob (pure function).
-pub fn brake_orientation(
-    vel: Vec2,
-    goal_dir: Vec2,
-    heading: f32,
-    a_fwd: f32,
-    a_rev: f32,
-    turn_rate: f32,
-    flip_thrust_ratio: f32,
-    flip_min_speed: f32,
-    flip_turn_margin: f32,
-) -> Vec2 {
-    let goal = goal_dir.normalize_or_zero();
-    if goal == Vec2::ZERO {
-        return goal_dir;
-    }
-    // Only the speed CLOSING on the goal is worth braking (receding/lateral does
-    // not motivate a flip).
-    let v_close = vel.dot(goal).max(0.0);
-    if v_close < flip_min_speed {
-        return goal; // short/slow → don't pay for a 180° turn.
-    }
-    let a_rev = a_rev.max(f32::MIN_POSITIVE);
-    let a_fwd = a_fwd.max(f32::MIN_POSITIVE);
-    if a_fwd / a_rev <= flip_thrust_ratio {
-        return goal; // retros strong enough → reverse-brake nose-on is fine.
-    }
-    let retro = (-vel).normalize_or_zero();
-    if retro == Vec2::ZERO {
-        return goal;
-    }
-    // Braking time SAVED by decelerating on the stronger forward drive.
-    let dt = v_close * (1.0 / a_rev - 1.0 / a_fwd);
-    // Turn time SPENT to swing the nose retrograde — π-bounded, monotone, no acos.
-    let nose = Vec2::from_angle(heading);
-    let misalign = ((1.0 - nose.dot(retro)) * 0.5).clamp(0.0, 1.0);
-    let t_turn = misalign * std::f32::consts::PI / turn_rate.max(f32::MIN_POSITIVE);
-    if dt > flip_turn_margin * t_turn {
-        retro
-    } else {
-        goal
-    }
 }
 
 /// First-order intercept point for a chaser/projectile closing at `speed` on a
@@ -298,56 +93,27 @@ pub fn pursue_intercept(pos: Vec2, closing_speed: f32, target_pos: Vec2, target_
     }
 }
 
-/// Follow a waypoint route: skips ahead past every waypoint already within
-/// `arrive_radius` (the LAST waypoint sticks), flies intermediate waypoints at
-/// full throttle, and [`arrive`]s on the final one (slow radius =
-/// [`WAYPOINT_SLOW_FACTOR`]`·arrive_radius`). Returns `(dir, throttle,
-/// next_idx)`; an empty route is a quiet no-op `(ZERO, 0.0, current_idx)`.
-pub fn waypoint_follow(
+/// The DESIRED WORLD-FRAME VELOCITY that holds a formation slot relative to a
+/// leader (R101 S4 — the `allocate_intent` controller path; the SOLE formation
+/// motion since R101 S8 retired the legacy `formation_keep` steer). The slot
+/// target is `leader_pos + rotate(slot_offset, leader_heading)` (offsets authored
+/// in the leader's frame, +X = leader's nose); the desired velocity is the
+/// leader's velocity PLUS a term closing the slot error over
+/// [`FORMATION_CLOSE_TIME`]: `leader_vel + (slot − pos) / FORMATION_CLOSE_TIME`.
+/// The FormationKeep brain arm emits this as a
+/// [`MoveCmd::v_des`](crate::ai::control::MoveCmd) (capped at the pace `v_max`)
+/// into the unified controller. On-slot with matched velocity the closing term →
+/// 0 → `v_des == leader_vel`, so a settled follower coasts WITH the leader (the
+/// velocity-matching formation; no chatter).
+pub fn formation_desired_vel(
     pos: Vec2,
-    vel: Vec2,
-    waypoints: &[Vec2],
-    current_idx: usize,
-    arrive_radius: f32,
-) -> (Vec2, f32, usize) {
-    if waypoints.is_empty() {
-        return (Vec2::ZERO, 0.0, current_idx);
-    }
-    let mut idx = current_idx.min(waypoints.len() - 1);
-    while idx + 1 < waypoints.len() && (waypoints[idx] - pos).length() <= arrive_radius {
-        idx += 1;
-    }
-    let target = waypoints[idx];
-    if idx + 1 == waypoints.len() {
-        let (dir, throttle) = arrive(pos, vel, target, WAYPOINT_SLOW_FACTOR * arrive_radius);
-        (dir, throttle, idx)
-    } else {
-        (seek(pos, target), 1.0, idx)
-    }
-}
-
-/// Hold a formation slot relative to a leader. The slot target is
-/// `leader_pos + rotate(slot_offset, leader_heading)` (offsets are authored in
-/// the leader's frame, +X = leader's nose). Velocity-matching model: the
-/// desired velocity is the leader's velocity plus a term closing the slot
-/// error over [`FORMATION_CLOSE_TIME`]; the output direction/throttle steer
-/// along the VELOCITY ERROR, so on-slot with matched velocity the error → 0 →
-/// zero direction + throttle → quiet station-keeping with no oscillation (the
-/// VC2 no-chatter requirement).
-pub fn formation_keep(
-    pos: Vec2,
-    vel: Vec2,
     leader_pos: Vec2,
     leader_vel: Vec2,
     leader_heading: f32,
     slot_offset: Vec2,
-) -> (Vec2, f32) {
+) -> Vec2 {
     let slot = leader_pos + Vec2::from_angle(leader_heading).rotate(slot_offset);
-    let desired_vel = leader_vel + (slot - pos) / FORMATION_CLOSE_TIME;
-    let vel_err = desired_vel - vel;
-    let dir = vel_err.normalize_or_zero();
-    let throttle = (vel_err.length() / FORMATION_THROTTLE_SPEED).min(1.0);
-    (dir, throttle)
+    leader_vel + (slot - pos) / FORMATION_CLOSE_TIME
 }
 
 /// Away-from-nearest-threat direction, or `None` when no threat is live. A
@@ -388,154 +154,6 @@ pub fn avoid(pos: Vec2, vel: Vec2, threats: &[(Vec2, f32)]) -> Option<Vec2> {
 pub fn range_band_radial(dist: f32, standoff: f32, band_frac: f32) -> f32 {
     let width = (standoff * band_frac).max(f32::MIN_POSITIVE);
     ((dist - standoff) / width).clamp(-1.0, 1.0)
-}
-
-/// TR-003 — inertia-aware reachability bias: blends `desired_dir` toward the
-/// current VELOCITY direction when momentum makes the raw desire unreachable.
-///
-/// **Model** (simple, deterministic, tunable): blend weight
-/// `w = misalign · speed_gate · agility_gate`, capped at [`REACH_BIAS_MAX`],
-/// where `misalign = (1 − v̂·d̂)/2 ∈ [0,1]` (0 = already going that way),
-/// `speed_gate = speed/(speed + REACH_SPEED_SOFT)` (slow ships can point
-/// anywhere — no bias), and `agility_gate = REACH_TURN_SOFT/(REACH_TURN_SOFT +
-/// turn_authority)` (agile ships need less help). `turn_authority` is the
-/// ship's max turn rate in rad/s (`ShipStats::max_turn_rate()`; pass `0` for
-/// "unknown" → maximum caution). Keys off velocity, not heading — momentum is
-/// what constrains reachability. Degenerate blends (exact-opposite vectors at
-/// the cap) fall back to the unbiased desire.
-pub fn reachability_bias(desired_dir: Vec2, vel: Vec2, turn_authority: f32) -> Vec2 {
-    let desired = desired_dir.normalize_or_zero();
-    let speed = vel.length();
-    if desired == Vec2::ZERO || speed <= f32::EPSILON {
-        return desired;
-    }
-    let vel_dir = vel / speed;
-    let misalign = (1.0 - vel_dir.dot(desired)) * 0.5;
-    let speed_gate = speed / (speed + REACH_SPEED_SOFT);
-    let agility_gate = REACH_TURN_SOFT / (REACH_TURN_SOFT + turn_authority.max(0.0));
-    let w = (misalign * speed_gate * agility_gate).min(REACH_BIAS_MAX);
-    let blended = (desired * (1.0 - w) + vel_dir * w).normalize_or_zero();
-    if blended == Vec2::ZERO {
-        desired
-    } else {
-        blended
-    }
-}
-
-/// Convert a chosen world-frame direction + throttle into a [`ShipIntent`]
-/// for a ship at `heading`: turn input = proportional control on the wrapped
-/// heading error ([`TURN_GAIN`], clamped ±1 — positive error = target to the
-/// LEFT/CCW = positive turn, the `flight.rs` convention), forward throttle
-/// gated by nose alignment (`max(0, nose·dir)`) so the ship turns before it
-/// burns (the mining nav pattern). Strafe is 0 in v1 (most AI hulls cannot
-/// strafe); fire fields stay default — combat (T026) sets them separately.
-/// A zero direction → the default (coasting) intent.
-pub fn compose_intent(desired_dir: Vec2, throttle: f32, heading: f32) -> ShipIntent {
-    let dir = desired_dir.normalize_or_zero();
-    if dir == Vec2::ZERO {
-        return ShipIntent::default();
-    }
-    let err = wrap_angle(dir.to_angle() - heading);
-    let turn = (err * TURN_GAIN).clamp(-1.0, 1.0);
-    let align = Vec2::from_angle(heading).dot(dir).max(0.0);
-    ShipIntent {
-        forward: throttle.clamp(0.0, 1.0) * align,
-        turn,
-        ..Default::default()
-    }
-}
-
-/// R97 Phase 1 Stage A — **aim-decoupled** intent composition: the strict
-/// generalization of [`compose_intent`] that DECOUPLES where the ship points
-/// (the `turn` channel, driven by `aim_dir`) from where it wants to MOVE (the
-/// `forward`/`strafe` channels, driven by `move_dir`). This is the primitive
-/// Stage B/C consume so a ship can keep its guns on a target (`aim_dir` = the
-/// gunnery lead) while translating anywhere — toward, away, or laterally.
-///
-/// **Aim → turn**: identical proportional control to [`compose_intent`]
-/// ([`TURN_GAIN`] on the wrapped heading error, clamped ±1), but on `aim_dir`
-/// instead of `move_dir`. A zero `aim_dir` falls back to `move_dir` (so an
-/// aimless mover still faces where it's going).
-///
-/// **Move → forward/strafe** (decomposed in the ship's HEADING frame):
-/// `nose = from_angle(heading)`, `fwd_comp = nose·m̂`, `lateral = perp(nose)·m̂`
-/// where `m̂` is the normalized move direction (`perp(v) = (-v.y, v.x)`, the
-/// +90°/CCW rotation matching the rest of the AI substrate).
-/// `forward`'s SIGN follows whether the move agrees with the AIM (`aim·m̂`) —
-/// the aim is where the nose is converging, so it decides forward vs retro.
-/// When the move is toward the aim (`aim·m̂ ≥ 0`) it is FORWARD thrust,
-/// alignment-gated on the CURRENT nose exactly like [`compose_intent`]
-/// (`throttle · max(0, fwd_comp)` — turn first, then burn). When the move is
-/// away from the aim (`aim·m̂ < 0`) the ship wants to hold its guns on the aim
-/// while translating opposite it → REVERSE thrust `throttle · fwd_comp`
-/// (negative; `flight.rs` routes `forward < 0` to `reverse_force`, un-gated, so
-/// it brakes/retros NOSE-ON). The result is clamped to `[-1, 1]`. Gating the
-/// reverse on `aim·m̂` (not raw `fwd_comp`) is what preserves parity: when
-/// `aim == move`, `aim·m̂ = 1 ≥ 0` always, so the forward branch is taken and the
-/// `max(0, fwd_comp)` gate reproduces `compose_intent` exactly.
-///
-/// `strafe = if can_strafe { (throttle · lateral).clamp(-1, 1) } else { 0 }` —
-/// the lateral component, gated on strafe authority (R93) — a forward-only hull
-/// keeps `strafe = 0` and translates by turning, just like today.
-///
-/// **Parity guarantee (the keystone Stage B relies on)**: when
-/// `aim_dir == move_dir` AND `!can_strafe` AND `throttle >= 0`, this returns
-/// BIT-IDENTICAL output to `compose_intent(move_dir, throttle, heading)` — the
-/// turn comes from the same vector, `aim·m̂ = 1 ≥ 0` selects the forward branch
-/// whose `throttle · max(0, fwd_comp)` IS `compose_intent`'s align-gated
-/// throttle, and strafe is forced to 0. (Proven over several geometries —
-/// forward, off-angle, BEHIND — in
-/// `compose_intent_aimed_matches_compose_intent_at_parity`.)
-///
-/// Pure + deterministic, no-NaN: `normalize_or_zero` handles degenerate inputs
-/// and a zero aim/move yields the default coasting intent.
-pub fn compose_intent_aimed(
-    move_dir: Vec2,
-    throttle: f32,
-    aim_dir: Vec2,
-    heading: f32,
-    can_strafe: bool,
-) -> ShipIntent {
-    let m = move_dir.normalize_or_zero();
-    // Aim drives the turn channel; fall back to the move direction when aimless.
-    let aim = if aim_dir == Vec2::ZERO {
-        m
-    } else {
-        aim_dir.normalize_or_zero()
-    };
-    if aim == Vec2::ZERO {
-        return ShipIntent::default();
-    }
-    let err = wrap_angle(aim.to_angle() - heading);
-    let turn = (err * TURN_GAIN).clamp(-1.0, 1.0);
-
-    // Decompose the desired MOVE in the ship's heading frame (nose = +X-local).
-    let nose = Vec2::from_angle(heading);
-    let left = Vec2::new(-nose.y, nose.x); // perp(nose), +90°/CCW
-    let fwd_comp = nose.dot(m); // > 0 ahead of the nose, < 0 behind it
-    let lateral = left.dot(m); // > 0 to port/left, < 0 to starboard/right
-    let throttle = throttle.clamp(-1.0, 1.0);
-    // The forward SIGN follows whether the move agrees with the AIM (where the
-    // nose converges). Move toward the aim → forward, align-gated on the current
-    // nose like `compose_intent` (`max(0, fwd_comp)`, turn-first — the parity
-    // branch). Move away from the aim → reverse `fwd_comp` (retro nose-on).
-    let forward = if aim.dot(m) >= 0.0 {
-        throttle * fwd_comp.max(0.0)
-    } else {
-        throttle * fwd_comp
-    }
-    .clamp(-1.0, 1.0);
-    let strafe = if can_strafe {
-        (throttle * lateral).clamp(-1.0, 1.0)
-    } else {
-        0.0
-    };
-    ShipIntent {
-        forward,
-        strafe,
-        turn,
-        ..Default::default()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -702,26 +320,6 @@ impl ContextMap {
     }
 }
 
-/// THE V-6 SEAM — the steering substrate's ONLY output is a [`ShipIntent`]
-/// **value**: the caller writes it to the ship's component; steering never
-/// touches `Velocity`/`Heading`/`Position` (TR-001). Applies the TR-003
-/// [`reachability_bias`] (`turn_authority` = the ship's max turn rate, rad/s)
-/// and composes via [`compose_intent`] (proportional turn + alignment-gated
-/// throttle, clamped ±1).
-pub fn steer_to_intent(
-    chosen_dir: Vec2,
-    throttle: f32,
-    heading: f32,
-    current_vel: Vec2,
-    turn_authority: f32,
-) -> ShipIntent {
-    compose_intent(
-        reachability_bias(chosen_dir, current_vel, turn_authority),
-        throttle,
-        heading,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,167 +340,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn arrive_full_throttle_outside_ramps_down_inside_slow_radius() {
-        let target = Vec2::new(100.0, 0.0);
-        let (dir, far) = arrive(Vec2::ZERO, Vec2::ZERO, target, 50.0);
-        assert!((dir - Vec2::X).length() < 1e-6);
-        assert_eq!(far, 1.0, "outside slow radius → full throttle");
-        let (_, near) = arrive(Vec2::new(75.0, 0.0), Vec2::ZERO, target, 50.0);
-        assert!(
-            (near - 0.5).abs() < 1e-6,
-            "halfway into the ramp → half throttle (got {near})"
-        );
-    }
-
-    #[test]
-    fn arrive_braked_cuts_to_reverse_inside_stopping_distance() {
-        let target = Vec2::new(100.0, 0.0);
-        let decel = 10.0;
-        // R98 HOTFIX C — the pinned proportional-brake knobs (the AiTuning
-        // defaults): full reverse at/above 40 u/s closing, deadband below 2.
-        let (brake_ref, eps) = (40.0, 2.0);
-        // Fast-closing ship just OUTSIDE its stopping distance → positive ramp,
-        // not a brake. stop_dist = 1·40·max(40, 40)/(2·10) = 80, so at dist 100
-        // (pos x=0) the ship is 20 u outside → ramp over a 50 u slow radius = 0.4.
-        let fast = Vec2::new(40.0, 0.0);
-        let (dir_out, t_out) = arrive_braked(
-            Vec2::new(0.0, 0.0),
-            fast,
-            target,
-            50.0,
-            decel,
-            1.0,
-            brake_ref,
-            eps,
-        );
-        assert!((dir_out - Vec2::X).length() < 1e-6, "steers at the goal");
-        assert!(
-            t_out > 0.0,
-            "outside the brake point → positive ramp (got {t_out})"
-        );
-        assert!(
-            (t_out - 0.4).abs() < 1e-5,
-            "linear ramp across the slow radius"
-        );
-
-        // SAME fast ship moved INSIDE the stopping distance (dist 70 < 80) →
-        // request reverse thrust: PROPORTIONAL — at the reference closing speed
-        // (40 = brake_ref) the brake saturates at the full -1.0.
-        let (dir_in, t_in) = arrive_braked(
-            Vec2::new(30.0, 0.0),
-            fast,
-            target,
-            50.0,
-            decel,
-            1.0,
-            brake_ref,
-            eps,
-        );
-        assert!(
-            (dir_in - Vec2::X).length() < 1e-6,
-            "still steers at the goal"
-        );
-        assert_eq!(
-            t_in, -1.0,
-            "closing at brake_ref inside the brake point → saturated reverse"
-        );
-
-        // PROPORTIONAL: a slower close brakes proportionally LESS. v_close 20 →
-        // stop_dist = 20·max(20, 40)/(2·10) = 40 (the authority-consistent
-        // model); at dist 15 (inside) → -(20/40) = -0.5.
-        let slow = Vec2::new(20.0, 0.0);
-        let (_, t_prop) = arrive_braked(
-            Vec2::new(85.0, 0.0),
-            slow,
-            target,
-            50.0,
-            decel,
-            1.0,
-            brake_ref,
-            eps,
-        );
-        assert!(
-            (t_prop + 0.5).abs() < 1e-5,
-            "half the reference closing speed → half the reverse (got {t_prop})"
-        );
-
-        // DEADBAND: closing below arrive_eps_speed inside the stopping distance
-        // coasts (throttle 0) — drag settles it; reverse NEVER builds backward
-        // speed at the goal (the anti-bang-bang guarantee).
-        let crawl = Vec2::new(1.0, 0.0); // stop_dist = 1/20 = 0.05
-        let (_, t_dead) = arrive_braked(
-            Vec2::new(99.96, 0.0),
-            crawl,
-            target,
-            50.0,
-            decel,
-            1.0,
-            brake_ref,
-            eps,
-        );
-        assert_eq!(
-            t_dead, 0.0,
-            "sub-deadband closing speed inside the brake point → coast-settle"
-        );
-
-        // Higher brake_aggression brakes EARLIER: at the same far position the
-        // stopping distance grows, so an aggression that pushes stop_dist past
-        // the range flips the ramp into a brake (still proportional: v_close 40
-        // = brake_ref → the saturated -1.0).
-        let (_, t_aggr) = arrive_braked(
-            Vec2::new(0.0, 0.0),
-            fast,
-            target,
-            50.0,
-            decel,
-            2.0,
-            brake_ref,
-            eps,
-        );
-        assert_eq!(
-            t_aggr, -1.0,
-            "aggression 2 → stop_dist 160 > range 100 → brakes earlier"
-        );
-
-        // A ship moving AWAY from the goal never brakes (v_close = 0).
-        let (_, t_recede) = arrive_braked(
-            Vec2::new(30.0, 0.0),
-            Vec2::new(-40.0, 0.0),
-            target,
-            50.0,
-            decel,
-            1.0,
-            brake_ref,
-            eps,
-        );
-        assert!(t_recede > 0.0, "receding → no brake demand, full ramp");
-
-        // Degenerate inputs never NaN: coincident goal (v_close 0 → deadband
-        // coast), zero decel, zero vel.
-        let (d0, t0) = arrive_braked(target, fast, target, 50.0, decel, 1.0, brake_ref, eps);
-        assert!(d0.is_finite() && t0.is_finite() && d0 == Vec2::ZERO);
-        assert_eq!(t0, 0.0, "coincident goal → deadband coast (no reverse)");
-        let (_, t_z) = arrive_braked(Vec2::ZERO, fast, target, 50.0, 0.0, 1.0, brake_ref, eps);
-        assert!(
-            t_z.is_finite(),
-            "zero decel floors the denominator (got {t_z})"
-        );
-        let (_, t_still) = arrive_braked(
-            Vec2::new(99.0, 0.0),
-            Vec2::ZERO,
-            target,
-            50.0,
-            decel,
-            1.0,
-            brake_ref,
-            eps,
-        );
-        assert!(
-            t_still.is_finite() && t_still >= 0.0,
-            "stationary → finite ramp"
-        );
-    }
+    // R101 S8 — `arrive_full_throttle_outside_ramps_down_inside_slow_radius`
+    // RETIRED with the `arrive` primitive: nav arriving/parking is now the
+    // controller's stoppable-speed property (covered by `controller_arrives_and_
+    // parks_no_overshoot` in `control.rs` + `nav_arrives_and_parks_via_controller`
+    // in `tests/ai.rs`).
 
     #[test]
     fn pursue_intercept_matches_turret_aim_angle_lead() {
@@ -931,66 +373,17 @@ mod tests {
         assert!((dir - Vec2::X).length() < 1e-5);
     }
 
-    #[test]
-    fn waypoint_follow_advances_past_reached_waypoints_and_arrives_on_last() {
-        let route = [
-            Vec2::new(0.0, 0.0),
-            Vec2::new(100.0, 0.0),
-            Vec2::new(100.0, 100.0),
-        ];
-        // Standing on waypoint 0 → skip to 1, full throttle toward it.
-        let (dir, throttle, idx) = waypoint_follow(Vec2::ZERO, Vec2::ZERO, &route, 0, 10.0);
-        assert_eq!(idx, 1);
-        assert!((dir - Vec2::X).length() < 1e-6);
-        assert_eq!(throttle, 1.0, "intermediate waypoints fly at full throttle");
-        // Near the final waypoint → arrive ramp throttles down; the last index sticks.
-        let (_, t_last, idx_last) =
-            waypoint_follow(Vec2::new(100.0, 80.0), Vec2::ZERO, &route, 2, 10.0);
-        assert_eq!(idx_last, 2);
-        assert!(t_last < 1.0, "final waypoint decelerates (got {t_last})");
-        // Empty route is a quiet no-op.
-        assert_eq!(
-            waypoint_follow(Vec2::ZERO, Vec2::ZERO, &[], 0, 10.0),
-            (Vec2::ZERO, 0.0, 0)
-        );
-    }
+    // R101 S8 — `waypoint_follow_advances_past_reached_waypoints_and_arrives_on_last`
+    // RETIRED with the `waypoint_follow` primitive (the nav route walker is now
+    // brain-arm logic feeding the controller; route-walk + arrive/park behavior is
+    // covered by `nav_arrives_and_parks_via_controller` in `tests/ai.rs`).
 
-    #[test]
-    fn formation_keep_is_quiet_on_slot_with_matched_velocity() {
-        // On the rotated slot, moving exactly with the leader → zero dir + throttle (no chatter).
-        let leader_vel = Vec2::new(5.0, 0.0);
-        let slot_offset = Vec2::new(-4.0, 2.0);
-        let leader_heading = 0.3;
-        let on_slot = Vec2::from_angle(leader_heading).rotate(slot_offset);
-        let (dir, throttle) = formation_keep(
-            on_slot,
-            leader_vel,
-            Vec2::ZERO,
-            leader_vel,
-            leader_heading,
-            slot_offset,
-        );
-        assert_eq!(dir, Vec2::ZERO);
-        assert!(throttle.abs() < 1e-6);
-    }
-
-    #[test]
-    fn formation_keep_steers_toward_the_heading_rotated_slot() {
-        // Leader at origin heading +Y: an astern offset (0,-5) in leader frame rotates to (5,0).
-        let (dir, throttle) = formation_keep(
-            Vec2::ZERO,
-            Vec2::ZERO,
-            Vec2::ZERO,
-            Vec2::ZERO,
-            FRAC_PI_2,
-            Vec2::new(0.0, -5.0),
-        );
-        assert!(
-            (dir - Vec2::X).length() < 1e-5,
-            "slot target rotates with the leader heading"
-        );
-        assert!(throttle > 0.0);
-    }
+    // R101 S8 — the two `formation_keep_*` tests RETIRED with the `formation_keep`
+    // primitive. The velocity-matching slot math survives as `formation_desired_vel`
+    // (tested via `formation_desired_vel_*` below) and the no-chatter / settle-and-
+    // hold formation property is covered through the LIVE controller arm by
+    // `formation_followers_settle_and_hold_without_chatter` +
+    // `formation_follower_tracks_moving_leader_via_desired_velocity` in `tests/ai.rs`.
 
     #[test]
     fn avoid_points_away_from_nearest_live_threat_only() {
@@ -1018,6 +411,38 @@ mod tests {
     }
 
     #[test]
+    fn formation_desired_vel_matches_velocity_on_slot_and_rotates_with_heading() {
+        // (a) On the heading-rotated slot, moving exactly with the leader → the
+        // closing term is 0, so `v_des == leader_vel` (the velocity-matching
+        // keystone: a settled follower coasts WITH the leader). This is the
+        // property the retired `formation_keep`-quiet test held.
+        let leader_vel = Vec2::new(5.0, 0.0);
+        let slot_offset = Vec2::new(-4.0, 2.0);
+        let leader_heading = 0.3;
+        let on_slot = Vec2::from_angle(leader_heading).rotate(slot_offset);
+        let v_des =
+            formation_desired_vel(on_slot, Vec2::ZERO, leader_vel, leader_heading, slot_offset);
+        assert!(
+            (v_des - leader_vel).length() < 1e-6,
+            "on-slot + matched velocity → v_des matches the leader (got {v_des})"
+        );
+        // (b) Off-slot at rest with a stationary leader → `v_des` closes toward the
+        // heading-rotated slot target. Leader heading +Y: an astern offset (0,-5) in
+        // the leader frame rotates to (5,0), so the closing velocity points +X.
+        let v_closing = formation_desired_vel(
+            Vec2::ZERO,
+            Vec2::ZERO,
+            Vec2::ZERO,
+            FRAC_PI_2,
+            Vec2::new(0.0, -5.0),
+        );
+        assert!(
+            v_closing.x > 0.0 && v_closing.normalize().distance(Vec2::X) < 1e-5,
+            "closes toward the heading-rotated slot target (got {v_closing})"
+        );
+    }
+
+    #[test]
     fn range_band_radial_signs_close_far_and_holds_on_ring() {
         // Far outside the band → saturated "close in"; far inside → saturated
         // "open range"; exactly on the ring → hold; linear within the band.
@@ -1037,29 +462,12 @@ mod tests {
         assert!(range_band_radial(5.0, 0.0, 0.25).is_finite());
     }
 
-    #[test]
-    fn reachability_bias_passthrough_when_slow_and_biases_at_speed() {
-        let desired = Vec2::Y;
-        // Slow (or stationary) → unbiased.
-        assert_eq!(reachability_bias(desired, Vec2::ZERO, 1.0), desired);
-        // Fast along +X with desire +Y → biased TOWARD the velocity direction, but never past it.
-        let fast = Vec2::new(60.0, 0.0);
-        let out = reachability_bias(desired, fast, 1.0);
-        assert!(
-            out.dot(Vec2::X) > 0.0,
-            "biased toward the momentum direction"
-        );
-        assert!(
-            out.dot(Vec2::Y) > out.dot(Vec2::X),
-            "the desire still dominates (w ≤ ½)"
-        );
-        // Higher turn authority → less bias (more agile, more trust in the raw desire).
-        let agile = reachability_bias(desired, fast, 10.0);
-        assert!(
-            agile.dot(Vec2::Y) > out.dot(Vec2::Y),
-            "agile ships get less momentum bias"
-        );
-    }
+    // R101 S8 — `reachability_bias_passthrough_when_slow_and_biases_at_speed`
+    // RETIRED with the `reachability_bias` primitive. The unified controller
+    // handles momentum/reachability intrinsically: `Facing::Free` points the nose
+    // at the required acceleration and the body-frame allocation brakes along the
+    // velocity, so there is no separate desire-toward-velocity blend to test
+    // (covered by the controller's flip-and-burn property tests in `control.rs`).
 
     // --- T007 context maps ---
 
@@ -1183,275 +591,21 @@ mod tests {
         );
     }
 
-    // --- compose / steer_to_intent (the V-6 seam) ---
+    // R101 S8 — `compose_intent_turn_sign_matches_the_flight_convention` and
+    // `steer_to_intent_emits_only_a_clamped_intent_composed_with_the_bias` RETIRED
+    // with the `compose_intent`/`steer_to_intent` composer pair. The unified
+    // `allocate_intent` controller is now the sole motion composer, and it carries
+    // the same turn-sign convention (CCW = positive turn) + clamping + intent-only
+    // (no fire) guarantees — exercised by the controller's own tests in `control.rs`
+    // (e.g. `non_strafe_hull_rotates_body_for_lateral` for the CCW turn sign,
+    // `parked_ship_does_not_spin` for the zero-command coast).
 
     #[test]
-    fn compose_intent_turn_sign_matches_the_flight_convention() {
-        // flight.rs: turn > 0 drives the CCW torque channel and heading increases CCW;
-        // intent.rs: "Turn left (+1) / right (-1)". Heading 0 = +X, so +Y is LEFT, -Y is RIGHT.
-        let left = compose_intent(Vec2::Y, 1.0, 0.0);
-        assert!(
-            left.turn > 0.0,
-            "target to the LEFT (CCW) → positive turn (got {})",
-            left.turn
-        );
-        let right = compose_intent(Vec2::new(0.0, -1.0), 1.0, 0.0);
-        assert!(
-            right.turn < 0.0,
-            "target to the RIGHT (CW) → negative turn (got {})",
-            right.turn
-        );
-        // Large errors clamp to ±1; alignment gates the throttle (turn first, then burn).
-        let behind = compose_intent(Vec2::new(-1.0, 0.0), 1.0, 0.0);
-        assert_eq!(behind.turn.abs(), 1.0, "clamped to the stick limit");
-        assert_eq!(behind.forward, 0.0, "no burn while pointing the wrong way");
-        let ahead = compose_intent(Vec2::X, 1.0, 0.0);
-        assert!((ahead.forward - 1.0).abs() < 1e-6 && ahead.turn.abs() < 1e-6);
-        assert_eq!(ahead.strafe, 0.0, "strafe stays 0 in v1");
-        // Sign convention holds away from heading 0 too (wrapped error across ±π).
-        let wrapped = compose_intent(Vec2::from_angle(-3.0), 1.0, 3.0);
-        assert!(
-            wrapped.turn > 0.0,
-            "shortest way across the ±π seam is CCW (got {})",
-            wrapped.turn
-        );
-    }
-
-    #[test]
-    fn steer_to_intent_emits_only_a_clamped_intent_composed_with_the_bias() {
-        let (dir, vel, heading, authority) = (Vec2::Y, Vec2::new(60.0, 0.0), 0.0, 1.0);
-        let intent = steer_to_intent(dir, 1.0, heading, vel, authority);
-        // Exactly the bias→compose pipeline (the V-6 seam returns a VALUE; caller writes it).
-        assert_eq!(
-            intent,
-            compose_intent(reachability_bias(dir, vel, authority), 1.0, heading)
-        );
-        assert!((-1.0..=1.0).contains(&intent.turn) && (-1.0..=1.0).contains(&intent.forward));
-        assert!(
-            intent.turn > 0.0,
-            "+Y desire from heading +X still turns left"
-        );
-        assert!(
-            !intent.fire_primary && !intent.fire_secondary,
-            "steering never fires"
-        );
-        // Zero direction → the default coasting intent.
-        assert_eq!(
-            steer_to_intent(Vec2::ZERO, 1.0, 1.0, Vec2::ZERO, 1.0),
-            ShipIntent::default()
-        );
-        // PI sanity for the wrap helper used throughout.
+    fn wrap_angle_normalizes_across_the_pi_seam() {
+        // The wrap helper (still public; used by the controller's turn channel and
+        // the pursuit-lead tests) folds onto (-π, π].
         assert!((wrap_angle(PI + 0.1) + PI - 0.1).abs() < 1e-5);
-    }
-
-    // --- R97 Stage A: compose_intent_aimed (aim/move decoupling) ---
-
-    #[test]
-    fn compose_intent_aimed_matches_compose_intent_at_parity() {
-        // THE PARITY PROOF (the strict-generalization guarantee Stage B relies on):
-        // aim == move AND !can_strafe AND throttle >= 0 → BIT-IDENTICAL to
-        // compose_intent(move, throttle, heading) across several geometries.
-        let cases = [
-            // (move_dir, throttle, heading)
-            (Vec2::X, 1.0, 0.0),                // forward, aligned
-            (Vec2::Y, 1.0, 0.0),                // 90° off (target to the left)
-            (Vec2::new(-1.0, 0.0), 1.0, 0.0),   // directly behind the nose
-            (Vec2::from_angle(0.7), 0.5, 0.0),  // off-angle, half throttle
-            (Vec2::from_angle(-3.0), 1.0, 3.0), // wrapped across the ±π seam
-            (Vec2::from_angle(2.1), 0.3, -1.2), // arbitrary heading + dir
-            (Vec2::ZERO, 1.0, 0.4),             // degenerate move → default
-        ];
-        for (dir, throttle, heading) in cases {
-            let baseline = compose_intent(dir, throttle, heading);
-            let aimed = compose_intent_aimed(dir, throttle, dir, heading, false);
-            assert_eq!(
-                aimed, baseline,
-                "parity (aim==move, !can_strafe, throttle>=0) must be bit-identical: \
-                 dir={dir:?} throttle={throttle} heading={heading}"
-            );
-        }
-    }
-
-    #[test]
-    fn compose_intent_aimed_decouples_aim_from_move() {
-        // Heading +X. AIM at a target to +X (dead ahead) while WANTING to move -X
-        // (away). Expect: turn toward +X ≈ 0 (already facing it), and forward < 0
-        // (a REVERSE-thrust request — retro away while the gun bears on +X).
-        let intent = compose_intent_aimed(Vec2::new(-1.0, 0.0), 1.0, Vec2::X, 0.0, false);
-        assert!(intent.turn.abs() < 1e-6, "already aimed at +X → ~zero turn");
-        assert!(
-            intent.forward < 0.0,
-            "move is BEHIND the nose → reverse thrust (got {})",
-            intent.forward
-        );
-        assert!(
-            (intent.forward + 1.0).abs() < 1e-6,
-            "full retro at throttle 1"
-        );
-        assert_eq!(intent.strafe, 0.0, "no strafe authority → strafe 0");
-
-        // Heading +X, AIM at +X target, MOVE +Y (lateral): a can_strafe hull
-        // strafes port (+) and barely thrusts forward; turn stays ~0 (facing +X).
-        let strafer = compose_intent_aimed(Vec2::Y, 1.0, Vec2::X, 0.0, true);
-        assert!(
-            strafer.turn.abs() < 1e-6,
-            "aim +X from heading +X → ~zero turn"
-        );
-        assert!(
-            (strafer.strafe - 1.0).abs() < 1e-6,
-            "full port strafe for +Y move"
-        );
-        assert!(
-            strafer.forward.abs() < 1e-6,
-            "pure lateral move → ~zero forward"
-        );
-    }
-
-    #[test]
-    fn compose_intent_aimed_turn_follows_aim_not_move() {
-        // Heading +X, MOVE +X (dead ahead) but AIM at +Y (target to the left):
-        // the turn must follow the AIM (positive/CCW), not the move (which is
-        // aligned and would give zero turn).
-        let intent = compose_intent_aimed(Vec2::X, 1.0, Vec2::Y, 0.0, false);
-        assert!(
-            intent.turn > 0.0,
-            "turn follows the aim (+Y is to the left → CCW) not the move (got {})",
-            intent.turn
-        );
-        // Forward still tracks the MOVE (aligned with the nose → full forward).
-        assert!(
-            (intent.forward - 1.0).abs() < 1e-6,
-            "forward tracks the move"
-        );
-    }
-
-    #[test]
-    fn compose_intent_aimed_strafe_only_when_can_strafe() {
-        // Same lateral move; only the can_strafe hull writes a strafe channel.
-        let no_strafe = compose_intent_aimed(Vec2::Y, 1.0, Vec2::X, 0.0, false);
-        assert_eq!(no_strafe.strafe, 0.0, "no strafe authority → 0");
-        let strafer = compose_intent_aimed(Vec2::Y, 1.0, Vec2::X, 0.0, true);
-        assert!(
-            strafer.strafe.abs() > 0.5,
-            "strafe authority → real lateral"
-        );
-    }
-
-    #[test]
-    fn compose_intent_aimed_is_never_nan_on_degenerate_inputs() {
-        // Zero move + zero aim → the default coasting intent (no NaN).
-        assert_eq!(
-            compose_intent_aimed(Vec2::ZERO, 1.0, Vec2::ZERO, 0.5, true),
-            ShipIntent::default()
-        );
-        // Zero aim but a real move → aim falls back to the move (faces where it goes).
-        let fallback = compose_intent_aimed(Vec2::Y, 1.0, Vec2::ZERO, 0.0, false);
-        assert!(fallback.turn > 0.0 && fallback.forward.is_finite());
-        // Zero move but a real aim → faces the aim, no translation, all finite.
-        let aim_only = compose_intent_aimed(Vec2::ZERO, 1.0, Vec2::Y, 0.0, true);
-        assert!(aim_only.turn > 0.0, "turns toward the aim");
-        assert!(
-            aim_only.forward.abs() < 1e-6 && aim_only.strafe.abs() < 1e-6,
-            "no move → no thrust"
-        );
-        assert!(
-            aim_only.forward.is_finite()
-                && aim_only.strafe.is_finite()
-                && aim_only.turn.is_finite()
-        );
-    }
-
-    // R100 — `brake_orientation`: the emergent goal-vs-flip nose decision.
-    // Default knobs: ratio 1.5, min_speed 15, margin 1.0.
-    const FLIP_RATIO: f32 = 1.5;
-    const FLIP_MIN_SPEED: f32 = 15.0;
-    const FLIP_MARGIN: f32 = 1.0;
-
-    #[test]
-    fn brake_orientation_flips_to_retrograde_on_a_long_fast_weak_retro_brake() {
-        // Heading +X, flying +X fast, goal ahead at +X. Weak retros (a_fwd 10,
-        // a_rev 1 → ratio 10 > 1.5) and a slow turn → the saved braking time far
-        // exceeds the turn cost → flip to retrograde (face −X).
-        let nose = brake_orientation(
-            Vec2::new(60.0, 0.0), // fast, closing on the +X goal
-            Vec2::X,
-            0.0,  // heading +X
-            10.0, // a_fwd
-            1.0,  // a_rev (weak)
-            2.0,  // turn_rate (rad/s)
-            FLIP_RATIO,
-            FLIP_MIN_SPEED,
-            FLIP_MARGIN,
-        );
-        assert!(
-            nose.dot(Vec2::new(-1.0, 0.0)) > 0.9,
-            "weak-retro long-fast brake flips to retrograde (nose≈−X), got {nose:?}"
-        );
-    }
-
-    #[test]
-    fn brake_orientation_stays_goal_facing_when_slow_or_strong_retro() {
-        // (a) Below flip_min_speed → never flips even with weak retros.
-        let slow = brake_orientation(
-            Vec2::new(10.0, 0.0), // v_close 10 < 15
-            Vec2::X,
-            0.0,
-            10.0,
-            1.0,
-            2.0,
-            FLIP_RATIO,
-            FLIP_MIN_SPEED,
-            FLIP_MARGIN,
-        );
-        assert!(
-            slow.dot(Vec2::X) > 0.9,
-            "sub-min-speed brake never flips (nose stays on goal +X), got {slow:?}"
-        );
-        // (b) Ratio 1.0 (forward == reverse) → retros strong enough → never flips.
-        let strong = brake_orientation(
-            Vec2::new(60.0, 0.0),
-            Vec2::X,
-            0.0,
-            10.0,
-            10.0, // a_fwd == a_rev → ratio 1.0 <= 1.5
-            2.0,
-            FLIP_RATIO,
-            FLIP_MIN_SPEED,
-            FLIP_MARGIN,
-        );
-        assert!(
-            strong.dot(Vec2::X) > 0.9,
-            "ratio-1.0 brake never flips (nose stays on goal), got {strong:?}"
-        );
-    }
-
-    #[test]
-    fn brake_orientation_is_goal_facing_for_degenerate_inputs_no_nan() {
-        // Zero goal → returns the (zero) goal_dir, finite.
-        let z = brake_orientation(
-            Vec2::new(50.0, 0.0),
-            Vec2::ZERO,
-            0.0,
-            10.0,
-            1.0,
-            2.0,
-            FLIP_RATIO,
-            FLIP_MIN_SPEED,
-            FLIP_MARGIN,
-        );
-        assert!(z.x.is_finite() && z.y.is_finite());
-        // Zero velocity → v_close 0 < min_speed → goal-facing, finite.
-        let still = brake_orientation(
-            Vec2::ZERO,
-            Vec2::X,
-            0.0,
-            10.0,
-            1.0,
-            2.0,
-            FLIP_RATIO,
-            FLIP_MIN_SPEED,
-            FLIP_MARGIN,
-        );
-        assert!((still - Vec2::X).length() < 1e-6, "zero vel → goal-facing");
+        assert!(wrap_angle(0.0).abs() < 1e-6);
+        assert!((wrap_angle(TAU + 0.3) - 0.3).abs() < 1e-5);
     }
 }

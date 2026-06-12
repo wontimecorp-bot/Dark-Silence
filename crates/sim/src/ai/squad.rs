@@ -7,12 +7,13 @@
 //! **Cost shape (TR-009)**: decisions are O(squads) — one assignment pass per
 //! squad per think (O(members) cheap field writes, no scoring); each member
 //! then executes its standing assignment through `ai_execute_system`'s O(1)
-//! steering math ([`formation_keep`](crate::ai::steering::formation_keep) /
-//! waypoint follow). Total decision cost scales with squad count, not ship
-//! count.
+//! steering math
+//! ([`formation_desired_vel`](crate::ai::steering::formation_desired_vel) →
+//! the unified `allocate_intent` controller / nav follow). Total decision cost
+//! scales with squad count, not ship count.
 //!
 //! **AD-004 (steering mix)**: Mid-tier members already execute squad orders as
-//! plain order-vector steering — `formation_keep` is a closed-form slot/order
+//! plain order-vector steering — the formation slot is a closed-form slot/order
 //! vector with (at most) the danger mask layered on top; NO per-member
 //! interest-map build happens here. Full 16-slot context maps remain
 //! Active-tier individual-brain territory (T007/T025).
@@ -95,8 +96,8 @@ pub enum SquadOrder {
 /// Leader-frame formation slot offsets (data-model §`Squad.formation`):
 /// `slots[i]` is a body-frame offset from the leader (+X = leader's nose),
 /// rotated by the leader's heading at execution time
-/// ([`crate::ai::steering::formation_keep`]). Slot 0 is the leader's own spot
-/// (the origin) in both built-in constructors.
+/// ([`crate::ai::steering::formation_desired_vel`]). Slot 0 is the leader's own
+/// spot (the origin) in both built-in constructors.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FormationDef {
     /// Leader-frame slot offsets; members map to slots by member index.
