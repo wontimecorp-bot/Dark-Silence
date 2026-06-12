@@ -6565,3 +6565,418 @@ fn commanded_hold_at_parks_on_anchor() {
         "home pinned to anchor"
     );
 }
+
+// ---------------------------------------------------------------------------
+// R102 Part B1 — AI disposition / personality (engine plug-ins)
+// VC: hunter acquires a passing hostile a sentry ignores; the caution flee
+// scale orders skittish > brave; a short-leash sentry breaks off + returns
+// while a long-leash hunter keeps chasing; a fickle ship drops a lost target
+// within its grace while a tenacious one holds it; the disposition style link
+// beats role/archetype; a ship WITHOUT a disposition is byte-identical to
+// before (the golden-world invariant).
+// ---------------------------------------------------------------------------
+
+use sim::ai::Disposition;
+
+/// A full flight + brain + perception ship the way a scenario authors an
+/// individual personality-driven unit: the `spawn_roled_ship` stack MINUS the
+/// role, PLUS an armed `ShipStats` (so acquisition is live), an explicit
+/// `home` anchor (the leash reference), and the given `Disposition`. Optional
+/// so the same helper builds the no-disposition control ship.
+fn spawn_dispo_ship(
+    w: &mut World,
+    id: u64,
+    faction: Faction,
+    pos: Vec2,
+    home: Vec2,
+    dispo: Option<Disposition>,
+) -> Entity {
+    let e = w
+        .spawn((
+            Ship,
+            ShipIntent::default(),
+            Position(pos),
+            Velocity(Vec2::ZERO),
+            Heading(0.0),
+            AngularVelocity(0.0),
+            FlightAssist::On,
+            AiStableId(id),
+            AiBrain {
+                think_tier: Tier::Active,
+                phase_bucket: 0,
+                home: Some(home),
+                ..AiBrain::default()
+            },
+            AoiTier {
+                tier: Tier::Active,
+                since_tick: 0,
+            },
+            ContactList::default(),
+            faction,
+            stats_with_top_speed(80.0), // armed (autocannon → can_fire)
+        ))
+        .id();
+    if let Some(d) = dispo {
+        w.entity_mut(e).insert(d);
+    }
+    e
+}
+
+/// R102 B1 — ACQUISITION GATE: a `hunter()` (FreeEngage) acquires + Engages a
+/// hostile that merely passes through its sensor range (never fired), while a
+/// `sentry()` (DefensiveOnly) in the same setup IGNORES the passerby — its
+/// target stays empty and it never selects Engage. This fixes "enemies ignore a
+/// passing player" for hunters AND keeps sentries defensive.
+#[test]
+fn hunter_acquires_and_engages_a_passing_hostile() {
+    let (mut w, mut s) = roles_world();
+    let home = Vec2::new(0.0, 0.0);
+    let hunter = spawn_dispo_ship(
+        &mut w,
+        0,
+        Faction::Red,
+        home,
+        home,
+        Some(Disposition::hunter()),
+    );
+    let sentry_home = Vec2::new(0.0, 5000.0);
+    let sentry = spawn_dispo_ship(
+        &mut w,
+        1,
+        Faction::Red,
+        sentry_home,
+        sentry_home,
+        Some(Disposition::sentry()),
+    );
+    // A hostile passes within sensor range of EACH ship (never fires on either).
+    let passer_h = spawn_hostile_body(&mut w, Faction::Blue, Vec2::new(120.0, 0.0), 3.0);
+    spawn_hostile_body(
+        &mut w,
+        Faction::Blue,
+        sentry_home + Vec2::new(120.0, 0.0),
+        3.0,
+    );
+
+    let mut hunter_engaged = false;
+    for t in 0..=90 {
+        mirror_tick_and_run(&mut w, &mut s, t);
+        if brain_of(&w, hunter).behavior == Behavior::Engage {
+            hunter_engaged = true;
+        }
+    }
+
+    let hb = brain_of(&w, hunter);
+    assert!(
+        hunter_engaged && hb.target == Some(passer_h),
+        "a hunter acquires + Engages a passing hostile (target {:?}, engaged {hunter_engaged})",
+        hb.target
+    );
+    let sb = brain_of(&w, sentry);
+    assert_eq!(
+        sb.target, None,
+        "a sentry IGNORES a passing hostile until fired upon (never auto-acquires)"
+    );
+    assert_ne!(
+        sb.behavior,
+        Behavior::Engage,
+        "a sentry never Engages an unprovoked passerby"
+    );
+}
+
+/// R102 B1 — SURVIVAL SCORE SCALE: a `skittish()` (high caution) ship lifts its
+/// flee/Evade desire far above a `berserker()`/brave one in the SAME threat, so
+/// once a health-driven Evade candidate competes it breaks off at higher health.
+/// The implemented mechanism is the strict-f32 `flee_score_scale` multiplier on
+/// the Evade candidate; this asserts its ordering (and that a brave ship is ×1,
+/// i.e. unscaled — the parity edge), and confirms it lands through the scoring
+/// fence via a scout's Evade candidate winning the survival bucket.
+#[test]
+fn skittish_retreats_at_higher_health_than_brave() {
+    let t = AiTuning::default();
+    let skittish = Disposition::skittish();
+    let brave = Disposition::berserker();
+    let timid_scale = skittish.flee_score_scale(&t);
+    let brave_scale = brave.flee_score_scale(&t);
+    assert!(
+        timid_scale > brave_scale,
+        "a skittish ship flees more eagerly than a brave one ({timid_scale} > {brave_scale})"
+    );
+    assert_eq!(
+        brave_scale, 1.0,
+        "a brave (zero-caution) ship leaves Evade unscaled"
+    );
+    assert!(
+        timid_scale >= 1.5,
+        "the skittish caution scale is a substantial lift ({timid_scale})"
+    );
+
+    // It lands through the scoring fence: a skittish SCOUT (its Evade candidate
+    // is the one path the think system scores) selects Evade against a superior
+    // perceived threat, the scaled survival score outranking its recon task.
+    let (mut w, mut s) = roles_world();
+    let scout = spawn_roled_ship(
+        &mut w,
+        0,
+        Faction::Red,
+        Vec2::ZERO,
+        ScenarioRole::new(
+            RoleGoal::ScoutArea {
+                min: Vec2::new(-50.0, -50.0),
+                max: Vec2::new(50.0, 50.0),
+            },
+            Posture::FreeEngage,
+        ),
+        false, // unarmed scout — every armed threat is "superior" (the v1 test)
+    );
+    w.entity_mut(scout).insert(skittish);
+    // An ARMED hostile inside the scout's sensor range (a superior threat — the
+    // scout's superiority test requires `ShipStats::can_fire`).
+    let threat = spawn_hostile_body(&mut w, Faction::Blue, Vec2::new(60.0, 0.0), 3.0);
+    w.entity_mut(threat).insert(stats_with_top_speed(80.0));
+    let mut evaded = false;
+    for tk in 0..=90 {
+        mirror_tick_and_run(&mut w, &mut s, tk);
+        if brain_of(&w, scout).behavior == Behavior::Evade {
+            evaded = true;
+            break;
+        }
+    }
+    assert!(
+        evaded,
+        "the skittish scout's (scaled) Evade wins the survival bucket vs a superior threat"
+    );
+}
+
+/// R102 B1 — LEASH: a `sentry()` (short leash) given a target that draws it far
+/// from `home` CLEARS the target past its leash and returns toward home; a
+/// `hunter()` (long leash) at the same distance keeps chasing.
+#[test]
+fn leashed_sentry_breaks_off_and_returns() {
+    let t = AiTuning::default();
+    let home = Vec2::ZERO;
+    // A distance comfortably past the sentry's short leash but well within the
+    // hunter's long leash (so the two dispositions diverge at the SAME point).
+    let far = Disposition::sentry().leash_radius(&t) + 30.0;
+    assert!(
+        far < Disposition::hunter().leash_radius(&t),
+        "the test distance is inside the hunter's leash ({far} < {})",
+        Disposition::hunter().leash_radius(&t)
+    );
+
+    for (dispo, expect_clear) in [
+        (Disposition::sentry(), true),
+        (Disposition::hunter(), false),
+    ] {
+        let (mut w, mut s) = roles_world();
+        // The ship sits FAR from home with a live target (pre-set, so the leash
+        // check is what decides — not acquisition).
+        let ship = spawn_dispo_ship(
+            &mut w,
+            0,
+            Faction::Red,
+            Vec2::new(far, 0.0),
+            home,
+            Some(dispo),
+        );
+        let ghost = w.spawn_empty().id();
+        w.get_mut::<AiBrain>(ship).unwrap().target = Some(ghost);
+        mirror_tick_and_run(&mut w, &mut s, 0);
+        let b = brain_of(&w, ship);
+        if expect_clear {
+            assert_eq!(
+                b.target, None,
+                "a short-leash sentry past its leash breaks off (returns home)"
+            );
+            assert_ne!(
+                b.behavior,
+                Behavior::Engage,
+                "the sentry is no longer chasing"
+            );
+        } else {
+            assert_eq!(
+                b.target,
+                Some(ghost),
+                "a long-leash hunter at the same distance keeps chasing"
+            );
+        }
+    }
+}
+
+/// R102 B1 — TENACITY: two ships acquire a target that then leaves sensor range;
+/// the low-tenacity (`skittish`) one clears `brain.target` within its grace
+/// (reverts behavior), while the high-tenacity (`hunter`) one still holds it. A
+/// big `home`/leash so the leash never confounds the staleness path.
+#[test]
+fn tenacious_holds_lost_target_fickle_drops_it() {
+    let t = AiTuning::default();
+    // Both ships acquire (aggression > 0.66 → FreeEngage) but differ ONLY in
+    // tenacity — so the divergence is purely the lost-target grace.
+    let fickle = Disposition {
+        aggression: 0.9,
+        caution: 0.2,
+        leash: 0.95,
+        tenacity: 0.1,
+    };
+    let dogged = Disposition {
+        tenacity: 0.95,
+        ..fickle
+    };
+    let fickle_grace = fickle.target_grace_ticks(&t);
+    let dogged_grace = dogged.target_grace_ticks(&t);
+    assert!(
+        fickle_grace < dogged_grace,
+        "the fickle grace {fickle_grace} is shorter than the dogged grace {dogged_grace}"
+    );
+
+    for (dispo, drops) in [(fickle, true), (dogged, false)] {
+        let (mut w, mut s) = roles_world();
+        // Home AT the ship so the leash radius (centered on home) never trips —
+        // the staleness path is the only releaser under test.
+        let home = Vec2::ZERO;
+        let ship = spawn_dispo_ship(&mut w, 0, Faction::Red, Vec2::ZERO, home, Some(dispo));
+        // A live perceived hostile: the ship acquires it and stamps target_seen.
+        let hostile = spawn_hostile_body(&mut w, Faction::Blue, Vec2::new(60.0, 0.0), 3.0);
+        let mut acquired_at = None;
+        for tk in 0..=30 {
+            mirror_tick_and_run(&mut w, &mut s, tk);
+            if brain_of(&w, ship).target == Some(hostile) {
+                acquired_at = Some(tk);
+                break;
+            }
+        }
+        let acquired_at = acquired_at.expect("the ship acquires the in-range hostile");
+
+        // The hostile leaves sensor range (it stays ALIVE — not a despawn, so the
+        // V-1 sweep does not clear it; only the staleness grace can). It ages out
+        // of the contact list after the perception staleness window (≈45 ticks),
+        // then the disposition grace decides whether to keep the target. Run to a
+        // window AFTER the fickle total (staleness + fickle grace) but BEFORE the
+        // dogged total — so the two dispositions diverge here.
+        w.get_mut::<Position>(hostile).unwrap().0 = Vec2::new(5000.0, 0.0);
+        let perception_window = 45_u64; // 3 × the Active scan cadence (15)
+        let until = acquired_at + perception_window + fickle_grace + 30;
+        assert!(
+            until < acquired_at + perception_window + dogged_grace,
+            "the test window ends before the dogged ship's grace expires"
+        );
+        let mut fickle_cleared_at = None;
+        for tk in acquired_at + 1..=until {
+            mirror_tick_and_run(&mut w, &mut s, tk);
+            if drops && brain_of(&w, ship).target.is_none() && fickle_cleared_at.is_none() {
+                fickle_cleared_at = Some(tk);
+            }
+        }
+
+        let b = brain_of(&w, ship);
+        if drops {
+            assert_eq!(
+                b.target, None,
+                "a fickle ship drops a lost target within its grace (reverts behavior)"
+            );
+            let cleared = fickle_cleared_at.expect("the fickle ship cleared its lost target");
+            assert!(
+                cleared > acquired_at,
+                "the fickle ship dropped after losing contact (at {cleared})"
+            );
+        } else {
+            assert_eq!(
+                b.target,
+                Some(hostile),
+                "a tenacious ship still holds the lost target past the fickle grace"
+            );
+        }
+    }
+}
+
+/// R102 B1 — STYLE PRECEDENCE: a `hunter()` resolves Charge/Rush over a role/
+/// archetype default, and a `PlayerOrder` still beats the disposition (the full
+/// chain player > disposition > squad > role > archetype).
+#[test]
+fn disposition_style_beats_role_and_archetype() {
+    let (mut w, mut s) = roles_world();
+    // A patrol-roled ship whose ROLE pins a Leisurely/Kite style — the
+    // disposition link must override it.
+    let role = ScenarioRole::new(
+        RoleGoal::PatrolRoute(vec![Vec2::new(40.0, 0.0), Vec2::new(80.0, 0.0)]),
+        Posture::FreeEngage,
+    )
+    .with_style(Some(MovementProfile::Leisurely), Some(CombatStance::Kite));
+    let ship = spawn_roled_ship(&mut w, 0, Faction::Red, Vec2::new(40.0, 0.0), role, true);
+    w.entity_mut(ship).insert(Disposition::hunter());
+
+    mirror_tick_and_run(&mut w, &mut s, 0);
+    let b = brain_of(&w, ship);
+    assert_eq!(
+        b.movement_profile,
+        MovementProfile::Rush,
+        "the hunter disposition's Rush beats the role's Leisurely"
+    );
+    assert_eq!(
+        b.combat_stance,
+        CombatStance::Charge,
+        "the hunter disposition's Charge beats the role's Kite"
+    );
+
+    // A PlayerOrder still wins over the disposition (player > disposition). The
+    // tick-0 think armed a 15-tick commit window, so run to the next cadence
+    // tick (15) for a fresh think that observes the new order.
+    w.entity_mut(ship).insert(
+        PlayerOrder::settings_only()
+            .with_profile(MovementProfile::Leisurely)
+            .with_stance(CombatStance::Kite),
+    );
+    for tk in 1..=15 {
+        mirror_tick_and_run(&mut w, &mut s, tk);
+    }
+    let b = brain_of(&w, ship);
+    assert_eq!(
+        b.movement_profile,
+        MovementProfile::Leisurely,
+        "a player order beats the disposition (player > disposition)"
+    );
+    assert_eq!(b.combat_stance, CombatStance::Kite, "player stance wins");
+}
+
+/// R102 B1 — THE GOLDEN-WORLD INVARIANT: a ship WITHOUT a `Disposition` behaves
+/// byte-identically to before — acquisition is unconditional (it acquires a
+/// passing hostile exactly as today), and no leash/grace ever clears its target.
+/// Two identical ships (no disposition) run the same scenario; the trace is
+/// reproduced bit-for-bit across two runs, and the ship acquires + holds the
+/// passerby past where a leash WOULD have tripped.
+#[test]
+fn no_disposition_is_unchanged() {
+    let run = || {
+        let (mut w, mut s) = roles_world();
+        let home = Vec2::ZERO;
+        // NO disposition → today's unconditional acquisition + no leash/grace.
+        let ship = spawn_dispo_ship(&mut w, 0, Faction::Red, Vec2::new(400.0, 0.0), home, None);
+        // A passing hostile far from home (past where a leash WOULD trip) — a
+        // no-disposition ship must still acquire + hold it (no break-off).
+        spawn_hostile_body(&mut w, Faction::Blue, Vec2::new(450.0, 0.0), 3.0);
+        let mut trace = Vec::new();
+        for tk in 0..=120 {
+            mirror_tick_and_run(&mut w, &mut s, tk);
+            let intent = *w.get::<ShipIntent>(ship).expect("ship has intent");
+            let b = brain_of(&w, ship);
+            trace.push((b.behavior, b.target, state_bits_of_intent(intent)));
+        }
+        (trace, brain_of(&w, ship).target)
+    };
+
+    let (trace_a, final_target_a) = run();
+    let (trace_b, _) = run();
+    assert_eq!(
+        trace_a, trace_b,
+        "a ship without a Disposition is byte-identical across runs (no RNG path)"
+    );
+    // Unconditional acquisition held: it acquired the passerby and never leashed
+    // it away (no disposition → no leash/grace clears it).
+    assert!(
+        final_target_a.is_some(),
+        "a no-disposition ship acquires + HOLDS a passing hostile (today's behavior)"
+    );
+    assert!(
+        trace_a.iter().any(|(b, ..)| *b == Behavior::Engage),
+        "and Engages it (acquisition is unconditional without a disposition)"
+    );
+}

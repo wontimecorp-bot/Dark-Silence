@@ -42,6 +42,7 @@ use crate::ai::command::PlayerOrder;
 use crate::ai::control::{
     allocate_intent, deflect_v_des, stoppable_speed, ControlStats, Facing, MoveCmd,
 };
+use crate::ai::disposition::Disposition;
 use crate::ai::ident::{phase_bucket, AiStableId};
 use crate::ai::lod::{AoiTier, Tier};
 use crate::ai::perception::{nearest_contact, ContactList};
@@ -384,6 +385,16 @@ pub struct AiBrain {
     /// Determinism-safe: golden worlds spawn no `AiBrain`, so this stays `0`
     /// there and the producer branch is never taken.
     pub last_damaged_tick: u64,
+    /// R102 Part B1 — the last tick this brain's `target` was PERCEIVED (present
+    /// in the ship's [`ContactList`]). Stamped every think a [`Disposition`] ship
+    /// sees its target in contact; the disposition's tenacity-grace path
+    /// ([`Disposition::target_grace_ticks`](crate::ai::disposition::Disposition::target_grace_ticks))
+    /// clears a target out of contact for longer than the grace. `0` = the
+    /// default (never updated for a ship without a `Disposition`, so the grace
+    /// path — which only runs WITH a disposition — leaves it inert). Bookkeeping
+    /// nothing on the score path reads; golden worlds spawn no `AiBrain`, so this
+    /// stays `0` there.
+    pub target_seen_tick: u64,
 }
 
 impl Default for AiBrain {
@@ -410,6 +421,7 @@ impl Default for AiBrain {
             throttle_cap: 1.0,
             thinks_total: 0,
             last_damaged_tick: 0,
+            target_seen_tick: 0,
         }
     }
 }
@@ -1448,7 +1460,11 @@ const RECON_BASELINE: f32 = 0.7;
 /// `fired_upon_until` (armed by the trigger pass on a damage event) still gates
 /// it; a ship with NO role under a player `DefensiveOnly` posture has no armed
 /// window, so it stays weapons-tight (deadline `0`, strict `<` → never).
-fn posture_allows_engage(posture: Posture, role: Option<&ScenarioRole>, now: u64) -> bool {
+pub(crate) fn posture_allows_engage(
+    posture: Posture,
+    role: Option<&ScenarioRole>,
+    now: u64,
+) -> bool {
     match posture {
         Posture::FreeEngage => true,
         Posture::DefensiveOnly => now < role.map_or(0, |r| r.fired_upon_until),
@@ -1527,6 +1543,11 @@ pub fn ai_think_system(
         // Patrol cursor advance). Applied at HIGHEST precedence — its nav goal
         // overwrites the role's, and its style/posture win the resolution.
         Option<&mut PlayerOrder>,
+        // R102 Part B1: the per-ship personality trait (read-only). Sits BELOW
+        // the player order and ABOVE role/squad in the posture/style chains, and
+        // gates the leash break-off + tenacity stale-target release below. Absent
+        // → today's behavior (golden worlds spawn none, stay bit-identical).
+        Option<&Disposition>,
     )>,
     // T025/T027 target view (read-only, access-disjoint from `brains`' only
     // mutable component `AiBrain`): kinematics + the hull-state sources
@@ -1554,8 +1575,19 @@ pub fn ai_think_system(
     order.sort_unstable();
 
     for (_, entity) in order {
-        let Ok((_, _, mut brain, aoi, pos, vel, stats, mut role, contacts, mut player_order)) =
-            brains.get_mut(entity)
+        let Ok((
+            _,
+            _,
+            mut brain,
+            aoi,
+            pos,
+            vel,
+            stats,
+            mut role,
+            contacts,
+            mut player_order,
+            dispo,
+        )) = brains.get_mut(entity)
         else {
             continue;
         };
@@ -1589,6 +1621,10 @@ pub fn ai_think_system(
         // stays live — flee-permitted).
         let mut engage_allowed = true;
         let mut recon: Option<Behavior> = None;
+        // R102 Part B1 — a HARD combat-candidacy veto the posture chain must NOT
+        // re-open: the ScoutArea scout combat veto (TR-021). Survives any
+        // aggressive disposition (a scout never engages regardless of personality).
+        let mut scout_veto = false;
         // R96 precedence — the ROLE link of the resolved style chain (the squad
         // link rides `brain.squad_profile`/`_stance`, the base is the archetype
         // default). Captured from the role here, folded into the final
@@ -1611,9 +1647,25 @@ pub fn ai_think_system(
                 RoleGoal::SweepRegion { .. } => recon = Some(Behavior::Sweep),
                 RoleGoal::ScoutArea { .. } => {
                     recon = Some(Behavior::Scout);
+                    scout_veto = true;
                     engage_allowed = false; // The scout combat veto (TR-021).
                 }
                 _ => {}
+            }
+        }
+
+        // R102 Part B1 — the DISPOSITION posture link: a personality's
+        // `effective_posture()` sits ABOVE the role posture but BELOW a
+        // `PlayerOrder.posture` (resolved in the player block below). A present
+        // disposition re-derives the engage gate from its posture (via the same
+        // `posture_allows_engage` window read), UNLESS the scout veto stands (a
+        // scout never engages, regardless of personality). A ship WITHOUT a
+        // disposition is untouched here — today's role/`FreeEngage` gate stands,
+        // so golden/headless worlds (no `Disposition`) are byte-identical.
+        if let Some(d) = dispo {
+            if !scout_veto {
+                let posture = d.effective_posture();
+                engage_allowed = posture_allows_engage(posture, role.as_deref(), now);
             }
         }
 
@@ -1644,6 +1696,46 @@ pub fn ai_think_system(
             }
         }
 
+        // R102 Part B1 — DISPOSITION target upkeep (leash + tenacity), AFTER the
+        // role/player nav resolution so it acts on the FINAL target, and OUTSIDE
+        // the strict-f32 scoring fence (it is target bookkeeping + GEOMETRY — a
+        // `length()` leash distance — not scoring). The whole block is gated on a
+        // present `Disposition`, so a ship WITHOUT one keeps TODAY's behavior
+        // exactly (the role.rs threat-gone release for roled ships; non-roled
+        // hold-until-despawn) and golden/headless worlds (no `Disposition`) are
+        // byte-identical.
+        if let Some(d) = dispo {
+            if let Some(target) = brain.target {
+                // TENACITY → stale-target release: stamp the last tick the target
+                // is PERCEIVED (in the contact list); a target out of contact for
+                // longer than the grace is cleared. A fickle ship drops a lost
+                // target fast (reverts to its task — fixes "idle in Engage"); a
+                // tenacious one holds it. (Despawned targets are already pruned by
+                // the V-1 sweep, so a missing contact entry = out of sensor range.)
+                let perceived =
+                    contacts.is_some_and(|c| c.contacts.iter().any(|x| x.target == target));
+                if perceived {
+                    brain.target_seen_tick = now;
+                } else {
+                    let grace = d.target_grace_ticks(&tuning);
+                    if now.saturating_sub(brain.target_seen_tick) > grace {
+                        brain.target = None; // Lost past the grace → drop it.
+                    }
+                }
+            }
+            // LEASH → return-to-post: if still chasing a target that has drawn the
+            // ship too far from its `home` anchor, break off so the role waypoint
+            // (or Hold) wins and the ship returns. A short-leash sentry holds its
+            // post; a long-leash hunter chases far. GEOMETRY (a `length()` vs the
+            // leash radius), so it lives outside the strict-f32 fence.
+            if let (Some(target_pos), Some(home)) = (pos.map(|p| p.0), brain.home) {
+                if brain.target.is_some() && (target_pos - home).length() > d.leash_radius(&tuning)
+                {
+                    brain.target = None; // Roamed past the leash → return home.
+                }
+            }
+        }
+
         // R96 STYLE RESOLUTION (do it ONCE per think, after `role_apply`): the
         // documented precedence chain `squad ← role ← archetype default`. Each
         // writer stores its `Option` LOCALLY — the squad's onto
@@ -1660,14 +1752,35 @@ pub fn ai_think_system(
         // `PlayerOrder.profile`/`.stance` override wins the whole chain
         // (`player ← squad ← role ← archetype default`). `None` defers to the
         // next link, so a settings-only/style-less order is transparent here.
+        //
+        // R102 Part B1 — the DISPOSITION link sits between PLAYER and SQUAD:
+        // a personality's `move_profile()`/`combat_stance()` override wins over
+        // squad/role/archetype but yields to a player order
+        // (`player ← disposition ← squad ← role ← archetype default`). A
+        // balanced disposition returns `None` (defers), and a ship WITHOUT a
+        // disposition contributes `None` here — so the chain is byte-identical
+        // to before for golden/headless worlds (no `Disposition`).
+        let dispo_profile = dispo.and_then(Disposition::move_profile);
+        let dispo_stance = dispo.and_then(Disposition::combat_stance);
         brain.movement_profile = player_profile
+            .or(dispo_profile)
             .or(brain.squad_profile)
             .or(role_profile)
             .unwrap_or_else(|| default_movement_profile(brain.archetype));
         brain.combat_stance = player_stance
+            .or(dispo_stance)
             .or(brain.squad_stance)
             .or(role_stance)
             .unwrap_or_else(|| default_combat_stance(brain.archetype));
+
+        // R102 Part B1 — the personality SCORE scales (strict-f32, pre-resolved
+        // here so the candidate-push multiplies below stay inside the brain's
+        // strict-f32 fence: a multiply by a strict-f32-derived scalar is legal).
+        // A cautious ship lifts its flee/Evade desire; an aggressive one lifts
+        // its Engage desire. A ship WITHOUT a disposition gets `1.0` (× 1 — a
+        // no-op, so golden/headless worlds are byte-identical).
+        let flee_scale = dispo.map_or(1.0, |d| d.flee_score_scale(&tuning));
+        let engage_scale = dispo.map_or(1.0, |d| d.engage_score_scale(&tuning));
 
         // Candidate set (see system docs): movement presence + combat.
         let k = tuning.compensation_k;
@@ -1714,8 +1827,14 @@ pub fn ai_think_system(
                                 // role_apply when no longer perceived (resume)
                                 // or by the V-1 sweep on despawn.
                                 brain.target = Some(threat);
-                                candidates
-                                    .push((Behavior::Evade, score_behavior(&[MOVE_BASELINE], k)));
+                                // R102 B1: the personality flee scale lifts the
+                                // Evade desire (× 1 without a disposition — a
+                                // no-op). The multiply by the strict-f32-derived
+                                // `flee_scale` stays inside the scoring fence.
+                                candidates.push((
+                                    Behavior::Evade,
+                                    score_behavior(&[MOVE_BASELINE], k) * flee_scale,
+                                ));
                             }
                         }
                     }
@@ -1731,7 +1850,13 @@ pub fn ai_think_system(
             .flatten()
             .and_then(|t| targets.get(t).ok())
         {
-            candidates.push((Behavior::Engage, score_behavior(&[MOVE_BASELINE], k)));
+            // R102 B1: the personality engage scale lifts the Engage desire
+            // (× 1 without a disposition — a no-op). Strict-f32 multiply inside
+            // the fence (the scale is pre-resolved from strict-f32 ops).
+            candidates.push((
+                Behavior::Engage,
+                score_behavior(&[MOVE_BASELINE], k) * engage_scale,
+            ));
             if let (Some(pos), Some(vel)) = (pos, vel) {
                 // GEOMETRY (normalize/length) stays OUTSIDE the strict-f32
                 // markers; `ram_utility` consumes pure scalars (TR-004).

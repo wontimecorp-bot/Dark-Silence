@@ -15,6 +15,16 @@ use bevy_ecs::prelude::Resource;
 use crate::ai::brain::MovementProfile;
 use crate::fitting::CELL_WORLD_SIZE;
 
+/// R102 Part A — the default [`AiTuning::glide_min_radius`] (world units): the
+/// play-space radius the dormant-glide cutoff is floored to (≥ the max camera
+/// view corner), so no visible ship ever runs the no-physics kinematic glide.
+/// A free `fn` so the `#[serde(default = …)]` per-FIELD fallback restores this
+/// value when an older RON omits the field (otherwise serde's container default
+/// would supply `f32::default()` = 0.0, disabling the floor).
+fn default_glide_min_radius() -> f32 {
+    600.0
+}
+
 /// Global AI tuning. Inserted by the scenario/server world (and edited live via
 /// the dev panel, TR-020); a world that never inserts it reads
 /// `AiTuning::default()` — the pinned values every golden/bench fixture is
@@ -42,6 +52,20 @@ pub struct AiTuning {
     pub aoi_radius_mid: f32,
     /// Minimum ticks between tier changes per entity — boundary hysteresis (no thrash).
     pub tier_hysteresis_ticks: u32,
+    /// R102 Part A — the GLIDE-visibility FLOOR (world units): a hard lower bound
+    /// on the Dormant/cheap-glide cutoff, DECOUPLED from the tunable
+    /// [`Self::aoi_radius_mid`]. [`classify_aoi_system`](crate::ai::classify_aoi_system)
+    /// floors the effective Dormant boundary at `aoi_radius_mid.max(glide_min_radius)`,
+    /// so a ship within `glide_min_radius` of a player is NEVER classified
+    /// `Dormant` (and so never collapses to the no-physics kinematic glide),
+    /// **no matter how small the dev panel sets `aoi_radius_mid`**. This is the
+    /// fix for the dormant-GLIDE LOD leak (allied/enemy ships "sliding across
+    /// the screen without physics"): it must be ≥ the max camera view radius so
+    /// no visible ship ever glides. Default 600.0 — matching the
+    /// `skirmish_physics`/`skirmish_flythrough` play-space radius. `aoi_radius_mid`
+    /// still freely tunes the Active/Mid *think*-cadence split below this floor.
+    #[serde(default = "default_glide_min_radius")]
+    pub glide_min_radius: f32,
     /// TR-008 validity-nudge bound: max de-penetration distance applied at
     /// promotion, world units (default = one fine grid cell, `CELL_WORLD_SIZE`).
     pub promote_nudge_max: f32,
@@ -201,6 +225,33 @@ pub struct AiTuning {
     /// `0.0` = no floor (the inert default — flee is purely score-driven).
     pub weapons_free_flee_floor: f32,
 
+    // --- R102 Part B1 — disposition / personality knobs ---
+    // The magnitudes the [`Disposition`](crate::ai::disposition::Disposition)
+    // helper methods scale their traits by. Inert in every world WITHOUT a
+    // `Disposition` (the gated plug-ins only run when the component is present),
+    // so the golden trio is unaffected regardless of these values. Each is
+    // `#[serde(default)]` via the struct attribute, so older RONs parse.
+    /// R102 B1 — how strongly `caution` lifts the Evade/Retreat candidate score:
+    /// `flee_scale = 1 + caution · this` (a skittish ship at caution 0.9 with the
+    /// default ~1.0 flees ~1.9× as eagerly; a brave ship at caution 0 is ×1).
+    pub disposition_caution_flee_scale: f32,
+    /// R102 B1 — how strongly `aggression` lifts the Engage candidate score:
+    /// `engage_scale = 1 + aggression · this` (a hunter at aggression 0.9 with the
+    /// default ~0.5 engages ~1.45× as eagerly).
+    pub disposition_aggression_engage_scale: f32,
+    /// R102 B1 — the BASE leash radius (world units): the return-to-post distance
+    /// a max-leash (berserker) ship reaches; a short-leash sentry holds a small
+    /// fraction of it (see [`Disposition::leash_radius`](crate::ai::disposition::Disposition::leash_radius)).
+    pub disposition_leash_base: f32,
+    /// R102 B1 — the BASE lost-target grace (ticks): how long a `tenacity == 0`
+    /// ship holds an out-of-contact target before clearing it; a tenacious ship
+    /// holds `· (1 + tenacity · disposition_tenacity_grace_scale)` longer.
+    pub disposition_target_grace_base: f32,
+    /// R102 B1 — how strongly `tenacity` extends the lost-target grace:
+    /// `grace = base · (1 + tenacity · this)` (a hunter at tenacity 0.9 with the
+    /// default ~4.0 holds a lost target ~4.6× the base before dropping it).
+    pub disposition_tenacity_grace_scale: f32,
+
     // --- R97 Phase 2 Stage E — strategic objective/planner tier (HTN) ---
     // The SLOW squad-objective planner knobs (`strategic_plan_system`). Inert in
     // every world without a `SquadObjective` (the planner's query is empty), so
@@ -281,6 +332,11 @@ impl Default for AiTuning {
             aoi_radius_active: 120.0,
             aoi_radius_mid: 520.0,
             tier_hysteresis_ticks: 30,
+            // R102 Part A — the Dormant/glide cutoff is floored to this play-space
+            // radius (≥ the max camera view), so a ship the player can SEE never
+            // collapses to the no-physics kinematic glide regardless of how small
+            // `aoi_radius_mid` is tuned. 600 matches the skirmish play-space radius.
+            glide_min_radius: default_glide_min_radius(),
             promote_nudge_max: CELL_WORLD_SIZE,
             // Squads.
             max_squad_size: 8,
@@ -354,6 +410,19 @@ impl Default for AiTuning {
             move_drive_weight: 1.0,
             aim_drive_weight: 1.0,
             weapons_free_flee_floor: 0.0,
+            // R102 Part B1 — disposition / personality knobs. Sane v1 defaults:
+            // caution roughly doubles the flee desire at full caution (1.0),
+            // aggression adds ~half again to the engage desire at full aggression
+            // (0.5), a 300 u base leash (so a sentry holds ~50–60 u of its post
+            // and a hunter chases the full ~300 u), a 45-tick (1.5 s) base
+            // lost-target grace, and a 4× tenacity extension (a hunter holds a lost
+            // target ~7.5 s). Inert without a `Disposition`, so the golden trio is
+            // unaffected regardless.
+            disposition_caution_flee_scale: 1.0,
+            disposition_aggression_engage_scale: 0.5,
+            disposition_leash_base: 300.0,
+            disposition_target_grace_base: 45.0,
+            disposition_tenacity_grace_scale: 4.0,
             // R97 Phase 2 Stage E — strategic objective/planner tier (HTN).
             // SLOW 90-tick (3 s) re-plan cadence; withdraw when outnumbered
             // 1.5×; 40 u cohesion ring for Regroup; 50 u arrive radius for the
@@ -446,6 +515,12 @@ mod tests {
         assert!(t.collision_preempt_gain > 0.0 && t.collision_horizon_s > 0.0);
         assert!(t.move_drive_weight > 0.0 && t.aim_drive_weight > 0.0);
         assert!(t.weapons_free_flee_floor >= 0.0);
+        // R102 Part B1 disposition knobs: non-negative scales (a 0 scale is the
+        // inert "trait does nothing" edge), a positive leash base + grace base.
+        assert!(t.disposition_caution_flee_scale >= 0.0);
+        assert!(t.disposition_aggression_engage_scale >= 0.0);
+        assert!(t.disposition_leash_base > 0.0 && t.disposition_target_grace_base > 0.0);
+        assert!(t.disposition_tenacity_grace_scale >= 0.0);
         // R97 Stage E strategic planner: positive slow cadence, an outnumbered
         // ratio >= 1, and positive cohesion/arrive radii.
         assert!(t.strategic_plan_ticks > 0 && t.outnumbered_ratio >= 1.0);
@@ -453,6 +528,11 @@ mod tests {
         // R98 HOTFIX B3 — the Mid radius must clear the max-zoom view corner
         // (~202 u) so dormant kinematics never occur on screen.
         assert!(t.aoi_radius_mid > 202.0);
+        // R102 Part A — the glide-visibility floor is positive and at least the
+        // play-space radius (600 u, ≥ the max camera view corner), so a ship the
+        // player can see never collapses to the no-physics glide even when
+        // `aoi_radius_mid` is tuned smaller than the floor.
+        assert!(t.glide_min_radius >= 600.0);
         // R98 HOTFIX D — the release ring must be at least the acquisition ring
         // (>= 1 keeps the hysteresis a pure widening, never a shrink).
         assert!(t.defend_release_factor >= 1.0);
@@ -490,11 +570,36 @@ mod tests {
         let d = AiTuning::default();
         assert_eq!(t.aoi_radius_mid, d.aoi_radius_mid);
         assert_eq!(t.think_ticks_dormant, d.think_ticks_dormant);
+        // R102 Part A — `glide_min_radius` carries a per-FIELD serde default
+        // (`#[serde(default = "default_glide_min_radius")]`): absent from this
+        // partial RON it must restore 600.0, NOT `f32::default()` (0.0) — a 0
+        // floor would re-open the dormant-glide leak.
+        assert_eq!(t.glide_min_radius, d.glide_min_radius);
+        assert_eq!(t.glide_min_radius, 600.0);
         // R97 Stage A fields are also `#[serde(default)]`: absent from this
         // older/partial RON, they fall back to the pinned defaults.
         assert_eq!(t.threat_recency_window_ticks, d.threat_recency_window_ticks);
         assert_eq!(t.move_drive_weight, d.move_drive_weight);
         assert_eq!(t.weapons_free_flee_floor, d.weapons_free_flee_floor);
+        // R102 Part B1 disposition knobs are `#[serde(default)]` too: absent from
+        // this older/partial RON, they fall back to the pinned defaults.
+        assert_eq!(
+            t.disposition_caution_flee_scale,
+            d.disposition_caution_flee_scale
+        );
+        assert_eq!(
+            t.disposition_aggression_engage_scale,
+            d.disposition_aggression_engage_scale
+        );
+        assert_eq!(t.disposition_leash_base, d.disposition_leash_base);
+        assert_eq!(
+            t.disposition_target_grace_base,
+            d.disposition_target_grace_base
+        );
+        assert_eq!(
+            t.disposition_tenacity_grace_scale,
+            d.disposition_tenacity_grace_scale
+        );
         // R97 Stage E strategic planner fields are also `#[serde(default)]`:
         // absent from this partial RON, they fall back to the pinned defaults.
         assert_eq!(t.strategic_plan_ticks, d.strategic_plan_ticks);

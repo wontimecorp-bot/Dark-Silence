@@ -26,8 +26,8 @@ use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 use sim::ai::AiDebugCapture;
 use sim::ai::{
     cadence_for_tier, AiBrain, AiStableId, AiTuning, AoiTier, CombatStance, ContactList,
-    GlideState, LinkState, MovementProfile, Objective, OrderKind, PlayerOrder, Posture,
-    SensorNetworks, Squad, SquadObjective, Tier, WingObjective,
+    Disposition, GlideState, LinkState, MovementProfile, Objective, OrderKind, PlayerOrder,
+    Posture, SensorNetworks, Squad, SquadObjective, Tier, WingObjective,
 };
 use sim::components::{
     Afterburner, ArmorHp, Energy, Faction, Heading, Health, Heat, Position, Velocity,
@@ -960,6 +960,10 @@ struct AiShipDetail {
     order_profile: Option<MovementProfile>,
     order_stance: Option<CombatStance>,
     order_posture: Option<Posture>,
+    /// R102 Part C — the ship's live [`Disposition`] (the per-ship personality), if present.
+    /// Surfaced as an inspection line (preset name + the four traits + the resolved leash /
+    /// effective posture) and read back into the disposition dropdown. `None` = no personality.
+    disposition: Option<Disposition>,
     contacts_total: usize,
     last_scan_tick: u64,
     /// Nearest few contacts (by distance to the ship).
@@ -1075,6 +1079,10 @@ enum CommandRequest {
     SetStance(Entity, Option<CombatStance>),
     /// Merge a posture override (`None` = `(inherit)`).
     SetPosture(Entity, Option<Posture>),
+    /// R102 Part C — INSERT a [`Disposition`] preset onto the ship (sets its personality).
+    SetDisposition(Entity, Disposition),
+    /// R102 Part C — REMOVE the `Disposition` so the ship reverts to "no personality".
+    ClearDisposition(Entity),
 }
 
 /// R99 Phase B (B5) — a live Team-join request captured in the UI phase: re-faction
@@ -1082,6 +1090,17 @@ enum CommandRequest {
 struct TeamJoinRequest {
     faction: Faction,
 }
+
+/// R102 Part C — a "Spawn test enemy" request captured in the UI phase, applied in the
+/// write-back phase (where the server world is mutable). Spawns a fitted AI fighter near
+/// the player on the OPPOSITE faction with `dispo` so engagement can be tested immediately.
+struct SpawnTestEnemyRequest {
+    dispo: Disposition,
+}
+
+/// R102 Part C — how far in FRONT of the player the "Spawn test enemy" fighter appears
+/// (world units), close enough to engage immediately but clear of an instant ram.
+const TEST_ENEMY_SPAWN_DIST: f32 = 120.0;
 
 /// The hold radius (world units) a "Hold here" command guards around the ship's
 /// current position — a small default, tunable for feel.
@@ -1119,6 +1138,34 @@ fn posture_choices() -> [(&'static str, Option<Posture>); 4] {
         ("DefensiveOnly", Some(Posture::DefensiveOnly)),
         ("HoldFire", Some(Posture::HoldFire)),
     ]
+}
+
+/// R102 Part C — the per-ship Disposition preset choices (the six [`Disposition`]
+/// presets the sim authors with). Each pick INSERTS the matching `Disposition` onto the
+/// selected SERVER ship; a separate "Clear disposition" button removes the component
+/// (reverting the ship to "no personality"). The label is also reused by the AI-inspection
+/// line to NAME a ship's live disposition when it matches a known preset.
+fn dispo_choices() -> [(&'static str, Disposition); 6] {
+    [
+        ("Sentry", Disposition::sentry()),
+        ("Patroller", Disposition::patroller()),
+        ("Hunter", Disposition::hunter()),
+        ("Skittish", Disposition::skittish()),
+        ("Berserker", Disposition::berserker()),
+        ("Neutral", Disposition::neutral()),
+    ]
+}
+
+/// R102 Part C — the preset NAME for a live [`Disposition`] (so the AI-inspection line can
+/// read "Hunter" instead of raw traits), or `"custom"` when the four traits match no preset.
+/// Note `Patroller` and `Neutral` are identical (all 0.5) — `dispo_choices` lists `Patroller`
+/// first, so an all-0.5 ship is named "Patroller" (the closest scenario-authored intent).
+fn dispo_preset_name(d: &Disposition) -> &'static str {
+    dispo_choices()
+        .iter()
+        .find(|(_, preset)| preset == d)
+        .map(|(name, _)| *name)
+        .unwrap_or("custom")
 }
 
 /// The label for a currently-selected dropdown value, found by matching against the
@@ -1410,6 +1457,9 @@ fn gather_ai(
             order_profile: world.get::<PlayerOrder>(e).and_then(|o| o.profile),
             order_stance: world.get::<PlayerOrder>(e).and_then(|o| o.stance),
             order_posture: world.get::<PlayerOrder>(e).and_then(|o| o.posture),
+            // R102 Part C — the ship's live per-ship personality (the user's window into WHY
+            // it behaves as it does); copied out for the inspection line + the override dropdown.
+            disposition: world.get::<Disposition>(e).copied(),
             contacts_total,
             last_scan_tick,
             contacts,
@@ -1430,7 +1480,7 @@ fn gather_ai(
 }
 
 /// Render the selected ship's inspection detail (T038, TR-020a). Read-only rows via [`stat`].
-fn render_ai_detail(ui: &mut egui::Ui, d: &AiShipDetail, now: u64) {
+fn render_ai_detail(ui: &mut egui::Ui, d: &AiShipDetail, now: u64, tuning: &AiTuning) {
     stat(
         ui,
         "ship",
@@ -1489,6 +1539,27 @@ fn render_ai_detail(ui: &mut egui::Ui, d: &AiShipDetail, now: u64) {
     .on_hover_text(
         "The brain's current engage/follow target entity (pruned the tick it despawns).",
     );
+    // R102 Part C — the ship's per-ship PERSONALITY (Disposition): the preset name (or "custom")
+    // + the four raw traits + the resolved leash radius and effective posture. The user's window
+    // into WHY a ship behaves as it does. "none" = no personality (absent component → today's behaviour).
+    stat(
+        ui,
+        "disposition",
+        match d.disposition {
+            None => "none".to_string(),
+            Some(dz) => format!(
+                "{} (aggr {:.2} / caut {:.2} / leash {:.2} / tenac {:.2} · leash r{:.0}u · posture {:?})",
+                dispo_preset_name(&dz),
+                dz.aggression,
+                dz.caution,
+                dz.leash,
+                dz.tenacity,
+                dz.leash_radius(tuning),
+                dz.effective_posture(),
+            ),
+        },
+    )
+    .on_hover_text("R102 — the per-ship Disposition (personality): the preset NAME (or 'custom'), the four raw traits (aggression / caution / leash / tenacity), and the RESOLVED return-to-post leash radius + effective fire-control posture this disposition implies. 'none' = no personality component (the ship behaves exactly as the scenario authored it).");
     stat(
         ui,
         "link",
@@ -1666,6 +1737,11 @@ pub struct DevPanelState {
     pub command_mode: bool,
     /// R99 Phase B (B5) — last status of a Team "Join Red/Blue" click (shown by the buttons).
     pub team_status: String,
+    /// R102 Part C — the "Spawn test enemy" disposition pick, by preset INDEX into
+    /// [`dispo_choices`] (default `2` = Hunter, so a spawned test enemy engages on sight).
+    pub test_enemy_dispo_idx: usize,
+    /// R102 Part C — last status of a "Spawn test enemy" click (shown beside the button).
+    pub spawn_status: String,
 }
 
 impl Default for DevPanelState {
@@ -1682,6 +1758,10 @@ impl Default for DevPanelState {
             ai_metrics_since: None,
             command_mode: false,
             team_status: String::new(),
+            // R102 Part C — default the test-enemy disposition to Hunter (index 2 in
+            // `dispo_choices`) so a freshly spawned test enemy aggresses immediately.
+            test_enemy_dispo_idx: 2,
+            spawn_status: String::new(),
         }
     }
 }
@@ -2176,6 +2256,9 @@ fn dev_panel_ui(
     // write-back phase below (where the server world is mutable). `None` = no request.
     let mut command_request: Option<CommandRequest> = None;
     let mut team_request: Option<TeamJoinRequest> = None;
+    // R102 Part C — a "Spawn test enemy" request captured in the UI phase, applied in the
+    // write-back phase below (`host.server.spawn_test_enemy` needs `&mut ServerApp`).
+    let mut spawn_request: Option<SpawnTestEnemyRequest> = None;
 
     // T038/T039 (TR-020): snapshot the AI inspection + runtime metrics. `world_mut()` is needed
     // only to build the read-only QueryStates (see `gather_ai` docs) — nothing in the sim world is
@@ -2408,8 +2491,24 @@ fn dev_panel_ui(
                     ui.label(egui::RichText::new("AOI tiers (TR-007/TR-008)").strong());
                     slider(ui, "AOI radius Active", &mut ai_tun.aoi_radius_active, 5.0..=500.0)
                         .on_hover_text("Player-proximity radius of the Active tier (full per-ship AI), world units.");
-                    slider(ui, "AOI radius Mid", &mut ai_tun.aoi_radius_mid, 20.0..=2000.0)
-                        .on_hover_text("Player-proximity radius of the Mid tier (squad-driven AI); beyond = Dormant.");
+                    // R102 Part A — clamp the Mid-radius slider MINIMUM to the
+                    // glide-visibility floor (`glide_min_radius`, default 600 u) so the
+                    // user can't drag it into the visible band and re-create the
+                    // dormant-GLIDE leak (ships "sliding without physics"). The sim
+                    // floors the Dormant/glide cutoff regardless (belt-and-suspenders),
+                    // but pinning the slider keeps the UI honest about what's tunable.
+                    // Local copy first (the field is borrowed mutably below).
+                    let mid_floor = ai_tun.glide_min_radius;
+                    slider(
+                        ui,
+                        "AOI radius Mid",
+                        &mut ai_tun.aoi_radius_mid,
+                        mid_floor..=2000.0,
+                    )
+                    .on_hover_text(
+                        "Player-proximity radius of the Mid tier (squad-driven AI); beyond = Dormant. \
+                         Floored to glide_min_radius so no visible ship ever cheap-glides.",
+                    );
                     int(ui, "tier hysteresis", &mut ai_tun.tier_hysteresis_ticks, 0..=300,
                         "Minimum ticks between tier changes per entity (no boundary thrash). Promotion is immediate.");
                     slider(ui, "promote nudge max", &mut ai_tun.promote_nudge_max, 0.0..=50.0)
@@ -2540,6 +2639,88 @@ fn dev_panel_ui(
                     }
                 });
 
+                // R102 Part C — dev tools for TESTING the AI: a persisted scenario picker (applied
+                // on the NEXT launch) + a "Spawn test enemy" button (spawns an OPPOSITE-faction
+                // fighter near the player with a chosen disposition, so engagement can be tested
+                // immediately). The scenario pick is plain file IO (handled inline); the spawn is
+                // captured here + applied in the write-back phase (needs `&mut ServerApp`).
+                egui::CollapsingHeader::new("Dev tools (scenario / spawn)").show(ui, |ui| {
+                    // --- Scenario picker (persisted; applies on NEXT launch) ---
+                    ui.label(egui::RichText::new("Scenario (next launch)").strong());
+                    // Load the persisted pick (0 = Sandbox, 1 = MiningSkirmish; None = code default).
+                    let mut dev = tuning_io::load_dev_settings();
+                    let scenario_labels = [(0u8, "Sandbox"), (1u8, "MiningSkirmish")];
+                    let cur_scenario_label = match dev.preferred_scenario {
+                        Some(0) => "Sandbox",
+                        Some(1) => "MiningSkirmish",
+                        _ => "(code default)",
+                    };
+                    let mut picked_scenario: Option<u8> = None;
+                    egui::ComboBox::from_label("scenario")
+                        .selected_text(cur_scenario_label)
+                        .show_ui(ui, |ui| {
+                            for (val, lbl) in scenario_labels {
+                                if ui
+                                    .selectable_label(dev.preferred_scenario == Some(val), lbl)
+                                    .clicked()
+                                {
+                                    picked_scenario = Some(val);
+                                }
+                            }
+                        });
+                    if let Some(val) = picked_scenario {
+                        dev.preferred_scenario = Some(val);
+                        state.spawn_status = match tuning_io::save_dev_settings(&dev) {
+                            Ok(_) => "scenario saved — applies on next launch".to_string(),
+                            Err(e) => format!("scenario save failed: {e}"),
+                        };
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "The picked scenario is saved now but APPLIES ON THE NEXT LAUNCH \
+                             (re-spawning a live world is out of scope).",
+                        )
+                        .weak(),
+                    )
+                    .on_hover_text("Persisted to render_tuning.ron (DevSettings::preferred_scenario). net.rs reads it once at setup; live re-spawn is intentionally not done here.");
+
+                    ui.separator();
+                    // --- Spawn test enemy (near the player, opposite faction) ---
+                    ui.label(egui::RichText::new("Spawn test enemy").strong());
+                    let dispos = dispo_choices();
+                    // Keep the index in range (defensive against a stale persisted/edited value).
+                    if state.test_enemy_dispo_idx >= dispos.len() {
+                        state.test_enemy_dispo_idx = 2; // Hunter
+                    }
+                    let cur_dispo_label = dispos[state.test_enemy_dispo_idx].0;
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_label("disposition")
+                            .selected_text(cur_dispo_label)
+                            .show_ui(ui, |ui| {
+                                for (i, (lbl, _)) in dispos.iter().enumerate() {
+                                    if ui
+                                        .selectable_label(state.test_enemy_dispo_idx == i, *lbl)
+                                        .clicked()
+                                    {
+                                        state.test_enemy_dispo_idx = i;
+                                    }
+                                }
+                            });
+                        if ui
+                            .button("Spawn test enemy")
+                            .on_hover_text("Spawn a fitted AI fighter ~120u in front of the player on the OPPOSITE faction, with the chosen disposition, so engagement can be tested immediately. Requires a factioned player ship (use a Team button first if unfactioned).")
+                            .clicked()
+                        {
+                            spawn_request = Some(SpawnTestEnemyRequest {
+                                dispo: dispos[state.test_enemy_dispo_idx].1,
+                            });
+                        }
+                    });
+                    if !state.spawn_status.is_empty() {
+                        ui.label(egui::RichText::new(&state.spawn_status).weak());
+                    }
+                });
+
                 // T038 (TR-020a) — per-ship AI inspection: STRICTLY read-only (selection only
                 // changes what the panel shows, never sim state).
                 egui::CollapsingHeader::new("AI inspection (per-ship, read-only)").show(ui, |ui| {
@@ -2598,7 +2779,44 @@ fn dev_panel_ui(
                     }
                     ui.separator();
                     if let Some(d) = &ai_data.detail {
-                        render_ai_detail(ui, d, ai_data.metrics.now);
+                        render_ai_detail(ui, d, ai_data.metrics.now, &ai_tun);
+                    }
+                    // R102 Part C — per-ship Disposition (personality) override for the SELECTED
+                    // ship (shared `ai_selected` selection; NOT gated on command mode — it's an AI
+                    // TEST affordance, not a player command). Pick a preset → insert it; "Clear" →
+                    // remove the component (revert to "no personality"). Captured here, applied in
+                    // the write-back phase (the world is read-only during the UI pass).
+                    if let Some(d) = &ai_data.detail {
+                        let ship = d.entity;
+                        ui.separator();
+                        ui.label(egui::RichText::new("Disposition (selected ship)").strong())
+                            .on_hover_text("R102 — override this ship's per-ship personality (Disposition): pick a preset to INSERT it, or Clear to remove it (revert to scenario-authored behaviour). The live value shows on the 'disposition' inspection line above.");
+                        ui.horizontal(|ui| {
+                            let dispos = dispo_choices();
+                            // The closed combo names the live preset (or "custom"/"none").
+                            let cur_label = match d.disposition {
+                                None => "none",
+                                Some(dz) => dispo_preset_name(&dz),
+                            };
+                            egui::ComboBox::from_label("preset")
+                                .selected_text(cur_label)
+                                .show_ui(ui, |ui| {
+                                    for (lbl, preset) in dispos {
+                                        let selected = d.disposition == Some(preset);
+                                        if ui.selectable_label(selected, lbl).clicked() {
+                                            command_request =
+                                                Some(CommandRequest::SetDisposition(ship, preset));
+                                        }
+                                    }
+                                });
+                            if ui
+                                .button("Clear disposition")
+                                .on_hover_text("Remove the Disposition component — the ship reverts to 'no personality' (its scenario-authored behaviour).")
+                                .clicked()
+                            {
+                                command_request = Some(CommandRequest::ClearDisposition(ship));
+                            }
+                        });
                     }
                     // R99 Phase B (B4) — command + settings controls for the SELECTED ship,
                     // shown only with command mode ON and a ship resolved. Each control captures
@@ -3586,6 +3804,9 @@ fn dev_panel_ui(
             // determinism is untouched). Module/hull DESIGNS are NOT saved here; use the separate
             // "Save designs" button below. (Starfield presets save separately, in their section.)
             if ui.button("Save dev settings → RON").clicked() {
+                // Load the persisted preferences ONCE so the dev choices (faction + scenario) that
+                // aren't server-world resources survive a full save (they aren't rebuilt from `host`).
+                let persisted_prefs = tuning_io::load_dev_settings();
                 let dev = tuning_io::DevSettings {
                     tuning,
                     sim_tuning: sim,
@@ -3599,9 +3820,11 @@ fn dev_panel_ui(
                     ship_visual: *ship_visual,
                     cell_materials: cell_materials.clone(),
                     ai: ai_tun,
-                    // Preserve the persisted faction preference (not a server-world resource, so it
-                    // isn't rebuilt from `host` like the rest) — a full save must not reset it.
-                    preferred_faction: tuning_io::load_dev_settings().preferred_faction,
+                    // Preserve the persisted faction + scenario preferences (not server-world
+                    // resources, so they aren't rebuilt from `host` like the rest) — a full save
+                    // must not reset them. Load both from the on-disk settings in one read.
+                    preferred_faction: persisted_prefs.preferred_faction,
+                    preferred_scenario: persisted_prefs.preferred_scenario,
                 };
                 state.save_status = match tuning_io::save_dev_settings(&dev) {
                     Ok(m) => m,
@@ -3711,6 +3934,15 @@ fn dev_panel_ui(
         let world = host.server.world_mut();
         state.team_status = apply_team_join(world, ship, req.faction);
     }
+    // R102 Part C — apply a captured "Spawn test enemy" request: spawn a fitted AI fighter near
+    // the player on the OPPOSITE faction with the chosen disposition (needs `&mut ServerApp` for
+    // the `spawn_test_enemy` API). The player ship's live transform/faction is read first.
+    if let Some(req) = spawn_request {
+        let ship = net
+            .as_ref()
+            .and_then(|n| host.server.ship_entity_for(n.local_id));
+        state.spawn_status = apply_spawn_test_enemy(&mut host.server, ship, req.dispo);
+    }
     state.tuning_open = tuning_open;
     state.stats_open = stats_open;
 }
@@ -3752,6 +3984,14 @@ fn apply_command_request(world: &mut World, req: CommandRequest) {
         CommandRequest::SetPosture(ship, posture) => {
             merge(world, ship, &|o| o.posture = posture);
         }
+        // R102 Part C — disposition is a standalone per-ship component (NOT part of PlayerOrder):
+        // insert the chosen preset, or remove it entirely to revert to "no personality".
+        CommandRequest::SetDisposition(ship, dispo) => {
+            world.entity_mut(ship).insert(dispo);
+        }
+        CommandRequest::ClearDisposition(ship) => {
+            world.entity_mut(ship).remove::<Disposition>();
+        }
     }
 }
 
@@ -3782,6 +4022,47 @@ fn apply_team_join(world: &mut World, ship: Option<Entity>, faction: Faction) ->
         Ok(_) => format!("joined {side} (preference saved)"),
         Err(e) => format!("joined {side}, but save failed: {e}"),
     }
+}
+
+/// R102 Part C — spawn a fitted test enemy ~[`TEST_ENEMY_SPAWN_DIST`]u in FRONT of the player on
+/// the OPPOSITE faction, with `dispo`, so engagement can be tested immediately. Reads the player
+/// ship's live `Position`/`Heading`/`Faction` from the server world, then calls the server's
+/// `spawn_test_enemy` API. Returns a short status. Requires a FACTIONED player ship (an enemy needs
+/// an opposite side); reports a hint when unfactioned (use a Team button first).
+fn apply_spawn_test_enemy(
+    server: &mut server::ServerApp,
+    ship: Option<Entity>,
+    dispo: Disposition,
+) -> String {
+    let Some(ship) = ship else {
+        return "no player ship to spawn near".to_string();
+    };
+    let world = server.world();
+    let Some(faction) = world.get::<Faction>(ship).copied() else {
+        return "player ship is unfactioned — pick a Team first so the enemy gets the other side"
+            .to_string();
+    };
+    let pos = world.get::<Position>(ship).map(|p| p.0).unwrap_or_default();
+    let heading = world.get::<Heading>(ship).map(|h| h.0).unwrap_or_default();
+    // In front of the player along its nose; the enemy faces back toward the player.
+    let nose = Vec2::from_angle(heading);
+    let spawn_pos = pos + nose * TEST_ENEMY_SPAWN_DIST;
+    let enemy_heading = heading + std::f32::consts::PI;
+    let opposite = match faction {
+        Faction::Red => Faction::Blue,
+        Faction::Blue => Faction::Red,
+    };
+    let entity = server.spawn_test_enemy(spawn_pos, enemy_heading, opposite, dispo);
+    let side = match opposite {
+        Faction::Red => "Red",
+        Faction::Blue => "Blue",
+    };
+    format!(
+        "spawned {side} test enemy ({}) at ({:.0}, {:.0}) [{entity:?}]",
+        dispo_preset_name(&dispo),
+        spawn_pos.x,
+        spawn_pos.y
+    )
 }
 
 /// Refinement 43 — install `module_id` into `slot` on the live `ship`'s [`Fit`] (validated against the

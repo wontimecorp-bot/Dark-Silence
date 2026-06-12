@@ -34,8 +34,10 @@ use std::collections::{BTreeMap, VecDeque};
 use bevy_ecs::prelude::*;
 use glam::Vec2;
 
-use crate::ai::brain::{AiBrain, AiEvent, RethinkQueue};
+use crate::ai::brain::{posture_allows_engage, AiBrain, AiEvent, RethinkQueue};
+use crate::ai::disposition::Disposition;
 use crate::ai::lod::{AoiTier, Tier};
+use crate::ai::role::ScenarioRole;
 use crate::ai::tuning::AiTuning;
 use crate::broadphase::CoarseIndex;
 use crate::clock::CurrentTick;
@@ -298,6 +300,14 @@ pub fn perception_scan_system(
         &Position,
         Option<&AoiTier>,
         Option<&ShipStats>,
+        // R102 Part B1: the per-ship personality + its role (the role supplies
+        // the DefensiveOnly fired-upon window). When a `Disposition` is present
+        // the acquisition below is GATED on its effective posture allowing
+        // engagement now (a sentry ignores a passing hostile; a hunter acquires
+        // immediately). Absent → today's unconditional acquire (golden/headless
+        // worlds, which spawn no `Disposition`, are byte-identical).
+        Option<&Disposition>,
+        Option<&ScenarioRole>,
     )>,
     // Candidate view (read-only, access-disjoint from the scanners' mutable
     // components `AiBrain`/`ContactList`) — so scanners can sense each other.
@@ -305,7 +315,7 @@ pub fn perception_scan_system(
 ) {
     let now = tick.0;
     let range_sq = tuning.base_sensor_range * tuning.base_sensor_range;
-    for (entity, mut brain, mut list, faction, pos, aoi, stats) in &mut scanners {
+    for (entity, mut brain, mut list, faction, pos, aoi, stats, dispo, role) in &mut scanners {
         // Reads below go through `Deref` (no change-detection flag).
         let tier = aoi.map_or(Tier::Active, |a| a.tier);
         let cadence = scan_cadence_for_tier(tier, &tuning);
@@ -364,7 +374,16 @@ pub fn perception_scan_system(
         }
 
         // v1 target acquisition (see system docs): idle + armed → nearest.
-        if brain.target.is_none() && stats.is_some_and(|s| s.can_fire) {
+        //
+        // R102 Part B1 — acquisition is additionally gated on WILLINGNESS when a
+        // `Disposition` is present: the ship only auto-acquires a NEW target if
+        // its effective posture permits engaging it NOW (a Sentry/DefensiveOnly
+        // ship ignores a passing hostile until fired upon; a Hunter/FreeEngage
+        // acquires immediately). A ship WITHOUT a disposition acquires
+        // UNCONDITIONALLY — exactly today's behavior — so golden/headless worlds
+        // (no `Disposition`) are byte-identical (the gated branch never runs).
+        let willing = dispo.is_none_or(|d| posture_allows_engage(d.effective_posture(), role, now));
+        if brain.target.is_none() && stats.is_some_and(|s| s.can_fire) && willing {
             if let Some(best) = nearest_contact(&list.contacts, pos.0) {
                 brain.target = Some(best);
             }

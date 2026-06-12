@@ -304,7 +304,17 @@ fn setup_loopback_host(world: &mut World) {
     // drifting asteroids + seeker + the two fitted E007 enemies); `MiningSkirmish` is the
     // new game mode. The headless tests never call `spawn_scenario`, so `spawn_demo_world`
     // + the test entity sets are untouched.
-    server.spawn_scenario(SELECTED_SCENARIO);
+    //
+    // R102 Part C — honour the dev-panel's persisted "Scenario (next launch)" pick
+    // (`DevSettings::preferred_scenario`: 0 = Sandbox, 1 = MiningSkirmish; absent/unknown =
+    // the code default `SELECTED_SCENARIO`). Read once HERE at setup — re-spawning a live
+    // world is out of scope, so the pick applies on the next launch.
+    let scenario = match dev.preferred_scenario {
+        Some(0) => Scenario::Sandbox,
+        Some(1) => Scenario::MiningSkirmish,
+        _ => SELECTED_SCENARIO,
+    };
+    server.spawn_scenario(scenario);
     // `spawn_scenario(MiningSkirmish)` inserts `MiningTuning` from `scenario.ron`, so apply the dev
     // override AFTERWARDS (else it would be clobbered). Sandbox also inserts a default MiningTuning.
     server.world_mut().insert_resource(dev.mining);

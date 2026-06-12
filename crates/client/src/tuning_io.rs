@@ -141,6 +141,14 @@ pub struct DevSettings {
     /// in BOTH feature configs (only the buttons are dev-gated) so `net.rs` compiles without `dev_panel`.
     #[serde(default)]
     pub preferred_faction: Option<u8>,
+    /// R102 Part C — the dev-chosen scenario for the NEXT launch (a small `u8` so we don't depend
+    /// on a serde derive for the server `Scenario` enum): `0` = Sandbox, `1` = MiningSkirmish;
+    /// `None`/unknown = the code default (`net::SELECTED_SCENARIO`). Set by the dev panel's
+    /// "Scenario (next launch)" dropdown; READ once at `net.rs` setup (re-spawning a live world is
+    /// out of scope, so the pick applies on the next launch). Present in BOTH feature configs (only
+    /// the dropdown is dev-gated) so `net.rs` compiles without `dev_panel`.
+    #[serde(default)]
+    pub preferred_scenario: Option<u8>,
 }
 
 impl Default for DevSettings {
@@ -159,6 +167,7 @@ impl Default for DevSettings {
             cell_materials: CellMaterials::default(),
             ai: sim::ai::AiTuning::default(),
             preferred_faction: None,
+            preferred_scenario: None,
         }
     }
 }

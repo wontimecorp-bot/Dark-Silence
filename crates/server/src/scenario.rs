@@ -12,7 +12,7 @@ use bevy_ecs::prelude::With;
 use glam::{Vec2, Vec3};
 use serde::Deserialize;
 use sim::ai::{
-    spawn_squad, AiBrain, AiIdAllocator, AiTuning, AoiTier, CombatStance, ContactList,
+    spawn_squad, AiBrain, AiIdAllocator, AiTuning, AoiTier, CombatStance, ContactList, Disposition,
     FormationDef, MovementProfile, Objective, PlayerShip, Posture, RoleGoal, ScenarioRole, Squad,
     SquadObjective, SquadOrder, WingObjective,
 };
@@ -103,6 +103,60 @@ fn default_ram_mass() -> f32 {
 /// wing-level DefendZone showcase objectives in `spawn_skirmish_ai`.
 fn defend_zone(anchor: Vec2, radius: f32) -> Objective {
     Objective::DefendZone { anchor, radius }
+}
+
+/// R102 Part B — the skirmish's DISPOSITIONED AI ship GROUPS, each mapped to one
+/// [`Disposition`] personality preset so the arena reads as a varied living place
+/// rather than a monoculture of identical brains. The presets layer ON TOP of the
+/// existing `ScenarioRole`/`Posture`/squad authoring (the disposition's
+/// `effective_posture` is kept CONSISTENT with each group's authored posture — see
+/// [`disposition_for`]); they tune the gated brain seams (acquisition gate, leash,
+/// tenacity grace, style/score scales) without changing the squad/role structure.
+///
+/// NOTE — the Red `DefendZone` PATROL squad is INTENTIONALLY ABSENT from this
+/// enum: it stays UN-dispositioned (its defensive character already comes from its
+/// `DefendZone` objective + `DefensiveOnly`-equivalent guard role). That squad
+/// piles three fighters onto the Red outpost — the exact spot the
+/// `skirmish_physics` regression test parks its player — where the ships sit in a
+/// dense resting-contact knot. Attaching ANY new component there shifts the ECS
+/// archetype/iteration order, which perturbs that already-at-the-edge crowd
+/// collision past the test's tuned `MAX_TICK_DV` bound (measured: the near-player
+/// peak |Δv| jumps from well under 5 to ~8.8 u/s — a real, physically-legitimate
+/// bounce, but over the regression guard). The escort (a 2-ship perimeter group,
+/// NOT in the dense pile) and every away-from-spawn group disposition cleanly. See
+/// `spawn_skirmish_ai`'s doc for the full rationale.
+#[derive(Clone, Copy)]
+enum SkirmishGroup {
+    /// The Red perimeter ESCORT (2 ships, role-less, wing-driven perimeter ring) —
+    /// the VARIETY pick: [`Disposition::skittish`] (flees early via high caution,
+    /// barely engages, gives up a lost target fast), so the player sees a fleeing
+    /// enemy near the Red outpost. Safe for `skirmish_physics`: it sits on the
+    /// outpost PERIMETER, not in the dense `DefendZone` knot.
+    SkittishEscort,
+    /// Route PATROLS — the Blue `PatrolRoute` squad. Roams its route, investigates,
+    /// returns: [`Disposition::patroller`] (the balanced middle — medium leash,
+    /// reacts to a player who flies near, not only when fired upon). Far from the
+    /// Red spawn, so the `skirmish_flythrough` player meets it mid-arena.
+    RoutePatrol,
+    /// AMBUSH pairs (both factions, `FreeEngage`) — the aggressive element:
+    /// [`Disposition::hunter`] (acquires on sight, long leash, tenacious — they
+    /// chase, matching the ambush's `FreeEngage` posture). Near the central rock,
+    /// far from the Red spawn.
+    Ambusher,
+}
+
+/// R102 Part B — the [`Disposition`] preset for each dispositioned skirmish AI
+/// [`SkirmishGroup`]. The mapping keeps the personality's `effective_posture`
+/// aligned with each group's authored fire-control posture: the skittish/patroller
+/// presets read `DefensiveOnly` (the escort/patrol posture), the hunter reads
+/// `FreeEngage` (the ambush posture) — so the disposition reinforces, never
+/// contradicts, the role/squad authoring.
+fn disposition_for(group: SkirmishGroup) -> Disposition {
+    match group {
+        SkirmishGroup::SkittishEscort => Disposition::skittish(),
+        SkirmishGroup::RoutePatrol => Disposition::patroller(),
+        SkirmishGroup::Ambusher => Disposition::hunter(),
+    }
 }
 
 /// A host's turret battery: the shared aim spec + (kinetic) weapon stats + per-turret mount offsets.
@@ -303,8 +357,32 @@ impl ServerApp {
     ///   AROUND its target instead of the Brawler archetype's `Charge`. No
     ///   squad, no objective, no wing.
     ///
+    /// R102 Part B — DISPOSITION MIX (the arena feels alive + varied): most AI
+    /// groups ALSO carry a [`Disposition`] personality preset
+    /// ([`disposition_for`] / [`SkirmishGroup`]), layered on top of the
+    /// role/squad authoring above and kept posture-CONSISTENT with it:
+    /// - **Red perimeter escort → [`Disposition::skittish`]** (the VARIETY
+    ///   pick: flees early, barely engages — the player sees a fleeing enemy
+    ///   near the Red outpost; `DefensiveOnly` matches its role-less guard).
+    /// - **Blue patrol `PatrolRoute` squad → [`Disposition::patroller`]**
+    ///   (roams the route, REACTS to a player who flies near — not only when
+    ///   fired upon — then returns; medium leash; `DefensiveOnly` matches the
+    ///   patrol posture).
+    /// - **Ambush pairs (both factions, `FreeEngage`) → [`Disposition::hunter`]**
+    ///   (the aggressive element: acquires on sight, long leash, tenacious —
+    ///   they chase; `FreeEngage` matches the ambush posture).
+    /// - **Red patrol `DefendZone` squad → NO disposition** (defensive by its
+    ///   `DefendZone` guard authoring already). It is INTENTIONALLY left bare:
+    ///   the three fighters knot onto the Red outpost — exactly where
+    ///   `skirmish_physics` parks its player — and attaching any component there
+    ///   shifts the ECS iteration order, perturbing that at-the-edge resting-knot
+    ///   collision past the test's `MAX_TICK_DV` (a real ~8.8 u/s bounce). The
+    ///   personality presets it would have used (sentry-style defense) are proven
+    ///   in the `skirmish_behaviors` suite instead. See [`SkirmishGroup`].
+    ///
     /// 12 AI ships total — playtest content, not the bench. Additive only:
-    /// `Scenario::Sandbox` and every golden world are untouched, and the
+    /// `Scenario::Sandbox` and every golden world are untouched (no golden world
+    /// spawns a `Disposition`, so the gated brain seams never run there), and the
     /// Phase-1 arena lock (`mining_skirmish_scenario_spawns_the_static_arena`)
     /// counts `Target` sub-kinds, which fitted `Ship`s never carry.
     fn spawn_skirmish_ai(&mut self, hw: f32) {
@@ -355,7 +433,19 @@ impl ServerApp {
                     ScenarioRole::new(RoleGoal::PatrolRoute(route.clone()), Posture::DefensiveOnly)
                         .with_style(Some(MovementProfile::Leisurely), None)
                 });
-                members.push(self.spawn_ai_fighter(route[0] + offset, heading, faction, role));
+                // R102 Part B personality: the Blue route patrol roams as a
+                // PATROLLER (reacts + returns). The Red (strategic) `DefendZone`
+                // patrol is left BARE — adding a component to the dense
+                // outpost-knot it forms perturbs the `skirmish_physics` crowd
+                // collision past the regression bound (see `SkirmishGroup`).
+                let dispo = (!strategic).then(|| disposition_for(SkirmishGroup::RoutePatrol));
+                members.push(self.spawn_ai_fighter(
+                    route[0] + offset,
+                    heading,
+                    faction,
+                    role,
+                    dispo,
+                ));
             }
             let patrol_squad = spawn_squad(
                 &mut self.world,
@@ -392,7 +482,16 @@ impl ServerApp {
                 for j in 0..2 {
                     let pos = outpost
                         + Vec2::new(-sign * (50.0 + 15.0 * j as f32), -60.0 - 10.0 * j as f32);
-                    escort_members.push(self.spawn_ai_fighter(pos, heading, faction, None));
+                    // R102 Part B variety: the escort is SKITTISH (flees early) —
+                    // role-less (the wing drives its perimeter ring), so the
+                    // disposition is its only personality layer.
+                    escort_members.push(self.spawn_ai_fighter(
+                        pos,
+                        heading,
+                        faction,
+                        None,
+                        Some(disposition_for(SkirmishGroup::SkittishEscort)),
+                    ));
                 }
                 let escort_squad = spawn_squad(
                     &mut self.world,
@@ -419,7 +518,15 @@ impl ServerApp {
                 // movement-profile override → its archetype pace.
                 let role = ScenarioRole::new(ambush.clone(), Posture::FreeEngage)
                     .with_style(None, Some(CombatStance::Orbit { ccw: true }));
-                self.spawn_ai_fighter(pos, heading, faction, Some(role));
+                // R102 Part B: the ambush pair are HUNTERS (the aggressive
+                // element) — `FreeEngage` matches the hunter's effective posture.
+                self.spawn_ai_fighter(
+                    pos,
+                    heading,
+                    faction,
+                    Some(role),
+                    Some(disposition_for(SkirmishGroup::Ambusher)),
+                );
             }
         }
     }
@@ -445,6 +552,10 @@ impl ServerApp {
     /// the classifier promotes it near the player), `ContactList` (perception)
     /// and — for ROLE-driven ships only — its `ScenarioRole` (R98 Fix A: a
     /// strategically commanded member passes `None`, the one-controller rule).
+    /// R102 Part B — an optional [`Disposition`] (personality) layers on top of
+    /// the role/squad authoring: `Some(...)` inserts it alongside the AI stack so
+    /// the brain's gated disposition seams (acquisition gate, leash, tenacity,
+    /// style/score scales) read it; `None` keeps today's behavior exactly.
     /// The helper's always-firing `ShipIntent` is reset: an AI ship's trigger
     /// belongs to its brain's `fire_decision` (TR-011), not a spawn-time pin.
     fn spawn_ai_fighter(
@@ -453,6 +564,7 @@ impl ServerApp {
         heading: f32,
         faction: Faction,
         role: Option<ScenarioRole>,
+        dispo: Option<Disposition>,
     ) -> Entity {
         let entity = self.spawn_fitted_ship(pos, heading, faction);
         let bucket_count = self.world.get_resource::<AiTuning>().map_or_else(
@@ -469,10 +581,31 @@ impl ServerApp {
         if let Some(role) = role {
             self.world.entity_mut(entity).insert(role);
         }
+        // R102 Part B: the per-ship personality (when authored). Inserted next to
+        // the AI stack so it is present the first tick the brain thinks.
+        if let Some(dispo) = dispo {
+            self.world.entity_mut(entity).insert(dispo);
+        }
         if let Some(mut intent) = self.world.get_mut::<ShipIntent>(entity) {
             intent.fire_primary = false; // The brain owns the trigger (TR-011).
         }
         entity
+    }
+
+    /// R102 Part C — spawn ONE ad-hoc AI fighter for the dev panel's "Spawn test enemy" button: the
+    /// same armed fitted `Ship` + full AI stack as [`Self::spawn_ai_fighter`] (no `ScenarioRole`, so
+    /// its own brain drives it), plus the chosen [`Disposition`] so the spawned ship's personality is
+    /// set up front. A thin `pub` API the windowed dev panel calls; NOT a feature gate (it's server
+    /// API) and NOT called by any golden/headless world, so determinism is untouched. Returns the
+    /// spawned [`Entity`].
+    pub fn spawn_test_enemy(
+        &mut self,
+        pos: Vec2,
+        heading: f32,
+        faction: Faction,
+        dispo: Disposition,
+    ) -> Entity {
+        self.spawn_ai_fighter(pos, heading, faction, None, Some(dispo))
     }
 
     /// Spawn a faction's refinery outpost (Phase 4): the beefy `Health` structure + its turret

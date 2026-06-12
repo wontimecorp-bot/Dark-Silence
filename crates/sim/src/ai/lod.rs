@@ -118,7 +118,16 @@ pub fn classify_aoi_system(
     let now = tick.0;
     let hysteresis = u64::from(tuning.tier_hysteresis_ticks);
     let active2 = tuning.aoi_radius_active * tuning.aoi_radius_active;
-    let mid2 = tuning.aoi_radius_mid * tuning.aoi_radius_mid;
+    // R102 Part A — FLOOR the Dormant/cheap-glide cutoff at `glide_min_radius`,
+    // DECOUPLED from the tunable Mid radius: a ship within `glide_min_radius`
+    // of a player is never Dormant (so never glides), no matter how small
+    // `aoi_radius_mid` is set. `aoi_radius_mid` still drives the Active/Mid
+    // *think-cadence* split below the floor — but the Dormant boundary (the only
+    // one that gates the no-physics glide) is the larger of the two. This is the
+    // fix for the dormant-GLIDE LOD leak; the floor is ≥ the max camera view, so
+    // no visible ship ever runs the kinematic glide.
+    let dormant_cut = tuning.aoi_radius_mid.max(tuning.glide_min_radius);
+    let dormant_cut2 = dormant_cut * dormant_cut;
 
     // Stable-order player snapshot: sorted by entity bits so any tie-sensitive
     // consumer of this list is iteration-order independent (the nearest-distance
@@ -142,7 +151,12 @@ pub fn classify_aoi_system(
             }
             if best <= active2 {
                 Tier::Active
-            } else if best <= mid2 {
+            } else if best <= dormant_cut2 {
+                // Within the FLOORED Dormant cutoff → Mid (full physics, never
+                // glides). The `mid2` band is the natural Mid think-cadence
+                // region; the `mid2 < best <= dormant_cut2` shell (present only
+                // when `aoi_radius_mid < glide_min_radius`) is held in Mid purely
+                // to keep the ship out of the no-physics glide while visible.
                 Tier::Mid
             } else {
                 Tier::Dormant
@@ -238,6 +252,19 @@ const GLIDE_ARRIVE_RADIUS: f32 = 10.0;
 /// (deterministic fixed ladder, no solver).
 const NUDGE_STEPS: u32 = 8;
 
+/// R102 Part A — the glide-visibility guard MARGIN (world units) added to
+/// [`AiTuning::glide_min_radius`] when deciding whether a gliding/collapsing
+/// squad is "near a player". The classifier floors the Dormant *tier* exactly
+/// at `glide_min_radius`, but a squad's MEMBER can sit inside the play space
+/// while the centroid is outside it, and a MOVING player closes the gap a few
+/// world units per tick (player ~70 u/s + glide anchor speed, each × the 1/30 s
+/// step ≈ ≤ 5 u/tick combined). This margin makes the per-member glide guard
+/// wake a squad a tick or two BEFORE any member actually enters
+/// `glide_min_radius`, so a ship is never observed gliding at or inside the
+/// play-space radius (the test/camera boundary). 20 u is generous headroom over
+/// one tick of mutual closing yet far below the radius itself.
+const GLIDE_FLOOR_MARGIN: f32 = 20.0;
+
 /// COLLAPSE (T019, AD-001): a squad that has settled into `Dormant` becomes a
 /// cheap-glide aggregate.
 ///
@@ -263,11 +290,41 @@ pub fn glide_collapse_system(
     tuning: Res<AiTuning>,
     tick: Res<CurrentTick>,
     mut commands: Commands,
+    players: Query<&Position, With<PlayerShip>>,
     squads: Query<(Entity, &AiStableId, &Squad, &AoiTier, &Position), Without<GlideState>>,
     mut members: Query<(&Position, &Velocity, Option<&mut ShipIntent>), Without<Squad>>,
 ) {
     let now = tick.0;
     let hysteresis = u64::from(tuning.tier_hysteresis_ticks);
+    // R102 Part A — the glide-visibility FLOOR (see `classify_aoi_system`): a
+    // squad is NEVER collapsed to the no-physics glide while ANY of its member
+    // ships is within `glide_min_radius` of ANY player, even if the squad
+    // CENTROID (the AOI-classified subject) sits just beyond the floor — a
+    // formation's spread can place a member inside the play space while the
+    // centroid is outside it. This per-MEMBER guard closes that gap exactly (no
+    // formation-radius margin guesswork), so a ship the player can see never
+    // begins gliding regardless of how the centroid classifies. A small margin
+    // (`GLIDE_FLOOR_MARGIN`) keeps a squad from collapsing just OUTSIDE the floor
+    // only to be re-woken next tick as a moving player closes in.
+    let guard = tuning.glide_min_radius + GLIDE_FLOOR_MARGIN;
+    let glide_floor2 = guard * guard;
+    let player_pos: Vec<Vec2> = players.iter().map(|p| p.0).collect();
+    let member_inside_floor =
+        |members: &Query<(&Position, &Velocity, Option<&mut ShipIntent>), Without<Squad>>,
+         squad: &Squad|
+         -> bool {
+            for &m in &squad.members {
+                let Ok((pos, _, _)) = members.get(m) else {
+                    continue;
+                };
+                for &pp in &player_pos {
+                    if (pp - pos.0).length_squared() <= glide_floor2 {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
 
     let mut order: Vec<(AiStableId, Entity)> = squads.iter().map(|(e, id, ..)| (*id, e)).collect();
     order.sort_unstable();
@@ -278,6 +335,9 @@ pub fn glide_collapse_system(
         };
         if aoi.tier != Tier::Dormant || aoi.since_tick.saturating_add(hysteresis) > now {
             continue; // Not dormant, or not hysteresis-settled yet.
+        }
+        if member_inside_floor(&members, squad) {
+            continue; // A visible member — never collapse (R102 floor).
         }
 
         // Offsets + mean velocity, in stable member order.
@@ -475,6 +535,14 @@ pub fn glide_motion_system(
     entities: &Entities,
     mut queue: ResMut<RethinkQueue>,
     mut commands: Commands,
+    // R102 Part A — players (`Without<Gliding>/<Squad>`, so access-disjoint from
+    // `members`/`squads`) for the glide-visibility floor: a gliding squad whose
+    // centroid still classifies Dormant but ANY of whose members has drifted
+    // within `glide_min_radius` of a player must EXPAND this tick. The
+    // centroid-only classifier can lag a member crossing the floor (formation
+    // spread + the player MOVING toward the glide), so this is the in-flight
+    // twin of the per-member collapse guard.
+    players: Query<&Position, (With<PlayerShip>, Without<Squad>, Without<Gliding>)>,
     mut squads: Query<(
         Entity,
         &AiStableId,
@@ -496,6 +564,13 @@ pub fn glide_motion_system(
 ) {
     let dt = dt.0;
     let nudge_max = tuning.promote_nudge_max;
+    // R102 Part A — the glide-visibility guard radius: the floor plus a one-tick
+    // closing margin (see `GLIDE_FLOOR_MARGIN`), so a gliding squad whose member
+    // is about to enter the play space (centroid still Dormant, player moving in)
+    // expands BEFORE the member is observed inside `glide_min_radius`.
+    let guard = tuning.glide_min_radius + GLIDE_FLOOR_MARGIN;
+    let glide_floor2 = guard * guard;
+    let player_pos: Vec<Vec2> = players.iter().map(|p| p.0).collect();
 
     // Overlap test against the coarse neighborhood (conservative margin: one
     // coarse cell covers any neighbor with radius ≤ COARSE_CELL_SIZE, since
@@ -534,10 +609,33 @@ pub fn glide_motion_system(
             gs.member_offsets.retain(|(m, _)| entities.contains(*m));
         }
 
+        // R102 Part A — the glide-visibility FLOOR breach: ANY member within
+        // `glide_min_radius` of ANY player forces expansion this tick, even
+        // while the centroid still classifies Dormant. Tested against the
+        // member's position AFTER this tick's glide integration
+        // (`squad_pos + vel·dt + offset`) so a member the glide is about to push
+        // INTO the play space wakes the SAME tick it crosses (not a tick late) —
+        // the current position is `squad_pos + offset`, and `vel·dt` is the step
+        // this system is about to take; covering the post-step position also
+        // covers the current one whenever the glide closes on the player. The
+        // squad's `Position` is owned by this system, so this is the authoritative
+        // pre-integration value.
+        let predicted = squad_pos.0 + gs.vel * dt;
+        let floor_breach = !player_pos.is_empty()
+            && gs.member_offsets.iter().any(|&(_, off)| {
+                let mpos = predicted + off;
+                let cur = squad_pos.0 + off;
+                player_pos.iter().any(|&pp| {
+                    (pp - mpos).length_squared() <= glide_floor2
+                        || (pp - cur).length_squared() <= glide_floor2
+                })
+            });
+
         // ------------------------------------------------------------------
-        // EXPAND: the tier left Dormant (player proximity or hostile scan).
+        // EXPAND: the tier left Dormant (player proximity or hostile scan), OR
+        // a member crossed the glide-visibility floor (R102 Part A).
         // ------------------------------------------------------------------
-        if aoi.tier != Tier::Dormant {
+        if aoi.tier != Tier::Dormant || floor_breach {
             let glide_vel = gs.vel;
             let speed2 = glide_vel.length_squared();
             let event = if hold.is_some() {
