@@ -513,6 +513,11 @@ fn net_fixed_update(
     mut host: NonSendMut<LoopbackHost>,
     mut state: NonSendMut<NetClientState>,
     mut feedback: ResMut<HitFeedback>,
+    // R104 — charge the embedded sim tick's wall time to this frame's perf budget.
+    // ACCUMULATES across fixed-step catch-up sub-steps (zeroed each frame in
+    // `perf_hud::reset_frame_counters`); the only sim-adjacent touch is this
+    // read-only timing, no logic change.
+    mut perf: ResMut<crate::perf_hud::PerfStats>,
     ship_q: Query<&ShipIntent, With<LocalShip>>,
 ) {
     // The intent the player is holding this tick (PreUpdate wrote it). Default to
@@ -530,7 +535,10 @@ fn net_fixed_update(
     // Step the embedded authoritative server: this applies the input and steps the
     // full shared sim (motion + collision + weapon + AI + destruction) one tick, so
     // collision and hits resolve THIS tick and surface in `render_state` below.
+    let _sim_t = std::time::Instant::now();
     host.server.tick();
+    perf.sim_ms += _sim_t.elapsed().as_secs_f32() * 1000.0;
+    perf.fixed_substeps += 1;
 
     // E007 live-demo feedback surfacing: combat resolves in the embedded SERVER's
     // world, so `fitted_damage_system` sets the SERVER's `HitFeedback` — but the HUD
@@ -564,6 +572,25 @@ fn net_fixed_update(
 // A Bevy system with the params it genuinely needs (transport host, net state, render
 // assets + the material store for the per-bubble alpha fade, fixed dt, the id→entity
 // map, and the interp/velocity/shield queries); the count is inherent to the system.
+/// R104 — bundles the render-look toggles + the perf-stats sink into ONE
+/// `SystemParam` so `capture_render_state` stays under Bevy's 16-param system
+/// limit (adding the perf `ResMut` would otherwise push it to 17).
+#[derive(bevy::ecs::system::SystemParam)]
+struct RenderToggles<'w> {
+    hull_mode: Res<'w, HullRenderMode>,
+    module_mode: Res<'w, ModuleColorMode>,
+    ship_visual: Res<'w, crate::ShipVisualTuning>,
+    perf: ResMut<'w, crate::perf_hud::PerfStats>,
+}
+
+/// R104 — cap how many ship hull meshes are REBUILT per frame from carve damage.
+/// The cell-set change is still DETECTED every frame; over-budget rebuilds defer a
+/// frame or two (nearest-to-player ships first), so heavy combat smooths instead of
+/// stalling the frame on many simultaneous mesh regenerations. First-sight + style
+/// toggles bypass the cap. Damage still applies instantly in the sim — only the
+/// VISUAL hull update is throttled.
+const MAX_HULL_REBUILDS_PER_FRAME: usize = 2;
+
 #[allow(clippy::too_many_arguments)]
 fn capture_render_state(
     mut commands: Commands,
@@ -579,15 +606,15 @@ fn capture_render_state(
     shield_child_q: Query<&ShieldChild>,
     mut bubble_q: Query<(&mut Visibility, &mut Transform)>,
     mut ship_hull_q: Query<&mut ShipHull>,
-    hull_mode: Res<HullRenderMode>,
-    module_mode: Res<ModuleColorMode>,
-    ship_visual: Res<crate::ShipVisualTuning>,
+    // R104 — bundled into one SystemParam (hull/module/visual toggles + the perf
+    // stats sink) to keep this system under Bevy's 16-param limit.
+    mut toggles: RenderToggles,
 ) {
     let local_id = state.local_id;
-    let contour = hull_mode.contour;
-    let module_color = module_mode.on;
+    let contour = toggles.hull_mode.contour;
+    let module_color = toggles.module_mode.on;
     // R53 — the live combat-hull plate dims; a change rebuilds the hull (see `sync_ship_hull`).
-    let style = ship_visual.hull_style();
+    let style = toggles.ship_visual.hull_style();
     let entities = host.server.render_state();
 
     // Phase 1B LOD origin: the local player ship's world position (the follow-camera
@@ -602,7 +629,19 @@ fn capture_render_state(
     // Track which ids are present this tick so we can despawn the rest.
     let mut present: std::collections::HashSet<EntityId> = std::collections::HashSet::new();
 
-    for e in &entities {
+    // R104 — process NEAREST-to-player first so the per-frame hull-rebuild budget
+    // is spent on the ships you're looking at; far ships' carve rebuilds defer.
+    let mut order: Vec<usize> = (0..entities.len()).collect();
+    order.sort_by(|&a, &b| {
+        let da = entities[a].pos.distance_squared(lod_origin);
+        let db = entities[b].pos.distance_squared(lod_origin);
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut rebuild_budget = MAX_HULL_REBUILDS_PER_FRAME;
+    let mut hull_rebuilds: u32 = 0;
+
+    for &idx in &order {
+        let e = &entities[idx];
         present.insert(e.id);
 
         if let Some(&bevy_entity) = render_map.map.get(&e.id) {
@@ -659,6 +698,8 @@ fn capture_render_state(
                 contour,
                 module_color,
                 style,
+                &mut rebuild_budget,
+                &mut hull_rebuilds,
             );
             // Show + fade (or lazily spawn) this entity's LOCALIZED shield-impact flash
             // from the hit-driven `shield_flash`, placed at the impact (`hit_dir`).
@@ -707,6 +748,8 @@ fn capture_render_state(
                 contour,
                 module_color,
                 style,
+                &mut rebuild_budget,
+                &mut hull_rebuilds,
             );
             // Seed (if its shield is being hit) its localized impact flash immediately
             // so the first rendered frame already shows it at the impact point.
@@ -735,6 +778,9 @@ fn capture_render_state(
             render_map.map.insert(e.id, spawned);
         }
     }
+
+    // R104 — surface this frame's actual hull rebuilds to the perf overlay.
+    toggles.perf.mesh_rebuilds += hull_rebuilds;
 
     // Despawn rendered entities whose id is gone from the authoritative world
     // (destroyed targets, expired projectiles) so they vanish immediately. The
@@ -925,6 +971,10 @@ fn sync_ship_hull(
     contour: bool,
     module_color: bool,
     style: crate::scene::HullStyle,
+    // R104 — per-frame CARVE-rebuild budget (remaining) + a counter of rebuilds
+    // actually done this frame (for the perf overlay). See the `needs_build` block.
+    rebuild_budget: &mut usize,
+    hull_rebuilds: &mut u32,
 ) {
     // Only a fitted ship OR a severed chunk / dead hulk carries a cell payload; everything
     // else (projectiles, plain targets) keeps its single mesh and is handled by the
@@ -1041,13 +1091,28 @@ fn sync_ship_hull(
             // Build on first sight, REBUILD when the cell set changed (Phase-2 erosion), when the
             // render-style toggle flipped (voxel ↔ contour), OR when the module-color toggle flipped
             // (same cells, new look) — all "same parent, new mesh" cases.
-            let needs_build = current.child().is_none()
-                || current.cells_hash() != hash
-                || current.built_contour() != contour
+            let first_sight = current.child().is_none();
+            let cells_changed = current.cells_hash() != hash;
+            let toggle_change = current.built_contour() != contour
                 || current.built_module_color() != module_color
                 // R53 — a live "Hull plates" edit changes the combat-hull dims (cells unchanged).
                 || (use_ext && current.built_style() != Some(style));
-            if needs_build {
+            let needs_build = first_sight || cells_changed || toggle_change;
+            // R104 — budget per-frame CARVE rebuilds (the per-hit lag source). A
+            // "carve only" rebuild (an already-built ship whose cell set changed,
+            // no first-sight, no style/colour toggle) is capped to
+            // MAX_HULL_REBUILDS_PER_FRAME; over budget, DEFER it (leave the hull
+            // hash mismatched so `needs_build` re-fires next frame — a few-frame
+            // visual delay under heavy fire instead of a frame stall). First-sight
+            // + toggle rebuilds always proceed. The caller processes ships
+            // nearest-to-player first, so the ones you're looking at update first.
+            let carve_only = cells_changed && !first_sight && !toggle_change;
+            let defer = carve_only && *rebuild_budget == 0;
+            if needs_build && !defer {
+                if carve_only {
+                    *rebuild_budget -= 1;
+                }
+                *hull_rebuilds += 1;
                 // Free the previous mesh + child (rebuild path) so meshes/entities don't leak.
                 if let Some(old) = current.take_mesh() {
                     meshes.remove(&old);
@@ -1826,6 +1891,19 @@ pub fn spawn_ship_particles(
     }
 
     // --- damage: sparks on a fresh hit (flash edge) + smoke on a carve (cell count drop) ---
+    // R104 — when the live particle pool is filling under heavy fire, scale DOWN
+    // the per-hit spark/smoke counts (floor of 1, so a hit always shows something)
+    // so the particle churn doesn't compound the combat lag. Light combat is full.
+    let load_scale: f32 = {
+        let cap = crate::particles::PARTICLE_CAP;
+        if count.0 >= cap * 3 / 4 {
+            0.25
+        } else if count.0 >= cap / 2 {
+            0.5
+        } else {
+            1.0
+        }
+    };
     let mut seen = std::collections::HashSet::new();
     for (se, fx, gt) in &damaged {
         seen.insert(se);
@@ -1834,7 +1912,8 @@ pub fn spawn_ship_particles(
         let sid = se.to_bits() as u32;
         if tuning.spark_on && fx.flash > 0.3 && pflash <= 0.3 {
             let dir = Vec3::new(fx.hit_dir.x, fx.hit_dir.y, 0.0).normalize_or_zero();
-            for i in 0..10u32 {
+            let sparks = ((10.0 * load_scale) as u32).max(1);
+            for i in 0..sparks {
                 let seed = f.wrapping_mul(977).wrapping_add(sid).wrapping_add(i);
                 let vel = dir * (CELL_SIZE * 10.0) + jitter(seed) * (CELL_SIZE * 14.0);
                 let s = CELL_SIZE * 0.10;
@@ -1852,7 +1931,7 @@ pub fn spawn_ship_particles(
             }
         }
         if tuning.smoke_on && fx.cells < pcells {
-            let puffs = tuning.smoke_amount as u32;
+            let puffs = ((tuning.smoke_amount * load_scale) as u32).max(1);
             for i in 0..puffs {
                 let seed = f.wrapping_mul(733).wrapping_add(sid).wrapping_add(i);
                 let j = jitter(seed);

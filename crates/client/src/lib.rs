@@ -45,6 +45,10 @@ pub mod interpolation;
 pub mod module_bars;
 pub mod net;
 pub mod particles;
+// R104 — frame-time telemetry (FPS / sim-ms / render-ms / fixed sub-steps /
+// hull-mesh-rebuilds per frame) + an F9 HUD overlay, so combat lag is visible
+// (sim cost vs render cost). Non-dev-gated; compiles in both feature configs.
+pub mod perf_hud;
 pub mod prediction;
 pub mod radar;
 pub mod render_sync;
@@ -53,6 +57,7 @@ pub mod ship_visuals;
 pub mod starfield;
 pub mod tuning_io;
 
+use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::prelude::*;
 use fitting_ui::{FittingScreenState, FittingUiPlugin};
 use net::NetClientPlugin;
@@ -112,6 +117,8 @@ pub fn run() -> AppExit {
         // Refinement 44: egui is now ALWAYS-ON (the EVE-style fitting screen uses it, not just the
         // feature-gated dev panel) — `EguiPlugin` is added here once; `DevPanelPlugin` no longer adds it.
         .add_plugins(bevy_egui::EguiPlugin::default())
+        // R104 — frame-time diagnostics feed the perf overlay (FPS / frame-ms).
+        .add_plugins(FrameTimeDiagnosticsPlugin::default())
         // Refinement 25: the procedural starfield background material (custom WGSL shader).
         .add_plugins(MaterialPlugin::<starfield::StarfieldMaterial>::default())
         // R48/R49: the cinematic hull material (ExtendedMaterial — fresnel rim + panels + grime).
@@ -139,6 +146,9 @@ pub fn run() -> AppExit {
         .insert_resource(dev.ship_visual)
         // R50: live particle count (engine ion-trail + damage smoke/sparks cap).
         .init_resource::<particles::ParticleCount>()
+        // R104: perf telemetry resources (frame/sim timings + the F9 overlay toggle).
+        .init_resource::<perf_hud::PerfStats>()
+        .init_resource::<perf_hud::ShowPerf>()
         // Refinement 21/22: load the shared HUD fonts (label + mono) + icon images into
         // `FontAssets`/`IconAssets` BEFORE the Startup HUD setups, which clone the handles.
         .add_systems(PreStartup, fonts::load_hud_assets)
@@ -161,6 +171,9 @@ pub fn run() -> AppExit {
                 radar::setup_radar.after(camera::setup_camera),
                 // Refinement 25: the starfield background quad — a camera child, so the camera first.
                 starfield::setup_starfield.after(camera::setup_camera),
+                // R104 — the F9 perf overlay text node + the fixed-step catch-up clamp.
+                perf_hud::setup_perf_hud,
+                perf_hud::clamp_fixed_catchup,
             ),
         )
         // Input runs before the fixed step so intents apply the same frame; the
@@ -214,6 +227,20 @@ pub fn run() -> AppExit {
                 // R50: engine ion-trail + damage smoke/sparks particles (spawn + age/despawn).
                 net::spawn_ship_particles,
                 particles::update_particles,
+            ),
+        );
+
+    // R104 — perf telemetry systems (a separate `add_systems` keeps the big
+    // Update tuple above under Bevy's tuple-arity limit). `reset_frame_counters`
+    // runs in `First` so the per-frame counters (sim-ms accumulates across any
+    // catch-up sub-steps, rebuilds, sub-step count) start clean each render frame.
+    app.add_systems(First, perf_hud::reset_frame_counters)
+        .add_systems(
+            Update,
+            (
+                perf_hud::toggle_perf,
+                perf_hud::update_perf_stats,
+                perf_hud::update_perf_hud,
             ),
         );
 

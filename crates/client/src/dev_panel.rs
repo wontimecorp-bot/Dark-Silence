@@ -25,7 +25,7 @@ use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 #[cfg(feature = "ai_debug")]
 use sim::ai::AiDebugCapture;
 use sim::ai::{
-    cadence_for_tier, AiBrain, AiStableId, AiTuning, AoiTier, CombatStance, ContactList,
+    cadence_for_tier, AiBrain, AiStableId, AiTuning, AoiTier, Behavior, CombatStance, ContactList,
     Disposition, GlideState, LinkState, MovementProfile, Objective, OrderKind, PlayerOrder,
     Posture, SensorNetworks, Squad, SquadObjective, Tier, WingObjective,
 };
@@ -951,10 +951,22 @@ struct AiShipDetail {
     last_damaged_tick: u64,
     thinks_total: u64,
     target: Option<String>,
+    /// R103 Part 3 — the brain's current nav waypoint (`brain.waypoint`), pre-formatted
+    /// `"(x.x, y.y)"` or `"—"` when unset. The point a MoveTo/Patrol/Waypoint ship flies to.
+    waypoint: String,
+    /// R103 Part 3 — the brain's patrol/return anchor (`brain.home`), pre-formatted
+    /// `"(x.x, y.y)"` or `"—"` when unset. The HoldAt anchor and the leash origin.
+    home: String,
     /// R99 Phase B — the selected ship's live [`PlayerOrder`], pre-formatted (kind +
     /// the 3 style fields), or `"none"` when the component is absent. Surfaced as a
     /// read-only inspection line + read back into the command controls.
     player_order: String,
+    /// R103 Part 3 — the INTERPRETED command-status line: a single human-readable
+    /// sentence explaining the ship's relationship to its `PlayerOrder` (following vs
+    /// PAUSED-while-engaging vs arrived vs holding vs leashed). Computed in `gather_ai`
+    /// from (order kind, behavior, target, home, waypoint, self pos, ARRIVE_RADIUS); the
+    /// user's window into WHY a commanded ship stopped following its move order.
+    order_status: String,
     /// R99 Phase B — the raw style overrides from the ship's `PlayerOrder` (all `None`
     /// when the component is absent), so the B4 dropdowns can show the live selection.
     order_profile: Option<MovementProfile>,
@@ -1065,6 +1077,131 @@ fn format_player_order(order: Option<&PlayerOrder>) -> String {
     )
 }
 
+/// R103 Part 3 (dev-panel DIAGNOSTIC) — pre-format an optional nav point as
+/// `"(x.x, y.y)"`, or `"—"` when unset. `Vec2` has no `Display`, so the components are
+/// formatted explicitly (mirroring `format_player_order`'s point phrasing, at one decimal).
+fn format_opt_point(p: Option<Vec2>) -> String {
+    match p {
+        Some(v) => format!("({:.1}, {:.1})", v.x, v.y),
+        None => "—".to_string(),
+    }
+}
+
+/// R103 Part 3 (dev-panel DIAGNOSTIC) — resolve a referenced [`Entity`] to a
+/// `"#<stable-id>"` label, falling back to `"#<entity>"` (the raw debug form) when
+/// the entity carries no [`AiStableId`] (e.g. a non-AI target). Mirrors the
+/// entity→stable-id lookup `gather_ai` already does for the inspected ship, reused
+/// here for the order-status target reference so the user sees the same spawn-order id.
+fn target_id_label(world: &World, e: Entity) -> String {
+    match world.get::<AiStableId>(e) {
+        Some(s) => format!("#{}", s.0),
+        None => format!("#{e:?}"),
+    }
+}
+
+/// R103 Part 3 (dev-panel DIAGNOSTIC) — the INTERPRETED command-status line: pick the
+/// single MOST-INFORMATIVE sentence describing the ship's relationship to its
+/// `PlayerOrder`, so the user instantly reads "fighting vs following". Pure phrasing —
+/// it reads no sim state beyond the snapshot scalars passed in and drives no behavior.
+///
+/// `target_label` is the pre-resolved `"#<stable-id>"` of `brain.target` (via
+/// [`target_id_label`]) when one is set, else `None`. `leashed` is the optional
+/// `(leash_radius, dist_from_home)` of a `Disposition`-carrying ship that is BEYOND its
+/// leash (the home distance is resolved at the call site, where the world is in hand, and
+/// folded into this pair so this stays world-free) — so the leash cause can be surfaced too.
+///
+/// Priority (most-confusing-case first): a PAUSED move (combat outvoted the order)
+/// is reported above all else, since that is the exact "why did my ship stop following"
+/// question this line answers.
+fn order_status_line(
+    order: Option<&PlayerOrder>,
+    behavior: Behavior,
+    target_label: Option<&str>,
+    waypoint: Option<Vec2>,
+    pos: Option<Vec2>,
+    leashed: Option<(f32, f32)>,
+) -> String {
+    // No order, or a settings-only order (kind None): nothing to interpret.
+    let Some(kind) = order.and_then(|o| o.kind.as_ref()) else {
+        return "order: none".to_string();
+    };
+    // Distance from a goal point to the ship (INFINITY when either is unknown, so the
+    // "arrived" test never false-positives without a real position/waypoint).
+    let dist_to = |goal: Option<Vec2>| match (goal, pos) {
+        (Some(g), Some(p)) => (g - p).length(),
+        _ => f32::INFINITY,
+    };
+    // The leash suffix (appended to a following/holding line) when a Disposition ship is
+    // beyond its return-to-post leash — the SECONDARY cause a chase may break off.
+    let leash_suffix = match leashed {
+        Some((r, d)) => format!(" (leashed — {d:.0}u from home, beyond leash {r:.0}u)"),
+        None => String::new(),
+    };
+    match kind {
+        // MoveTo / Patrol: the move order can be PAUSED by combat (the user's exact
+        // confusion), still in transit, or arrived.
+        OrderKind::MoveTo(p) => {
+            if behavior == Behavior::Engage {
+                let t = target_label.unwrap_or("?");
+                format!("order: PAUSED — engaging {t} (combat outvoted the move)")
+            } else if dist_to(waypoint) <= ARRIVE_RADIUS {
+                "order: arrived".to_string()
+            } else {
+                format!(
+                    "order: following → MoveTo({:.0}, {:.0}){leash_suffix}",
+                    p.x, p.y
+                )
+            }
+        }
+        OrderKind::Patrol { points, index } => {
+            if behavior == Behavior::Engage {
+                let t = target_label.unwrap_or("?");
+                format!("order: PAUSED — engaging {t} (combat outvoted the patrol)")
+            } else if dist_to(waypoint) <= ARRIVE_RADIUS {
+                "order: arrived (advancing patrol leg)".to_string()
+            } else {
+                let leg = points.get(*index).copied();
+                match leg {
+                    Some(g) => format!(
+                        "order: following → Patrol leg {index} ({:.0}, {:.0}){leash_suffix}",
+                        g.x, g.y
+                    ),
+                    None => format!("order: following → Patrol{leash_suffix}"),
+                }
+            }
+        }
+        // HoldAt: holding the anchor; if it has acquired/engaged a hostile it is
+        // DEFENDING (the documented v1 hold rule — in-range hostiles are prosecuted).
+        OrderKind::HoldAt { anchor, radius } => {
+            let base = format!(
+                "order: holding at ({:.0}, {:.0}) r{:.0}",
+                anchor.x, anchor.y, radius
+            );
+            if behavior == Behavior::Engage {
+                let t = target_label.unwrap_or("?");
+                format!("{base} — defending {t}")
+            } else {
+                format!("{base}{leash_suffix}")
+            }
+        }
+        // Attack: an explicit user target — name it (the brain's Engage path does the rest).
+        OrderKind::Attack(t) => {
+            let label = target_label
+                .map(str::to_string)
+                .unwrap_or_else(|| target_id_label_dangling(*t));
+            format!("order: attacking {label}")
+        }
+    }
+}
+
+/// R103 Part 3 — the fallback label for an `Attack(t)` whose entity wasn't pre-resolved
+/// against the world (no [`AiStableId`] could be looked up at gather time): the raw
+/// `"#<entity>"` debug form. Kept as a tiny helper so the [`order_status_line`] signature
+/// stays world-free (pure phrasing) while still naming the commanded target.
+fn target_id_label_dangling(e: Entity) -> String {
+    format!("#{e:?}")
+}
+
 /// R99 Phase B — a command captured in the UI (read/draw) phase and applied in the
 /// write-back phase (where `host.server.world_mut()` is mutable), mirroring the R43
 /// `equip_weapon` deferral. Each variant carries the SERVER ship entity it targets.
@@ -1105,6 +1242,13 @@ const TEST_ENEMY_SPAWN_DIST: f32 = 120.0;
 /// The hold radius (world units) a "Hold here" command guards around the ship's
 /// current position — a small default, tunable for feel.
 const HOLD_RADIUS: f32 = 30.0;
+
+/// R103 Part 3 (dev-panel DIAGNOSTIC) — a local mirror of the sim's
+/// `ai::brain::ARRIVE_RADIUS` (`pub(crate)` there, so not importable). Used ONLY
+/// to phrase the read-only ORDER-STATUS line (`arrived` vs `following`); it
+/// drives no sim behavior. Keep in sync with `crates/sim/src/ai/brain.rs` if that
+/// constant ever changes — a drift here only mis-phrases a diagnostic, never the AI.
+const ARRIVE_RADIUS: f32 = 10.0;
 
 /// R99 Phase B — the combat-stance dropdown choices. `Orbit` carries a `ccw: bool`,
 /// so it is split into two concrete picks; the rest are field-less. `None` =
@@ -1380,6 +1524,30 @@ fn gather_ai(
             }
             _ => "none",
         };
+        // R103 Part 3 — the INTERPRETED order-status line (read-only): resolve the engage
+        // target's stable-id label (reusing the same lookup as the inspected ship), the
+        // leash state (a Disposition ship beyond its return-to-post leash), then phrase the
+        // single most-informative sentence. Diagnostics only — no sim/world write.
+        let order = world.get::<PlayerOrder>(e);
+        let target_label = brain.target.map(|t| target_id_label(world, t));
+        let leashed = world.get::<Disposition>(e).and_then(|dz| {
+            match (brain.home, pos) {
+                (Some(h), Some(p)) => {
+                    let d = (h - p).length();
+                    let r = dz.leash_radius(tuning);
+                    (d > r).then_some((r, d))
+                }
+                _ => None,
+            }
+        });
+        let order_status = order_status_line(
+            order,
+            brain.behavior,
+            target_label.as_deref(),
+            brain.waypoint,
+            pos,
+            leashed,
+        );
         let mut contacts: Vec<AiContactRow> = Vec::new();
         let (contacts_total, last_scan_tick) = world.get::<ContactList>(e).map_or((0, 0), |cl| {
             contacts = cl
@@ -1453,7 +1621,12 @@ fn gather_ai(
             last_damaged_tick: brain.last_damaged_tick,
             thinks_total: brain.thinks_total,
             target: brain.target.map(|t| format!("{t:?}")),
+            // R103 Part 3 — the nav waypoint + home anchor, pre-formatted "(x.x, y.y)" / "—".
+            waypoint: format_opt_point(brain.waypoint),
+            home: format_opt_point(brain.home),
             player_order: format_player_order(world.get::<PlayerOrder>(e)),
+            // R103 Part 3 — the interpreted command-status sentence (computed above).
+            order_status,
             order_profile: world.get::<PlayerOrder>(e).and_then(|o| o.profile),
             order_stance: world.get::<PlayerOrder>(e).and_then(|o| o.stance),
             order_posture: world.get::<PlayerOrder>(e).and_then(|o| o.posture),
@@ -1538,6 +1711,25 @@ fn render_ai_detail(ui: &mut egui::Ui, d: &AiShipDetail, now: u64, tuning: &AiTu
     )
     .on_hover_text(
         "The brain's current engage/follow target entity (pruned the tick it despawns).",
+    );
+    // R103 Part 3 — the nav goal points: the waypoint the ship flies to + the home/return
+    // anchor. Shown next to behavior/target so a paused move order is legible at a glance.
+    stat(ui, "waypoint", &d.waypoint).on_hover_text(
+        "R103 — the brain's current nav waypoint (brain.waypoint): the point a MoveTo / Patrol / Waypoint ship flies to. '—' = no waypoint set.",
+    );
+    stat(ui, "home", &d.home).on_hover_text(
+        "R103 — the brain's home / return anchor (brain.home): the HoldAt anchor and the disposition leash origin. '—' = no home set.",
+    );
+    // R103 Part 3 — the COMMAND STATUS mini-section: the interpreted order-status line first,
+    // rendered BOLD so the user instantly reads "fighting vs following", then the raw order.
+    ui.add_space(2.0);
+    ui.label(egui::RichText::new("Command status").strong().underline());
+    ui.label(egui::RichText::new(&d.order_status).strong().monospace())
+        .on_hover_text(
+            "R103 — the INTERPRETED relationship to the player command: 'following' (en route to the move/patrol goal), 'PAUSED — engaging …' (a nearby enemy was acquired and combat OUTVOTED the move order — the PlayerOrder persists but the Engage behavior wins until the target clears), 'arrived', 'holding', 'attacking', or '(leashed …)' when a disposition ship is beyond its return-to-post leash. 'order: none' = no commanded nav goal.",
+        );
+    stat(ui, "player order", &d.player_order).on_hover_text(
+        "R99 — the RAW PlayerOrder (nav kind + the 3 style overrides) the status line above interprets. 'none' = no order; 'settings-only' = style overrides without a nav command.",
     );
     // R102 Part C — the ship's per-ship PERSONALITY (Disposition): the preset name (or "custom")
     // + the four raw traits + the resolved leash radius and effective posture. The user's window

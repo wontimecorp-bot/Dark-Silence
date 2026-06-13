@@ -4934,7 +4934,7 @@ fn world_checksum(w: &mut World) -> (u64, usize, bool) {
 /// The TR-019 scenario world, built deterministically from fixed inputs (no
 /// time, no rand): a player at the origin; a Red 3-fighter squad beside it
 /// (Active tier — brains think on the fast cadence, members scan, the Red
-/// sensor network fuses); and a Blue 3-fighter squad 700 units out — Dormant,
+/// sensor network fuses); and a Blue 3-fighter squad 820 units out — Dormant,
 /// so it COLLAPSES to a cheap-glide aggregate at the hysteresis dwell, then
 /// its `MoveTo` glide (anchor speed 80 u/s) carries it straight at the Red
 /// squad: crossing the player's mid band / Red's sensor bubble promotes it
@@ -4944,8 +4944,29 @@ fn world_checksum(w: &mut World) -> (u64, usize, bool) {
 /// component → fire intents rise but no projectile/damage path runs, so the
 /// 600-tick population is stable). Default `AiTuning` radii throughout — the
 /// collapse depends on them.
+///
+/// R103 — the Blue squad spawns at 820u (was 700u): the `glide_min_radius` floor
+/// rose from 600 to 750 (clearing the 700u radar), so a squad at 700u is now
+/// held in Mid (never glides) — it must start BEYOND the 750 floor to still
+/// settle Dormant and collapse. 820u (just past the floor) keeps the
+/// collapse→glide→expand→perceive round-trip this test proves inside the
+/// 600-tick budget; the `MoveTo(30, 0)` goal still pulls it onto the Red squad.
 fn build_checksum_world() -> World {
     let (mut w, _schedule) = perception_world();
+    // R103 — raise this fixture's own-ship sensor range (perception/far-scan)
+    // from the 200u default to 350u. UNRELATED to the AOI/collapse radii (the
+    // collapse still depends on the pinned `aoi_radius_*`/`glide_min_radius`):
+    // this only governs PERCEPTION. With `glide_min_radius` raised to 750, the
+    // Blue aggregate now EXPANDS 150u farther out and the expanded squad settles
+    // into a combat standoff (~264u from Red, driven by the FUSED sensor network)
+    // that sits just OUTSIDE the 200u own-sensor range — so no member's
+    // `ContactList` ever fills and the test's "perceive" probe goes vacuous.
+    // 350u clears the standoff, so the expanded members actually perceive the foe
+    // they are holding station against, restoring the real
+    // collapse→glide→expand→PERCEIVE round-trip this determinism test proves.
+    if let Some(mut t) = w.get_resource_mut::<AiTuning>() {
+        t.base_sensor_range = 350.0;
+    }
     w.spawn((PlayerShip, Position(Vec2::ZERO)));
 
     // Red squad: inside aoi_radius_active (120) of the player, station-keeping.
@@ -4961,10 +4982,15 @@ fn build_checksum_world() -> World {
     }
     spawn_squad(&mut w, &red, FormationDef::wedge(3, 8.0), SquadOrder::Hold);
 
-    // Blue squad: far beyond aoi_radius_mid (520) → settles Dormant + glides;
-    // the MoveTo goal sits ON the Red squad, so the glide path closes the gap.
+    // Blue squad: just beyond the glide_min_radius floor (750) → settles Dormant
+    // + glides; the MoveTo goal sits ON the Red squad, so the glide path closes
+    // the gap. R103 — 820u (was 700u): 700 now falls INSIDE the raised 750 floor
+    // (held in Mid, never glides), so the start is pushed out just past it (820 =
+    // 750 + ~70u, mirroring the original ~100u margin over the old 600 floor) so
+    // the collapse→glide→expand→perceive round-trip still completes inside the
+    // 600-tick run.
     let blue: Vec<Entity> = (0..3)
-        .map(|i| spawn_squad_member(&mut w, Vec2::new(700.0 + i as f32 * 8.0, 0.0)))
+        .map(|i| spawn_squad_member(&mut w, Vec2::new(820.0 + i as f32 * 8.0, 0.0)))
         .collect();
     for &m in &blue {
         w.entity_mut(m).insert((

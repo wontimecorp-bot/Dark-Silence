@@ -15,14 +15,21 @@ use bevy_ecs::prelude::Resource;
 use crate::ai::brain::MovementProfile;
 use crate::fitting::CELL_WORLD_SIZE;
 
-/// R102 Part A — the default [`AiTuning::glide_min_radius`] (world units): the
-/// play-space radius the dormant-glide cutoff is floored to (≥ the max camera
-/// view corner), so no visible ship ever runs the no-physics kinematic glide.
-/// A free `fn` so the `#[serde(default = …)]` per-FIELD fallback restores this
-/// value when an older RON omits the field (otherwise serde's container default
-/// would supply `f32::default()` = 0.0, disabling the floor).
+/// R103 (was R102 Part A) — the default [`AiTuning::glide_min_radius`] (world
+/// units): the perceivable-space radius the dormant-glide cutoff is floored to,
+/// so no ship ever runs the no-physics kinematic glide within ANY surface the
+/// player can perceive (the main view OR the radar). 750.0 = client
+/// `radar::RADAR_RANGE` (700u) + ~50u margin: the radar (not the ~375u main
+/// view) is the WIDEST perceivable surface, so the floor must clear it. The 50u
+/// margin puts the glide→physics handoff beyond the radar, so a squad expands at
+/// 750u — ~50u before the 700u radar — and combined with the `skirmish_physics`
+/// |Δv| ≤ 5 bound the handoff is settled physics before it is ever perceptible.
+/// Keep in sync if `RADAR_RANGE` changes. A free `fn` so the `#[serde(default =
+/// …)]` per-FIELD fallback restores this value when an older RON omits the field
+/// (otherwise serde's container default would supply `f32::default()` = 0.0,
+/// disabling the floor).
 fn default_glide_min_radius() -> f32 {
-    600.0
+    750.0
 }
 
 /// Global AI tuning. Inserted by the scenario/server world (and edited live via
@@ -52,18 +59,22 @@ pub struct AiTuning {
     pub aoi_radius_mid: f32,
     /// Minimum ticks between tier changes per entity — boundary hysteresis (no thrash).
     pub tier_hysteresis_ticks: u32,
-    /// R102 Part A — the GLIDE-visibility FLOOR (world units): a hard lower bound
-    /// on the Dormant/cheap-glide cutoff, DECOUPLED from the tunable
+    /// R103 (was R102 Part A) — the GLIDE-visibility FLOOR (world units): a hard
+    /// lower bound on the Dormant/cheap-glide cutoff, DECOUPLED from the tunable
     /// [`Self::aoi_radius_mid`]. [`classify_aoi_system`](crate::ai::classify_aoi_system)
     /// floors the effective Dormant boundary at `aoi_radius_mid.max(glide_min_radius)`,
     /// so a ship within `glide_min_radius` of a player is NEVER classified
     /// `Dormant` (and so never collapses to the no-physics kinematic glide),
     /// **no matter how small the dev panel sets `aoi_radius_mid`**. This is the
     /// fix for the dormant-GLIDE LOD leak (allied/enemy ships "sliding across
-    /// the screen without physics"): it must be ≥ the max camera view radius so
-    /// no visible ship ever glides. Default 600.0 — matching the
-    /// `skirmish_physics`/`skirmish_flythrough` play-space radius. `aoi_radius_mid`
-    /// still freely tunes the Active/Mid *think*-cadence split below this floor.
+    /// the screen without physics"): it must be ≥ client `radar::RADAR_RANGE`
+    /// (700u) + ~50u margin so no ship glides within ANY surface the player can
+    /// PERCEIVE — the main view OR the 700u radar (R102 floored only the ~375u
+    /// main view at 600u and MISSED the wider radar; R103 raises it to 750.0).
+    /// The 50u margin puts the glide→physics handoff beyond the radar so a ship
+    /// is settled physics before it's perceptible. Keep in sync if `RADAR_RANGE`
+    /// changes. Default 750.0. `aoi_radius_mid` still freely tunes the Active/Mid
+    /// *think*-cadence split below this floor.
     #[serde(default = "default_glide_min_radius")]
     pub glide_min_radius: f32,
     /// TR-008 validity-nudge bound: max de-penetration distance applied at
@@ -332,10 +343,13 @@ impl Default for AiTuning {
             aoi_radius_active: 120.0,
             aoi_radius_mid: 520.0,
             tier_hysteresis_ticks: 30,
-            // R102 Part A — the Dormant/glide cutoff is floored to this play-space
-            // radius (≥ the max camera view), so a ship the player can SEE never
-            // collapses to the no-physics kinematic glide regardless of how small
-            // `aoi_radius_mid` is tuned. 600 matches the skirmish play-space radius.
+            // R103 (was R102 Part A) — the Dormant/glide cutoff is floored to this
+            // PERCEIVABLE-space radius (≥ client `radar::RADAR_RANGE` 700u + 50u
+            // margin), so a ship the player can SEE OR SEE ON RADAR never collapses
+            // to the no-physics kinematic glide regardless of how small
+            // `aoi_radius_mid` is tuned. 750 clears the 700u radar (the widest
+            // perceivable surface — wider than the ~375u main view R102's 600 only
+            // covered) with a 50u glide→physics handoff margin.
             glide_min_radius: default_glide_min_radius(),
             promote_nudge_max: CELL_WORLD_SIZE,
             // Squads.
@@ -528,11 +542,13 @@ mod tests {
         // R98 HOTFIX B3 — the Mid radius must clear the max-zoom view corner
         // (~202 u) so dormant kinematics never occur on screen.
         assert!(t.aoi_radius_mid > 202.0);
-        // R102 Part A — the glide-visibility floor is positive and at least the
-        // play-space radius (600 u, ≥ the max camera view corner), so a ship the
-        // player can see never collapses to the no-physics glide even when
-        // `aoi_radius_mid` is tuned smaller than the floor.
-        assert!(t.glide_min_radius >= 600.0);
+        // R103 (was R102 Part A) — the glide-visibility floor is positive and at
+        // least the WIDEST perceivable surface (the 700u radar; the ~375u main
+        // view is narrower), so a ship the player can see — on screen OR on radar
+        // — never collapses to the no-physics glide even when `aoi_radius_mid` is
+        // tuned smaller than the floor. `>= 700.0` is the radar bound (the 750
+        // default carries +50u handoff margin over it).
+        assert!(t.glide_min_radius >= 700.0);
         // R98 HOTFIX D — the release ring must be at least the acquisition ring
         // (>= 1 keeps the hysteresis a pure widening, never a shrink).
         assert!(t.defend_release_factor >= 1.0);
@@ -570,12 +586,12 @@ mod tests {
         let d = AiTuning::default();
         assert_eq!(t.aoi_radius_mid, d.aoi_radius_mid);
         assert_eq!(t.think_ticks_dormant, d.think_ticks_dormant);
-        // R102 Part A — `glide_min_radius` carries a per-FIELD serde default
-        // (`#[serde(default = "default_glide_min_radius")]`): absent from this
-        // partial RON it must restore 600.0, NOT `f32::default()` (0.0) — a 0
+        // R103 (was R102 Part A) — `glide_min_radius` carries a per-FIELD serde
+        // default (`#[serde(default = "default_glide_min_radius")]`): absent from
+        // this partial RON it must restore 750.0, NOT `f32::default()` (0.0) — a 0
         // floor would re-open the dormant-glide leak.
         assert_eq!(t.glide_min_radius, d.glide_min_radius);
-        assert_eq!(t.glide_min_radius, 600.0);
+        assert_eq!(t.glide_min_radius, 750.0);
         // R97 Stage A fields are also `#[serde(default)]`: absent from this
         // older/partial RON, they fall back to the pinned defaults.
         assert_eq!(t.threat_recency_window_ticks, d.threat_recency_window_ticks);

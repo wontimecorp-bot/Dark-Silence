@@ -535,13 +535,34 @@ pub fn glide_motion_system(
     entities: &Entities,
     mut queue: ResMut<RethinkQueue>,
     mut commands: Commands,
-    // R102 Part A — players (`Without<Gliding>/<Squad>`, so access-disjoint from
-    // `members`/`squads`) for the glide-visibility floor: a gliding squad whose
-    // centroid still classifies Dormant but ANY of whose members has drifted
-    // within `glide_min_radius` of a player must EXPAND this tick. The
+    // R103 (was R102 Part A) — players for the glide-visibility floor: a gliding
+    // squad whose centroid still classifies Dormant but ANY of whose members has
+    // drifted within `glide_min_radius` of a player must EXPAND this tick. The
     // centroid-only classifier can lag a member crossing the floor (formation
-    // spread + the player MOVING toward the glide), so this is the in-flight
-    // twin of the per-member collapse guard.
+    // spread + the player MOVING toward the glide), so this is the in-flight twin
+    // of the per-member collapse guard.
+    //
+    // R103 Task 2(a) — the `Without<Squad>` + `Without<Gliding>` filters are
+    // SOUNDNESS-REQUIRED, not behavioral: they make this `&Position` view
+    // ECS-access-disjoint from the `squads`/`members` queries below (which BORROW
+    // `Position` mutably — `members` is `&mut Position` + `With<Gliding>`, so
+    // without `Without<Gliding>` Bevy 0.18 flags a conflicting `Position` access
+    // and PANICS at schedule build; `colliders` carries the same pair for the
+    // same reason). Crucially NEITHER filter can ever exclude a REAL player: a
+    // `PlayerShip` is never a squad-member offset carrier (`Squad`) and is never
+    // `Gliding` (that marker is inserted ONLY on collapsed squad MEMBERS by
+    // `glide_collapse_system`, never on a player). So this set equals
+    // `classify_aoi_system`'s `With<PlayerShip>` set restricted to
+    // not-squad/not-gliding entities — which for players is the SAME set. The
+    // filters therefore CANNOT "silently empty" the set of a present player (the
+    // R103 footgun review): a faction-swap that teleports the player onto a
+    // gliding neighborhood still expands those squads THIS tick via the
+    // floor-breach below, because the marker (and so this set's membership) is
+    // never dropped — proven by `server`'s `faction_swap_midflight_does_not_mass_glide`.
+    // The remaining transient-empty-player concern (a momentarily missing player)
+    // cannot mass-collapse squads either: `classify_aoi_system` demotes to
+    // `Dormant` only after the full `tier_hysteresis_ticks` dwell, so a few-tick
+    // blip never reaches the Dormant state collapse requires.
     players: Query<&Position, (With<PlayerShip>, Without<Squad>, Without<Gliding>)>,
     mut squads: Query<(
         Entity,
